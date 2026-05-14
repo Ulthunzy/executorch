@@ -27,6 +27,7 @@ from executorch.examples.qualcomm.oss_scripts.llama.encoder.encoder_config impor
 )
 from executorch.examples.qualcomm.oss_scripts.llama.tokenizer import TokenizerWrapper
 from huggingface_hub import hf_hub_download
+from PIL import Image
 from transformers import AutoProcessor
 from transformers.image_utils import load_image
 
@@ -130,6 +131,24 @@ class DatasetBuilder:
         # Process image with text prompt using HuggingFace processor
         # Some HF processors (e.g. InternVL3) need to pass text arg or it will cause error and process failed
         processor = AutoProcessor.from_pretrained(self.repo_id)
+        if self.control_args.decoder_model in {
+            "qwen2_5_vl-3b_instruct",
+            "lincal_vl-3b_instruct",
+        }:
+            resized_images = [
+                image.resize(
+                    (config.img_resized_w, config.img_resized_h),
+                    Image.Resampling.BICUBIC,
+                )
+                for image in images
+            ]
+            pixel_values = processor.image_processor.preprocess(
+                images=resized_images,
+                return_tensors="pt",
+                do_resize=False,
+            )["pixel_values"]
+            return [(pixel_values,)]
+
         pixel_values = processor(
             text=prompt,
             images=images,

@@ -34,7 +34,16 @@ from executorch.examples.models.phi_4_mini import (
 from executorch.examples.models.qwen2_5 import (
     convert_weights as convert_qwen2_5_weights,
 )
+from executorch.examples.models.qwen2_5_vl import (
+    convert_weights as convert_qwen2_5_vl_weights,
+)
+from executorch.examples.models.lincal_vl import (
+    convert_weights as convert_lincal_vl_weights,
+)
 from executorch.examples.models.qwen3 import convert_weights as convert_qwen3_weights
+from executorch.examples.models.lincal import (
+    convert_weights as convert_lincal_weights,
+)
 from executorch.examples.models.smollm2 import (
     convert_weights as convert_smollm2_weights,
 )
@@ -56,6 +65,7 @@ from executorch.examples.qualcomm.oss_scripts.llama.encoder.encoder_config impor
     GraniteSpeechEncoder,
     InternVL3Encoder,
     MultiModalityConfig,
+    Qwen2_5VL3BEncoder,
     SmolVLMEncoder,
     VisionModalityConfig,
 )
@@ -63,6 +73,7 @@ from executorch.examples.qualcomm.oss_scripts.llama.model.static_llama import (
     LlamaModel,
     LlamaModelWithoutEmbedding,
     MultiScopeAwareLlamaModel,
+    MultiScopeAwareLlamaModelWithoutEmbedding,
 )
 
 from executorch.examples.qualcomm.oss_scripts.llama.static_llm_quant_recipe import (
@@ -81,8 +92,13 @@ from executorch.examples.qualcomm.oss_scripts.llama.static_llm_quant_recipe impo
     Phi4MiniQuantRecipe,
     Qwen2_5_0_5BQuantRecipe,
     Qwen2_5_1_5BQuantRecipe,
+    Qwen2_5_VL_3BQuantRecipe,
     Qwen3_0_6BQuantRecipe,
     Qwen3_1_7BQuantRecipe,
+    Qwen3_4BQuantRecipe,
+    Lincal_0_6BQuantRecipe,
+    Lincal_1_7BQuantRecipe,
+    Lincal_4BQuantRecipe,
     Smollm2QuantRecipe,
     Smollm3QuantRecipe,
     SmolVLMQuantRecipe,
@@ -94,11 +110,16 @@ from tabulate import tabulate
 BASE_DIR = os.path.dirname(__file__)
 
 
-LLM_VARIANT_ARCHS: Dict[str, LlamaModel] = {
+LLM_VARIANT_ARCHS: Dict[str, Type[LlamaModel]] = {
     "gemma3-1b": MultiScopeAwareLlamaModel,
     "granite_speech_3_3-2b": LlamaModelWithoutEmbedding,
+    "lincal-0_6b": MultiScopeAwareLlamaModel,
+    "lincal-1_7b": MultiScopeAwareLlamaModel,
+    "lincal-4b": MultiScopeAwareLlamaModel,
     "smolvlm_500m_instruct": LlamaModelWithoutEmbedding,
     "internvl3_1b": LlamaModelWithoutEmbedding,
+    "qwen2_5_vl-3b_instruct": LlamaModelWithoutEmbedding,
+    "lincal_vl-3b_instruct": MultiScopeAwareLlamaModelWithoutEmbedding,
     "gemma2-2b": MultiScopeAwareLlamaModel,
 }
 
@@ -352,7 +373,7 @@ class Gemma2(LLMModelConfig):
 @register_llm_model("gemma3-1b")
 @dataclass(init=False, frozen=True)
 class Gemma3(LLMModelConfig):
-    repo_id: str = "google/gemma-3-1b-it"
+    repo_id: str = "/hunter/model/google/gemma-3-1b-it"
     params_path: str = os.path.join(
         BASE_DIR, "../../../models/gemma3/config/1b_config.json"
     )
@@ -524,6 +545,25 @@ class Qwen3_1_7B(LLMModelConfig):
     quant_recipe = Qwen3_1_7BQuantRecipe
 
 
+@register_llm_model("qwen3-4b")
+@dataclass(init=False, frozen=True)
+class Qwen3_4B(LLMModelConfig):
+    repo_id: str = "Qwen/Qwen3-4B"
+    params_path: str = os.path.join(
+        BASE_DIR, "../../../models/qwen3/config/4b_config.json"
+    )
+    convert_weights = convert_qwen3_weights
+    transform_weight = False
+    instruct_model = True
+    num_sharding = 4
+    masked_softmax = True
+    seq_mse_candidates = 0
+    r1 = False
+    r2 = False
+    r3 = True
+    quant_recipe = Qwen3_4BQuantRecipe
+
+
 @register_llm_model("smollm2_135m")
 @dataclass(init=False, frozen=True)
 class Smollm2_135M(LLMModelConfig):
@@ -560,6 +600,66 @@ class Smollm3_3B(LLMModelConfig):
     quant_recipe = Smollm3QuantRecipe
 
 
+@register_llm_model("lincal-0_6b")
+@dataclass(init=False, frozen=True)
+class Lincal_0_6B(LLMModelConfig):
+    repo_id: str = "/hunter/model/Lincal/Lincal-0.6B"
+    params_path: str = os.path.join(
+        BASE_DIR, "../../../models/lincal/config/0_6b_config.json"
+    )
+    convert_weights = convert_lincal_weights
+    transform_weight = False
+    instruct_model = True
+    num_sharding = 1
+    group_size = 32
+    masked_softmax = True
+    seq_mse_candidates = 0
+    r1 = False
+    r2 = False
+    r3 = False
+    quant_recipe = Lincal_0_6BQuantRecipe
+
+
+@register_llm_model("lincal-1_7b")
+@dataclass(init=False, frozen=True)
+class Lincal_1_7B(LLMModelConfig):
+    repo_id: str = "/hunter/model/Lincal/Lincal-1.7B-1.0.05.1"
+    params_path: str = os.path.join(
+        BASE_DIR, "../../../models/lincal/config/1_7b_config.json"
+    )
+    convert_weights = convert_lincal_weights
+    transform_weight = False
+    instruct_model = True
+    num_sharding = 1
+    group_size = 16
+    masked_softmax = True
+    seq_mse_candidates = 0
+    r1 = False
+    r2 = False
+    r3 = True
+    quant_recipe = Lincal_1_7BQuantRecipe
+
+
+@register_llm_model("lincal-4b")
+@dataclass(init=False, frozen=True)
+class Lincal_4B(LLMModelConfig):
+    repo_id: str = "Lincal/Lincal-4B"
+    params_path: str = os.path.join(
+        BASE_DIR, "../../../models/lincal/config/4b_config.json"
+    )
+    convert_weights = convert_lincal_weights
+    transform_weight = False
+    instruct_model = True
+    num_sharding = 8
+    group_size = 32
+    masked_softmax = True
+    seq_mse_candidates = 0
+    r1 = False
+    r2 = False
+    r3 = True
+    quant_recipe = Lincal_4BQuantRecipe
+
+
 @register_llm_model(
     "internvl3_1b",
     modality_encoders=InternVL3Encoder,
@@ -580,6 +680,50 @@ class InternVL3_1B(LLMModelConfig):
     r2 = False
     r3 = False
     quant_recipe = InternVL3_1B_QuantRecipe
+
+
+@register_llm_model(
+    "qwen2_5_vl-3b_instruct",
+    vision_encoder=Qwen2_5VL3BEncoder,
+)
+@dataclass(init=False, frozen=True)
+class Qwen2_5_VL_3B(LLMModelConfig):
+    repo_id: str = "Qwen/Qwen2.5-VL-3B-Instruct"
+    params_path: str = os.path.join(
+        BASE_DIR, "../../../models/qwen2_5_vl/config/3b_config.json"
+    )
+    convert_weights = convert_qwen2_5_vl_weights
+    transform_weight = False
+    instruct_model = True
+    num_sharding = 2
+    masked_softmax = True
+    seq_mse_candidates = 0
+    r1 = False
+    r2 = False
+    r3 = False
+    quant_recipe = Qwen2_5_VL_3BQuantRecipe
+
+
+@register_llm_model(
+    "lincal_vl-3b_instruct",
+    vision_encoder=Qwen2_5VL3BEncoder,
+)
+@dataclass(init=False, frozen=True)
+class Lincal_VL_3B(LLMModelConfig):
+    repo_id: str = "/hunter/model/Lincal/Lincal-VL-3B"
+    params_path: str = os.path.join(
+        BASE_DIR, "../../../models/lincal_vl/config/3b_config.json"
+    )
+    convert_weights = convert_lincal_vl_weights
+    transform_weight = False
+    instruct_model = True
+    num_sharding = 1
+    masked_softmax = True
+    seq_mse_candidates = 0
+    r1 = False
+    r2 = False
+    r3 = False
+    quant_recipe = Qwen2_5_VL_3BQuantRecipe
 
 
 @register_llm_model(

@@ -37,6 +37,16 @@ VLM_SPECIAL_TOKENS = {
         "fake_wrap_start": "<img>",
         "fake_wrap_end": "</img>",
     },
+    "qwen2_5_vl-3b_instruct": {
+        IMG_TOKEN: "<|image_pad|>",
+        "fake_wrap_start": "<|vision_start|>",
+        "fake_wrap_end": "<|vision_end|>",
+    },
+    "lincal_vl-3b_instruct": {
+        IMG_TOKEN: "<|image_pad|>",
+        "fake_wrap_start": "<|vision_start|>",
+        "fake_wrap_end": "<|vision_end|>",
+    },
 }
 # Special tokens for Audio-Language Model
 ALM_SPECIAL_TOKENS = {
@@ -351,6 +361,22 @@ class TokenizerWrapper:
         Returns:
             Formatted prompt string
         """
+
+        if self.decoder_model in {"qwen2_5_vl-3b_instruct", "lincal_vl-3b_instruct"}:
+            image_count = prompt.count(IMG_TOKEN)
+            prompt = prompt.replace(IMG_TOKEN, "").lstrip()
+            template_prompt = ""
+            if system_prompt:
+                template_prompt += "<|im_start|>system\n"
+                template_prompt += system_prompt
+                template_prompt += "<|im_end|>\n"
+            template_prompt += "<|im_start|>user\n"
+            if image_count:
+                template_prompt += "<|image_pad|>\n" * image_count
+            template_prompt += prompt
+            template_prompt += "<|im_end|>\n"
+            template_prompt += "<|im_start|>assistant\n"
+            return template_prompt
 
         messages = []
         message = {"role": "user", "content": prompt}

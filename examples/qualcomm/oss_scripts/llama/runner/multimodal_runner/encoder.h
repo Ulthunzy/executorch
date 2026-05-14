@@ -7,6 +7,7 @@
  */
 
 #pragma once
+#include <executorch/extension/llm/runner/image.h>
 #include <executorch/extension/module/module.h>
 #include <executorch/extension/tensor/tensor.h>
 #include <executorch/extension/tensor/tensor_ptr.h>
@@ -50,6 +51,17 @@ class EncoderRunner {
    */
   executorch::runtime::Result<executorch::aten::Tensor> encode(
       executorch::extension::TensorPtr& input_tensor);
+
+  /**
+   * @brief Encode raw image/tensor input using the encoder input metadata.
+   *
+   * This path is used by Qualcomm multimodal runners that feed preprocessed
+   * encoder inputs from disk. Some VLM encoders take flattened patch tensors
+   * rather than CHW/NCHW images, so we reshape the raw buffer using the module
+   * metadata instead of the generic Image tensor layout.
+   */
+  executorch::runtime::Result<executorch::aten::Tensor> encode(
+      const executorch::extension::llm::Image& image);
 
  private:
   executorch::extension::Module* module_;

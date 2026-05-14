@@ -39,6 +39,7 @@ enum DecoderModelVersion {
   kPhi4,
   kQwen2_5,
   kQwen3,
+  kLincal,
   kSmollm2_135m,
   kSmollm3,
   kCodegen,

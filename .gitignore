@@ -26,6 +26,13 @@ executorch.egg-info
 pip-out/
 build-profiling/
 
+llama-output/*
+llama_qnn/*
+
+run.log*
+
+mybuild.sh
+
 # Any exported models and profiling outputs
 *.bin
 *.model
@@ -80,3 +87,30 @@ xcuserdata/
 # Agents
 .claude/*.local.*
 extension/pybindings/mlx.metallib
+
+examples/qualcomm/oss_scripts/llama/generate_single_weight_heatmaps.py
+examples/qualcomm/oss_scripts/llama/weigh_comparison.py
+examples/qualcomm/oss_scripts/llama/weight_change.py
+examples/qualcomm/oss_scripts/llama/weight_comparison.py
+
+weight_analysis/
+weight_heatmaps/
+
+run*.log*
+llama-output/
+llama_qnn/
+luxi/
+*output-qnn/
+*.pt
+*.pte
+*.pth
+
+mybuild.sh
+attention-debug/
+forward.dlc
+
+examples/qualcomm/oss_scripts/llama/pte_compare.py
+transformers_test.py
+
+.claude/skills/hunter-qualcomm-refresh
+.claude/skills/hunter-qualcomm-merge

@@ -121,18 +121,34 @@ void load_image(
     const std::vector<int32_t>& expected_size,
     const ScalarType& expected_dtype) {
   const size_t n = expected_size.size();
-  ET_CHECK_MSG(n >= 3, "expected dim should at least be 3, but got %zu", n);
-  const int32_t channels = expected_size[n - 3];
-  const int32_t height = expected_size[n - 2];
-  const int32_t width = expected_size[n - 1];
+  ET_CHECK_MSG(!expected_size.empty(), "expected dim cannot be empty");
+
+  int32_t channels = 1;
+  int32_t height = 1;
+  int32_t width = 1;
+  if (n >= 3) {
+    channels = expected_size[n - 3];
+    height = expected_size[n - 2];
+    width = expected_size[n - 1];
+  } else if (n == 2) {
+    height = expected_size[0];
+    width = expected_size[1];
+  } else {
+    width = expected_size[0];
+  }
 
   size_t num_elems = std::accumulate(
       expected_size.begin(),
       expected_size.end(),
       size_t{1},
       std::multiplies<size_t>());
-
-  std::streamsize expected_length = num_elems * sizeof(float);
+  ET_CHECK_MSG(
+      expected_dtype == ScalarType::Float || expected_dtype == ScalarType::Byte,
+      "Unsupported encoder input dtype: %d",
+      static_cast<int>(expected_dtype));
+  const size_t element_size =
+      expected_dtype == ScalarType::Byte ? sizeof(uint8_t) : sizeof(float);
+  std::streamsize expected_length = num_elems * element_size;
 
   std::ifstream file(image_path, std::ios::binary | std::ios::ate);
   ET_CHECK_MSG(
@@ -147,14 +163,22 @@ void load_image(
       expected_length,
       image_path.c_str());
   file.seekg(0, std::ios::beg);
-  std::vector<float> buffer(num_elems);
-  file.read(reinterpret_cast<char*>(buffer.data()), expected_length);
-  file.close();
-
-  image = Image(std::move(buffer), width, height, channels);
+  if (expected_dtype == ScalarType::Byte) {
+    std::vector<uint8_t> buffer(num_elems);
+    file.read(reinterpret_cast<char*>(buffer.data()), expected_length);
+    file.close();
+    image = Image(std::move(buffer), width, height, channels);
+  } else {
+    std::vector<float> buffer(num_elems);
+    file.read(reinterpret_cast<char*>(buffer.data()), expected_length);
+    file.close();
+    image = Image(std::move(buffer), width, height, channels);
+  }
   ET_LOG(
       Info,
-      "image Channels: %" PRId32 ", Height: %" PRId32 ", Width: %" PRId32,
+      "image tensor loaded with rank=%zu, channels=%" PRId32
+      ", height=%" PRId32 ", width=%" PRId32,
+      n,
       image.channels(),
       image.height(),
       image.width());

@@ -162,6 +162,7 @@ std::string get_formatted_prompt(
       formatted_prompt.append("<|end|><|assistant|>");
       break;
     case example::DecoderModelVersion::kQwen3:
+    case example::DecoderModelVersion::kLincal:
       formatted_prompt.append("<|im_start|>user\n");
       formatted_prompt.append(prompt);
       formatted_prompt.append("<|im_end|>\n");

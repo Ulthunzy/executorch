@@ -6,6 +6,7 @@
 
 # decode qdq file name
 DECODE_QDQ_FILENAME = "decode_qdq.pt2"
+VISION_ENCODER_INPUT_FILENAME = "vision_encoder_input"
 
 # eval methods
 PROMPT_EVAL = "prompt_eval"
@@ -56,8 +57,14 @@ DECODER_MODEL_VERSION = {
     "phi_4_mini": "phi_4_mini",
     "qwen2_5-0_5b": "qwen2_5",
     "qwen2_5-1_5b": "qwen2_5",
+    "qwen2_5_vl-3b_instruct": "qwen2_5_vl",
+    "lincal_vl-3b_instruct": "qwen2_5_vl",
     "qwen3-0_6b": "qwen3",
     "qwen3-1_7b": "qwen3",
+    "qwen3-4b": "qwen3",
+    "lincal-0_6b": "lincal",
+    "lincal-1_7b": "lincal",
+    "lincal-4b": "lincal",
     "smollm2_135m": "smollm2_135m",
     "smollm3-3b": "smollm3",
     "glm-1_5b": "glm",

@@ -71,3 +71,6 @@
 	path = backends/mlx/third-party/mlx
 	url = https://github.com/ml-explore/mlx.git
 	shallow = true
+[submodule "third-party/boringssl"]
+	path = third-party/boringssl
+	url = https://github.com/google/boringssl.git

@@ -16,6 +16,7 @@
 #include <executorch/examples/qualcomm/oss_scripts/llama/runner/multimodal_runner/multimodal_lhd_token_generator.h>
 #include <executorch/examples/qualcomm/oss_scripts/llama/runner/multimodal_runner/multimodal_runner.h>
 #include <executorch/examples/qualcomm/oss_scripts/llama/runner/rpc_mem.h>
+#include <executorch/examples/qualcomm/oss_scripts/llama/runner/utils.h>
 #include <executorch/extension/llm/runner/text_llm_runner.h>
 #include <executorch/extension/llm/runner/util.h>
 #include <executorch/runtime/core/exec_aten/exec_aten.h>
@@ -140,6 +141,9 @@ QNNMultimodalRunner<T>::QNNMultimodalRunner(
     model_version_ = VisionLanguageModel::kInternvl3;
   } else if (model_version == "granite_speech") {
     model_version_ = AudioLanguageModel::kGraniteSpeech;
+  } else if (
+      model_version == "qwen2_5_vl" || model_version == "lincal_vl") {
+    model_version_ = VisionLanguageModel::kQwen2_5_VL;
   } else {
     ET_CHECK_MSG(false, "Unsupported Decoder Model");
   }
@@ -161,6 +165,10 @@ Error QNNMultimodalRunner<T>::load() {
   if (is_loaded()) {
     return Error::Ok;
   }
+#if ET_QNN_RUNNER_DEV_MEM_LOG
+  const dev_mem::RssSample load_before = dev_mem::sample_rss();
+  dev_mem::log_proc_status_mem("multimodal load stage: entry");
+#endif
   std::string prompt_embedding_method_name, tok_embedding_method_name;
   std::string token_generator_method_name, prompt_processor_method_name;
   std::vector<std::string> method_names;
@@ -203,7 +211,9 @@ Error QNNMultimodalRunner<T>::load() {
   if (const auto* vlm = std::get_if<VisionLanguageModel>(&model_version_)) {
     if (*vlm == VisionLanguageModel::kSmolvlm) {
       eos_ids->insert(tokenizer_->encode("<end_of_utterance>", 0, 0).get()[0]);
-    } else if (*vlm == VisionLanguageModel::kInternvl3) {
+    } else if (
+        *vlm == VisionLanguageModel::kInternvl3 ||
+        *vlm == VisionLanguageModel::kQwen2_5_VL) {
       eos_ids->insert(tokenizer_->encode("<|im_end|>", 0, 0).get()[0]);
     }
   } else if (
@@ -225,6 +235,10 @@ Error QNNMultimodalRunner<T>::load() {
   ET_CHECK_OK_OR_RETURN_ERROR(decoder_runner_->load(method_names));
 
   ET_LOG(Info, "Reading metadata from model");
+#if ET_QNN_RUNNER_DEV_MEM_LOG
+  const dev_mem::RssSample metadata_stage_before = dev_mem::sample_rss();
+  dev_mem::log_proc_status_mem("multimodal load stage: metadata extraction (before)");
+#endif
   // retrieve any method meta, can be either prefill or kv
   int64_t num_layers =
       ET_UNWRAP(text_decoder_->get("get_n_layers")).toScalar().to<int64_t>();
@@ -298,6 +312,16 @@ Error QNNMultimodalRunner<T>::load() {
     sliding_window =
         ET_UNWRAP(text_decoder_->get("get_sliding_window")).toInt();
   }
+#if ET_QNN_RUNNER_DEV_MEM_LOG
+  const dev_mem::RssSample metadata_stage_after = dev_mem::sample_rss();
+  dev_mem::log_rss_delta(
+      "multimodal load stage: metadata extraction",
+      metadata_stage_before,
+      metadata_stage_after);
+  dev_mem::log_proc_status_mem("multimodal load stage: metadata extraction (after)");
+  const dev_mem::RssSample load_io_before = dev_mem::sample_rss();
+  dev_mem::log_proc_status_mem("multimodal load stage: io/cache allocation (before)");
+#endif
   kv_manager_ = std::make_unique<KVManager<T>>(typename KVManager<T>::Metadata{
       context_len_,
       head_dim,
@@ -402,9 +426,70 @@ Error QNNMultimodalRunner<T>::load() {
       buffer_manager_.get(),
       tok_embedding_->method_meta(tok_embedding_method_name));
 
+  if (const auto* vlm = std::get_if<VisionLanguageModel>(&model_version_)) {
+    if (text_decoder_->method_names()->count("image_token_id") > 0) {
+      image_token_id_ = ET_UNWRAP(text_decoder_->get("image_token_id")).toInt();
+      ET_LOG(
+          Info,
+          "Image placeholder token ID for vision modality loaded: %zu",
+          image_token_id_);
+    } else if (*vlm == VisionLanguageModel::kQwen2_5_VL) {
+      ET_CHECK_MSG(
+          false,
+          "Qwen2.5-VL compatible models require image_token_id metadata.");
+    }
+  }
+
   // Initialize embedding merger
   embedding_merger_ =
       std::make_unique<MultimodalEmbeddingMerger>(static_cast<int32_t>(dim));
+
+#if ET_QNN_RUNNER_DEV_MEM_LOG
+  const dev_mem::RssSample load_io_after = dev_mem::sample_rss();
+  dev_mem::log_rss_delta(
+      "multimodal load stage: io/cache allocation",
+      load_io_before,
+      load_io_after);
+  dev_mem::log_proc_status_mem("multimodal load stage: io/cache allocation (after)");
+
+  const size_t prompt_io_bytes =
+      prompt_processor_->total_prompt_processor_io_size_in_bytes();
+  const size_t token_io_bytes =
+      token_generator_->total_token_generator_io_size_in_bytes();
+  const size_t embedding_prefill_io_bytes =
+      tok_embedding_processor_->total_embedding_processor_io_size_in_bytes();
+  const size_t embedding_decode_io_bytes =
+      tok_embedding_generator_->total_embedding_processor_io_size_in_bytes();
+  const size_t total_static_buffers =
+      kv_manager_->total_cache_size_in_bytes() + prompt_io_bytes +
+      token_io_bytes + embedding_prefill_io_bytes + embedding_decode_io_bytes;
+  const dev_mem::RssSample load_after = dev_mem::sample_rss();
+  ET_LOG(
+      Info,
+      "[DEV_MEM] multimodal load current RSS: before=%.2f MiB after=%.2f MiB delta=%.2f MiB",
+      dev_mem::bytes_to_mib(load_before.current_bytes),
+      dev_mem::bytes_to_mib(load_after.current_bytes),
+      dev_mem::bytes_to_mib(
+          dev_mem::saturating_sub(
+              load_after.current_bytes, load_before.current_bytes)));
+  ET_LOG(
+      Info,
+      "[DEV_MEM] multimodal load peak RSS: before=%.2f MiB after=%.2f MiB delta=%.2f MiB",
+      dev_mem::bytes_to_mib(load_before.peak_bytes),
+      dev_mem::bytes_to_mib(load_after.peak_bytes),
+      dev_mem::bytes_to_mib(
+          dev_mem::saturating_sub(
+              load_after.peak_bytes, load_before.peak_bytes)));
+  ET_LOG(
+      Info,
+      "[DEV_MEM] multimodal static buffers: kv_cache=%.2f MiB prompt_io=%.2f MiB token_io=%.2f MiB embedding_prefill_io=%.2f MiB embedding_decode_io=%.2f MiB total=%.2f MiB",
+      dev_mem::bytes_to_mib(kv_manager_->total_cache_size_in_bytes()),
+      dev_mem::bytes_to_mib(prompt_io_bytes),
+      dev_mem::bytes_to_mib(token_io_bytes),
+      dev_mem::bytes_to_mib(embedding_prefill_io_bytes),
+      dev_mem::bytes_to_mib(embedding_decode_io_bytes),
+      dev_mem::bytes_to_mib(total_static_buffers));
+#endif
 
   return Error::Ok;
 }
@@ -448,6 +533,8 @@ executorch::runtime::Error QNNMultimodalRunner<T>::generate(
 
   // Reset merger for new generation
   embedding_merger_->reset();
+  const bool placeholder_merge =
+      modality_of(model_version_) == Modality::kVision && image_token_id_ != 0;
 
   // Process each input and add embeddings to merger
   for (const MultimodalInput& input : inputs) {
@@ -466,7 +553,11 @@ executorch::runtime::Error QNNMultimodalRunner<T>::generate(
           tok_embedding_processor_->get_prompt_embeddings();
 
       // Add text embeddings to merger
-      embedding_merger_->add_embeddings(text_embeddings);
+      if (placeholder_merge) {
+        embedding_merger_->add_text_embeddings(text_embeddings);
+      } else {
+        embedding_merger_->add_embeddings(text_embeddings);
+      }
 
       prompt_tokens.insert(prompt_tokens.end(), tokens.begin(), tokens.end());
 
@@ -483,23 +574,24 @@ executorch::runtime::Error QNNMultimodalRunner<T>::generate(
       embedding_merger_->add_embeddings(audio_embeddings_tensor);
     } else if (input.is_image()) {
       const Image& image = input.get_image();
-      auto image_tensor_res = image.toTensor(/*with_batch*/ true);
-      executorch::extension::TensorPtr image_tensor_ptr =
-          image_tensor_res.get();
-
-      auto encode_res = encoder_runner_->encode(image_tensor_ptr);
+      auto encode_res = encoder_runner_->encode(image);
       executorch::aten::Tensor image_embeddings_tensor = encode_res.get();
 
       // Add image embeddings to merger
-      embedding_merger_->add_embeddings(image_embeddings_tensor);
+      if (placeholder_merge) {
+        embedding_merger_->add_image_embeddings(image_embeddings_tensor);
+      } else {
+        embedding_merger_->add_embeddings(image_embeddings_tensor);
+      }
 
     } else {
       ET_CHECK_MSG(false, "Unsupported input data type");
     }
   }
 
-  TensorStruct<float> merged_embeddings =
-      embedding_merger_->get_merged_embeddings();
+  TensorStruct<float> merged_embeddings = placeholder_merge
+      ? embedding_merger_->merge(prompt_tokens, image_token_id_)
+      : embedding_merger_->get_merged_embeddings();
   int num_prompt_tokens = embedding_merger_->get_total_tokens();
 
   ET_CHECK_MSG(num_prompt_tokens >= 1, "Expected at least 1 prompt token");
@@ -511,6 +603,9 @@ executorch::runtime::Error QNNMultimodalRunner<T>::generate(
     token_callback(prompt);
   }
 
+#if ET_QNN_RUNNER_DEV_MEM_LOG
+  const dev_mem::RssSample prefill_before = dev_mem::sample_rss();
+#endif
   auto prefill_res = prompt_processor_->prefill(
       merged_embeddings, cur_pos_, dump_logits, nullptr);
   ET_CHECK_OK_OR_RETURN_ERROR(prefill_res.error());
@@ -518,6 +613,14 @@ executorch::runtime::Error QNNMultimodalRunner<T>::generate(
   cur_pos_ += num_prompt_tokens;
   stats_.first_token_ms = time_in_ms();
   stats_.prompt_eval_end_ms = time_in_ms();
+#if ET_QNN_RUNNER_DEV_MEM_LOG
+  const dev_mem::RssSample prefill_after = dev_mem::sample_rss();
+  dev_mem::log_rss_delta(
+      "multimodal prefill",
+      prefill_before,
+      prefill_after);
+  dev_mem::log_proc_status_mem("multimodal prefill (after)");
+#endif
 
   // print the first token from prefill. No prev_token so use cur_token for
   // it.
@@ -533,9 +636,20 @@ executorch::runtime::Error QNNMultimodalRunner<T>::generate(
   // start the main loop
   prompt_tokens.push_back(cur_token);
 
+#if ET_QNN_RUNNER_DEV_MEM_LOG
+  const dev_mem::RssSample decode_before = dev_mem::sample_rss();
+#endif
   int64_t num_generated_tokens = ET_UNWRAP(token_generator_->generate(
       prompt_tokens, cur_pos_, seq_len, token_callback, dump_logits, nullptr));
   stats_.inference_end_ms = time_in_ms();
+#if ET_QNN_RUNNER_DEV_MEM_LOG
+  const dev_mem::RssSample decode_after = dev_mem::sample_rss();
+  dev_mem::log_rss_delta(
+      "multimodal decode",
+      decode_before,
+      decode_after);
+  dev_mem::log_proc_status_mem("multimodal decode (after)");
+#endif
   ET_LOG(
       Info,
       "RSS after finishing text generation: %f MiB (0 if unsupported)",

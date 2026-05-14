@@ -6,8 +6,10 @@
 
 from executorch.examples.qualcomm.oss_scripts.llama.encoder.encoder_config import (
     AudioModalityConfig,
+    GraniteSpeechEncoder,
     InternVL3Encoder,
     MultiModalityConfig,
+    Qwen2_5VL3BEncoder,
     SmolVLMEncoder,
     VisionModalityConfig,
 )
@@ -15,17 +17,21 @@ from executorch.examples.qualcomm.oss_scripts.llama.encoder.encoder_quant_recipe
     EncoderQuantRecipe,
     GraniteSpeechEncoderQuantRecipe,
     InternVL3EncoderQuantRecipe,
+    Qwen2_5_VL_Encoder_QuantRecipe,
     SmolVLMEncoderQuantRecipe,
 )
 
 __all__ = [
     "EncoderQuantRecipe",
+    "GraniteSpeechEncoder",
+    "GraniteSpeechEncoderQuantRecipe",
     "InternVL3Encoder",
     "InternVL3EncoderQuantRecipe",
     "MultiModalityConfig",
+    "Qwen2_5VL3BEncoder",
+    "Qwen2_5_VL_Encoder_QuantRecipe",
     "SmolVLMEncoder",
     "SmolVLMEncoderQuantRecipe",
     "VisionModalityConfig",
     "AudioModalityConfig",
-    "GraniteSpeechEncoderQuantRecipe",
 ]

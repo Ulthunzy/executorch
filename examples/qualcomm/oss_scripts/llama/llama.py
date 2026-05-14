@@ -10,17 +10,21 @@
 import json
 import logging
 import os
+import shutil
 import sys
 from multiprocessing.connection import Client
 from typing import Dict
 
 import torch
+from executorch.backends.qualcomm.debugger.utils import QnnTool
 from executorch.backends.qualcomm.export_utils import (
+    SimpleADB,
     get_backend_type,
     setup_common_args_and_variables,
 )
 
 from executorch.backends.qualcomm.utils.utils import (
+    dump_context_from_pte,
     generate_htp_compiler_spec,
     generate_qnn_executorch_compiler_spec,
     get_soc_to_chipset_map,
@@ -67,6 +71,222 @@ logging.basicConfig(level=logging.INFO, format=FORMAT)
 logging.getLogger().setLevel(logging.INFO)
 # Avoid the error message "Could not initialize NNPACK! Reason: Unsupported hardware."
 torch.backends.nnpack.set_flags(False)
+
+
+def _dumpfile_to_method_name(dump_file: str) -> str:
+    stem = os.path.splitext(os.path.basename(dump_file))[0]
+    return stem.rsplit("_", 1)[0] if "_" in stem else stem
+
+
+def _get_qnn_dummy_tensor(shape, data_type, qnn_data_type):
+    dtype_map = {
+        qnn_data_type.QNN_DATATYPE_BOOL_8: torch.bool,
+        qnn_data_type.QNN_DATATYPE_FLOAT_16: torch.float16,
+        qnn_data_type.QNN_DATATYPE_FLOAT_32: torch.float32,
+        qnn_data_type.QNN_DATATYPE_INT_8: torch.int8,
+        qnn_data_type.QNN_DATATYPE_INT_16: torch.int16,
+        qnn_data_type.QNN_DATATYPE_INT_32: torch.int32,
+        qnn_data_type.QNN_DATATYPE_INT_64: torch.int64,
+        qnn_data_type.QNN_DATATYPE_SFIXED_POINT_8: torch.int8,
+        qnn_data_type.QNN_DATATYPE_SFIXED_POINT_16: torch.int16,
+        qnn_data_type.QNN_DATATYPE_SFIXED_POINT_32: torch.int32,
+        qnn_data_type.QNN_DATATYPE_UINT_8: torch.uint8,
+        qnn_data_type.QNN_DATATYPE_UINT_16: torch.uint16,
+        qnn_data_type.QNN_DATATYPE_UINT_32: torch.int32,
+        qnn_data_type.QNN_DATATYPE_UFIXED_POINT_8: torch.uint8,
+        qnn_data_type.QNN_DATATYPE_UFIXED_POINT_16: torch.uint16,
+        qnn_data_type.QNN_DATATYPE_UFIXED_POINT_32: torch.int32,
+    }
+    dtype = dtype_map.get(data_type, torch.float32)
+    return torch.zeros(shape, dtype=dtype)
+
+
+def _build_qnn_profile_inputs(args, dump_file: str, fallback_inputs):
+    if os.path.splitext(dump_file)[1] != ".bin":
+        return fallback_inputs
+
+    try:
+        import executorch.backends.qualcomm.python.PyQnnManagerAdaptor as PyQnnManagerAdaptor
+        from executorch.backends.qualcomm.partition.utils import (
+            generate_qnn_executorch_option,
+        )
+        from executorch.examples.qualcomm.qaihub_scripts.utils.utils import (
+            preprocess_binary,
+        )
+    except Exception as exc:
+        logging.warning(
+            "Falling back to exported example inputs for %s because QNN pybind helpers are unavailable: %s",
+            dump_file,
+            exc,
+        )
+        return fallback_inputs
+
+    backend_options = generate_htp_compiler_spec(use_fp16=False)
+    compiler_specs = generate_qnn_executorch_compiler_spec(
+        soc_model=get_soc_to_chipset_map()[args.model],
+        backend_options=backend_options,
+        is_from_context_binary=True,
+    )
+
+    with open(dump_file, "rb") as f:
+        ctx_bin = preprocess_binary(f.read(), compiler_specs)
+
+    qnn_mgr = PyQnnManagerAdaptor.QnnManager(
+        generate_qnn_executorch_option(compiler_specs), ctx_bin
+    )
+    try:
+        err = qnn_mgr.Init().value
+        if err != 0:
+            raise RuntimeError(f"failed to load context binary, error code {err}")
+
+        graph_name = qnn_mgr.GetGraphNames()[0]
+        qnn_mgr.AllocateTensor(graph_name)
+        qnn_inputs = []
+        for tensor in qnn_mgr.GetGraphInputs(graph_name):
+            dims = tensor.GetDims()
+            shape = tuple(int(dim) for dim in dims.tolist())
+            qnn_inputs.append(
+                _get_qnn_dummy_tensor(
+                    shape,
+                    tensor.GetDataType(),
+                    PyQnnManagerAdaptor.Qnn_DataType_t,
+                )
+            )
+        return [tuple(qnn_inputs)]
+    except Exception as exc:
+        logging.warning(
+            "Falling back to exported example inputs for %s because QNN graph inputs could not be introspected: %s",
+            dump_file,
+            exc,
+        )
+        return fallback_inputs
+    finally:
+        qnn_mgr.Destroy()
+
+
+def _build_optrace_targets(
+    args,
+    multi_modal_mgr,
+    pte_filenames: Dict[str, str],
+):
+    pte_targets = {}
+
+    decoder_inputs = {}
+    if multi_modal_mgr.text_decoder.decode.decoder is not None:
+        decoder_inputs["kv_forward"] = [multi_modal_mgr.text_decoder.decode.export_input]
+    if multi_modal_mgr.text_decoder.prefill.decoder is not None:
+        decoder_inputs["prefill_forward"] = [
+            multi_modal_mgr.text_decoder.prefill.export_input
+        ]
+    if decoder_inputs:
+        pte_targets[f"{args.artifact}/{pte_filenames[TEXT_DECODER]}.pte"] = (
+            decoder_inputs
+        )
+
+    if multi_modal_mgr.text_decoder.apply_embedding:
+        embedding_inputs = {}
+        if multi_modal_mgr.text_decoder.decode.tok_embedding is not None:
+            embedding_inputs["tok_embedding_kv_forward"] = [
+                multi_modal_mgr.text_decoder.decode.tok_embedding_export_input
+            ]
+        if multi_modal_mgr.text_decoder.prefill.tok_embedding is not None:
+            embedding_inputs["tok_embedding_prefill_forward"] = [
+                multi_modal_mgr.text_decoder.prefill.tok_embedding_export_input
+            ]
+        if embedding_inputs:
+            pte_targets[f"{args.artifact}/{pte_filenames[TOK_EMBEDDING]}.pte"] = (
+                embedding_inputs
+            )
+
+    for modality_name in (VISION_ENCODER, TEXT_ENCODER, AUDIO_ENCODER):
+        modality = getattr(multi_modal_mgr, modality_name, None)
+        if modality is None or modality.model is None:
+            continue
+        pte_targets[f"{args.artifact}/{pte_filenames[modality_name]}.pte"] = {
+            "forward": [modality.example_input]
+        }
+
+    return pte_targets
+
+
+def _generate_optrace_reports(
+    args,
+    multi_modal_mgr,
+    pte_filenames: Dict[str, str],
+):
+    pte_targets = _build_optrace_targets(args, multi_modal_mgr, pte_filenames)
+    trace_root = os.path.join(args.artifact, "optrace")
+    os.makedirs(trace_root, exist_ok=True)
+    manifest = {}
+
+    for pte_path, method_inputs in pte_targets.items():
+        if not os.path.exists(pte_path):
+            logging.warning("Skipping optrace for missing pte: %s", pte_path)
+            continue
+
+        pte_name = os.path.splitext(os.path.basename(pte_path))[0]
+        pte_trace_dir = os.path.join(trace_root, pte_name)
+        os.makedirs(pte_trace_dir, exist_ok=True)
+        manifest[pte_name] = {}
+
+        for dump_file in dump_context_from_pte(pte_path):
+            method_name = _dumpfile_to_method_name(dump_file)
+            example_inputs = method_inputs.get(method_name)
+            if example_inputs is None:
+                logging.warning(
+                    "Skipping dumped binary %s because no example inputs were found for method %s.",
+                    dump_file,
+                    method_name,
+                )
+                continue
+
+            method_trace_dir = os.path.join(pte_trace_dir, method_name)
+            os.makedirs(method_trace_dir, exist_ok=True)
+            copied_dump = shutil.copy2(dump_file, method_trace_dir)
+            workspace = f"/data/local/tmp/executorch/{pte_name}_{method_name}"
+            profiling_inputs = _build_qnn_profile_inputs(
+                args, copied_dump, example_inputs
+            )
+            adb = SimpleADB(
+                qnn_sdk=os.getenv("QNN_SDK_ROOT"),
+                build_path=f"{args.build_folder}",
+                pte_path=pte_path,
+                workspace=workspace,
+                device_id=args.device,
+                host_id=args.host,
+                soc_model=args.model,
+                shared_buffer=args.shared_buffer,
+                target=args.target,
+            )
+            qnn_tool = QnnTool(
+                method_trace_dir,
+                profiling_inputs,
+                get_soc_to_chipset_map()[args.model],
+                adb,
+                build_folder=args.build_folder,
+                workspace=workspace,
+            )
+            optrace_path, qhas_path = qnn_tool.generate_optrace(
+                os.path.basename(copied_dump)
+            )
+            manifest[pte_name][method_name] = {
+                "binary": copied_dump,
+                "optrace": optrace_path,
+                "qhas": qhas_path,
+            }
+            logging.info(
+                "Generated optrace for %s/%s under %s",
+                pte_name,
+                method_name,
+                method_trace_dir,
+            )
+
+        manifest_path = os.path.join(pte_trace_dir, "manifest.json")
+        with open(manifest_path, "w") as f:
+            json.dump(manifest[pte_name], f, indent=2, sort_keys=True)
+
+    with open(os.path.join(trace_root, "manifest.json"), "w") as f:
+        json.dump(manifest, f, indent=2, sort_keys=True)
 
 
 def compile_attention_sink_evictor(
@@ -125,6 +345,8 @@ def compile(
             encoder_compile_specs = generate_qnn_executorch_compiler_spec(
                 soc_model=get_soc_to_chipset_map()[args.soc_model],
                 backend_options=backend_options,
+                online_prepare=args.online_prepare,
+                optrace=args.optrace,
                 # x86 emulator does not support shared buffer
                 shared_buffer=not args.enable_x86_64,
             )
@@ -140,6 +362,8 @@ def compile(
                 generate_qnn_executorch_compiler_spec(
                     soc_model=get_soc_to_chipset_map()[args.soc_model],
                     backend_options=backend_options,
+                    online_prepare=args.online_prepare,
+                    optrace=args.optrace,
                     # x86 emulator does not support shared buffer
                     shared_buffer=not args.enable_x86_64,
                 )
@@ -156,6 +380,8 @@ def compile(
                 generate_qnn_executorch_compiler_spec(
                     soc_model=get_soc_to_chipset_map()[args.soc_model],
                     backend_options=backend_options,
+                    online_prepare=args.online_prepare,
+                    optrace=args.optrace,
                     # x86 emulator does not support shared buffer
                     shared_buffer=not args.enable_x86_64,
                     use_mha2sha=True,
@@ -173,6 +399,8 @@ def compile(
 
     # perform compilation
     multi_modal_mgr.compile(compile_specs=compile_specs, pte_filenames=pte_filenames)
+    if args.optrace:
+        _generate_optrace_reports(args, multi_modal_mgr, pte_filenames)
 
 
 def inference(
@@ -423,6 +651,13 @@ def _build_parser():
     )
 
     parser.add_argument(
+        "--enable_true_swa",
+        help="Enable true sliding-window attention export when the decoder family supports it.",
+        action="store_true",
+        default=False,
+    )
+
+    parser.add_argument(
         "--max_context_len",
         help="Maximum length of the model's memory/cache, including both prompt tokens and generated tokens.",
         default=None,
@@ -496,6 +731,14 @@ def _build_parser():
     )
 
     parser.add_argument(
+        "--optrace",
+        "--obtrace",
+        dest="optrace",
+        action="store_true",
+        help="Generate QNN optrace/QHAS reports after compilation. This requires an attached device and stores reports under <artifact>/optrace.",
+    )
+
+    parser.add_argument(
         "--eval_methods",
         choices=[PROMPT_EVAL, TASKS_EVAL, SQNR_EVAL],
         nargs="+",
@@ -552,6 +795,12 @@ def export_llama(args) -> None:
         raise ValueError("--calibration_num_threads must be >= 0")
     if args.compile_only and args.pre_gen_pte:
         raise RuntimeError("Cannot set both compile_only and pre_gen_pte as true")
+    if args.optrace and args.enable_x86_64:
+        raise RuntimeError("--optrace is only supported for on-device execution.")
+    if args.optrace and args.device is None:
+        raise RuntimeError(
+            "device serial is required for --optrace. Please specify -s/--device."
+        )
     if (TASKS_EVAL or SQNR_EVAL) in args.eval_methods and args.model_mode not in {
         "kv",
         "hybrid",

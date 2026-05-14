@@ -16,6 +16,7 @@
 #include <executorch/examples/qualcomm/oss_scripts/llama/runner/lhd_token_generator.h>
 #include <executorch/examples/qualcomm/oss_scripts/llama/runner/rpc_mem.h>
 #include <executorch/examples/qualcomm/oss_scripts/llama/runner/runner.h>
+#include <executorch/examples/qualcomm/oss_scripts/llama/runner/utils.h>
 #include <executorch/extension/llm/runner/text_llm_runner.h>
 #include <executorch/extension/llm/runner/util.h>
 #include <executorch/runtime/core/exec_aten/exec_aten.h>
@@ -24,6 +25,7 @@
 #include <pytorch/tokenizers/hf_tokenizer.h>
 #include <pytorch/tokenizers/llama2c_tokenizer.h>
 #include <algorithm>
+#include <climits>
 #include <fstream>
 
 using executorch::extension::Module;
@@ -135,6 +137,9 @@ Runner<T>::Runner(
     decoder_model_version_ = DecoderModelVersion::kQwen2_5;
   } else if (decoder_model_version == "qwen3") {
     decoder_model_version_ = DecoderModelVersion::kQwen3;
+  } else if (decoder_model_version == "lincal") {
+    decoder_model_version_ = DecoderModelVersion::kLincal;
+    cache_mode_ = CacheMode::HybridCache;
   } else if (decoder_model_version == "smollm2_135m") {
     decoder_model_version_ = DecoderModelVersion::kSmollm2_135m;
   } else if (decoder_model_version == "smollm3") {
@@ -164,6 +169,11 @@ Error Runner<T>::load() {
     return Error::Ok;
   }
 
+#if ET_QNN_RUNNER_DEV_MEM_LOG
+  const dev_mem::RssSample load_before = dev_mem::sample_rss();
+  dev_mem::log_proc_status_mem("load stage: entry");
+#endif
+
   std::string token_generator_method_name, prompt_processor_method_name;
   std::vector<std::string> method_names;
   switch (eval_mode_) {
@@ -183,6 +193,10 @@ Error Runner<T>::load() {
       ET_CHECK_MSG(false, "Unsupported llama evaluation mode");
       break;
   }
+#if ET_QNN_RUNNER_DEV_MEM_LOG
+  const dev_mem::RssSample tokenizer_stage_before = dev_mem::sample_rss();
+  dev_mem::log_proc_status_mem("load stage: tokenizer/eos setup (before)");
+#endif
   auto eos_ids = std::make_unique<std::unordered_set<uint64_t>>();
   if (tokenizer_ != nullptr) {
     eos_ids->insert(tokenizer_->encode("<|eot_id|>", 0, 0).get()[0]);
@@ -203,6 +217,7 @@ Error Runner<T>::load() {
     eos_ids->insert(tokenizer_->encode("<|end|>", 0, 0).get()[0]);
   } else if (
       decoder_model_version_ == DecoderModelVersion::kQwen3 ||
+      decoder_model_version_ == DecoderModelVersion::kLincal ||
       decoder_model_version_ == DecoderModelVersion::kSmollm2_135m ||
       decoder_model_version_ == DecoderModelVersion::kSmollm3) {
     eos_ids->insert(tokenizer_->encode("<|im_end|>", 0, 0).get()[0]);
@@ -217,16 +232,62 @@ Error Runner<T>::load() {
     eos_ids->insert(tokenizer_->encode("<|user|>", 0, 0).get()[0]);
   }
 
+#if ET_QNN_RUNNER_DEV_MEM_LOG
+  const dev_mem::RssSample tokenizer_stage_after = dev_mem::sample_rss();
+  dev_mem::log_rss_delta(
+      "load stage: tokenizer/eos setup",
+      tokenizer_stage_before,
+      tokenizer_stage_after);
+  dev_mem::log_proc_status_mem("load stage: tokenizer/eos setup (after)");
+  const dev_mem::RssSample method_meta_stage_before = dev_mem::sample_rss();
+  dev_mem::log_proc_status_mem("load stage: method_meta fetch (before)");
+#endif
+
   Result<MethodMeta> method_meta =
       module_->method_meta(token_generator_method_name);
+
+#if ET_QNN_RUNNER_DEV_MEM_LOG
+  const dev_mem::RssSample method_meta_stage_after = dev_mem::sample_rss();
+  dev_mem::log_rss_delta(
+      "load stage: method_meta fetch",
+      method_meta_stage_before,
+      method_meta_stage_after);
+  dev_mem::log_proc_status_mem("load stage: method_meta fetch (after)");
+#endif
 
   // For some tokenizer.json, runtime vocab_size might be different, use output
   // shape to get vocab size.
   int32_t vocab_size = method_meta->output_tensor_meta(0)->sizes()[2];
+#if ET_QNN_RUNNER_DEV_MEM_LOG
+  const dev_mem::RssSample decoder_ctor_stage_before = dev_mem::sample_rss();
+  dev_mem::log_proc_status_mem("load stage: decoder runner ctor (before)");
+#endif
   decoder_runner_ =
       std::make_unique<DecoderRunner>(module_.get(), vocab_size, temperature_);
 
+#if ET_QNN_RUNNER_DEV_MEM_LOG
+  const dev_mem::RssSample decoder_ctor_stage_after = dev_mem::sample_rss();
+  dev_mem::log_rss_delta(
+      "load stage: decoder runner ctor",
+      decoder_ctor_stage_before,
+      decoder_ctor_stage_after);
+  dev_mem::log_proc_status_mem("load stage: decoder runner ctor (after)");
+  const dev_mem::RssSample load_methods_before = dev_mem::sample_rss();
+  dev_mem::log_proc_status_mem("load stage: module load_method (before)");
+#endif
+
   ET_CHECK_OK_OR_RETURN_ERROR(decoder_runner_->load(method_names));
+
+#if ET_QNN_RUNNER_DEV_MEM_LOG
+  const dev_mem::RssSample load_methods_after = dev_mem::sample_rss();
+  dev_mem::log_rss_delta(
+      "load stage: module load_method",
+      load_methods_before,
+      load_methods_after);
+  dev_mem::log_proc_status_mem("load stage: module load_method (after)");
+  const dev_mem::RssSample metadata_stage_before = dev_mem::sample_rss();
+  dev_mem::log_proc_status_mem("load stage: metadata extraction (before)");
+#endif
 
   ET_LOG(Info, "Reading metadata from model");
   // retrieve any method meta, can be either prefill or kv
@@ -275,6 +336,100 @@ Error Runner<T>::load() {
   if (module_->method_names()->count("get_sliding_window") > 0) {
     sliding_window = ET_UNWRAP(module_->get("get_sliding_window")).toInt();
   }
+
+  bool enable_true_swa = false;
+  std::vector<int32_t> layer_cache_len;
+  std::vector<bool> layer_is_swa;
+  int32_t window_context_len = context_len_;
+  if (cache_mode_ == CacheMode::HybridCache) {
+    window_context_len = method_meta->input_tensor_meta(2)->sizes()[2];
+    if (window_context_len != context_len_) {
+      enable_true_swa = true;
+    }
+
+    const size_t base_inputs = 3 + (cache_mode_ == CacheMode::HybridCache ? 1 : 0);
+    const size_t k_cache_start = base_inputs;
+    const int32_t full_cache_len = context_len_ - token_generator_ar_len;
+    layer_cache_len.resize(num_layers);
+    layer_is_swa.assign(num_layers, false);
+    for (int64_t layer = 0; layer < num_layers; ++layer) {
+      const int32_t cache_len =
+          method_meta->input_tensor_meta(k_cache_start + static_cast<size_t>(layer))
+              ->sizes()[3];
+      layer_cache_len[layer] = cache_len;
+      if (cache_len != full_cache_len) {
+        layer_is_swa[layer] = true;
+        enable_true_swa = true;
+      }
+    }
+  }
+  if (enable_true_swa) {
+    int64_t swa_layers = 0;
+    int32_t min_cache_len = INT32_MAX;
+    int32_t max_cache_len_seen = 0;
+    for (int64_t layer = 0; layer < num_layers; ++layer) {
+      if (!layer_is_swa.empty() && layer_is_swa[layer]) {
+        swa_layers++;
+      }
+      if (!layer_cache_len.empty()) {
+        min_cache_len = std::min(min_cache_len, layer_cache_len[layer]);
+        max_cache_len_seen = std::max(max_cache_len_seen, layer_cache_len[layer]);
+      }
+    }
+    ET_LOG(
+        Info,
+        "True SWA enabled: window_context_len=%d, full_context_len=%d, swa_layers=%lld/%lld, cache_len_range=[%d,%d]",
+        window_context_len,
+        context_len_,
+        static_cast<long long>(swa_layers),
+        static_cast<long long>(num_layers),
+        (min_cache_len == INT32_MAX ? 0 : min_cache_len),
+        max_cache_len_seen);
+  }
+
+  if (enable_true_swa &&
+      (eval_mode_ == EvalMode::kHybrid ||
+       eval_mode_ == EvalMode::kLookaheadDecoding)) {
+    auto prompt_method_meta = module_->method_meta(prompt_processor_method_name);
+    if (!prompt_method_meta.ok()) {
+      ET_LOG(
+          Error,
+          "Failed to fetch prompt method metadata for %s",
+          prompt_processor_method_name.c_str());
+      return Error::Internal;
+    }
+    const size_t base_inputs = 3 + (cache_mode_ == CacheMode::HybridCache ? 1 : 0);
+    const size_t k_cache_start = base_inputs;
+    for (int64_t layer = 0; layer < num_layers; ++layer) {
+      if (!layer_is_swa.empty() && layer_is_swa[layer]) {
+        const int32_t prefill_cache_len =
+            prompt_method_meta->input_tensor_meta(
+                                   k_cache_start + static_cast<size_t>(layer))
+                ->sizes()[3];
+        if (prefill_cache_len != layer_cache_len[layer]) {
+          ET_LOG(
+              Error,
+              "Unsupported true SWA export: prefill_forward and kv_forward use different cache layouts "
+              "(layer=%lld prefill_cache_len=%d decode_cache_len=%d). "
+              "The legacy prefill/decode compaction test path has been removed; please refresh/export the model with a consistent true-SWA cache layout.",
+              static_cast<long long>(layer),
+              prefill_cache_len,
+              layer_cache_len[layer]);
+          return Error::NotSupported;
+        }
+      }
+    }
+  }
+#if ET_QNN_RUNNER_DEV_MEM_LOG
+  const dev_mem::RssSample metadata_stage_after = dev_mem::sample_rss();
+  dev_mem::log_rss_delta(
+      "load stage: metadata extraction",
+      metadata_stage_before,
+      metadata_stage_after);
+  dev_mem::log_proc_status_mem("load stage: metadata extraction (after)");
+  const dev_mem::RssSample load_io_before = dev_mem::sample_rss();
+  dev_mem::log_proc_status_mem("load stage: io/cache allocation (before)");
+#endif
   kv_manager_ = std::make_unique<KVManager<T>>(typename KVManager<T>::Metadata{
       context_len_,
       head_dim,
@@ -282,6 +437,9 @@ Error Runner<T>::load() {
       max_cache_len,
       num_heads,
       num_layers});
+  if (enable_true_swa) {
+    kv_manager_->configure_cache_size_swa(layer_cache_len, layer_is_swa);
+  }
 
   if (attention_sink_rope_module_ != nullptr) {
     attention_sink_rope_runner_ = std::make_unique<AttentionSinkRopeRunner>(
@@ -351,12 +509,60 @@ Error Runner<T>::load() {
   }
   ET_LOG(Info, "creating io_memory");
   // prepare io
-  kv_manager_->init_cache(buffer_manager_.get(), prompt_processor_ar_len);
+  if (enable_true_swa) {
+    kv_manager_->init_cache_swa(
+        buffer_manager_.get(),
+        prompt_processor_ar_len,
+        layer_cache_len,
+        layer_is_swa);
+  } else {
+    kv_manager_->init_cache(buffer_manager_.get(), prompt_processor_ar_len);
+  }
   prompt_processor_->init_io(
       buffer_manager_.get(),
       module_->method_meta(prompt_processor_method_name));
   token_generator_->init_io(
       buffer_manager_.get(), module_->method_meta(token_generator_method_name));
+#if ET_QNN_RUNNER_DEV_MEM_LOG
+  const dev_mem::RssSample load_io_after = dev_mem::sample_rss();
+  dev_mem::log_rss_delta(
+      "load stage: io/cache allocation",
+      load_io_before,
+      load_io_after);
+  dev_mem::log_proc_status_mem("load stage: io/cache allocation (after)");
+
+  const size_t prompt_io_bytes =
+      prompt_processor_->total_prompt_processor_io_size_in_bytes();
+  const size_t token_io_bytes =
+      token_generator_->total_token_generator_io_size_in_bytes();
+  const size_t total_static_buffers =
+      kv_manager_->total_cache_size_in_bytes() + prompt_io_bytes +
+      token_io_bytes;
+  const dev_mem::RssSample load_after = dev_mem::sample_rss();
+  ET_LOG(
+      Info,
+      "[DEV_MEM] load current RSS: before=%.2f MiB after=%.2f MiB delta=%.2f MiB",
+      dev_mem::bytes_to_mib(load_before.current_bytes),
+      dev_mem::bytes_to_mib(load_after.current_bytes),
+      dev_mem::bytes_to_mib(
+          dev_mem::saturating_sub(
+              load_after.current_bytes, load_before.current_bytes)));
+  ET_LOG(
+      Info,
+      "[DEV_MEM] load peak RSS: before=%.2f MiB after=%.2f MiB delta=%.2f MiB",
+      dev_mem::bytes_to_mib(load_before.peak_bytes),
+      dev_mem::bytes_to_mib(load_after.peak_bytes),
+      dev_mem::bytes_to_mib(
+          dev_mem::saturating_sub(
+              load_after.peak_bytes, load_before.peak_bytes)));
+  ET_LOG(
+      Info,
+      "[DEV_MEM] static buffers: kv_cache=%.2f MiB prompt_io=%.2f MiB token_io=%.2f MiB total=%.2f MiB",
+      dev_mem::bytes_to_mib(kv_manager_->total_cache_size_in_bytes()),
+      dev_mem::bytes_to_mib(prompt_io_bytes),
+      dev_mem::bytes_to_mib(token_io_bytes),
+      dev_mem::bytes_to_mib(total_static_buffers));
+#endif
   return Error::Ok;
 }
 
@@ -446,6 +652,9 @@ Error Runner<T>::generate_from_prompt_or_file(
     token_callback(prompt);
   }
   bool dump_logits = dump_logits_path_.empty() ? false : true;
+#if ET_QNN_RUNNER_DEV_MEM_LOG
+  const dev_mem::RssSample prefill_before = dev_mem::sample_rss();
+#endif
   auto prefill_res = prompt_processor_->prefill(
       prompt_tokens, cur_pos_, dump_logits, attention_sink_rope_runner_.get());
   ET_CHECK_OK_OR_RETURN_ERROR(prefill_res.error());
@@ -453,6 +662,12 @@ Error Runner<T>::generate_from_prompt_or_file(
   cur_pos_ += num_prompt_tokens;
   stats_.first_token_ms = time_in_ms();
   stats_.prompt_eval_end_ms = time_in_ms();
+
+#if ET_QNN_RUNNER_DEV_MEM_LOG
+  const dev_mem::RssSample prefill_after = dev_mem::sample_rss();
+  dev_mem::log_rss_delta("prefill", prefill_before, prefill_after);
+  dev_mem::log_proc_status_mem("prefill (after)");
+#endif
 
   // print the first token from prefill. No prev_token so use cur_token for
   // it.
@@ -467,6 +682,9 @@ Error Runner<T>::generate_from_prompt_or_file(
 
   // start the main loop
   prompt_tokens.push_back(cur_token);
+#if ET_QNN_RUNNER_DEV_MEM_LOG
+  const dev_mem::RssSample decode_before = dev_mem::sample_rss();
+#endif
   int64_t num_generated_tokens = ET_UNWRAP(token_generator_->generate(
       prompt_tokens,
       cur_pos_,
@@ -475,6 +693,11 @@ Error Runner<T>::generate_from_prompt_or_file(
       dump_logits,
       attention_sink_rope_runner_.get()));
   stats_.inference_end_ms = time_in_ms();
+#if ET_QNN_RUNNER_DEV_MEM_LOG
+  const dev_mem::RssSample decode_after = dev_mem::sample_rss();
+  dev_mem::log_rss_delta("decode", decode_before, decode_after);
+  dev_mem::log_proc_status_mem("decode (after)");
+#endif
   ET_LOG(
       Info,
       "RSS after finishing text generation: %f MiB (0 if unsupported)",

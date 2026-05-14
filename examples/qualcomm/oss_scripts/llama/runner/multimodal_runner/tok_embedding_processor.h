@@ -13,6 +13,7 @@
 #include <executorch/examples/qualcomm/oss_scripts/llama/runner/utils.h>
 #include <memory>
 #include <string>
+#include <vector>
 
 namespace example {
 /**
@@ -86,8 +87,7 @@ class TokenEmbeddingProcessor {
   TensorStruct<float> embeddings_;
   TensorStruct<float> prompt_embeddings_;
   std::vector<float> prompt_embeddings_buffer_;
-  std::array<executorch::aten::TensorImpl::SizesType, 3>
-      prompt_embeddings_sizes_{};
+  std::vector<executorch::aten::TensorImpl::SizesType> prompt_embeddings_sizes_;
 
   std::vector<executorch::runtime::EValue> inputs_;
   std::vector<executorch::aten::Tensor> input_tensors_;

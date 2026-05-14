@@ -130,6 +130,10 @@ class PromptProcessor {
   // Used for attention sink to evict KV cache.
   std::vector<executorch::runtime::EValue> cache_inputs_;
 
+  // True SWA uses a shorter window attention mask than the full context.
+  bool true_swa_enabled_swa_{false};
+  int32_t window_context_len_swa_{0};
+
   // Unused by default, only used when dump_logits_path is provided.
   std::vector<uint16_t> prompt_all_logits_;
 };

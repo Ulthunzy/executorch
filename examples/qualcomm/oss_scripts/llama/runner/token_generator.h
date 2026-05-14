@@ -115,6 +115,9 @@ class TokenGenerator {
 
   // stats
   executorch::llm::Stats* stats_;
+  // True SWA uses a shorter window attention mask than the full context.
+  bool true_swa_enabled_swa_{false};
+  int32_t window_context_len_swa_{0};
 
   /**
    * @brief Fill in I/O buffers with prompt token and position.

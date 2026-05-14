@@ -63,13 +63,24 @@ void LhdTokenGenerator<T>::init_attention_mask(int32_t n_past) {
       this->attention_mask_.data, attention_map, metadata_.ar_len, n_past);
   // Initialize window attention mask with current position
   if (metadata_.cache_mode == CacheMode::HybridCache) {
-    this->kv_manager_->init_attention_mask(
-        this->window_attention_mask_.data,
-        attention_map,
-        metadata_.ar_len,
-        n_past,
-        metadata_.sliding_window,
-        position_offset_);
+    if (this->true_swa_enabled_swa_) {
+      this->kv_manager_->init_attention_mask_swa(
+          this->window_attention_mask_.data,
+          attention_map,
+          metadata_.ar_len,
+          n_past,
+          this->window_context_len_swa_,
+          metadata_.sliding_window,
+          position_offset_);
+    } else {
+      this->kv_manager_->init_attention_mask(
+          this->window_attention_mask_.data,
+          attention_map,
+          metadata_.ar_len,
+          n_past,
+          metadata_.sliding_window,
+          position_offset_);
+    }
   }
 }
 
@@ -218,7 +229,11 @@ Result<int64_t> LhdTokenGenerator<T>::generate(
   input_pos.reserve(metadata_.ar_len);
 
   // Rearrange KV cache first and initialize the input and output of KV cache
-  this->kv_manager_->rearrange_cache(metadata_.ar_len);
+  if (this->true_swa_enabled_swa_) {
+    this->kv_manager_->rearrange_cache_swa(metadata_.ar_len);
+  } else {
+    this->kv_manager_->rearrange_cache(metadata_.ar_len);
+  }
 
   // Initialize attention sink rope runner if given and update position
   // accordingly
@@ -395,20 +410,57 @@ Result<int64_t> LhdTokenGenerator<T>::generate(
     }
     // Update KV Cache with the output results
     int32_t n_update = shifted_pos - prev_pos;
-    this->kv_manager_->update_cache(
-        metadata_.ar_len, prev_pos, n_update, selected);
+    if (this->true_swa_enabled_swa_) {
+      this->kv_manager_->update_cache_swa(
+          metadata_.ar_len, prev_pos, n_update, selected);
+    } else {
+      this->kv_manager_->update_cache(
+          metadata_.ar_len, prev_pos, n_update, selected);
+    }
 
     // Update attention mask with current position
     this->kv_manager_->update_attention_mask(
         this->attention_mask_.data, metadata_.ar_len, prev_pos, n_update);
     if (metadata_.cache_mode == CacheMode::HybridCache) {
-      this->kv_manager_->update_attention_mask(
-          this->window_attention_mask_.data,
-          metadata_.ar_len,
-          prev_pos,
-          n_update,
-          metadata_.sliding_window,
-          position_offset_);
+      if (this->true_swa_enabled_swa_) {
+        std::vector<int32_t> attention_map;
+        attention_map.reserve(metadata_.ar_len);
+        for (int i = 0; i < metadata_.window; ++i) {
+          attention_map.push_back(i - 1);
+        }
+        for (int i = 1; i < metadata_.ngram - 1; ++i) {
+          for (int j = 0; j < metadata_.window; ++j) {
+            attention_map.push_back((i - 1) * metadata_.window + j);
+          }
+        }
+        for (int g = 0; g < metadata_.gcap; g++) {
+          for (int j = 0; j < metadata_.ngram - 1; j++) {
+            if (j == 0) {
+              attention_map.push_back(0);
+            } else {
+              attention_map.push_back(
+                  (metadata_.window + g) * (metadata_.ngram - 1) + j - 1);
+            }
+          }
+        }
+        this->kv_manager_->update_attention_mask_swa(
+            this->window_attention_mask_.data,
+            attention_map,
+            metadata_.ar_len,
+            prev_pos,
+            n_update,
+            this->window_context_len_swa_,
+            metadata_.sliding_window,
+            position_offset_);
+      } else {
+        this->kv_manager_->update_attention_mask(
+            this->window_attention_mask_.data,
+            metadata_.ar_len,
+            prev_pos,
+            n_update,
+            metadata_.sliding_window,
+            position_offset_);
+      }
     }
 
     // data-dependent terminating condition: we have n_eos_ number of EOS

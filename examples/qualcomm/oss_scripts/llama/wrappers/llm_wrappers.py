@@ -14,7 +14,7 @@ import time
 import types
 
 from functools import partial
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 import torch
 
@@ -78,6 +78,10 @@ from executorch.examples.qualcomm.oss_scripts.llama.model.embedding import (
 from executorch.examples.qualcomm.oss_scripts.llama.model.static_llama import (
     LlamaModel,
     ModelArgs,
+    MultiScopeAwareLlamaModel,
+    MultiScopeAwareLlamaModel_swa,
+    MultiScopeAwareLlamaModelWithoutEmbedding,
+    MultiScopeAwareLlamaModelWithoutEmbedding_swa,
 )
 from executorch.examples.qualcomm.oss_scripts.llama.static_llm_quant_recipe import (
     StaticLLMQuantRecipe,
@@ -101,6 +105,107 @@ from torchao.prototype.spinquant import apply_spinquant
 from torchao.quantization.pt2e import MinMaxObserver
 from torchao.quantization.pt2e.quantize_pt2e import convert_pt2e, prepare_pt2e
 from transformers import AutoModel, AutoModelForSpeechSeq2Seq
+
+
+_HF_VLM_MODEL_CACHE: Dict[str, Any] = {}
+
+
+def _get_cached_qwen2_5_vl_for_conditional_generation(repo_id: str):
+    model = _HF_VLM_MODEL_CACHE.get(repo_id)
+    if model is not None:
+        return model
+
+    from transformers import Qwen2_5_VLForConditionalGeneration
+
+    model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
+        repo_id, _attn_implementation="eager"
+    ).eval()
+    _HF_VLM_MODEL_CACHE[repo_id] = model
+    return model
+
+
+def _load_local_model_config(
+    params_path: Optional[str],
+) -> Optional[Dict[str, Any]]:
+    if params_path is None:
+        return None
+    with open(params_path) as f:
+        return json.load(f)
+
+
+def _flatten_model_args_for_static_llama(model_config: Dict[str, Any]) -> Dict[str, Any]:
+    if "text_config" not in model_config:
+        return model_config
+
+    text_config = model_config["text_config"]
+    flattened = {
+        "dim": text_config["hidden_size"],
+        "n_layers": text_config["num_hidden_layers"],
+        "n_heads": text_config["num_attention_heads"],
+        "n_kv_heads": text_config.get(
+            "num_key_value_heads", text_config["num_attention_heads"]
+        ),
+        "vocab_size": text_config["vocab_size"],
+        "hidden_dim": text_config["intermediate_size"],
+        "head_dim": text_config["hidden_size"] // text_config["num_attention_heads"],
+        "norm_eps": text_config.get("rms_norm_eps", 1e-5),
+        "rope_theta": text_config.get("rope_theta", model_config.get("rope_theta")),
+        "attention_qkv_bias": text_config.get(
+            "attention_qkv_bias", model_config.get("attention_qkv_bias", True)
+        ),
+        "use_qk_norm": text_config.get(
+            "use_qk_norm", model_config.get("use_qk_norm", False)
+        ),
+        "qk_norm_before_rope": text_config.get(
+            "qk_norm_before_rope",
+            model_config.get("qk_norm_before_rope", False),
+        ),
+        "use_hf_rope": True,
+        "use_scaled_rope": False,
+        "bos_idx": text_config.get("bos_token_id", model_config.get("bos_token_id", 1)),
+        "eos_idx": text_config.get("eos_token_id", model_config.get("eos_token_id", 3)),
+    }
+
+    layer_types = text_config.get("layer_types") or model_config.get("layer_types")
+    if layer_types is not None:
+        flattened["layer_types"] = layer_types
+
+    use_sliding_window = bool(
+        text_config.get("use_sliding_window") or model_config.get("use_sliding_window")
+    )
+    if use_sliding_window:
+        flattened["sliding_window"] = text_config.get(
+            "sliding_window", model_config.get("sliding_window")
+        )
+        flattened["local_rope_theta"] = text_config.get(
+            "local_rope_theta",
+            model_config.get("local_rope_theta", flattened.get("rope_theta")),
+        )
+
+    return flattened
+
+
+def _overlay_local_vision_config(
+    auto_model, local_config: Optional[Dict[str, Any]]
+) -> None:
+    if local_config is None:
+        return
+
+    vision_config = local_config.get("vision_config")
+    if vision_config is None or getattr(auto_model.config, "vision_config", None) is None:
+        return
+
+    for key, value in vision_config.items():
+        setattr(auto_model.config.vision_config, key, value)
+
+    depth = getattr(auto_model.config.vision_config, "depth", None)
+    fullatt_block_indexes = getattr(
+        auto_model.config.vision_config, "fullatt_block_indexes", None
+    )
+    if depth is not None and fullatt_block_indexes is not None:
+        auto_model.config.vision_config.fullatt_block_indexes = [
+            idx for idx in fullatt_block_indexes if idx < depth
+        ]
 
 
 class TextDecoder(Component):
@@ -136,8 +241,13 @@ class TextDecoder(Component):
             config.params_path if control_args.params is None else control_args.params
         )
         with open(params_path) as f:
+            model_args_dict = _flatten_model_args_for_static_llama(json.load(f))
             self.model_args = process_model_args(
-                control_args, ModelArgs(**json.load(f)), self.quant_recipe, config, mode
+                control_args,
+                ModelArgs(**model_args_dict),
+                self.quant_recipe,
+                config,
+                mode,
             )
         # prepare instance
         self.tok_embedding, self.decoder = self._prepare_model()
@@ -286,7 +396,14 @@ class TextDecoder(Component):
                 auto_model = AutoModelForSpeechSeq2Seq.from_pretrained(
                     self.config.repo_id, _attn_implementation="eager"
                 )
-            elif hasattr(self.config, VISION_ENCODER):
+            elif self.control_args.decoder_model in {
+                "qwen2_5_vl-3b_instruct",
+                "lincal_vl-3b_instruct",
+            }:
+                auto_model = _get_cached_qwen2_5_vl_for_conditional_generation(
+                    self.config.repo_id
+                )
+            else:
                 auto_model = AutoModel.from_pretrained(
                     self.config.repo_id, _attn_implementation="eager"
                 )
@@ -303,9 +420,16 @@ class TextDecoder(Component):
             # For gemma, we have preprocessed the weight of rmsnorm
             self.model_args.norm_type = "rmsnorm"
 
-        decoder: LlamaModel = LLM_VARIANT_ARCHS.get(
-            self.control_args.decoder_model, LlamaModel
-        )(
+        decoder_cls = LLM_VARIANT_ARCHS.get(self.control_args.decoder_model, LlamaModel)
+        if getattr(self.control_args, "enable_true_swa", False) and inspect.isclass(
+            decoder_cls
+        ):
+            if issubclass(decoder_cls, MultiScopeAwareLlamaModel):
+                decoder_cls = MultiScopeAwareLlamaModel_swa
+            elif issubclass(decoder_cls, MultiScopeAwareLlamaModelWithoutEmbedding):
+                decoder_cls = MultiScopeAwareLlamaModelWithoutEmbedding_swa
+
+        decoder: LlamaModel = decoder_cls(
             self.model_args,
             ar_len=self.model_args.ar_len,
             output_new_cache_only=True,
@@ -342,6 +466,21 @@ class TextDecoder(Component):
             (self.meta["get_head_dim"], self.meta["get_ar_len"]),
             (self.meta["get_ar_len"], self.meta["get_head_dim"]),
         }
+
+        if getattr(self.control_args, "enable_true_swa", False) and (
+            "get_sliding_window" in self.meta
+        ):
+            max_seq_len = self.meta.get(
+                "get_max_seq_len", self.meta["get_max_context_len"]
+            )
+            window_context_len = min(
+                max_seq_len,
+                self.meta["get_sliding_window"] + self.meta["get_ar_len"] - 1,
+            )
+            self.kv_cache_shape |= {
+                (self.meta["get_head_dim"], window_context_len),
+                (window_context_len, self.meta["get_head_dim"]),
+            }
 
         if self.apply_embedding:
             self.tok_embedding_export_input = (
@@ -383,13 +522,42 @@ class TextDecoder(Component):
                 kv_idx += 1
 
     def _tag_ios(self, node, fixed_point_type):
+        max_context_len = self.meta["get_max_context_len"]
+        max_seq_len = self.meta.get("get_max_seq_len", max_context_len)
         atten_mask_shape = {
             (
                 self.meta["get_max_batch_size"],
                 self.meta["get_ar_len"],
-                self.meta["get_max_context_len"],
+                max_context_len,
             ),
         }
+        if max_context_len != max_seq_len:
+            atten_mask_shape.add(
+                (
+                    self.meta["get_max_batch_size"],
+                    self.meta["get_ar_len"],
+                    max_seq_len,
+                )
+            )
+
+        if getattr(self.control_args, "enable_true_swa", False) and (
+            "get_sliding_window" in self.meta
+        ):
+            window_context_len = min(
+                max_seq_len,
+                self.meta["get_sliding_window"] + self.meta["get_ar_len"] - 1,
+            )
+            self.kv_cache_shape |= {
+                (self.meta["get_head_dim"], window_context_len),
+                (window_context_len, self.meta["get_head_dim"]),
+            }
+            atten_mask_shape.add(
+                (
+                    self.meta["get_max_batch_size"],
+                    self.meta["get_ar_len"],
+                    window_context_len,
+                )
+            )
 
         freq_shape = {
             (self.meta["get_ar_len"], self.meta["get_head_dim"] // 2),
@@ -1026,18 +1194,32 @@ class Modality(Component):
         self.model = None
         self.modality = modality
         repo_id = config.repo_id
+        self.preprocess = lambda data: data
+        params_path = (
+            config.params_path if control_args.params is None else control_args.params
+        )
+        local_model_config = _load_local_model_config(params_path)
 
         if config := getattr(config, modality, None):
             if modality == AUDIO_ENCODER:
                 auto_model = AutoModelForSpeechSeq2Seq.from_pretrained(repo_id)
                 self.num_layers = auto_model.config.encoder_config.num_layers
                 self.ctx_size = auto_model.config.encoder_config.context_size
+                backbone = auto_model
             elif modality == TEXT_ENCODER:
                 raise NotImplementedError(f"{modality} is under development")
             elif modality == VISION_ENCODER:
-                auto_model = AutoModel.from_pretrained(
-                    repo_id, _attn_implementation="eager"
-                )
+                if control_args.decoder_model == "lincal_vl-3b_instruct":
+                    auto_model = _get_cached_qwen2_5_vl_for_conditional_generation(
+                        repo_id
+                    )
+                    backbone = auto_model.model
+                else:
+                    auto_model = AutoModel.from_pretrained(
+                        repo_id, _attn_implementation="eager"
+                    )
+                    backbone = auto_model
+                _overlay_local_vision_config(auto_model, local_model_config)
                 self.num_layers = auto_model.config.vision_config.num_hidden_layers
             else:
                 raise NotImplementedError(f"Find no {modality}")
@@ -1045,9 +1227,10 @@ class Modality(Component):
             auto_model = auto_model.to(torch.float32).eval()
             self.model = config().create_encoder(auto_model.config).eval()
             self.model.load_state_dict(
-                auto_model.state_dict(), strict=False
+                backbone.state_dict(), strict=False
             )  # set strict to false to simplify parameter loading for non-text models
             self.example_input = self.model.get_example_inputs()
+            self.preprocess = getattr(self.model, "preprocess", lambda data: data)
 
             # set quant recipe
             self.quant_recipe: EncoderQuantRecipe = (
@@ -1137,7 +1320,7 @@ class Modality(Component):
     def _calibrate(self, model, calibration_datasets):
         outputs = []
         for turn in calibration_datasets:
-            outputs_each_turn = [model(*data) for data in turn]
+            outputs_each_turn = [model(*self.preprocess(data)) for data in turn]
             outputs.append(outputs_each_turn)
         return outputs
 

@@ -44,6 +44,12 @@ inline VisionSpecialTokens get_special_tokens(
       tokens.fake_wrap_start = "<img>";
       tokens.fake_wrap_end = "</img>";
       break;
+    case example::VisionLanguageModel::kQwen2_5_VL:
+      tokens.image_token = "<|image_pad|>";
+      tokens.global_img = "";
+      tokens.fake_wrap_start = "<|vision_start|>";
+      tokens.fake_wrap_end = "<|vision_end|>";
+      break;
     default:
       break;
   }
@@ -108,6 +114,28 @@ inline std::string apply_chat_template(
       formatted_prompt.append("<|im_start|>user:\n");
       formatted_prompt.append(expand_image_tokens(prompt, specials));
       formatted_prompt.append("<|im_end|>assistant\n");
+      break;
+    }
+    case example::VisionLanguageModel::kQwen2_5_VL: {
+      if (!system_prompt.empty()) {
+        formatted_prompt.append("<|im_start|>system\n");
+        formatted_prompt.append(system_prompt);
+        formatted_prompt.append("<|im_end|>\n");
+      }
+      formatted_prompt.append("<|im_start|>user\n");
+      std::string expanded_prompt = expand_image_tokens(prompt, specials);
+      size_t pos = 0;
+      while (
+          (pos = expanded_prompt.find("<|vision_end|>", pos)) !=
+          std::string::npos) {
+        pos += std::string("<|vision_end|>").size();
+        if (pos < expanded_prompt.size() && expanded_prompt[pos] != '\n') {
+          expanded_prompt.insert(pos, "\n");
+        }
+      }
+      formatted_prompt.append(expanded_prompt);
+      formatted_prompt.append("<|im_end|>\n");
+      formatted_prompt.append("<|im_start|>assistant\n");
       break;
     }
     default:

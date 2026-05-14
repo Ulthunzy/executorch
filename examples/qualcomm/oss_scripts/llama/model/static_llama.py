@@ -948,6 +948,220 @@ class LlamaModelWithoutEmbedding(LlamaModel):
         return meta_data
 
 
+class MultiScopeAwareLlamaModelWithoutEmbedding(LlamaModelWithoutEmbedding):
+    """
+    Multimodal decoder variant that supports per-layer full vs sliding-window attention.
+
+    This mirrors MultiScopeAwareLlamaModel but accepts hidden states instead of
+    token IDs because multimodal embeddings are prepared outside the decoder.
+    """
+
+    def __init__(
+        self,
+        config: ModelArgs,
+        ar_len=1,
+        output_new_cache_only=True,
+        output_cache=True,
+        use_i64_token=False,
+        **kwargs,
+    ):
+        super().__init__(
+            config=config,
+            ar_len=ar_len,
+            output_new_cache_only=output_new_cache_only,
+            output_cache=output_cache,
+            use_i64_token=use_i64_token,
+            **kwargs,
+        )
+        self.final_logit_softcapping = config.final_logit_softcapping
+
+        if config.layer_types is None:
+            raise ValueError(
+                "MultiScopeAwareLlamaModelWithoutEmbedding requires `layer_types` in ModelArgs."
+            )
+
+        self.layer_types = list(config.layer_types)[: config.n_layers]
+        if len(self.layer_types) != config.n_layers:
+            raise ValueError(
+                f"Length of layer_types ({len(self.layer_types)}) must match n_layers ({config.n_layers})"
+            )
+        if config.local_rope_theta is None:
+            raise ValueError(
+                "local_rope_theta should not be None, please set it explicitly in config."
+            )
+
+        self.sliding_window = config.sliding_window
+        local_freqs_cos, local_freqs_sin = hf_precompute_freqs_cis(
+            config.head_dim,
+            config.max_context_len,
+            config.local_rope_theta,
+            config.partial_rotary_factor,
+        )
+        local_freqs_cos = local_freqs_cos[:, : local_freqs_cos.shape[-1] // 2]
+        local_freqs_sin = local_freqs_sin[:, : local_freqs_sin.shape[-1] // 2]
+        self.register_buffer("local_freqs_cos", local_freqs_cos, persistent=False)
+        self.register_buffer("local_freqs_sin", local_freqs_sin, persistent=False)
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        atten_mask: torch.Tensor,
+        window_atten_mask: torch.Tensor,
+        input_pos: Optional[torch.Tensor] = None,
+        *args,
+    ) -> Tuple[torch.Tensor, List[torch.Tensor], List[torch.Tensor]]:
+        output_k_cache = []
+        output_v_cache = []
+        freqs_cos = (
+            self.freqs_cos[input_pos][0] if self.use_kv_cache else self.freqs_cos
+        )
+        freqs_sin = (
+            self.freqs_sin[input_pos][0] if self.use_kv_cache else self.freqs_sin
+        )
+        local_freqs_cos = (
+            self.local_freqs_cos[input_pos][0]
+            if self.use_kv_cache
+            else self.local_freqs_cos
+        )
+        local_freqs_sin = (
+            self.local_freqs_sin[input_pos][0]
+            if self.use_kv_cache
+            else self.local_freqs_sin
+        )
+
+        for ind, decoder_layer in enumerate(self.layers):
+            k_caches = None
+            v_caches = None
+            if self.use_kv_cache:
+                offset_k = ind
+                offset_v = self.n_layers + offset_k
+                k_caches = args[offset_k]
+                v_caches = args[offset_v]
+
+            if self.layer_types[ind] == "sliding_attention":
+                hidden_states, k, v = decoder_layer(
+                    hidden_states,
+                    freqs_cos=local_freqs_cos,
+                    freqs_sin=local_freqs_sin,
+                    atten_mask=window_atten_mask,
+                    k_caches=k_caches,
+                    v_caches=v_caches,
+                )
+            else:
+                hidden_states, k, v = decoder_layer(
+                    hidden_states,
+                    freqs_cos=freqs_cos,
+                    freqs_sin=freqs_sin,
+                    atten_mask=atten_mask,
+                    k_caches=k_caches,
+                    v_caches=v_caches,
+                )
+
+            output_k_cache.extend(k)
+            output_v_cache.extend(v)
+
+        hidden_states = self.norm(hidden_states)
+        logits = self.output(hidden_states)
+        if self.final_logit_softcapping:
+            logits = logits / self.final_logit_softcapping
+            logits = torch.tanh(logits)
+            logits = logits * self.final_logit_softcapping
+
+        if self.output_cache:
+            return logits, output_k_cache, output_v_cache
+        return logits
+
+    def get_example_inputs(self):
+        inputs = list(super().get_example_inputs())
+        causal_mask = CausalAttentionMask(
+            self.max_batch_size, self.ar_len, self.max_context_len
+        )
+        sliding_window_mask = SlidingWindowAttentionMask(
+            self.max_batch_size,
+            self.ar_len,
+            self.max_context_len,
+            sliding_window=self.sliding_window,
+        )
+        inputs[1] = AttentionMask([causal_mask, sliding_window_mask])
+        return tuple(inputs)
+
+    def get_metadata(self):
+        meta_data = super().get_metadata()
+        meta_data["get_sliding_window"] = self.sliding_window
+        return meta_data
+
+
+class MultiScopeAwareLlamaModelWithoutEmbedding_swa(
+    MultiScopeAwareLlamaModelWithoutEmbedding
+):
+    def _get_window_context_len_swa(self) -> int:
+        # Keep the decode KV cache length at (sliding_window - 1) while
+        # expanding the prompt-side attention span by (ar_len - 1) so the
+        # earliest token in a chunk still sees the full sliding window.
+        return min(self.max_seq_len, self.sliding_window + self.ar_len - 1)
+
+    def get_example_inputs(self):
+        hidden_states = torch.randn(
+            (self.max_batch_size, self.ar_len, self.dim), dtype=torch.float32
+        )
+
+        causal_mask = CausalAttentionMask(
+            self.max_batch_size, self.ar_len, self.max_seq_len
+        )
+        window_context_len = self._get_window_context_len_swa()
+        sliding_window_mask = SlidingWindowAttentionMask(
+            self.max_batch_size,
+            self.ar_len,
+            window_context_len,
+            sliding_window=self.sliding_window,
+        )
+
+        atten_mask = AttentionMask([causal_mask, sliding_window_mask])
+
+        if not self.use_kv_cache:
+            return (
+                hidden_states,
+                atten_mask,
+            )
+
+        pos_ids = torch.zeros((self.max_batch_size, self.ar_len), dtype=torch.int32)
+
+        full_cache_len = self.max_seq_len - self.ar_len
+        window_cache_len = max(0, window_context_len - self.ar_len)
+
+        k_cache, v_cache = [], []
+        for layer_idx in range(self.n_layers):
+            cache_len = (
+                window_cache_len
+                if self.layer_types[layer_idx] == "sliding_attention"
+                else full_cache_len
+            )
+            k_cache.append(
+                torch.zeros(
+                    self.max_batch_size,
+                    self.n_kv_heads,
+                    self.head_dim,
+                    cache_len,
+                )
+            )
+            v_cache.append(
+                torch.zeros(
+                    self.max_batch_size,
+                    self.n_kv_heads,
+                    cache_len,
+                    self.head_dim,
+                )
+            )
+
+        return (
+            hidden_states,
+            atten_mask,
+            pos_ids,
+            k_cache,
+            v_cache,
+        )
+
+
 class MultiScopeAwareLlamaModel(LlamaModel):
     def __init__(
         self,
@@ -1086,3 +1300,73 @@ class MultiScopeAwareLlamaModel(LlamaModel):
         meta_data = super().get_metadata()
         meta_data["get_sliding_window"] = self.sliding_window
         return meta_data
+
+
+class MultiScopeAwareLlamaModel_swa(MultiScopeAwareLlamaModel):
+    def _get_window_context_len_swa(self) -> int:
+        # Keep the decode KV cache length at (sliding_window - 1) while
+        # expanding the prompt-side attention span by (ar_len - 1) so the
+        # earliest token in a chunk still sees the full sliding window.
+        return min(self.max_seq_len, self.sliding_window + self.ar_len - 1)
+
+    def get_example_inputs(self, use_kv_cache=True):
+        dtype = torch.int64 if self.use_i64_token else torch.int32
+        tokens = torch.randint(
+            self.vocab_size, (self.max_batch_size, self.ar_len), dtype=dtype
+        )
+
+        causal_mask = CausalAttentionMask(
+            self.max_batch_size, self.ar_len, self.max_seq_len
+        )
+        window_context_len = self._get_window_context_len_swa()
+        sliding_window_mask = SlidingWindowAttentionMask(
+            self.max_batch_size,
+            self.ar_len,
+            window_context_len,
+            sliding_window=self.sliding_window,
+        )
+
+        atten_mask = AttentionMask([causal_mask, sliding_window_mask])
+
+        if not use_kv_cache:
+            return (
+                tokens,
+                atten_mask,
+            )
+
+        pos_ids = torch.zeros((self.max_batch_size, self.ar_len), dtype=torch.int32)
+
+        full_cache_len = self.max_seq_len - self.ar_len
+        window_cache_len = max(0, window_context_len - self.ar_len)
+
+        k_cache, v_cache = [], []
+        for layer_idx in range(self.n_layers):
+            cache_len = (
+                window_cache_len
+                if self.layer_types[layer_idx] == "sliding_attention"
+                else full_cache_len
+            )
+            k_cache.append(
+                torch.zeros(
+                    self.max_batch_size,
+                    self.n_kv_heads,
+                    self.head_dim,
+                    cache_len,
+                )
+            )
+            v_cache.append(
+                torch.zeros(
+                    self.max_batch_size,
+                    self.n_kv_heads,
+                    cache_len,
+                    self.head_dim,
+                )
+            )
+
+        return (
+            tokens,
+            atten_mask,
+            pos_ids,
+            k_cache,
+            v_cache,
+        )

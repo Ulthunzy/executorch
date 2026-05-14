@@ -4,10 +4,14 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+from typing import Tuple
+
 import torch
+import torch.nn.functional as F
 
 from executorch.examples.qualcomm.utils import replace_module_with_custom_class
 from torch import nn
+from executorch.examples.qualcomm.oss_scripts.llama.model import ROTARY_EMB_REGISTRY
 
 from transformers.models.idefics3.modeling_idefics3 import (
     BaseModelOutput,
@@ -22,6 +26,11 @@ from transformers.models.internvl.modeling_internvl import (
     InternVLConfig,
     InternVLMultiModalProjector,
     InternVLVisionModel,
+)
+from transformers.models.qwen2.modeling_qwen2 import Qwen2RMSNorm
+from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import (
+    Qwen2_5_VLMLP,
+    Qwen2_5_VisionTransformerPretrainedModel,
 )
 
 
@@ -175,6 +184,11 @@ class Idefics3VisionEncoder(Idefics3PreTrainedModel):
             extra_custom_kwargs={"config": config.vision_config},
         )
 
+    def preprocess(self, pixel_values: Tuple[torch.FloatTensor]) -> Tuple[torch.Tensor]:
+        # HTP Prepare failed when pixel_values has 5D dimension, so we squeeze the batch dimension here.
+        pixel_values = pixel_values[0]
+        return (pixel_values.squeeze(0),)
+
     def get_example_inputs(self):
         # pixel values - use config dimensions instead of hardcoded values
         return (
@@ -249,6 +263,9 @@ class InternVL3VisionEncoder(torch.nn.Module):
         self.config = config
         self.img_resized_h = img_resized_h
         self.img_resized_w = img_resized_w
+
+    def preprocess(self, pixel_values: Tuple[torch.FloatTensor]) -> Tuple[torch.Tensor]:
+        return pixel_values
 
     def get_example_inputs(self):
         # pixel values - use config dimensions instead of hardcoded values
@@ -362,3 +379,349 @@ class InternVL3VisionEncoder(torch.nn.Module):
         # Project features through multi-modal projector
         vision_features = self.multi_modal_projector(vision_features)
         return vision_features
+
+
+class StaticQwen2_5VLVisionAttention(nn.Module):
+    def __init__(
+        self,
+        config,
+        full_seq_len: int,
+        window_seq_len: int,
+    ) -> None:
+        super().__init__()
+        self.dim = config.hidden_size
+        self.num_heads = config.num_heads
+        self.head_dim = self.dim // self.num_heads
+        self.full_seq_len = full_seq_len
+        self.window_seq_len = window_seq_len
+        self.q_proj = nn.Linear(self.dim, self.dim, bias=True)
+        self.k_proj = nn.Linear(self.dim, self.dim, bias=True)
+        self.v_proj = nn.Linear(self.dim, self.dim, bias=True)
+        self.proj = nn.Linear(self.dim, self.dim)
+        self.scaling = self.head_dim**-0.5
+        self.apply_rope_emb = ROTARY_EMB_REGISTRY["default"]
+        self.register_load_state_dict_pre_hook(self._split_qkv_state_dict)
+
+    @staticmethod
+    def _split_qkv_tensor(qkv_tensor: torch.Tensor) -> tuple[torch.Tensor, ...]:
+        if qkv_tensor.shape[0] % 3 != 0:
+            raise ValueError(
+                f"Expected fused QKV tensor's leading dimension to be divisible by 3, got {tuple(qkv_tensor.shape)}"
+            )
+        return torch.chunk(qkv_tensor, 3, dim=0)
+
+    def _split_qkv_state_dict(
+        self,
+        module,
+        state_dict,
+        prefix,
+        local_metadata,
+        strict,
+        missing_keys,
+        unexpected_keys,
+        error_msgs,
+    ) -> None:
+        del module, local_metadata, strict, missing_keys, unexpected_keys, error_msgs
+
+        qkv_weight_key = f"{prefix}qkv.weight"
+        if qkv_weight_key in state_dict:
+            q_weight, k_weight, v_weight = self._split_qkv_tensor(
+                state_dict.pop(qkv_weight_key)
+            )
+            state_dict[f"{prefix}q_proj.weight"] = q_weight
+            state_dict[f"{prefix}k_proj.weight"] = k_weight
+            state_dict[f"{prefix}v_proj.weight"] = v_weight
+
+        qkv_bias_key = f"{prefix}qkv.bias"
+        if qkv_bias_key in state_dict:
+            q_bias, k_bias, v_bias = self._split_qkv_tensor(
+                state_dict.pop(qkv_bias_key)
+            )
+            state_dict[f"{prefix}q_proj.bias"] = q_bias
+            state_dict[f"{prefix}k_proj.bias"] = k_bias
+            state_dict[f"{prefix}v_proj.bias"] = v_bias
+
+    def _attention(
+        self,
+        query_states: torch.Tensor,
+        key_states: torch.Tensor,
+        value_states: torch.Tensor,
+    ) -> torch.Tensor:
+        attn_weights = torch.matmul(query_states, key_states) * self.scaling
+        attn_weights = torch.softmax(attn_weights, dim=-1)
+        return torch.matmul(attn_weights, value_states)
+
+    def _window_attention(
+        self,
+        query_states: torch.Tensor,
+        key_states: torch.Tensor,
+        value_states: torch.Tensor,
+    ) -> torch.Tensor:
+        # Run attention independently within each window chunk to match
+        # HuggingFace's eager attention path with `cu_window_seqlens`.
+        #
+        # Shapes:
+        #   query_states: [heads, seq, head_dim]
+        #   key_states:   [heads, seq, head_dim]
+        #   value_states: [heads, seq, head_dim]
+        seq_len = query_states.shape[1]
+        if self.window_seq_len <= 0 or seq_len % self.window_seq_len != 0:
+            raise ValueError(
+                f"Expected seq_len to be a positive multiple of window_seq_len, got seq_len={seq_len}, window_seq_len={self.window_seq_len}"
+            )
+
+        num_windows = seq_len // self.window_seq_len
+        q = query_states.reshape(
+            self.num_heads, num_windows, self.window_seq_len, self.head_dim
+        ).permute(1, 0, 2, 3)
+        k = key_states.reshape(
+            self.num_heads, num_windows, self.window_seq_len, self.head_dim
+        ).permute(1, 0, 2, 3)
+        v = value_states.reshape(
+            self.num_heads, num_windows, self.window_seq_len, self.head_dim
+        ).permute(1, 0, 2, 3)
+
+        attn_weights = torch.matmul(q, k.transpose(-2, -1)) * self.scaling
+        attn_weights = torch.softmax(attn_weights, dim=-1)
+        attn_output = torch.matmul(attn_weights, v)
+
+        return attn_output.permute(1, 0, 2, 3).reshape(
+            self.num_heads, seq_len, self.head_dim
+        )
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        position_embeddings: tuple[torch.Tensor, torch.Tensor],
+        full_attention: bool,
+    ) -> torch.Tensor:
+        seq_length = hidden_states.shape[0]
+        query_states = self.q_proj(hidden_states).reshape(
+            seq_length, self.num_heads, self.head_dim
+        )
+        key_states = self.k_proj(hidden_states).reshape(
+            seq_length, self.num_heads, self.head_dim
+        )
+        value_states = self.v_proj(hidden_states).reshape(
+            seq_length, self.num_heads, self.head_dim
+        )
+        cos, sin = position_embeddings
+        query_states = query_states.transpose(0, 1).contiguous()
+        key_states = key_states.transpose(0, 1).contiguous()
+        value_states = value_states.transpose(0, 1).contiguous()
+
+        query_states = self.apply_rope_emb(query_states.unsqueeze(0), cos, sin).squeeze(0)
+        key_states = self.apply_rope_emb(key_states.unsqueeze(0), cos, sin).squeeze(0)
+
+        if full_attention:
+            attn_output = self._attention(
+                query_states,
+                key_states.transpose(-2, -1),
+                value_states,
+            )
+        else:
+            attn_output = self._window_attention(query_states, key_states, value_states)
+
+        attn_output = attn_output.transpose(0, 1).reshape(seq_length, self.dim)
+
+        attn_output = self.proj(attn_output).contiguous()
+        return attn_output
+
+
+class StaticQwen2_5VLVisionBlock(nn.Module):
+    def __init__(
+        self,
+        config,
+        full_seq_len: int,
+        window_seq_len: int,
+    ) -> None:
+        super().__init__()
+        self.norm1 = Qwen2RMSNorm(config.hidden_size, eps=1e-6)
+        self.norm2 = Qwen2RMSNorm(config.hidden_size, eps=1e-6)
+        self.attn = StaticQwen2_5VLVisionAttention(
+            config,
+            full_seq_len=full_seq_len,
+            window_seq_len=window_seq_len,
+        )
+        self.mlp = Qwen2_5_VLMLP(config, bias=True)
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        position_embeddings: tuple[torch.Tensor, torch.Tensor],
+        full_attention: bool,
+    ) -> torch.Tensor:
+        hidden_states = hidden_states + self.attn(
+            self.norm1(hidden_states),
+            position_embeddings=position_embeddings,
+            full_attention=full_attention,
+        )
+        hidden_states = hidden_states + self.mlp(self.norm2(hidden_states))
+        return hidden_states
+
+
+class StaticQwen2_5VisionTransformerPretrainedModel(
+    Qwen2_5_VisionTransformerPretrainedModel
+):
+    def __init__(self, config, grid_thw: torch.Tensor):
+        super().__init__(config)
+        # Flattened patch-embed weights (Conv3d -> Linear equivalent).
+        #
+        # We keep the original Conv3d module so HF checkpoints can still load via
+        # `strict=False`, but use a 2D Parameter in forward to avoid introducing
+        # 5D tensors in the exported/quantized graph.
+        proj = self.patch_embed.proj
+        self.patch_embed_weight_flat = nn.Parameter(
+            proj.weight.detach().flatten(1).clone()
+        )
+
+        def _sync_patch_embed_weight_flat(module, _incompatible_keys):
+            with torch.no_grad():
+                module.patch_embed_weight_flat.copy_(
+                    module.patch_embed.proj.weight.flatten(1)
+                )
+
+        self.register_load_state_dict_post_hook(_sync_patch_embed_weight_flat)
+        static_grid_thw = grid_thw.to(dtype=torch.int64)
+        static_rotary_pos_emb = super().rot_pos_emb(static_grid_thw)
+        static_window_index, static_cu_window_seqlens = super().get_window_index(
+            static_grid_thw
+        )
+        static_cu_window_seqlens = torch.unique_consecutive(
+            torch.tensor(static_cu_window_seqlens, dtype=torch.int32)
+        )
+        static_cu_seqlens = torch.repeat_interleave(
+            static_grid_thw[:, 1] * static_grid_thw[:, 2],
+            static_grid_thw[:, 0],
+        ).cumsum(dim=0, dtype=torch.int32)
+        static_cu_seqlens = F.pad(static_cu_seqlens, (1, 0), value=0)
+        static_reverse_indices = torch.argsort(static_window_index)
+        window_seq_len = int(static_cu_window_seqlens[1].item())
+        full_seq_len = int(static_cu_seqlens[-1].item())
+
+        self.blocks = nn.ModuleList(
+            [
+                StaticQwen2_5VLVisionBlock(
+                    config,
+                    full_seq_len=full_seq_len,
+                    window_seq_len=window_seq_len,
+                )
+                for _ in range(config.depth)
+            ]
+        )
+
+        self.register_buffer("static_grid_thw", static_grid_thw, persistent=False)
+        self.register_buffer(
+            "static_rotary_pos_emb", static_rotary_pos_emb, persistent=False
+        )
+        self.register_buffer("static_window_index", static_window_index, persistent=False)
+        self.register_buffer(
+            "static_cu_window_seqlens", static_cu_window_seqlens, persistent=False
+        )
+        self.register_buffer("static_cu_seqlens", static_cu_seqlens, persistent=False)
+        self.register_buffer(
+            "static_reverse_indices", static_reverse_indices, persistent=False
+        )
+
+    def forward(
+        self, hidden_states: torch.Tensor, grid_thw: torch.Tensor = None, **kwargs
+    ) -> torch.Tensor:
+        # Qwen2.5-VL patch embedding is implemented as a Conv3d over a single
+        # patch volume after reshaping `hidden_states` from [S, C*T*P*P] to
+        # [S, C, T, P, P]. In the AOT+PTQ flow, mixing this 5D conv3d with the
+        # rest of the vision transformer can trigger QNN internal `*InputSlicePad`
+        # failures. Since kernel == stride and the output spatial/temporal dims
+        # are 1, this operation is equivalent to a Linear on the flattened patch.
+        target_dtype = self.patch_embed_weight_flat.dtype
+        hidden_states = F.linear(
+            hidden_states.to(dtype=target_dtype),
+            self.patch_embed_weight_flat,
+            bias=None,
+        )
+        rotary_pos_emb = self.static_rotary_pos_emb.to(hidden_states.device)
+
+        seq_len, _ = hidden_states.size()
+        hidden_states = hidden_states.reshape(
+            seq_len // self.spatial_merge_unit, self.spatial_merge_unit, -1
+        )
+        window_index = self.static_window_index.to(hidden_states.device)
+        hidden_states = hidden_states[window_index, :, :].reshape(seq_len, -1)
+        rotary_pos_emb = rotary_pos_emb.reshape(
+            seq_len // self.spatial_merge_unit, self.spatial_merge_unit, -1
+        )
+        rotary_pos_emb = rotary_pos_emb[window_index, :, :].reshape(seq_len, -1)
+        # Keep position embedding dtype aligned with the model's hidden_states
+        # to avoid implicit type promotion (e.g. bf16 weights + fp32 cos/sin
+        # -> fp32 activations) which can later break matmul/linear ops.
+        position_embeddings = (
+            rotary_pos_emb.cos().to(dtype=hidden_states.dtype),
+            rotary_pos_emb.sin().to(dtype=hidden_states.dtype),
+        )
+
+        for layer_num, blk in enumerate(self.blocks):
+            hidden_states = blk(
+                hidden_states,
+                position_embeddings=position_embeddings,
+                full_attention=layer_num in self.fullatt_block_indexes,
+            )
+
+        hidden_states = self.merger(hidden_states)
+        reverse_indices = self.static_reverse_indices.to(hidden_states.device)
+        hidden_states = hidden_states[reverse_indices, :]
+
+        return hidden_states
+
+
+class Qwen2_5VLVisionEncoder(torch.nn.Module):
+    def __init__(self, config, img_resized_h: int = 448, img_resized_w: int = 448):
+        super().__init__()
+        patch_size = config.vision_config.patch_size
+        self.image_grid_thw = torch.tensor(
+            [[1, img_resized_h // patch_size, img_resized_w // patch_size]],
+            dtype=torch.int64,
+        )
+        self.visual = StaticQwen2_5VisionTransformerPretrainedModel._from_config(
+            config.vision_config,
+            grid_thw=self.image_grid_thw,
+        )
+        self.config = config
+        self.img_resized_h = img_resized_h
+        self.img_resized_w = img_resized_w
+
+        temporal_patch_size = config.vision_config.temporal_patch_size
+        self.image_seq_len = int(
+            self.image_grid_thw.prod(-1).item()
+            // (config.vision_config.spatial_merge_size**2)
+        )
+        self.input_seq_len = int(self.image_grid_thw.prod(-1).item())
+        self.input_feature_dim = (
+            config.vision_config.in_channels
+            * temporal_patch_size
+            * patch_size
+            * patch_size
+        )
+
+    def preprocess(self, pixel_values: Tuple[torch.FloatTensor]) -> Tuple[torch.Tensor]:
+        if len(pixel_values) != 1:
+            return pixel_values
+
+        patches = pixel_values[0]
+        if patches.dim() == 3 and patches.shape[0] == 1:
+            patches = patches.squeeze(0)
+        return (patches,)
+
+    def get_example_inputs(self):
+        return (
+            torch.randn(
+                (self.input_seq_len, self.input_feature_dim),
+                dtype=torch.float32,
+            ),
+        )
+
+    def forward(self, pixel_values: torch.FloatTensor):
+        image_embeds = self.visual(
+            pixel_values,
+            grid_thw=self.image_grid_thw.to(pixel_values.device),
+        )
+        image_embeds = image_embeds[: self.image_seq_len]
+        return image_embeds.unsqueeze(0)

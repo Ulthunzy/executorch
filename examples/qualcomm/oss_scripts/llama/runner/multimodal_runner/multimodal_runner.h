@@ -45,6 +45,7 @@ enum class Modality {
 enum class VisionLanguageModel {
   kSmolvlm = 0,
   kInternvl3,
+  kQwen2_5_VL,
 };
 
 enum class AudioLanguageModel {
@@ -149,6 +150,7 @@ class QNNMultimodalRunner
   std::unique_ptr<TokenEmbeddingProcessor> tok_embedding_processor_;
   std::unique_ptr<TokenEmbeddingProcessor> tok_embedding_generator_;
   std::unique_ptr<MultimodalEmbeddingMerger> embedding_merger_;
+  uint64_t image_token_id_{0};
 
   // stats
   executorch::llm::Stats stats_;

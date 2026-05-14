@@ -11,8 +11,11 @@
 #include <fstream>
 
 using executorch::aten::Tensor;
+using executorch::aten::ScalarType;
 using executorch::extension::Module;
 using executorch::extension::TensorPtr;
+using executorch::extension::from_blob;
+using executorch::extension::llm::Image;
 using executorch::runtime::Error;
 using executorch::runtime::MethodMeta;
 using executorch::runtime::Result;
@@ -63,6 +66,44 @@ Result<Tensor> EncoderRunner::encode(TensorPtr& image_tensor) {
   ET_LOG(Info, "Encoder execution completed, got hidden states");
 
   return encoder_output_[0].toTensor();
+}
+
+Result<Tensor> EncoderRunner::encode(const Image& image) {
+  ET_CHECK_MSG(is_method_loaded(), "Encoder method not loaded");
+
+  Result<MethodMeta> method_meta = module_->method_meta(kEncoderForwardName);
+  ET_CHECK_MSG(method_meta.ok(), "Failed to get encoder method metadata");
+
+  auto input_meta = method_meta->input_tensor_meta(0);
+  std::vector<int32_t> input_sizes(
+      input_meta->sizes().begin(), input_meta->sizes().end());
+  const ScalarType input_dtype = input_meta->scalar_type();
+
+  TensorPtr tensor;
+  if (input_dtype == ScalarType::Float) {
+    ET_CHECK_MSG(
+        image.is_float(),
+        "Encoder expects float input but received a non-float buffer");
+    tensor = from_blob(
+        const_cast<float*>(image.get_float_data().data()),
+        input_sizes,
+        ScalarType::Float);
+  } else if (input_dtype == ScalarType::Byte) {
+    ET_CHECK_MSG(
+        image.is_uint8(),
+        "Encoder expects uint8 input but received a non-uint8 buffer");
+    tensor = from_blob(
+        const_cast<uint8_t*>(image.get_uint8_data().data()),
+        input_sizes,
+        ScalarType::Byte);
+  } else {
+    ET_CHECK_MSG(
+        false,
+        "Unsupported encoder input dtype: %d",
+        static_cast<int>(input_dtype));
+  }
+
+  return encode(tensor);
 }
 
 } // namespace example

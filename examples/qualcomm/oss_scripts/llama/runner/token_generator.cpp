@@ -61,7 +61,13 @@ TokenGenerator<T>::TokenGenerator(
       break;
   }
 
-  logits_.size = metadata_.ar_len * metadata_.vocab_size * sizeof(uint16_t);
+  // NOTE: For QNN exports, logits are typically produced as fp32 even when
+  // the KV cache is quantized. This size is used *before* init_io() can read
+  // tensor metadata, to pre-size the shared RPC buffer (RpcMem). Under-sizing
+  // here causes RpcMem allocations to run past the end of the shared buffer
+  // and later shared-memory registration failures.
+  logits_.size = static_cast<size_t>(metadata_.ar_len) *
+      static_cast<size_t>(metadata_.vocab_size) * sizeof(float);
 }
 template <typename T>
 void TokenGenerator<T>::init_io(
@@ -86,6 +92,7 @@ void TokenGenerator<T>::init_io(
 
   // [I]: attention_mask
   Result<TensorInfo> attention_mask = method_meta->input_tensor_meta(idx++);
+  attention_mask_.size = attention_mask->nbytes();
   attention_mask_.data = reinterpret_cast<uint16_t*>(
       buffer_manager->allocate(attention_mask_.size));
   attention_mask_.tensor = std::make_unique<TensorImpl>(
@@ -103,6 +110,9 @@ void TokenGenerator<T>::init_io(
   if (metadata_.cache_mode == CacheMode::HybridCache) {
     Result<TensorInfo> window_attention_mask =
         method_meta->input_tensor_meta(idx++);
+    window_attention_mask_.size = window_attention_mask->nbytes();
+    window_context_len_swa_ = window_attention_mask->sizes()[2];
+    true_swa_enabled_swa_ = window_context_len_swa_ != metadata_.context_len;
     window_attention_mask_.data = reinterpret_cast<uint16_t*>(
         buffer_manager->allocate(window_attention_mask_.size));
     window_attention_mask_.tensor = std::make_unique<TensorImpl>(
@@ -164,6 +174,7 @@ void TokenGenerator<T>::init_io(
 
   // [O]: logits
   Result<TensorInfo> logits = method_meta->output_tensor_meta(0);
+  logits_.size = logits->nbytes();
   logits_.data =
       reinterpret_cast<uint16_t*>(buffer_manager->allocate(logits_.size));
   logits_.tensor = std::make_unique<TensorImpl>(
@@ -229,15 +240,31 @@ Result<int64_t> TokenGenerator<T>::generate(
     AttentionSinkRopeRunner* attention_sink_rope_runner) {
   ET_CHECK_MSG(
       !tokens.empty(), "Token generation loop shouldn't take empty tokens");
+  if (dump_logits) {
+    token_all_logits_.clear();
+  }
   int64_t pos = start_pos; // position in the sequence
   int shifted_pos = start_pos;
   bool enable_attention_sink = attention_sink_rope_runner != nullptr;
+  ET_LOG(
+      Info,
+      "[SWA_DEBUG] generate() start: start_pos=%ld, cache_mode=%d, true_swa_enabled=%d, window_context_len=%d, context_len=%d, sliding_window=%d",
+      start_pos,
+      static_cast<int>(metadata_.cache_mode),
+      true_swa_enabled_swa_,
+      window_context_len_swa_,
+      metadata_.context_len,
+      metadata_.sliding_window);
 
   // Token after prefill
   uint64_t cur_token = tokens.back();
   uint64_t prev_token;
   // Rearrange KV cache first
-  kv_manager_->rearrange_cache(metadata_.ar_len);
+  if (true_swa_enabled_swa_) {
+    kv_manager_->rearrange_cache_swa(metadata_.ar_len);
+  } else {
+    kv_manager_->rearrange_cache(metadata_.ar_len);
+  }
   std::vector<int32_t> attention_map(metadata_.ar_len);
   std::iota(attention_map.begin(), attention_map.end(), -1);
 
@@ -257,12 +284,22 @@ Result<int64_t> TokenGenerator<T>::generate(
       attention_mask_.data, attention_map, metadata_.ar_len, shifted_pos);
   // Initialize window attention mask with current position
   if (metadata_.cache_mode == CacheMode::HybridCache) {
-    kv_manager_->init_attention_mask(
-        window_attention_mask_.data,
-        attention_map,
-        metadata_.ar_len,
-        shifted_pos,
-        metadata_.sliding_window);
+    if (true_swa_enabled_swa_) {
+      kv_manager_->init_attention_mask_swa(
+          window_attention_mask_.data,
+          attention_map,
+          metadata_.ar_len,
+          shifted_pos,
+          window_context_len_swa_,
+          metadata_.sliding_window);
+    } else {
+      kv_manager_->init_attention_mask(
+          window_attention_mask_.data,
+          attention_map,
+          metadata_.ar_len,
+          shifted_pos,
+          metadata_.sliding_window);
+    }
   }
 
   // Initialize the output of the module
@@ -288,12 +325,22 @@ Result<int64_t> TokenGenerator<T>::generate(
           attention_mask_.data, attention_map, metadata_.ar_len, shifted_pos);
       // Initialize window attention mask with current position
       if (metadata_.cache_mode == CacheMode::HybridCache) {
-        kv_manager_->init_attention_mask(
-            window_attention_mask_.data,
-            attention_map,
-            metadata_.ar_len,
-            shifted_pos,
-            metadata_.sliding_window);
+        if (true_swa_enabled_swa_) {
+          kv_manager_->init_attention_mask_swa(
+              window_attention_mask_.data,
+              attention_map,
+              metadata_.ar_len,
+              shifted_pos,
+              window_context_len_swa_,
+              metadata_.sliding_window);
+        } else {
+          kv_manager_->init_attention_mask(
+              window_attention_mask_.data,
+              attention_map,
+              metadata_.ar_len,
+              shifted_pos,
+              metadata_.sliding_window);
+        }
       }
     }
 
@@ -319,18 +366,34 @@ Result<int64_t> TokenGenerator<T>::generate(
     stats_->on_sampling_end();
 
     // Update KV Cache with the output results
-    kv_manager_->update_cache(
-        metadata_.ar_len, shifted_pos, metadata_.ar_len, {});
+    if (true_swa_enabled_swa_) {
+      kv_manager_->update_cache_swa(
+          metadata_.ar_len, shifted_pos, metadata_.ar_len, {});
+    } else {
+      kv_manager_->update_cache(
+          metadata_.ar_len, shifted_pos, metadata_.ar_len, {});
+    }
     // Update attention mask with current position
     kv_manager_->update_attention_mask(
         attention_mask_.data, metadata_.ar_len, shifted_pos, metadata_.ar_len);
     if (metadata_.cache_mode == CacheMode::HybridCache) {
-      kv_manager_->update_attention_mask(
-          window_attention_mask_.data,
-          metadata_.ar_len,
-          shifted_pos,
-          metadata_.ar_len,
-          metadata_.sliding_window);
+      if (true_swa_enabled_swa_) {
+        kv_manager_->update_attention_mask_swa(
+            window_attention_mask_.data,
+            attention_map,
+            metadata_.ar_len,
+            shifted_pos,
+            metadata_.ar_len,
+            window_context_len_swa_,
+            metadata_.sliding_window);
+      } else {
+        kv_manager_->update_attention_mask(
+            window_attention_mask_.data,
+            metadata_.ar_len,
+            shifted_pos,
+            metadata_.ar_len,
+            metadata_.sliding_window);
+      }
     }
     shifted_pos++;
     pos++;

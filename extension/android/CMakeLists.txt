@@ -77,6 +77,9 @@ add_library(
                         jni/jni_helper.cpp
 )
 
+target_sources(executorch_jni PRIVATE jni/jni_layer_yolo12.cpp)
+target_sources(executorch_jni PRIVATE jni/jni_layer_face_recognition.cpp)
+
 set(link_libraries)
 list(
   APPEND

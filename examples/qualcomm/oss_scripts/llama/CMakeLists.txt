@@ -10,6 +10,12 @@ set(CUSTOM_OP_SRCS_FILE
 )
 set(EXECUTORCH_ROOT ${CMAKE_CURRENT_SOURCE_DIR}/../../../..)
 
+option(
+  ET_QNN_RUNNER_DEV_MEM_LOG
+  "Enable developer memory logs in Qualcomm llama runners"
+  OFF
+)
+
 add_library(custom_ops ${CUSTOM_OP_SRCS_FILE})
 target_include_directories(custom_ops PUBLIC "${_common_include_directories}")
 target_include_directories(
@@ -74,6 +80,11 @@ target_link_libraries(
   quantized_kernels
   tokenizers::tokenizers
 )
+if(ET_QNN_RUNNER_DEV_MEM_LOG)
+  target_compile_definitions(
+    qnn_llama_runner PRIVATE ET_QNN_RUNNER_DEV_MEM_LOG=1
+  )
+endif()
 
 target_include_directories(
   qnn_llama_runner PUBLIC ${EXECUTORCH_ROOT}/extension/llm/tokenizers/include
@@ -139,6 +150,11 @@ target_link_libraries(
   quantized_kernels
   tokenizers::tokenizers
 )
+if(ET_QNN_RUNNER_DEV_MEM_LOG)
+  target_compile_definitions(
+    qnn_multimodal_runner PRIVATE ET_QNN_RUNNER_DEV_MEM_LOG=1
+  )
+endif()
 
 set_target_properties(
   qnn_multimodal_runner PROPERTIES LINK_FLAGS "-Wl,-rpath='$ORIGIN'"
