@@ -684,7 +684,7 @@ class InternVL3_1B(LLMModelConfig):
 
 @register_llm_model(
     "qwen2_5_vl-3b_instruct",
-    vision_encoder=Qwen2_5VL3BEncoder,
+    modality_encoders=Qwen2_5VL3BEncoder,
 )
 @dataclass(init=False, frozen=True)
 class Qwen2_5_VL_3B(LLMModelConfig):
@@ -706,7 +706,7 @@ class Qwen2_5_VL_3B(LLMModelConfig):
 
 @register_llm_model(
     "lincal_vl-3b_instruct",
-    vision_encoder=Qwen2_5VL3BEncoder,
+    modality_encoders=Qwen2_5VL3BEncoder,
 )
 @dataclass(init=False, frozen=True)
 class Lincal_VL_3B(LLMModelConfig):

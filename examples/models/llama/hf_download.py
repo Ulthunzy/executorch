@@ -39,11 +39,16 @@ def download_and_convert_hf_checkpoint(
         print(f"✔ Using cached converted model: {str(converted_path)}")
         return str(converted_path)
 
-    # 1. Download weights from Hugging Face.
-    print("⬇ Downloading and converting checkpoint...")
-    checkpoint_path = snapshot_download(
-        repo_id=repo_id,
-    )
+    local_repo = Path(repo_id).expanduser()
+    if local_repo.exists():
+        print(f"✔ Using local checkpoint directory: {str(local_repo)}")
+        checkpoint_path = str(local_repo)
+    else:
+        # 1. Download weights from Hugging Face.
+        print("⬇ Downloading and converting checkpoint...")
+        checkpoint_path = snapshot_download(
+            repo_id=repo_id,
+        )
 
     # 2. Convert weights to Meta format.
     convert_weights(checkpoint_path, str(converted_path))

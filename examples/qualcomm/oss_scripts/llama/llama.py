@@ -346,7 +346,7 @@ def compile(
                 soc_model=get_soc_to_chipset_map()[args.soc_model],
                 backend_options=backend_options,
                 online_prepare=args.online_prepare,
-                optrace=args.optrace,
+                profile_level=3 if args.optrace else 0,
                 # x86 emulator does not support shared buffer
                 shared_buffer=not args.enable_x86_64,
             )
@@ -363,7 +363,7 @@ def compile(
                     soc_model=get_soc_to_chipset_map()[args.soc_model],
                     backend_options=backend_options,
                     online_prepare=args.online_prepare,
-                    optrace=args.optrace,
+                    profile_level=3 if args.optrace else 0,
                     # x86 emulator does not support shared buffer
                     shared_buffer=not args.enable_x86_64,
                 )
@@ -381,7 +381,7 @@ def compile(
                     soc_model=get_soc_to_chipset_map()[args.soc_model],
                     backend_options=backend_options,
                     online_prepare=args.online_prepare,
-                    optrace=args.optrace,
+                    profile_level=3 if args.optrace else 0,
                     # x86 emulator does not support shared buffer
                     shared_buffer=not args.enable_x86_64,
                     use_mha2sha=True,
