@@ -1,5 +1,5 @@
 export ANDROID_NDK_ROOT=/hunter/android-ndk/android-ndk-r28c
-export QNN_SDK_ROOT=/hunter/qnn_sdk/src/backends/qnn/2.42.0.251225  #2.42.0.251225 #2.40.0.251030 #2.39.0.250926 #2.31.0.250130 #2.37.0.250724  # 2.36.3.250722 #2.28.2.241116
+export QNN_SDK_ROOT=/hunter/qnn_sdk/src/backends/qnn/2.45.0.260326  #2.45.0.260326 #2.42.0.251225 #2.40.0.251030 #2.39.0.250926 #2.31.0.250130 #2.37.0.250724  # 2.36.3.250722 #2.28.2.241116
 # export QNN_SDK_ROOT=/hunter/qnn_sdk/src/backends/qnn/automotive-ai-sdk-for-qualcomm-neural-networks/qnn_sdk_v2.40.0_auto_lnx/qaisw-v2.40.0.251030114326_189385-auto-lnx
 export ANDROID_SDK=/home/hunter/Android/Sdk
 export ANDROID_NDK=$ANDROID_NDK_ROOT
