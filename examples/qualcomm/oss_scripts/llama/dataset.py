@@ -9,6 +9,7 @@ import io
 import os
 from typing import Callable, Dict, List, Optional
 
+import numpy as np
 import requests
 
 import torch
@@ -127,6 +128,8 @@ class DatasetBuilder:
         """
 
         images = [load_image(image_path) for image_path in files_path]
+        if config.encoder_class.__name__ == "Qwen35VLVisionEncoder":
+            return self._build_qwen35_vl_vision_dataset(config, images)
 
         # Process image with text prompt using HuggingFace processor
         # Some HF processors (e.g. InternVL3) need to pass text arg or it will cause error and process failed
@@ -171,6 +174,62 @@ class DatasetBuilder:
 
         # save image file for runtime evaluation
         return [(pixel_values[i][None, ...],) for i in range(len(pixel_values))]
+
+    def _build_qwen35_vl_vision_dataset(
+        self, config: VisionModalityConfig, images: List[Image.Image]
+    ):
+        patches = []
+        patch_size = 16
+        temporal_patch_size = 2
+        merge_size = 2
+        image_mean = np.array([0.5, 0.5, 0.5], dtype=np.float32)[:, None, None]
+        image_std = np.array([0.5, 0.5, 0.5], dtype=np.float32)[:, None, None]
+
+        for image in images:
+            image = image.convert("RGB").resize(
+                (config.img_resized_w, config.img_resized_h),
+                resample=Image.Resampling.BICUBIC,
+            )
+            image = np.asarray(image, dtype=np.float32) / 255.0
+            image = np.transpose(image, (2, 0, 1))
+            image = (image - image_mean) / image_std
+
+            image = np.expand_dims(image, axis=0)
+            image = np.expand_dims(image, axis=1)
+            remainder = image.shape[1] % temporal_patch_size
+            if remainder:
+                repeats = np.repeat(
+                    image[:, -1:],
+                    temporal_patch_size - remainder,
+                    axis=1,
+                )
+                image = np.concatenate([image, repeats], axis=1)
+
+            batch_size = image.shape[0]
+            grid_t = image.shape[1] // temporal_patch_size
+            channels = image.shape[2]
+            grid_h = config.img_resized_h // patch_size
+            grid_w = config.img_resized_w // patch_size
+            image = image.reshape(
+                batch_size,
+                grid_t,
+                temporal_patch_size,
+                channels,
+                grid_h // merge_size,
+                merge_size,
+                patch_size,
+                grid_w // merge_size,
+                merge_size,
+                patch_size,
+            )
+            image = image.transpose(0, 1, 4, 7, 5, 8, 3, 2, 6, 9)
+            image = image.reshape(
+                batch_size * grid_t * grid_h * grid_w,
+                channels * temporal_patch_size * patch_size * patch_size,
+            )
+            patches.append((torch.from_numpy(image).unsqueeze(0).contiguous(),))
+
+        return patches
 
     def _build_dataset_for_encoder(
         self,

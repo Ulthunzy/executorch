@@ -65,10 +65,6 @@ tensor.
       executorch::runtime::TensorInfo tensor_info) override;
 
  private:
-  static constexpr size_t kRpcMemAlignment = 4096;
-  // Extra bytes to account for per-allocation alignment padding.
-  static constexpr size_t kRpcMemSlackBytes = 8 * 1024 * 1024;
-
   // shared buffer
   void* shared_buffer_base_ptr_;
   size_t total_bytes_{0};

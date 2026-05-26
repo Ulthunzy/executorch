@@ -54,6 +54,11 @@ inline std::vector<int32_t> collect_selected_indices(
   }
   return indices;
 }
+
+template <typename T>
+void fill_cache_input(T* cache, size_t bytes, int32_t zero_point) {
+  std::fill_n(cache, bytes / sizeof(T), static_cast<T>(zero_point));
+}
 } // namespace
 
 template <typename T>
@@ -67,6 +72,33 @@ template <typename T>
 void KVManager<T>::recompute_total_cache_size(
     const std::vector<int32_t>* layer_cache_len,
     const std::vector<bool>* layer_is_swa) {
+  if (!metadata_.cache_specs.empty()) {
+    ET_CHECK_MSG(
+        metadata_.cache_specs.size() == static_cast<size_t>(metadata_.num_layers),
+        "cache_specs size (%zu) must match num_layers (%ld)",
+        metadata_.cache_specs.size(),
+        metadata_.num_layers);
+    total_cache_size_ = 0;
+    for (const auto& spec : metadata_.cache_specs) {
+      if (spec.update_mode == Metadata::kFullOverwrite) {
+        ET_CHECK_MSG(
+            spec.k_input_bytes == spec.k_output_bytes &&
+                spec.v_input_bytes == spec.v_output_bytes,
+            "Full-overwrite cache requires matching input/output byte sizes");
+        total_cache_size_ +=
+            align_shared_buffer_allocation_size(spec.k_input_bytes) +
+            align_shared_buffer_allocation_size(spec.v_input_bytes);
+        continue;
+      }
+      total_cache_size_ +=
+          align_shared_buffer_allocation_size(spec.k_input_bytes) +
+          align_shared_buffer_allocation_size(spec.k_output_bytes) +
+          align_shared_buffer_allocation_size(spec.v_input_bytes) +
+          align_shared_buffer_allocation_size(spec.v_output_bytes);
+    }
+    return;
+  }
+
   const bool use_swa_layout = layer_cache_len != nullptr &&
       layer_is_swa != nullptr && !layer_cache_len->empty() &&
       !layer_is_swa->empty();
@@ -84,15 +116,17 @@ void KVManager<T>::recompute_total_cache_size(
       cache_len_in = (*layer_cache_len)[layer];
     }
     ET_CHECK_MSG(cache_len_in >= 0, "cache_len_in must be >= 0, got %d", cache_len_in);
-    cache_in_bytes += static_cast<size_t>(metadata_.num_heads) *
+    const size_t layer_cache_in_bytes = static_cast<size_t>(metadata_.num_heads) *
         static_cast<size_t>(metadata_.head_dim) *
         static_cast<size_t>(cache_len_in) * sizeof(T);
+    cache_in_bytes += align_shared_buffer_allocation_size(layer_cache_in_bytes);
   }
 
-  const size_t cache_out_bytes = static_cast<size_t>(metadata_.num_layers) *
-      static_cast<size_t>(metadata_.num_heads) *
+  const size_t layer_cache_out_bytes = static_cast<size_t>(metadata_.num_heads) *
       static_cast<size_t>(metadata_.head_dim) *
       static_cast<size_t>(metadata_.max_ar_len) * sizeof(T);
+  const size_t cache_out_bytes = static_cast<size_t>(metadata_.num_layers) *
+      align_shared_buffer_allocation_size(layer_cache_out_bytes);
   total_cache_size_ = 2 * (cache_in_bytes + cache_out_bytes);
 }
 
@@ -100,6 +134,10 @@ template <typename T>
 void KVManager<T>::configure_cache_size_swa(
     const std::vector<int32_t>& layer_cache_len,
     const std::vector<bool>& layer_is_swa) {
+  if (!metadata_.cache_specs.empty()) {
+    recompute_total_cache_size();
+    return;
+  }
   recompute_total_cache_size(&layer_cache_len, &layer_is_swa);
 }
 
@@ -242,6 +280,52 @@ void KVManager<T>::update_attention_mask(
 template <typename T>
 void KVManager<T>::init_cache(IMemAlloc* buffer_manager, int32_t ar_len) {
   cur_ar_len_ = ar_len;
+  if (!metadata_.cache_specs.empty()) {
+    ET_CHECK_MSG(
+        metadata_.cache_specs.size() == static_cast<size_t>(metadata_.num_layers),
+        "cache_specs size (%zu) must match num_layers (%ld)",
+        metadata_.cache_specs.size(),
+        metadata_.num_layers);
+    for (int layer = 0; layer < metadata_.num_layers; ++layer) {
+      const auto& spec = metadata_.cache_specs[layer];
+      const bool in_place_overwrite =
+          spec.update_mode == Metadata::kFullOverwrite;
+      if (in_place_overwrite) {
+        ET_CHECK_MSG(
+            spec.k_input_bytes == spec.k_output_bytes &&
+                spec.v_input_bytes == spec.v_output_bytes,
+            "Full-overwrite cache requires matching input/output byte sizes");
+      }
+      T* single_layer_k_cache_in =
+          reinterpret_cast<T*>(buffer_manager->allocate(spec.k_input_bytes));
+      T* single_layer_k_cache_out = in_place_overwrite
+          ? single_layer_k_cache_in
+          : reinterpret_cast<T*>(buffer_manager->allocate(spec.k_output_bytes));
+      T* single_layer_v_cache_in =
+          reinterpret_cast<T*>(buffer_manager->allocate(spec.v_input_bytes));
+      T* single_layer_v_cache_out = in_place_overwrite
+          ? single_layer_v_cache_in
+          : reinterpret_cast<T*>(buffer_manager->allocate(spec.v_output_bytes));
+
+      fill_cache_input(
+          single_layer_k_cache_in, spec.k_input_bytes, spec.k_zero_point);
+      if (!in_place_overwrite) {
+        std::memset(single_layer_k_cache_out, 0, spec.k_output_bytes);
+      }
+      fill_cache_input(
+          single_layer_v_cache_in, spec.v_input_bytes, spec.v_zero_point);
+      if (!in_place_overwrite) {
+        std::memset(single_layer_v_cache_out, 0, spec.v_output_bytes);
+      }
+
+      k_cache_[layer].buffer = single_layer_k_cache_in;
+      k_cache_[layer].output_buffer = single_layer_k_cache_out;
+      v_cache_[layer].buffer = single_layer_v_cache_in;
+      v_cache_[layer].output_buffer = single_layer_v_cache_out;
+    }
+    return;
+  }
+
   const size_t max_in_cache_block_in_bytes =
       metadata_.max_cache_len * sizeof(T);
   const size_t max_out_cache_block_in_bytes = metadata_.max_ar_len * sizeof(T);
@@ -278,6 +362,23 @@ void KVManager<T>::reset_state(int32_t ar_len, bool clear_buffers) {
     return;
   }
 
+  if (!metadata_.cache_specs.empty()) {
+    for (int layer = 0; layer < metadata_.num_layers; ++layer) {
+      const auto& spec = metadata_.cache_specs[layer];
+      fill_cache_input(
+          k_cache_[layer].buffer, spec.k_input_bytes, spec.k_zero_point);
+      fill_cache_input(
+          v_cache_[layer].buffer, spec.v_input_bytes, spec.v_zero_point);
+      if (k_cache_[layer].output_buffer != k_cache_[layer].buffer) {
+        std::memset(k_cache_[layer].output_buffer, 0, spec.k_output_bytes);
+      }
+      if (v_cache_[layer].output_buffer != v_cache_[layer].buffer) {
+        std::memset(v_cache_[layer].output_buffer, 0, spec.v_output_bytes);
+      }
+    }
+    return;
+  }
+
   const size_t out_elems = static_cast<size_t>(metadata_.num_heads) *
       static_cast<size_t>(metadata_.head_dim) *
       static_cast<size_t>(metadata_.max_ar_len);
@@ -308,6 +409,10 @@ void KVManager<T>::rearrange_cache(int32_t ar_len_dst) {
   if (cur_ar_len_ == ar_len_dst)
     return;
   for (int layer = 0; layer < metadata_.num_layers; ++layer) {
+    if (!metadata_.cache_specs.empty() &&
+        metadata_.cache_specs[layer].update_mode == Metadata::kFullOverwrite) {
+      continue;
+    }
     rearrange_key(k_cache_[layer], ar_len_dst);
     rearrange_value(v_cache_[layer], ar_len_dst);
   }
@@ -402,6 +507,11 @@ void KVManager<T>::update_cache(
       selected_indices.size(),
       n_update);
   for (int layer = 0; layer < metadata_.num_layers; ++layer) {
+    if (!metadata_.cache_specs.empty() &&
+        metadata_.cache_specs[layer].update_mode == Metadata::kFullOverwrite) {
+      update_full_overwrite_cache(k_cache_[layer], v_cache_[layer], layer);
+      continue;
+    }
     update_key(k_cache_[layer], n_past, n_update, selected_indices);
     update_value(v_cache_[layer], n_past, n_update, selected_indices);
   }
@@ -483,11 +593,37 @@ void KVManager<T>::update_value(
 }
 
 template <typename T>
+void KVManager<T>::update_full_overwrite_cache(
+    const KVCache<T>& k_cache,
+    const KVCache<T>& v_cache,
+    int32_t layer) {
+  ET_CHECK_MSG(
+      !metadata_.cache_specs.empty() &&
+          static_cast<size_t>(layer) < metadata_.cache_specs.size(),
+      "Full-overwrite cache update requires per-layer cache specs");
+  const auto& spec = metadata_.cache_specs[layer];
+  ET_CHECK_MSG(
+      spec.k_input_bytes == spec.k_output_bytes &&
+          spec.v_input_bytes == spec.v_output_bytes,
+      "Full-overwrite cache requires matching input/output byte sizes");
+  if (k_cache.buffer != k_cache.output_buffer) {
+    std::memcpy(k_cache.buffer, k_cache.output_buffer, spec.k_input_bytes);
+  }
+  if (v_cache.buffer != v_cache.output_buffer) {
+    std::memcpy(v_cache.buffer, v_cache.output_buffer, spec.v_input_bytes);
+  }
+}
+
+template <typename T>
 void KVManager<T>::init_cache_swa(
     IMemAlloc* buffer_manager,
     int32_t ar_len,
     const std::vector<int32_t>& layer_cache_len,
     const std::vector<bool>& layer_is_swa) {
+  if (!metadata_.cache_specs.empty()) {
+    init_cache(buffer_manager, ar_len);
+    return;
+  }
   if (layer_cache_len.empty() || layer_is_swa.empty()) {
     init_cache(buffer_manager, ar_len);
     return;
@@ -551,6 +687,10 @@ void KVManager<T>::init_cache_swa(
 
 template <typename T>
 void KVManager<T>::rearrange_cache_swa(int32_t ar_len_dst) {
+  if (!metadata_.cache_specs.empty()) {
+    rearrange_cache(ar_len_dst);
+    return;
+  }
   if (!has_swa_layers_swa_ || layer_is_swa_.empty()) {
     rearrange_cache(ar_len_dst);
     return;
@@ -574,6 +714,10 @@ void KVManager<T>::update_cache_swa(
     int32_t n_past,
     int32_t n_update,
     const std::vector<bool>& selected) {
+  if (!metadata_.cache_specs.empty()) {
+    update_cache(ar_len, n_past, n_update, selected);
+    return;
+  }
   if (!has_swa_layers_swa_ || layer_is_swa_.empty()) {
     update_cache(ar_len, n_past, n_update, selected);
     return;

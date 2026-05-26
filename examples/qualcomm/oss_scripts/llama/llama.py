@@ -49,11 +49,18 @@ from executorch.examples.qualcomm.oss_scripts.llama.decoder_constants import (
     TOK_EMBEDDING_GRAPH_NAMES,
     VISION_ENCODER,
 )
-from executorch.examples.qualcomm.oss_scripts.llama.decoder_runtime_evaluator import (
-    DefaultEval,
-    SqnrEval,
-    TaskEval,
-)
+
+
+def _ensure_transformers_vlm_eval_compat():
+    import transformers
+
+    if not hasattr(transformers, "AutoModelForVision2Seq") and hasattr(
+        transformers, "AutoModelForImageTextToText"
+    ):
+        transformers.AutoModelForVision2Seq = transformers.AutoModelForImageTextToText
+
+
+_ensure_transformers_vlm_eval_compat()
 
 from executorch.examples.qualcomm.oss_scripts.llama.tokenizer import TokenizerWrapper
 from executorch.examples.qualcomm.oss_scripts.llama.wrappers import (
@@ -71,6 +78,18 @@ logging.basicConfig(level=logging.INFO, format=FORMAT)
 logging.getLogger().setLevel(logging.INFO)
 # Avoid the error message "Could not initialize NNPACK! Reason: Unsupported hardware."
 torch.backends.nnpack.set_flags(False)
+
+
+def _load_runtime_evaluators():
+    _ensure_transformers_vlm_eval_compat()
+
+    from executorch.examples.qualcomm.oss_scripts.llama.decoder_runtime_evaluator import (
+        DefaultEval,
+        SqnrEval,
+        TaskEval,
+    )
+
+    return DefaultEval, SqnrEval, TaskEval
 
 
 def _dumpfile_to_method_name(dump_file: str) -> str:
@@ -332,13 +351,16 @@ def compile(
         TOK_EMBEDDING: None,
         TEXT_DECODER: None,
     }
+    # Weight sharing is only useful when both decode and prefill graphs are
+    # emitted. x86 emulator also does not support it.
+    use_weight_sharing = not args.enable_x86_64 and args.model_mode != "kv"
     for modality in compile_specs:
         if is_multimodal and modality in {AUDIO_ENCODER, TEXT_ENCODER, VISION_ENCODER}:
-            # Encoder quantization is enabled only when the input contains a single image in each conversation.
-            # In multi‑image scenarios, we skip encoder quantization by default to preserve modality feature quality,
-            # because the encoder is quite sensitive and quantization can make it harder for the model to distinguish
-            # between images within the same conversation.
-            to_skip = len(args.image_path) > 1
+            # Skip encoder quantization for multi-image prompts and for Qwen3.5
+            # vision while its encoder path is validated through fp16 first.
+            to_skip = len(args.image_path) > 1 or (
+                args.decoder_model.startswith("qwen3_5") and modality == VISION_ENCODER
+            )
             backend_options = generate_htp_compiler_spec(
                 use_fp16=to_skip,
             )
@@ -355,8 +377,7 @@ def compile(
         elif is_multimodal and modality == TOK_EMBEDDING:
             backend_options = generate_htp_compiler_spec(
                 use_fp16=False,
-                # x86 emulator does not support weight sharing
-                use_weight_sharing=not args.enable_x86_64,
+                use_weight_sharing=use_weight_sharing,
             )
             compile_specs[modality] = [
                 generate_qnn_executorch_compiler_spec(
@@ -373,8 +394,7 @@ def compile(
             backend_options = generate_htp_compiler_spec(
                 use_fp16=False,
                 use_multi_contexts=decoder_model_config.num_sharding > 1,
-                # x86 emulator does not support weight sharing
-                use_weight_sharing=not args.enable_x86_64,
+                use_weight_sharing=use_weight_sharing,
             )
             compile_specs[modality] = [
                 generate_qnn_executorch_compiler_spec(
@@ -416,6 +436,7 @@ def inference(
     calibration_data,
     is_multimodal,
 ):
+    DefaultEval, SqnrEval, TaskEval = _load_runtime_evaluators()
 
     assert args.model_mode in EVAL_MODE, f"Unknown model_mode: {args.model_mode}."
 

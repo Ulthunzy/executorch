@@ -13,6 +13,7 @@ from typing import List, Optional, Tuple
 import scipy
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from executorch.examples.models.llama.model_args import ModelArgs
 from executorch.examples.models.llama.rope import (
@@ -27,6 +28,8 @@ from executorch.examples.qualcomm.oss_scripts.llama.masking_utils import (
 from executorch.examples.qualcomm.oss_scripts.llama.model import (
     FeedForward_REGISTRY,
     NORM_REGISTRY,
+    Qwen35RMSNorm,
+    Qwen35RMSNormGated,
     ROTARY_EMB_REGISTRY,
 )
 
@@ -43,6 +46,25 @@ def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
         batch, num_key_value_heads, n_rep, slen, head_dim
     )
     return hidden_states.reshape(batch, num_key_value_heads * n_rep, slen, head_dim)
+
+
+def repeat_heads(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
+    batch, seq_len, num_heads, head_dim = hidden_states.shape
+    if n_rep == 1:
+        return hidden_states
+    hidden_states = hidden_states[:, :, :, None, :].expand(
+        batch, seq_len, num_heads, n_rep, head_dim
+    )
+    return hidden_states.reshape(batch, seq_len, num_heads * n_rep, head_dim)
+
+
+def _l2norm(x: torch.Tensor, dim: int = -1, eps: float = 1e-6) -> torch.Tensor:
+    inv_norm = torch.rsqrt((x * x).sum(dim=dim, keepdim=True) + eps)
+    return x * inv_norm
+
+
+def _qnn_softplus(x: torch.Tensor) -> torch.Tensor:
+    return F.relu(x) + torch.log1p(torch.exp(-torch.abs(x)))
 
 
 class AttentionSinkRope(nn.Module):
@@ -283,6 +305,8 @@ class LlamaAttention(nn.Module):
         self.enable_masked_softmax = getattr(config, "enable_masked_softmax", False)
         self.use_qk_norm = config.use_qk_norm
         self.qk_norm_before_rope = config.qk_norm_before_rope
+        self.use_q_gate = config.use_q_gate
+        q_out_dim = self.n_heads * self.head_dim * (2 if self.use_q_gate else 1)
         # If None, assume each layer uses rope
         self.use_rope = (
             config.no_rope_layer_interval is None
@@ -292,8 +316,13 @@ class LlamaAttention(nn.Module):
         if self.use_qk_norm:
             q_norm_dim = self.head_dim
             k_norm_dim = self.head_dim
-            self.q_norm_fn = torch.nn.RMSNorm(q_norm_dim, eps=config.norm_eps)
-            self.k_norm_fn = torch.nn.RMSNorm(k_norm_dim, eps=config.norm_eps)
+            norm_cls = (
+                Qwen35RMSNorm
+                if config.rms_norm_add_unit_offset
+                else torch.nn.RMSNorm
+            )
+            self.q_norm_fn = norm_cls(q_norm_dim, eps=config.norm_eps)
+            self.k_norm_fn = norm_cls(k_norm_dim, eps=config.norm_eps)
 
         if config.partial_rotary_factor < 1:
             self.apply_rope_emb = ROTARY_EMB_REGISTRY["partial"]
@@ -302,7 +331,7 @@ class LlamaAttention(nn.Module):
 
         self.wq = nn.Linear(
             self.dim,
-            self.n_heads * self.head_dim,
+            q_out_dim,
             bias=getattr(config, "attention_qkv_bias", False),
         )
         self.wk = nn.Linear(
@@ -343,7 +372,7 @@ class LlamaAttention(nn.Module):
     def prepare_attention_conv(self):
         self.wq_conv = nn.Conv2d(
             self.dim,
-            self.n_heads * self.head_dim,
+            self.n_heads * self.head_dim * (2 if self.use_q_gate else 1),
             1,
             bias=getattr(self.config, "attention_qkv_bias", False),
         )
@@ -400,7 +429,15 @@ class LlamaAttention(nn.Module):
         q = q.permute(0, 3, 1, 2).squeeze(-1)
         k = k.permute(0, 3, 1, 2).squeeze(-1)
         v = v.permute(0, 3, 1, 2).squeeze(-1)
-        q = q.view(bsz, seq_len, self.n_heads, self.head_dim).transpose(1, 2)
+        if self.use_q_gate:
+            q, gate = torch.chunk(
+                q.view(bsz, seq_len, self.n_heads, self.head_dim * 2), 2, dim=-1
+            )
+            gate = gate.reshape(bsz, seq_len, -1)
+        else:
+            q = q.view(bsz, seq_len, self.n_heads, self.head_dim)
+            gate = None
+        q = q.transpose(1, 2)
         k = k.view(bsz, seq_len, self.n_kv_heads, self.head_dim).transpose(1, 2)
         v = v.view(bsz, seq_len, self.n_kv_heads, self.head_dim).transpose(1, 2)
 
@@ -443,7 +480,9 @@ class LlamaAttention(nn.Module):
             attn = attn + atten_mask
         attn = self.attn_softmax(attn)
         y = attn @ vh
-        y = y.transpose(1, 2)
+        y = y.transpose(1, 2).reshape(bsz, seq_len, -1)
+        if gate is not None:
+            y = y * torch.sigmoid(gate)
         y = y.reshape(bsz, seq_len, 1, -1).transpose(1, 3)
         y = self.wo_conv(y)
         y = y.transpose(1, 3)
@@ -468,7 +507,15 @@ class LlamaAttention(nn.Module):
         q = self.wq(hidden_states)
         k = self.wk(hidden_states)
         v = self.wv(hidden_states)
-        q = q.view(bsz, seq_len, self.n_heads, self.head_dim).transpose(1, 2)
+        if self.use_q_gate:
+            q, gate = torch.chunk(
+                q.view(bsz, seq_len, self.n_heads, self.head_dim * 2), 2, dim=-1
+            )
+            gate = gate.reshape(bsz, seq_len, -1)
+        else:
+            q = q.view(bsz, seq_len, self.n_heads, self.head_dim)
+            gate = None
+        q = q.transpose(1, 2)
         k = k.view(bsz, seq_len, self.n_kv_heads, self.head_dim).transpose(1, 2)
         v = v.view(bsz, seq_len, self.n_kv_heads, self.head_dim).transpose(1, 2)
 
@@ -517,12 +564,198 @@ class LlamaAttention(nn.Module):
         attn = self.attn_softmax(attn)
         y = attn @ vh
         y = y.transpose(1, 2).reshape(bsz, seq_len, -1)
+        if gate is not None:
+            y = y * torch.sigmoid(gate)
         y = self.wo(y)
 
         if self.output_new_cache_only:
             return y, [k], [v]
 
         return y, [kh], [vh]
+
+
+class Qwen35DeltaNet(nn.Module):
+    def __init__(self, layer_idx: int, config: ModelArgs, output_new_cache_only=False):
+        super().__init__()
+        del layer_idx
+        del output_new_cache_only
+        self.hidden_size = config.dim
+        self.max_batch_size = config.max_batch_size
+        self.num_k_heads = config.linear_num_key_heads
+        self.num_v_heads = config.linear_num_value_heads
+        self.head_k_dim = config.linear_key_head_dim
+        self.head_v_dim = config.linear_value_head_dim
+        self.scaling = self.head_k_dim**-0.5
+        self.key_dim = self.head_k_dim * self.num_k_heads
+        self.value_dim = self.head_v_dim * self.num_v_heads
+        self.conv_kernel_size = config.linear_conv_kernel_dim
+        self.conv_dim = self.key_dim * 2 + self.value_dim
+
+        assert (
+            self.num_v_heads % self.num_k_heads == 0
+        ), "linear_num_value_heads must be divisible by linear_num_key_heads."
+
+        self.in_proj_qkv = nn.Linear(self.hidden_size, self.conv_dim, bias=False)
+        self.in_proj_z = nn.Linear(self.hidden_size, self.value_dim, bias=False)
+        self.in_proj_b = nn.Linear(self.hidden_size, self.num_v_heads, bias=False)
+        self.in_proj_a = nn.Linear(self.hidden_size, self.num_v_heads, bias=False)
+        self.conv1d = nn.Conv1d(
+            in_channels=self.conv_dim,
+            out_channels=self.conv_dim,
+            kernel_size=self.conv_kernel_size,
+            groups=self.conv_dim,
+            bias=False,
+            padding=0,
+        )
+        self.dt_bias = nn.Parameter(torch.ones(self.num_v_heads))
+        a = torch.empty(self.num_v_heads).uniform_(0, 16)
+        self.A_log = nn.Parameter(torch.log(a))
+        self.norm = Qwen35RMSNormGated(self.head_v_dim, eps=config.norm_eps)
+        self.out_proj = nn.Linear(self.value_dim, self.hidden_size, bias=False)
+
+    def _apply_causal_conv(
+        self, mixed_qkv: torch.Tensor, conv_state: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        batch_size, seq_len, _ = mixed_qkv.shape
+        mixed_qkv = mixed_qkv.transpose(1, 2)
+        conv_state = conv_state[:batch_size]
+        conv_weight = self.conv1d.weight.squeeze(1).to(mixed_qkv.dtype)
+
+        if seq_len == 1:
+            mixed_qkv_last = mixed_qkv.squeeze(-1)
+            new_conv_state = torch.cat([conv_state[:, :, 1:], mixed_qkv], dim=-1)
+            out = (conv_state[:, :, 1:] * conv_weight[:, :-1].unsqueeze(0)).sum(
+                dim=-1
+            ) + mixed_qkv_last * conv_weight[:, -1].unsqueeze(0)
+            out = F.silu(out.unsqueeze(-1)).to(mixed_qkv.dtype)
+            return out.transpose(1, 2).contiguous(), new_conv_state
+
+        hidden_states_new = torch.cat([conv_state, mixed_qkv], dim=-1)
+        new_conv_state = hidden_states_new[:, :, -self.conv_kernel_size :]
+        conv_outputs = []
+        for i in range(seq_len):
+            window = hidden_states_new[:, :, i + 1 : i + 1 + self.conv_kernel_size]
+            conv_outputs.append((window * conv_weight.unsqueeze(0)).sum(dim=-1))
+        out = torch.stack(conv_outputs, dim=-1)
+        out = F.silu(out).to(mixed_qkv.dtype)
+        return out.transpose(1, 2).contiguous(), new_conv_state
+
+    def _recurrent_gated_delta_rule(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        g: torch.Tensor,
+        beta: torch.Tensor,
+        recurrent_state: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        initial_dtype = query.dtype
+        query = _l2norm(query.float()) * self.scaling
+        key = _l2norm(key.float())
+        value = value.float()
+        beta = beta.float()
+        last_recurrent_state = recurrent_state[: query.shape[0]].float()
+        outputs = []
+
+        for i in range(query.shape[1]):
+            q_t = query[:, i]
+            k_t = key[:, i]
+            v_t = value[:, i]
+            g_t = g[:, i].exp().unsqueeze(-1).unsqueeze(-1)
+            g_t = g_t.expand_as(last_recurrent_state)
+            beta_t = beta[:, i].unsqueeze(-1).expand_as(v_t)
+
+            last_recurrent_state = last_recurrent_state * g_t
+            k_for_state = k_t.unsqueeze(-1).expand_as(last_recurrent_state)
+            kv_mem = (last_recurrent_state * k_for_state).sum(dim=-2)
+            delta = (v_t - kv_mem) * beta_t
+            state_update = k_t.unsqueeze(-1).expand(
+                k_t.shape[0], k_t.shape[1], k_t.shape[2], delta.shape[-1]
+            ) * delta.unsqueeze(-2).expand(
+                delta.shape[0], delta.shape[1], k_t.shape[-1], delta.shape[-1]
+            )
+            last_recurrent_state = last_recurrent_state + state_update
+            q_for_state = q_t.unsqueeze(-1).expand_as(last_recurrent_state)
+            outputs.append((last_recurrent_state * q_for_state).sum(dim=-2))
+
+        core_attn_out = torch.stack(outputs, dim=1)
+        if last_recurrent_state.shape[0] != recurrent_state.shape[0]:
+            last_recurrent_state = torch.cat(
+                [
+                    last_recurrent_state,
+                    recurrent_state[last_recurrent_state.shape[0] :].float(),
+                ],
+                dim=0,
+            )
+        return core_attn_out.to(initial_dtype), last_recurrent_state.to(initial_dtype)
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        freqs_cos: torch.Tensor,
+        freqs_sin: torch.Tensor,
+        atten_mask: torch.Tensor,
+        k_caches: torch.Tensor,
+        v_caches: torch.Tensor,
+        input_pos: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        del freqs_cos
+        del freqs_sin
+        del atten_mask
+        del input_pos
+        batch_size, seq_len, _ = hidden_states.shape
+        conv_state = k_caches
+        recurrent_state = v_caches
+        if conv_state is None:
+            conv_state = torch.zeros(
+                batch_size,
+                self.conv_dim,
+                self.conv_kernel_size,
+                dtype=hidden_states.dtype,
+                device=hidden_states.device,
+            )
+        if recurrent_state is None:
+            recurrent_state = torch.zeros(
+                batch_size,
+                self.num_v_heads,
+                self.head_k_dim,
+                self.head_v_dim,
+                dtype=hidden_states.dtype,
+                device=hidden_states.device,
+            )
+
+        mixed_qkv = self.in_proj_qkv(hidden_states)
+        z = self.in_proj_z(hidden_states).reshape(
+            batch_size, seq_len, -1, self.head_v_dim
+        )
+        b = self.in_proj_b(hidden_states)
+        a = self.in_proj_a(hidden_states)
+
+        mixed_qkv, new_conv_state = self._apply_causal_conv(mixed_qkv, conv_state)
+        query, key, value = torch.split(
+            mixed_qkv,
+            [self.key_dim, self.key_dim, self.value_dim],
+            dim=-1,
+        )
+        query = query.reshape(batch_size, seq_len, -1, self.head_k_dim)
+        key = key.reshape(batch_size, seq_len, -1, self.head_k_dim)
+        value = value.reshape(batch_size, seq_len, -1, self.head_v_dim)
+        if self.num_v_heads // self.num_k_heads > 1:
+            head_repeat = self.num_v_heads // self.num_k_heads
+            query = repeat_heads(query, head_repeat)
+            key = repeat_heads(key, head_repeat)
+
+        beta = b.sigmoid()
+        g = -self.A_log.float().exp() * _qnn_softplus(a.float() + self.dt_bias)
+        core_attn_out, new_recurrent_state = self._recurrent_gated_delta_rule(
+            query, key, value, g, beta, recurrent_state
+        )
+        core_attn_out = self.norm(
+            core_attn_out.reshape(-1, self.head_v_dim),
+            z.reshape(-1, self.head_v_dim),
+        )
+        core_attn_out = core_attn_out.reshape(batch_size, seq_len, -1)
+        return self.out_proj(core_attn_out), [new_conv_state], [new_recurrent_state]
 
 
 class FeedForward(nn.Module):
@@ -634,6 +867,103 @@ class LlamaDecoderLayer(nn.Module):
             else h + out
         )
 
+        return output, k_cache, v_cache
+
+
+class Qwen35DecoderLayer(nn.Module):
+    def __init__(self, layer_idx: int, config: ModelArgs, output_new_cache_only=False):
+        super().__init__()
+        layer_type = (
+            config.layer_types[layer_idx]
+            if config.layer_types is not None
+            else "full_attention"
+        )
+        if layer_type == "linear_attention":
+            self.attention = Qwen35DeltaNet(
+                layer_idx=layer_idx,
+                config=config,
+                output_new_cache_only=output_new_cache_only,
+            )
+        elif layer_type == "full_attention":
+            self.attention = LlamaAttention(
+                layer_idx=layer_idx,
+                config=config,
+                output_new_cache_only=output_new_cache_only,
+            )
+        else:
+            raise ValueError(f"Unsupported Qwen3.5 layer type: {layer_type}")
+
+        self.feed_forward = FeedForward_REGISTRY.get(
+            config.model_architecture, FeedForward
+        )(config)
+        self.attention_norm = Qwen35RMSNorm(
+            config.dim,
+            eps=config.norm_eps,
+            add_unit_offset=config.rms_norm_add_unit_offset,
+        )
+        self.ffn_norm = (
+            Qwen35RMSNorm(
+                config.dim,
+                eps=config.norm_eps,
+                add_unit_offset=config.rms_norm_add_unit_offset,
+            )
+            if config.use_ffn_norm
+            else None
+        )
+        self.post_attention_norm = (
+            Qwen35RMSNorm(
+                config.dim,
+                eps=config.norm_eps,
+                add_unit_offset=config.rms_norm_add_unit_offset,
+            )
+            if config.post_attention_norm
+            else None
+        )
+        self.residual_multiplier = config.residual_multiplier
+        self.post_ffn_norm = (
+            Qwen35RMSNorm(
+                config.dim,
+                eps=config.norm_eps,
+                add_unit_offset=config.rms_norm_add_unit_offset,
+            )
+            if config.post_ffn_norm
+            else None
+        )
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        freqs_cos: torch.Tensor,
+        freqs_sin: torch.Tensor,
+        atten_mask: torch.Tensor,
+        k_caches: List[torch.Tensor],
+        v_caches: List[torch.Tensor],
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        hidden_states = self.attention_norm(x)
+        h, k_cache, v_cache = self.attention(
+            hidden_states=hidden_states,
+            freqs_cos=freqs_cos,
+            freqs_sin=freqs_sin,
+            atten_mask=atten_mask,
+            k_caches=k_caches,
+            v_caches=v_caches,
+        )
+        if self.post_attention_norm:
+            h = self.post_attention_norm(h)
+        h = (
+            x + h * self.residual_multiplier
+            if self.residual_multiplier is not None
+            else x + h
+        )
+        hidden_states = hidden_states if self.ffn_norm is None else self.ffn_norm(h)
+        out = self.feed_forward(hidden_states)
+        if self.post_ffn_norm:
+            out = self.post_ffn_norm(out)
+        output = (
+            h + out * self.residual_multiplier
+            if self.residual_multiplier is not None
+            else h + out
+        )
         return output, k_cache, v_cache
 
 
@@ -822,6 +1152,328 @@ class LlamaModel(nn.Module):
             "get_use_kv_cache": self.use_kv_cache,
             "get_kv_io_bit_width": self.kv_io_bit_width,
         }
+
+
+class Qwen35Model(LlamaModel):
+    def __init__(
+        self,
+        config: ModelArgs,
+        ar_len=1,
+        output_new_cache_only=True,
+        output_cache=True,
+        use_i64_token=False,
+        **kwargs,
+    ):
+        nn.Module.__init__(self)
+        del kwargs
+        self.dim = config.dim
+        self.head_dim = config.head_dim
+        self.max_batch_size = config.max_batch_size
+        self.max_seq_len = config.max_seq_len
+        self.max_context_len = config.max_context_len
+        self.n_heads = config.n_heads
+        self.n_kv_heads = config.n_kv_heads
+        self.n_layers = config.n_layers
+        self.vocab_size = config.vocab_size
+        self.rope_freq_base = config.rope_freq_base
+        self.use_kv_cache = config.use_kv_cache
+        self.embedding_scale_factor = config.embedding_scale_factor
+        self.ar_len = ar_len
+        self.output_new_cache_only = output_new_cache_only
+        self.use_i64_token = use_i64_token
+        self.output_cache = output_cache
+        self.kv_io_bit_width = config.kv_io_bit_width
+        self.logits_scaling = config.logits_scaling
+        self.layer_types = config.layer_types
+
+        assert self.layer_types is not None, "Qwen3.5 requires layer_types."
+        assert len(self.layer_types) == self.n_layers, (
+            f"Length of layer_types ({len(self.layer_types)}) must match "
+            f"n_layers ({self.n_layers})"
+        )
+
+        self.layers = nn.ModuleList(
+            [
+                Qwen35DecoderLayer(i, config, self.output_new_cache_only)
+                for i in range(config.n_layers)
+            ]
+        )
+        self.norm = Qwen35RMSNorm(
+            config.dim,
+            eps=config.norm_eps,
+            add_unit_offset=config.rms_norm_add_unit_offset,
+        )
+        self.output = nn.Linear(config.dim, config.vocab_size, bias=config.output_bias)
+        self.tok_embeddings = nn.Embedding(config.vocab_size, config.dim)
+
+        if config.use_hf_rope:
+            freqs_cos, freqs_sin = hf_precompute_freqs_cis(
+                config.head_dim,
+                config.max_context_len,
+                config.rope_freq_base,
+                config.partial_rotary_factor,
+            )
+            freqs_cos = freqs_cos[:, : freqs_cos.shape[-1] // 2].contiguous()
+            freqs_sin = freqs_sin[:, : freqs_sin.shape[-1] // 2].contiguous()
+        else:
+            freqs_cos, freqs_sin = precompute_freqs_cis(
+                config.head_dim,
+                config.max_context_len,
+                config.rope_freq_base,
+                config.use_scaled_rope,
+                config.rope_scale_factor,
+            )
+        self.register_buffer("freqs_cos", freqs_cos, persistent=False)
+        self.register_buffer("freqs_sin", freqs_sin, persistent=False)
+        self.mrope_section = getattr(config, "mrope_section", [11, 11, 10])
+        self.rotary_freq_dim = freqs_cos.shape[-1]
+
+        self.linear_conv_kernel_dim = config.linear_conv_kernel_dim
+        self.linear_key_head_dim = config.linear_key_head_dim
+        self.linear_value_head_dim = config.linear_value_head_dim
+        self.linear_num_key_heads = config.linear_num_key_heads
+        self.linear_num_value_heads = config.linear_num_value_heads
+        self.linear_key_dim = self.linear_key_head_dim * self.linear_num_key_heads
+        self.linear_value_dim = (
+            self.linear_value_head_dim * self.linear_num_value_heads
+        )
+        self.linear_conv_dim = self.linear_key_dim * 2 + self.linear_value_dim
+
+    def _apply_interleaved_mrope(
+        self,
+        temporal_freqs: torch.Tensor,
+        height_freqs: torch.Tensor,
+        width_freqs: torch.Tensor,
+    ) -> torch.Tensor:
+        h_end = min(self.mrope_section[1] * 3, self.rotary_freq_dim)
+        w_end = min(self.mrope_section[2] * 3, self.rotary_freq_dim)
+        freqs = []
+        for idx in range(self.rotary_freq_dim):
+            if idx % 3 == 1 and idx < h_end:
+                freqs.append(height_freqs[:, idx : idx + 1])
+            elif idx % 3 == 2 and idx < w_end:
+                freqs.append(width_freqs[:, idx : idx + 1])
+            else:
+                freqs.append(temporal_freqs[:, idx : idx + 1])
+        return torch.cat(freqs, dim=-1)
+
+    def _get_qwen35_freqs(
+        self, input_pos: Optional[torch.Tensor]
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        if not self.use_kv_cache:
+            return self.freqs_cos, self.freqs_sin
+        if input_pos is not None and input_pos.dim() == 3:
+            input_pos = input_pos.to(torch.long)
+            return (
+                self._apply_interleaved_mrope(
+                    self.freqs_cos[input_pos[0]][0],
+                    self.freqs_cos[input_pos[1]][0],
+                    self.freqs_cos[input_pos[2]][0],
+                ),
+                self._apply_interleaved_mrope(
+                    self.freqs_sin[input_pos[0]][0],
+                    self.freqs_sin[input_pos[1]][0],
+                    self.freqs_sin[input_pos[2]][0],
+                ),
+            )
+        return self.freqs_cos[input_pos][0], self.freqs_sin[input_pos][0]
+
+    def get_example_inputs(self):
+        dtype = torch.int64 if self.use_i64_token else torch.int32
+        tokens = torch.randint(
+            self.vocab_size, (self.max_batch_size, self.ar_len), dtype=dtype
+        )
+        atten_mask = AttentionMask(
+            CausalAttentionMask(self.max_batch_size, self.ar_len, self.max_context_len)
+        )
+        if self.use_kv_cache:
+            pos_ids = torch.zeros((self.max_batch_size, self.ar_len), dtype=torch.int32)
+            k_cache, v_cache = [], []
+            for layer_type in self.layer_types:
+                if layer_type == "linear_attention":
+                    k_cache.append(
+                        torch.zeros(
+                            self.max_batch_size,
+                            self.linear_conv_dim,
+                            self.linear_conv_kernel_dim,
+                        )
+                    )
+                    v_cache.append(
+                        torch.zeros(
+                            self.max_batch_size,
+                            self.linear_num_value_heads,
+                            self.linear_key_head_dim,
+                            self.linear_value_head_dim,
+                        )
+                    )
+                else:
+                    k_cache.append(
+                        torch.zeros(
+                            self.max_batch_size,
+                            self.n_kv_heads,
+                            self.head_dim,
+                            self.max_context_len - self.ar_len,
+                        )
+                    )
+                    v_cache.append(
+                        torch.zeros(
+                            self.max_batch_size,
+                            self.n_kv_heads,
+                            self.max_context_len - self.ar_len,
+                            self.head_dim,
+                        )
+                    )
+            return (
+                tokens,
+                atten_mask,
+                pos_ids,
+                k_cache,
+                v_cache,
+            )
+
+        return (
+            tokens,
+            atten_mask,
+        )
+
+    def get_metadata(self):
+        meta_data = super().get_metadata()
+        meta_data["get_bos_id"] = 248045
+        meta_data["get_eos_id"] = 248046
+        meta_data["get_eos_ids"] = [248046, 248044]
+        meta_data["get_n_eos"] = 2
+        return meta_data
+
+
+class Qwen35ModelWithoutEmbedding(Qwen35Model):
+    def __init__(
+        self,
+        config: ModelArgs,
+        ar_len=1,
+        output_new_cache_only=True,
+        output_cache=True,
+        use_i64_token=False,
+        **kwargs,
+    ):
+        super().__init__(
+            config=config,
+            ar_len=ar_len,
+            output_new_cache_only=output_new_cache_only,
+            output_cache=output_cache,
+            use_i64_token=use_i64_token,
+        )
+        self.audio_token_id = kwargs.get("audio_token_id", None)
+        self.image_token_id = kwargs.get("image_token_id", None)
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        atten_mask: torch.Tensor,
+        input_pos: Optional[torch.Tensor] = None,
+        *args,
+    ) -> Tuple[torch.Tensor, List[torch.Tensor], List[torch.Tensor]]:
+        output_k_cache = []
+        output_v_cache = []
+        freqs_cos, freqs_sin = self._get_qwen35_freqs(input_pos)
+
+        hidden_states = self.embedding_scale_factor * hidden_states
+
+        for ind, decoder_layer in enumerate(self.layers):
+            k_caches = None
+            v_caches = None
+            if self.use_kv_cache:
+                offset_k = ind
+                offset_v = self.n_layers + offset_k
+                k_caches = args[offset_k]
+                v_caches = args[offset_v]
+
+            hidden_states, k, v = decoder_layer(
+                hidden_states,
+                freqs_cos=freqs_cos,
+                freqs_sin=freqs_sin,
+                atten_mask=atten_mask,
+                k_caches=k_caches,
+                v_caches=v_caches,
+            )
+            output_k_cache.extend(k)
+            output_v_cache.extend(v)
+
+        hidden_states = self.norm(hidden_states)
+        logits = self.output(hidden_states)
+
+        if self.logits_scaling:
+            logits = logits / self.logits_scaling
+
+        if self.output_cache:
+            return logits, output_k_cache, output_v_cache
+        return logits
+
+    def get_example_inputs(self):
+        hidden_states = torch.randn(
+            (self.max_batch_size, self.ar_len, self.dim), dtype=torch.float32
+        )
+        atten_mask = AttentionMask(
+            CausalAttentionMask(self.max_batch_size, self.ar_len, self.max_context_len)
+        )
+        if self.use_kv_cache:
+            pos_ids = torch.zeros(
+                (3, self.max_batch_size, self.ar_len), dtype=torch.int32
+            )
+            k_cache, v_cache = [], []
+            for layer_type in self.layer_types:
+                if layer_type == "linear_attention":
+                    k_cache.append(
+                        torch.zeros(
+                            self.max_batch_size,
+                            self.linear_conv_dim,
+                            self.linear_conv_kernel_dim,
+                        )
+                    )
+                    v_cache.append(
+                        torch.zeros(
+                            self.max_batch_size,
+                            self.linear_num_value_heads,
+                            self.linear_key_head_dim,
+                            self.linear_value_head_dim,
+                        )
+                    )
+                else:
+                    k_cache.append(
+                        torch.zeros(
+                            self.max_batch_size,
+                            self.n_kv_heads,
+                            self.head_dim,
+                            self.max_context_len - self.ar_len,
+                        )
+                    )
+                    v_cache.append(
+                        torch.zeros(
+                            self.max_batch_size,
+                            self.n_kv_heads,
+                            self.max_context_len - self.ar_len,
+                            self.head_dim,
+                        )
+                    )
+            return (
+                hidden_states,
+                atten_mask,
+                pos_ids,
+                k_cache,
+                v_cache,
+            )
+
+        return (
+            hidden_states,
+            atten_mask,
+        )
+
+    def get_metadata(self):
+        meta_data = super().get_metadata()
+        if self.audio_token_id:
+            meta_data["audio_token_id"] = self.audio_token_id
+        if self.image_token_id:
+            meta_data["image_token_id"] = self.image_token_id
+        return meta_data
 
 
 class LlamaModelWithoutEmbedding(LlamaModel):

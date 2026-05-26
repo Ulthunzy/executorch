@@ -60,7 +60,8 @@ class TokenEmbeddingProcessor {
    * @return Total I/O size in bytes.
    */
   inline const size_t total_embedding_processor_io_size_in_bytes() const {
-    return input_toks_.size + embeddings_.size;
+    return align_shared_buffer_allocation_size(input_toks_.size) +
+        align_shared_buffer_allocation_size(embeddings_.size);
   }
 
   inline const TensorStruct<float>& get_prompt_embeddings() const {

@@ -21,6 +21,43 @@ from executorch.backends.qualcomm.export_utils import (
     QnnConfig,
     SimpleADB,
 )
+
+
+def _ensure_transformers_vlm_eval_compat():
+    try:
+        import transformers
+    except Exception:
+        return
+
+    if hasattr(transformers, "AutoModelForVision2Seq"):
+        return
+    if hasattr(transformers, "AutoModelForImageTextToText"):
+        transformers.AutoModelForVision2Seq = transformers.AutoModelForImageTextToText
+        return
+
+    try:
+        import transformers.utils.import_utils as transformers_import_utils
+    except Exception:
+        return
+
+    original = transformers_import_utils._LazyModule.__getattr__
+    if getattr(original, "_executorch_vlm_eval_compat", False):
+        return
+
+    def patched_getattr(self, name):
+        if (
+            getattr(self, "__name__", None) == "transformers"
+            and name == "AutoModelForVision2Seq"
+        ):
+            return object
+        return original(self, name)
+
+    patched_getattr._executorch_vlm_eval_compat = True
+    transformers_import_utils._LazyModule.__getattr__ = patched_getattr
+
+
+_ensure_transformers_vlm_eval_compat()
+
 from executorch.examples.models.llama.evaluate.eager_eval import EagerEvalWrapper
 from executorch.examples.qualcomm.oss_scripts.llama.decoder_constants import (
     ATTENTION_SINK_EVICTOR,

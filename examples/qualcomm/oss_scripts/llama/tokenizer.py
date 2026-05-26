@@ -47,6 +47,11 @@ VLM_SPECIAL_TOKENS = {
         "fake_wrap_start": "<|vision_start|>",
         "fake_wrap_end": "<|vision_end|>",
     },
+    "qwen3_5-0_8b": {
+        IMG_TOKEN: "<|image_pad|>",
+        "fake_wrap_start": "",
+        "fake_wrap_end": "",
+    },
 }
 # Special tokens for Audio-Language Model
 ALM_SPECIAL_TOKENS = {

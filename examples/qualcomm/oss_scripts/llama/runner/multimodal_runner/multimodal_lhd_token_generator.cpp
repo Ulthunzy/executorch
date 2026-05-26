@@ -20,7 +20,9 @@ void MultimodalLhdTokenGenerator<T>::prepare_io(
   for (int i = 0; i < metadata_.ar_len; i++) {
     if (i < input_tokens.size()) {
       // Prepare pos data
-      this->input_pos_.data[i] = input_pos[i];
+      for (int dim = 0; dim < metadata_.position_id_dim; ++dim) {
+        this->input_pos_.data[dim * metadata_.ar_len + i] = input_pos[i];
+      }
     }
   }
 

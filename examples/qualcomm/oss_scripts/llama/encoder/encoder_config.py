@@ -12,6 +12,7 @@ from executorch.examples.qualcomm.oss_scripts.llama.encoder.encoder_quant_recipe
     GraniteSpeechEncoderQuantRecipe,
     InternVL3EncoderQuantRecipe,
     Qwen2_5_VL_Encoder_QuantRecipe,
+    Qwen35VLEncoderQuantRecipe,
     SmolVLMEncoderQuantRecipe,
 )
 from executorch.examples.qualcomm.oss_scripts.llama.model.audio_encoder import (
@@ -21,6 +22,7 @@ from executorch.examples.qualcomm.oss_scripts.llama.model.vision_encoder import 
     Idefics3VisionEncoder,
     InternVL3VisionEncoder,
     Qwen2_5VLVisionEncoder,
+    Qwen35VLVisionEncoder,
 )
 
 
@@ -141,3 +143,17 @@ class Qwen2_5VL3BEncoder(VisionModalityConfig):
     img_resized_w = 448
     img_url = "http://images.cocodataset.org/val2017/000000039769.jpg"
     quant_recipe = Qwen2_5_VL_Encoder_QuantRecipe
+
+
+@dataclass(init=False, frozen=True)
+class Qwen35VLEncoder(VisionModalityConfig):
+    """
+    Config for Qwen3.5-VL vision encoder.
+    """
+
+    encoder_class = Qwen35VLVisionEncoder
+    img_seq_len = 196
+    img_resized_h = 448
+    img_resized_w = 448
+    img_url = "http://images.cocodataset.org/val2017/000000039769.jpg"
+    quant_recipe = Qwen35VLEncoderQuantRecipe

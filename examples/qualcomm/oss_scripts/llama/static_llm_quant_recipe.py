@@ -4,6 +4,7 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+import re
 from typing import Optional
 
 import torch
@@ -11,6 +12,7 @@ from executorch.backends.qualcomm.quantizer.custom_annotation import annotate_kv
 from executorch.backends.qualcomm.quantizer.quant_recipe import (
     QuantGranularity,
     QuantRecipe,
+    QuantizationStrategy,
 )
 from executorch.backends.qualcomm.quantizer.quantizer import QuantDtype
 from torchao.quantization.pt2e import MinMaxObserver
@@ -44,6 +46,91 @@ class StaticLLMQuantRecipe:
     def get_logits_output_bit_width(self) -> int:
         # We use 16bit logits for all quant config
         return 32 if self.default_quant_dtype is None else 16
+
+
+class RegexTargetQuantRecipe(QuantRecipe):
+    def add_regex_node_target(
+        self,
+        regex,
+        targets,
+        quant_dtype,
+        is_qat,
+        act_observer,
+        granularity,
+        act_symmetric: bool = False,
+        note: str = "",
+        priority: int = 1,
+        extra_kwargs: Optional[dict] = None,
+        exclude_regex=None,
+    ):
+        self._strategies.append(
+            ByNameRegexAndTarget(
+                quant_dtype,
+                is_qat,
+                granularity,
+                act_observer,
+                act_symmetric,
+                extra_kwargs or {},
+                note,
+                priority,
+                regex,
+                targets,
+                exclude_regex or set(),
+            ),
+        )
+        return self
+
+
+class ByNameRegexAndTarget(QuantizationStrategy):
+    def __init__(
+        self,
+        quant_dtype,
+        is_qat,
+        granularity,
+        act_observer,
+        act_symmetric,
+        extra_kwargs,
+        note,
+        priority,
+        patterns,
+        targets,
+        exclude_patterns,
+    ):
+        super().__init__(
+            quant_dtype,
+            is_qat,
+            granularity,
+            act_observer,
+            act_symmetric,
+            extra_kwargs,
+            note,
+            priority,
+        )
+        self.patterns = patterns
+        self.targets = targets
+        self.exclude_patterns = exclude_patterns
+
+    def _matches(self, node: torch.fx.Node) -> bool:
+        if self.targets is not None and node.target not in self.targets:
+            return False
+        if node.op == "call_function" and "nn_module_stack" in node.meta:
+            module_stacks = [
+                module_stack
+                for module_stack, _ in list(node.meta["nn_module_stack"].values())
+                if module_stack
+            ]
+            if any(
+                re.search(pattern, module_stack)
+                for pattern in self.exclude_patterns
+                for module_stack in module_stacks
+            ):
+                return False
+            for module_stack, _ in list(node.meta["nn_module_stack"].values())[::-1]:
+                if module_stack and any(
+                    re.search(pattern, module_stack) for pattern in self.patterns
+                ):
+                    return True
+        return False
 
 
 class LlamaStories260KQuantRecipe(StaticLLMQuantRecipe):
@@ -712,6 +799,58 @@ class Qwen3_4BQuantRecipe(StaticLLMQuantRecipe):
             )
         )
         self.recipe.custom_quant_annotations.append(annotate_kv_8bit)
+
+
+class Qwen3_5_0_8BQuantRecipe(StaticLLMQuantRecipe):
+    default_quant_dtype = QuantDtype.use_16a4w
+
+    def __init__(self, verbose: bool = False):
+        super().__init__()
+
+        conv2d_ops = {
+            torch.ops.aten.conv2d.default,
+        }
+
+        self.recipe = (
+            RegexTargetQuantRecipe(
+                self.default_quant_dtype,
+                False,
+                act_observer=MinMaxObserver,
+                granularity=QuantGranularity.PER_TENSOR,
+                verbose=verbose,
+                note="Qwen3.5 default follows Qwen3-0.6B 16a4w quantization.",
+            )
+            .add_regex_node_target(
+                {
+                    r"layers\.\d+\.attention\.(in_proj_qkv|in_proj_z|in_proj_b)(\.|$)",
+                    r"layers\.\d+\.attention\.(wq|wk|wv)(_conv)?(\.|$)",
+                    r"layers\.\d+\.feed_forward\.(w1_conv|w3_conv)(\.|$)"
+                },
+                conv2d_ops,
+                QuantDtype.use_16a4w_block,
+                False,
+                act_observer=MinMaxObserver,
+                granularity=QuantGranularity.PER_BLOCK,
+                priority=12,
+                extra_kwargs={"block_size": (1, 32, 1, 1)},
+                note="Qwen3.5 q/k/v-style projection convs use 16a4w per-block.",
+            )
+            .add_regex_node_target(
+                {
+                    r"layers\.\d+\.attention\.(in_proj_a|out_proj)(\.|$)",
+                    r"layers\.\d+\.attention\.wo(_conv)?(\.|$)",
+                    r"layers\.\d+\.feed_forward\.(w2_conv)(\.|$)",
+                    r"output\.conv",
+                },
+                conv2d_ops,
+                QuantDtype.use_16a8w,
+                False,
+                act_observer=MinMaxObserver,
+                granularity=QuantGranularity.PER_CHANNEL,
+                priority=11,
+                note="Qwen3.5 sensitive projection convs use 16a8w per-channel.",
+            )
+        )
 
 
 class Smollm2QuantRecipe(StaticLLMQuantRecipe):

@@ -330,6 +330,14 @@ class TextDecoder(Component):
                     partial_rotary_dim,
                 )
 
+        if self.control_args.decoder_model.startswith("qwen3_5"):
+            decoder_state_keys = set(decoder.state_dict().keys())
+            if set(state_dict.keys()) - decoder_state_keys:
+                state_dict = {
+                    key: value
+                    for key, value in state_dict.items()
+                    if key in decoder_state_keys
+                }
         decoder.load_state_dict(state_dict, strict=True, assign=True)
 
         # apply spin quant if required
@@ -462,10 +470,24 @@ class TextDecoder(Component):
             # single head, kv input
             (self.meta["get_head_dim"], self.meta["get_max_context_len"]),
             (self.meta["get_max_context_len"], self.meta["get_head_dim"]),
+            (
+                self.meta["get_head_dim"],
+                self.meta["get_max_context_len"] - self.meta["get_ar_len"],
+            ),
+            (
+                self.meta["get_max_context_len"] - self.meta["get_ar_len"],
+                self.meta["get_head_dim"],
+            ),
             # single head, kv output
             (self.meta["get_head_dim"], self.meta["get_ar_len"]),
             (self.meta["get_ar_len"], self.meta["get_head_dim"]),
         }
+        self.cache_io_shape = set()
+        if decoder.use_kv_cache:
+            self.cache_io_shape = {
+                tuple(cache.shape)
+                for cache in (*self.example_input[3], *self.example_input[4])
+            }
 
         if getattr(self.control_args, "enable_true_swa", False) and (
             "get_sliding_window" in self.meta
@@ -521,6 +543,200 @@ class TextDecoder(Component):
                 ]
                 kv_idx += 1
 
+    def _save_input_kv_cache_quant_attrs(self):
+        kv_idx = 0
+        quantize_targets = {
+            torch.ops.quantized_decomposed.quantize_per_tensor.default,
+            torch.ops.quantized_decomposed.quantize_per_tensor.tensor,
+        }
+        for node in self.decoder.graph.nodes:
+            if node.op != "placeholder" or "val" not in node.meta:
+                continue
+            if tuple(node.meta["val"].size()) not in self.cache_io_shape:
+                continue
+            quant_node = next(
+                (user for user in node.users if user.target in quantize_targets),
+                None,
+            )
+            if quant_node is None:
+                continue
+            self.meta[f"get_kv_input_{kv_idx}_scale"] = quant_node.args[1]
+            self.meta[f"get_kv_input_{kv_idx}_zero_point"] = quant_node.args[2]
+            kv_idx += 1
+        if kv_idx == 0:
+            logging.warning("No KV cache input qparams were saved from the graph.")
+        else:
+            logging.info(
+                "Saved %d KV cache input qparams from the converted graph.",
+                kv_idx,
+            )
+
+    def _collect_input_kv_cache_qparams(self):
+        quantize_targets = {
+            torch.ops.quantized_decomposed.quantize_per_tensor.default,
+            torch.ops.quantized_decomposed.quantize_per_tensor.tensor,
+        }
+        cache_input_qparams = []
+        for node in self.decoder.graph.nodes:
+            if node.op != "placeholder" or "val" not in node.meta:
+                continue
+            if tuple(node.meta["val"].size()) not in self.cache_io_shape:
+                continue
+            quant_node = next(
+                (user for user in node.users if user.target in quantize_targets),
+                None,
+            )
+            if quant_node is None:
+                continue
+            cache_input_qparams.append(
+                (
+                    quant_node.args[1],
+                    quant_node.args[2],
+                    quant_node.args[3],
+                    quant_node.args[4],
+                    quant_node.args[5],
+                )
+            )
+        return cache_input_qparams
+
+    def _find_qdq_node(self, node, targets, visited):
+        if not isinstance(node, torch.fx.Node):
+            return None
+        if node in visited:
+            return None
+        visited.add(node)
+        if node.target in targets:
+            return node
+        for arg in node.args:
+            if isinstance(arg, torch.fx.Node):
+                qdq_node = self._find_qdq_node(arg, targets, visited)
+                if qdq_node is not None:
+                    return qdq_node
+            if isinstance(arg, (list, tuple)):
+                for item in arg:
+                    qdq_node = self._find_qdq_node(item, targets, visited)
+                    if qdq_node is not None:
+                        return qdq_node
+        return None
+
+    def _apply_qparams(self, qdq_node, qparams):
+        old_args = qdq_node.args
+        new_args = (
+            old_args[0],
+            qparams[0],
+            qparams[1],
+            qparams[2],
+            qparams[3],
+            qparams[4],
+        )
+        if old_args == new_args:
+            return False
+        qdq_node.args = new_args
+        return True
+
+    def _align_output_kv_cache_qparams(self, cache_input_qparams, source: str):
+        quantize_targets = {
+            torch.ops.quantized_decomposed.quantize_per_tensor.default,
+            torch.ops.quantized_decomposed.quantize_per_tensor.tensor,
+        }
+        dequantize_targets = {
+            torch.ops.quantized_decomposed.dequantize_per_tensor.default,
+            torch.ops.quantized_decomposed.dequantize_per_tensor.tensor,
+        }
+        changed = 0
+        visited = 0
+        for node in self.decoder.graph.nodes:
+            if node.op != "output":
+                continue
+            outputs = node.args[0]
+            for output_index, output_node in enumerate(outputs[1:]):
+                if output_index >= len(cache_input_qparams):
+                    break
+                dequant_node = self._find_qdq_node(
+                    output_node, dequantize_targets, set()
+                )
+                if dequant_node is None:
+                    continue
+                visited += 1
+                qparams = cache_input_qparams[output_index]
+                quant_node = self._find_qdq_node(
+                    dequant_node.args[0], quantize_targets, set()
+                )
+                if quant_node is not None and self._apply_qparams(quant_node, qparams):
+                    changed += 1
+                if self._apply_qparams(dequant_node, qparams):
+                    changed += 1
+            break
+
+        if changed > 0:
+            self.decoder.graph.lint()
+            self.decoder.recompile()
+            logging.info(
+                "Aligned %d KV cache output qparams to %s qparams.",
+                changed,
+                source,
+            )
+        else:
+            logging.info(
+                "KV cache qparam alignment against %s visited %d outputs, no changes needed.",
+                source,
+                visited,
+            )
+
+    def _align_input_kv_cache_qparams(self, cache_input_qparams, source: str):
+        quantize_targets = {
+            torch.ops.quantized_decomposed.quantize_per_tensor.default,
+            torch.ops.quantized_decomposed.quantize_per_tensor.tensor,
+        }
+        changed = 0
+        visited = 0
+        kv_idx = 0
+        for node in self.decoder.graph.nodes:
+            if node.op != "placeholder" or "val" not in node.meta:
+                continue
+            if tuple(node.meta["val"].size()) not in self.cache_io_shape:
+                continue
+            if kv_idx >= len(cache_input_qparams):
+                break
+            quant_node = next(
+                (user for user in node.users if user.target in quantize_targets),
+                None,
+            )
+            visited += 1
+            if quant_node is not None and self._apply_qparams(
+                quant_node, cache_input_qparams[kv_idx]
+            ):
+                changed += 1
+            kv_idx += 1
+
+        if changed > 0:
+            self.decoder.graph.lint()
+            self.decoder.recompile()
+            logging.info(
+                "Aligned %d KV cache input qparams to %s qparams.",
+                changed,
+                source,
+            )
+        else:
+            logging.info(
+                "KV cache input qparam alignment against %s visited %d inputs, no changes needed.",
+                source,
+                visited,
+            )
+
+    def _align_kv_cache_io_qparams(self):
+        cache_input_qparams = self._collect_input_kv_cache_qparams()
+        expected_cache_qparams = 2 * self.meta["get_n_layers"]
+        if len(cache_input_qparams) != expected_cache_qparams:
+            logging.warning(
+                "Expected %d cache input qparams, found %d; skip KV cache qparam alignment.",
+                expected_cache_qparams,
+                len(cache_input_qparams),
+            )
+            return
+
+        self._align_output_kv_cache_qparams(cache_input_qparams, "matching input")
+
     def _tag_ios(self, node, fixed_point_type):
         max_context_len = self.meta["get_max_context_len"]
         max_seq_len = self.meta.get("get_max_seq_len", max_context_len)
@@ -569,20 +785,37 @@ class TextDecoder(Component):
         quant_io_type = None
 
         if node.op == "placeholder":
+            users = [
+                user
+                for user in node.users
+                if not (isinstance(user.target, str) and user.target == "_guards_fn")
+            ]
+            node_shape = tuple(node.meta["val"].size())
             if (
-                len(users := list(node.users)) == 1
+                self.control_args.decoder_model.startswith("qwen3_5")
+                and node_shape in self.cache_io_shape
+            ):
+                quant_io_type = fixed_point_type["kv_type"]
+            elif (
+                len(users) == 1
                 and users[0].meta["val"].size()[-2:] in self.kv_cache_shape
             ):
                 quant_io_type = fixed_point_type["kv_type"]
-            elif node.meta["val"].size() in self.io_shape:
+            elif node_shape in self.io_shape:
                 quant_io_type = fixed_point_type["io_type"]
-            elif node.meta["val"].size() in atten_mask_shape:
+            elif node_shape in atten_mask_shape:
                 quant_io_type = fixed_point_type["io_type"]
 
         if is_graph_output(node):
-            if node.meta["val"].size()[-2:] in self.kv_cache_shape:
+            node_shape = tuple(node.meta["val"].size())
+            if (
+                self.control_args.decoder_model.startswith("qwen3_5")
+                and node_shape in self.cache_io_shape
+            ):
                 quant_io_type = fixed_point_type["kv_type"]
-            elif node.meta["val"].size() in self.io_shape:
+            elif node.meta["val"].size()[-2:] in self.kv_cache_shape:
+                quant_io_type = fixed_point_type["kv_type"]
+            elif node_shape in self.io_shape:
                 quant_io_type = fixed_point_type["io_type"]
 
         # tag sharding io
@@ -592,7 +825,11 @@ class TextDecoder(Component):
             quant_io_type = fixed_point_type["io_type"]
 
         # tag select op as quantized tensors for freq_sin and freq_cos. It is caused by sharding
-        if node.target in freq_op and node.meta["val"].size() in freq_shape:
+        if (
+            not self.control_args.decoder_model.startswith("qwen3_5")
+            and node.target in freq_op
+            and node.meta["val"].size() in freq_shape
+        ):
             quant_io_type = fixed_point_type["io_type"]
 
         return quant_io_type
@@ -840,10 +1077,26 @@ class TextDecoder(Component):
             # Auto-tune thread count BEFORE prepare_pt2e so the benchmark
             # runs on the exported model without observers — no risk of
             # polluting observer state with synthetic inputs.
-            if self.mode == Mode.DECODE or not self.model_args.use_kv_cache:
+            qwen35_prefill_with_kv = (
+                self.control_args.decoder_model.startswith("qwen3_5")
+                and self.mode == Mode.PREFILL
+                and self.model_args.use_kv_cache
+            )
+            should_calibrate = (
+                self.mode == Mode.DECODE
+                or not self.model_args.use_kv_cache
+                or qwen35_prefill_with_kv
+            )
+            if getattr(self.quant_recipe, "skip_calibration", False):
+                should_calibrate = False
+            if should_calibrate:
                 calib_threads = getattr(self.control_args, "calibration_num_threads", 0)
                 if calib_threads <= 0:
-                    calib_threads = self._auto_tune_calibration_threads()
+                    calib_threads = (
+                        self._auto_tune_calibration_threads()
+                        if not qwen35_prefill_with_kv
+                        else torch.get_num_threads()
+                    )
 
             self.decoder = prepare_pt2e(self.decoder, quantizer)
             if self.apply_embedding:
@@ -852,7 +1105,8 @@ class TextDecoder(Component):
                 )
 
             # start calibration (only for kv mode or prefill mode without kv cache)
-            if self.mode == Mode.DECODE or not self.model_args.use_kv_cache:
+            input_samples = []
+            if should_calibrate:
                 original_threads = torch.get_num_threads()
                 torch.set_num_threads(calib_threads)
                 logging.info(
@@ -877,6 +1131,8 @@ class TextDecoder(Component):
                 self.decoder(*self.export_input)
 
             self.decoder = convert_pt2e(self.decoder)
+            if self.control_args.decoder_model.startswith("qwen3_5"):
+                self._align_kv_cache_io_qparams()
 
             if self.control_args.quant_recipe_suggestion:
                 self._quant_recipe_suggestion(
@@ -928,6 +1184,10 @@ class TextDecoder(Component):
 
         # save logit's quantization attributes to meta
         self._save_logits_quant_attrs()
+
+        # save KV cache input quantization attributes for qzero initialization
+        if self.control_args.decoder_model.startswith("qwen3_5"):
+            self._save_input_kv_cache_quant_attrs()
 
         # save output KV cache's quantization attributes to meta for attention sink
         self._save_output_kv_cache_quant_attrs()
@@ -1074,16 +1334,43 @@ class HybridTextDecoder(Component):
         # here we use a mechanism to make sure the encoding align correctly and
         # save AoT quantization time as well.
         # ---
-        if self.prefill.decoder is not None and self.prefill.model_args.use_kv_cache:
-            self._encoding_override(
-                decode_model=self.decode.decoder,
-                prefill_model=self.prefill.decoder,
-            )
-            if self.apply_embedding:
-                self._encoding_override(
-                    decode_model=self.decode.tok_embedding,
-                    prefill_model=self.prefill.tok_embedding,
+        if (
+            self.prefill.decoder is not None
+            and self.prefill.model_args.use_kv_cache
+            and self.decode.quant_recipe is not None
+        ):
+            if self.control_args.decoder_model.startswith("qwen3_5"):
+                decode_cache_qparams = self.decode._collect_input_kv_cache_qparams()
+                expected_cache_qparams = 2 * self.decode.meta["get_n_layers"]
+                if len(decode_cache_qparams) == expected_cache_qparams:
+                    self.prefill._align_input_kv_cache_qparams(
+                        decode_cache_qparams, "decode input"
+                    )
+                    self.prefill._align_output_kv_cache_qparams(
+                        decode_cache_qparams, "decode input"
+                    )
+                else:
+                    logging.warning(
+                        "Expected %d decode cache input qparams, found %d; "
+                        "skip qwen3.5 hybrid cross-graph KV qparam alignment.",
+                        expected_cache_qparams,
+                        len(decode_cache_qparams),
+                    )
+                logging.info(
+                    "Skipping hybrid encoding override for qwen3.5 because "
+                    "decode and prefill graphs are not isomorphic; only KV cache "
+                    "qparams are aligned across graphs."
                 )
+            else:
+                self._encoding_override(
+                    decode_model=self.decode.decoder,
+                    prefill_model=self.prefill.decoder,
+                )
+                if self.apply_embedding:
+                    self._encoding_override(
+                        decode_model=self.decode.tok_embedding,
+                        prefill_model=self.prefill.tok_embedding,
+                    )
 
         # prepare lowering tok_embedding if applicable
         if self.apply_embedding:
@@ -1220,7 +1507,14 @@ class Modality(Component):
                     )
                     backbone = auto_model
                 _overlay_local_vision_config(auto_model, local_model_config)
-                self.num_layers = auto_model.config.vision_config.num_hidden_layers
+                vision_config = auto_model.config.vision_config
+                auto_model.config.dtype = torch.float32
+                vision_config.dtype = torch.float32
+                self.num_layers = getattr(
+                    vision_config,
+                    "num_hidden_layers",
+                    getattr(vision_config, "depth", 0),
+                )
             else:
                 raise NotImplementedError(f"Find no {modality}")
 
@@ -1265,6 +1559,7 @@ class Modality(Component):
     def _get_sharding_get_pattern(self):
         prefixes = [
             "encoder.layers",
+            "visual.blocks",
             "vision_tower.encoder.layer",
             "vision_model.encoder.layers",
         ]

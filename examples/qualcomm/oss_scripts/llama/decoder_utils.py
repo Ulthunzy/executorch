@@ -5,12 +5,50 @@
 # LICENSE file in the root directory of this source tree.
 
 import logging
+import math
 from collections import defaultdict, OrderedDict
 from dataclasses import dataclass
 from typing import Callable, List, Optional, Tuple, Union
 
 import torch
 from executorch.backends.qualcomm._passes import SeqMSE
+
+
+def _ensure_transformers_vlm_eval_compat():
+    try:
+        import transformers
+    except Exception:
+        return
+
+    if hasattr(transformers, "AutoModelForVision2Seq"):
+        return
+    if hasattr(transformers, "AutoModelForImageTextToText"):
+        transformers.AutoModelForVision2Seq = transformers.AutoModelForImageTextToText
+        return
+
+    try:
+        import transformers.utils.import_utils as transformers_import_utils
+    except Exception:
+        return
+
+    original = transformers_import_utils._LazyModule.__getattr__
+    if getattr(original, "_executorch_vlm_eval_compat", False):
+        return
+
+    def patched_getattr(self, name):
+        if (
+            getattr(self, "__name__", None) == "transformers"
+            and name == "AutoModelForVision2Seq"
+        ):
+            return object
+        return original(self, name)
+
+    patched_getattr._executorch_vlm_eval_compat = True
+    transformers_import_utils._LazyModule.__getattr__ = patched_getattr
+
+
+_ensure_transformers_vlm_eval_compat()
+
 from executorch.examples.models.llama.evaluate.eager_eval import EagerEvalWrapper
 from executorch.examples.qualcomm.oss_scripts.llama.masking_utils import AttentionMask
 
@@ -75,6 +113,72 @@ class DecoderInputs:
     input_ids: Optional[torch.Tensor] = None
     input_ids_dtype: Optional[torch.dtype] = None
     embedding: Optional[torch.Tensor] = None
+
+
+def _make_tmp_pos(all_pos: torch.Tensor, start: int, end: int, ar_len: int):
+    num_tokens = end - start
+    if all_pos.dim() == 3:
+        tmp_pos = torch.zeros(
+            (all_pos.size(0), all_pos.size(1), ar_len), dtype=torch.int32
+        )
+        tmp_pos[:, :, :num_tokens] = all_pos[:, :, start:end]
+        return tmp_pos
+
+    tmp_pos = torch.zeros((1, ar_len), dtype=torch.int32)
+    tmp_pos[0, :num_tokens] = all_pos[0, start:end]
+    return tmp_pos
+
+
+def _build_qwen35_mrope_positions(
+    prompt_token_list: List[int],
+    max_seq_len: int,
+    image_token_id: Optional[int],
+    example_pos: torch.Tensor,
+) -> torch.Tensor:
+    if example_pos.dim() != 3 or image_token_id is None:
+        return torch.arange(0, max_seq_len, 1, dtype=torch.int32).unsqueeze(0)
+
+    positions = []
+    rope_pos = 0
+    idx = 0
+    while idx < len(prompt_token_list):
+        if prompt_token_list[idx] != image_token_id:
+            next_idx = idx
+            while (
+                next_idx < len(prompt_token_list)
+                and prompt_token_list[next_idx] != image_token_id
+            ):
+                next_idx += 1
+            for pos in range(rope_pos, rope_pos + next_idx - idx):
+                positions.append([pos, pos, pos])
+            rope_pos += next_idx - idx
+            idx = next_idx
+            continue
+
+        next_idx = idx
+        while (
+            next_idx < len(prompt_token_list)
+            and prompt_token_list[next_idx] == image_token_id
+        ):
+            next_idx += 1
+        num_image_tokens = next_idx - idx
+        grid = int(math.sqrt(num_image_tokens))
+        if grid * grid != num_image_tokens:
+            raise ValueError(
+                f"Qwen3.5 image token count ({num_image_tokens}) must form a square grid."
+            )
+        for h in range(grid):
+            for w in range(grid):
+                positions.append([rope_pos, rope_pos + h, rope_pos + w])
+        rope_pos += grid
+        idx = next_idx
+
+    position_delta = rope_pos - len(prompt_token_list)
+    while len(positions) < max_seq_len:
+        pos = len(positions) + position_delta
+        positions.append([pos, pos, pos])
+
+    return torch.tensor(positions[:max_seq_len], dtype=torch.int32).T.unsqueeze(1)
 
 
 class GraphModuleCalibrationWrapper(EagerEvalWrapper):
@@ -350,7 +454,16 @@ def smart_mask_updater(
     lade_pos_offset=None,
     position_shift=0,
 ):
-    max_cache_len = k_caches[0].size(-1)
+    def is_state_cache(k_cache):
+        return k_cache.dim() != 4
+
+    default_max_cache_len = (
+        atten_mask.masks[0].max_context_len - atten_mask.masks[0].ar_len
+    )
+    max_cache_len = next(
+        (k_cache.size(-1) for k_cache in k_caches if not is_state_cache(k_cache)),
+        default_max_cache_len,
+    )
 
     shifted_pos = pos + position_shift
     if shifted_pos + n_updates <= max_cache_len:
@@ -359,14 +472,24 @@ def smart_mask_updater(
             for i, offset in enumerate(lade_token_offset):
                 current_pos = shifted_pos + i
                 for j, (k_cache, v_cache) in enumerate(zip(k_caches, v_caches)):
+                    if is_state_cache(k_cache):
+                        k_cache.copy_(new_k_caches[j])
+                        v_cache.copy_(new_v_caches[j])
+                        continue
                     k_cache[:, :, :, current_pos] = new_k_caches[j][:, :, :, offset]
                     v_cache[:, :, current_pos, :] = new_v_caches[j][:, :, offset, :]
         else:
             for i, k_cache in enumerate(k_caches):
+                if is_state_cache(k_cache):
+                    k_cache.copy_(new_k_caches[i])
+                    continue
                 k_cache[:, :, :, shifted_pos : shifted_pos + n_updates] = new_k_caches[
                     i
                 ][:, :, :, :n_updates]
             for i, v_cache in enumerate(v_caches):
+                if is_state_cache(k_caches[i]):
+                    v_cache.copy_(new_v_caches[i])
+                    continue
                 v_cache[:, :, shifted_pos : shifted_pos + n_updates, :] = new_v_caches[
                     i
                 ][:, :, :n_updates, :]
@@ -435,12 +558,9 @@ def _prefill_chunking(
                     actual_chunk_tokens
                 )
 
-            # Prepare tmp_pos (padded with zeros).
-            tmp_pos = torch.zeros((1, ar_len), dtype=torch.int32)
-            tmp_pos[0, :num_tokens_in_chunk] = inputs.all_pos[
-                0,
-                pos : pos + num_tokens_in_chunk,
-            ]
+            tmp_pos = _make_tmp_pos(
+                inputs.all_pos, pos, pos + num_tokens_in_chunk, ar_len
+            )
 
             # Run inference.
             if inputs.input_ids is not None:
@@ -549,11 +669,9 @@ def _generate(
                 # Get text_embedding
                 embedding = tok_embedding(tmp_token_list)
 
-            # Prepare tmp_pos (padded with zeros).
-            tmp_pos = torch.zeros((1, ar_len), dtype=torch.int32)
-            tmp_pos[0, :num_tokens_in_chunk] = inputs.all_pos[
-                0, chunk_start_idx:chunk_end_idx
-            ]
+            tmp_pos = _make_tmp_pos(
+                inputs.all_pos, chunk_start_idx, chunk_end_idx, ar_len
+            )
 
             if inputs.input_ids is not None:
                 logits, new_k_caches, new_v_caches = module(
@@ -740,10 +858,7 @@ def kv_inference(  # noqa: C901
         ]
     )
 
-    _, atten_mask, _, k_caches, v_caches = get_example_inputs()
-
-    # TODO: change criteria & support batch inputs if necessary
-    all_pos = torch.arange(0, max_seq_len, 1, dtype=torch.int32).unsqueeze(0)
+    _, atten_mask, example_pos, k_caches, v_caches = get_example_inputs()
 
     prompt_token_list, total_token_list, result_logits = [], [], []
 
@@ -761,6 +876,14 @@ def kv_inference(  # noqa: C901
     else:
         # pyre-ignore
         prompt_token_list = prompt.flatten().tolist()
+
+    # TODO: change criteria & support batch inputs if necessary
+    all_pos = _build_qwen35_mrope_positions(
+        prompt_token_list,
+        max_seq_len,
+        image_token_id if is_multimodal else None,
+        example_pos,
+    )
 
     # 2. process embedding
     if is_multimodal:

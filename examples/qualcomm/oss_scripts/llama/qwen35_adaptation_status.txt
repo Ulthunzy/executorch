@@ -1,0 +1,1135 @@
+Qwen3.5-0.8B VLM Adaptation Plan
+=================================
+
+Summary
+-------
+- 适配 qwen3_5-0_8b，但不新增 Runner<float> /
+  QNNMultimodalRunner<float>，当前先保持现有 uint16 runtime 路径。
+- 不新增 get_logits_output_bit_width、get_attention_mask_io_bit_width、
+  logits scale/zero_point、Qwen3.5 cache shape 等 metadata；按当前框架已有逻辑处理。
+- 创建并维护 examples/qualcomm/oss_scripts/llama/qwen35_adaptation_status.txt，
+  实现过程中持续记录功能、问题和测试结果。
+
+Key Changes
+-----------
+- 添加 Qwen3.5 model/export 集成：
+  - 注册 qwen3_5-0_8b，目标本地模型路径
+    /hunter/model/Qwen/Qwen3.5-0.8B。
+  - 接入 Qwen3.5 text decoder：DeltaNet linear-attention、Qwen35 RMSNorm、
+    M-RoPE、Qwen35ModelWithoutEmbedding。
+  - 接入 Qwen35 vision encoder/config/quant recipe；encoder 可先按
+    fp16/skip-quant 路径验证。
+
+- 添加 Qwen3.5 quant recipes：
+  - 增加 Qwen3_5_0_8BQuantRecipeSpeed。
+  - speed recipe 中明确将 output.conv 设置为 QuantDtype.use_16a8w。
+  - 不改变当前 logits bitwidth 策略。
+
+- Runtime cache 行为：
+  - 为 Qwen3.5 linear-attention state cache 增加明确语义，区别于普通
+    append 和 true-SWA circular。
+  - 建议新增 cache update enum：
+    - kAppend: full-attention KV append/update。
+    - kCircular: true-SWA circular update。
+    - kFullOverwrite: linear-attention state output 全量覆盖旧 state。
+  - Qwen3.5 linear 层使用 kFullOverwrite。
+
+Tracking File
+-------------
+- 第一项实现动作：创建
+  examples/qualcomm/oss_scripts/llama/qwen35_adaptation_status.txt。
+- 每轮改动后更新：
+  - 已完成功能
+  - 当前问题
+  - 测试命令
+  - 测试结果
+  - 下一步
+
+Test Plan
+---------
+- 所有命令使用 conda et_npu 环境，并导入 env.sh：
+  source /home/hunter/anaconda3/etc/profile.d/conda.sh && conda activate et_npu && source env.sh && ...
+- 先摘掉 encoder 路径，做 decoder-only 验证。
+- 先测 kv 模式，max_seq_len=256。
+- 用 Qwen3.5 的 embedding + 3 linear_attention + 1 full_attention + lm_head
+  结构逐步测试；VLM 当前导出形态是 tok_embedding 图接 decoder 图，
+  decoder 图内部保留 norm + lm_head/output，最终比较 lm_head logits：
+  - 先测 tok_embedding + 一个 3+1 block + lm_head。
+  - 没问题后再加一个 3+1 block。
+  - 每一步比较 FP32、CPU QDQ、QNN 三者 lm_head 输出 logits 的 SQNR。
+- 测试不同层数时从
+  /hunter/cpp_code/ET/npu/executorch/examples/models/qwen3_5/config/0_8b_config.json
+  读取原始配置并生成临时 params JSON，只在临时 JSON 中修改 n_layers 和
+  layer_types；不要真实修改原始 0_8b_config.json，也不要通过代码裁层。
+- 导出命令模板（artifact/log 名称需要按日期、max_seq_len、ar_len、
+  block 数和模式更新；例如当前 first-block kv 测试使用 m256-ar4-block1-kv）：
+  source /home/hunter/anaconda3/etc/profile.d/conda.sh && conda activate et_npu && source env.sh && \
+  python examples/qualcomm/oss_scripts/llama/llama.py \
+    -b build-android \
+    -m SM8850 \
+    --artifact ./llama-output/qwen3_5-0_8b-m256-ar4-block1-kv \
+    --decoder_model qwen3_5-0_8b \
+    --params ./llama-output/qwen3_5-0_8b-m256-ar4-block1-kv/qwen3_5_0_8b_block1_params.json \
+    --model_mode kv \
+    --prefill_ar_len 4 \
+    --max_seq_len 256 \
+    --prompt "描述一下这张图片" \
+    --image_path "/home/hunter/下载/test.jpg" \
+    --compile_only \
+    > run.log-0525-qwen3_5-0_8b-m256-ar4-block1-kv.txt 2>&1
+- 如果复用同一个 pte 做运行验证，不需要重复传输权重到 device 端，可直接复用：
+  ./qnn_llama_runner \
+    --decoder_model_version qwen3 \
+    --tokenizer_path ./tokenizer.json \
+    --model_path hybrid_llama_qnn.pte \
+    --seq_len 3600 --output_path outputs/outputs.txt \
+    --eval_mode 1 \
+    --prompt "$PROMPT" \
+    --shared_buffer
+- kv 模式稳定后再测 hybrid 模式，同样使用 max_seq_len=256。
+
+
+Qwen3.5-0.8B VLM Adaptation Status
+===================================
+
+Goal
+----
+- Adapt qwen3_5-0_8b for the Qualcomm llama export/runtime flow.
+- Keep the existing uint16 runtime path; do not add Runner<float> or
+  QNNMultimodalRunner<float> in this pass.
+- Do not add new logits bitwidth, attention mask bitwidth, logits qparam, or
+  Qwen3.5 cache-shape metadata beyond what the current framework already uses.
+- Add explicit runtime cache semantics for Qwen3.5 linear-attention state cache:
+  full overwrite, separate from append and circular/SWA behavior.
+
+Completed
+---------
+- Created this adaptation tracking file.
+- Wrote the requested Chinese plan at the front of this file.
+- Added Python-side Qwen3.5 model/export integration:
+  - Registered qwen3_5-0_8b with local repo path
+    /hunter/model/Qwen/Qwen3.5-0.8B.
+  - Added Qwen35 RMSNorm and gated RMSNorm.
+  - Added Qwen35 DeltaNet linear-attention, Qwen35 decoder layer,
+    M-RoPE handling, and Qwen35ModelWithoutEmbedding.
+  - Added Qwen35 vision encoder/config and Qwen35 encoder quant recipe.
+  - Added Qwen3.5 tokenizer multimodal special-token mapping.
+  - Added Qwen3.5 vision dataset patch preprocessing.
+- Added Qwen3.5 decoder M-RoPE position generation for Python SQNR/inference.
+- Added Python cache update handling for linear-attention state full overwrite.
+- Added local transformers/lm_eval compatibility handling in decoder_utils and
+  decoder_runtime_evaluator so `AutoModelForVision2Seq` missing from the
+  installed transformers package no longer blocks direct SQNR/helper imports.
+- Added Qwen3_5_0_8BQuantRecipeSpeed.
+  - output.conv is explicitly annotated as QuantDtype.use_16a8w.
+  - No logits bitwidth/qparam override was added.
+- Updated llama export compile options:
+  - Qwen3.5 vision encoder uses fp16/skip-quant for the first validation path.
+  - Qwen3.5 text decoder disables mha2sha.
+  - Weight sharing remains disabled for kv-only export.
+- Updated export wrapper behavior for Qwen3.5:
+  - Filters extra HF checkpoint keys before strict decoder load.
+  - Tags Qwen3.5 linear-attention state cache I/O by full tensor shape.
+  - Makes speed recipe skip-calibration effective.
+  - Skips hybrid decode/prefill encoding override for Qwen3.5 because the
+    graphs are not isomorphic.
+  - Supports Qwen3.5 vision encoder layer counting via vision_config.depth.
+- Added C++ runtime cache semantics:
+  - Added KVManager cache update modes kAppend, kCircular, and kFullOverwrite.
+  - Added per-layer cache specs derived from method metadata for qwen3_5.
+  - Qwen3.5 equal-sized state caches use kFullOverwrite.
+  - Full-overwrite state caches are copied from output buffer to input buffer
+    instead of using append or true-SWA circular update.
+- Added qwen3_5 C++ multimodal runner handling:
+  - VisionLanguageModel::kQwen3_5 parsing and EOS handling.
+  - M-RoPE position-id dimension inference from exported method metadata.
+  - Prompt position-id generation for text and square-grid image embeddings.
+  - Decode position delta support after image tokens.
+  - Qwen3.5 image embeddings are inserted directly instead of placeholder
+    replacement.
+  - Vision chat template emits Qwen3.5 user/assistant format with
+    <|vision_start|>/<|vision_end|> and thinking prefill.
+- Corrected first-block export strategy:
+  - Keep examples/models/qwen3_5/config/0_8b_config.json as the full 24-layer
+    source config.
+  - Generate a temporary params JSON for each block test.
+  - For the first block temp config: n_layers = 4 and layer_types =
+    linear_attention, linear_attention, linear_attention, full_attention.
+  - The tested path is tok_embedding graph + selected decoder block(s) +
+    decoder norm + lm_head/output, and SQNR is measured on lm_head logits.
+- Added Qwen3.5 KV/cache qparam alignment after convert_pt2e:
+  - Collects each cache input quantize_per_tensor scale/zero_point.
+  - Rewrites matching cache output quantize/dequantize qparams to the input
+    qparams before saving decode_qdq.pt2 and before QNN lowering.
+  - Scoped to qwen3_5 decoder export; logits qparams and bitwidth metadata are
+    unchanged.
+- Added Qwen3.5 KV/cache input zero-point initialization in the C++ runtime:
+  - Exports get_kv_input_{idx}_scale and get_kv_input_{idx}_zero_point metadata
+    for Qwen3.5 cache input placeholders.
+  - Reads get_kv_input_{idx}_zero_point in QNNMultimodalRunner.
+  - Initializes and resets Qwen3.5 uint16 cache input buffers to each cache
+    tensor's quantized zero point instead of raw zero.
+  - This keeps the existing uint16 runtime path; no float runner instantiation
+    was added.
+- Removed the stale fixed Qwen3.5 logits qparam override from the quant recipe.
+  Qwen3.5 logits scale/zero_point should come from the converted quantized
+  graph, not from a hard-coded (1/256, 32768) recipe hook.
+- Tightened Qwen3.5 runtime metadata handling:
+  - get_kv_input_{idx}_zero_point is now required for Qwen3.5 PTEs.
+  - Missing cache qparam metadata is treated as an export/runtime error instead
+    of silently falling back to zero.
+  - The exported qparams are still static PTQ qparams: they are computed during
+    calibration/export and then fixed in that PTE. They are not recomputed per
+    runtime prompt or image.
+
+Current Problems
+----------------
+- Direct Python import smoke test is currently blocked by missing Python
+  dependencies in this environment (flatbuffers first; after adding the local
+  flatbuffers path, torchao is also missing).
+- First-block kv export hit and fixed one encoder preprocessing issue:
+  Qwen35 vision preprocess squeezed [1, 784, 1536] to [784, 1536], but the
+  exported encoder graph expects the 3D shape. preprocess now preserves the
+  dataset tensor shape.
+- First-block kv export now completes and writes the expected PTE set, but QNN
+  compile logs still contain repeated
+  "scale too large for requant qu16->qu16: 19999.916016" diagnostics. The
+  process exits successfully, so this is tracked as an accuracy/runtime risk
+  for the next SQNR run rather than an export blocker.
+- Block1 and block2 kv runtime execution are structurally working on device
+  after rebuilding the Android runner, but the full FP32/CPU-QDQ/QNN SQNR
+  passes are not accuracy-green yet:
+  - Block1 CPU QDQ vs QNN lm_head logits SQNR: 18.293 dB.
+  - Block1 FP32 vs CPU QDQ lm_head logits SQNR: 1.877 dB.
+  - Block1 FP32 vs QNN lm_head logits SQNR: 1.887 dB.
+  - Block2 CPU QDQ vs QNN lm_head logits SQNR: 18.054 dB.
+  - Block2 FP32 vs CPU QDQ lm_head logits SQNR: 0.789 dB.
+  - Block2 FP32 vs QNN lm_head logits SQNR: 0.808 dB.
+  This means the exported QDQ graph and QNN runtime are aligned, but the
+  current speed recipe is very lossy versus FP32 for these truncated block
+  tests. Treat this as a quantization/recipe risk before calling kv mode fully
+  stable.
+- Do not treat logits qparams or logits/attention-mask bitwidth metadata as the
+  current suspect:
+  - The framework already uses uint16 for logits and attention mask in this
+    flow.
+  - get_logits_output_bit_width and get_attention_mask_io_bit_width are not
+    needed for the current Qwen3.5 path.
+  - Logits scale/zero_point are computed by PTQ calibration/export and are
+    readable from the PTE metadata. Example current values observed from block
+    tests:
+    block1 scale = 0.000370977243, zero_point = 37081;
+    block2 scale = 0.000407945539, zero_point = 37705.
+  - CPU QDQ vs QNN SQNR around 18 dB indicates the QNN runtime and exported QDQ
+    graph are aligned enough that logits qparam loading is not the first issue.
+- Full 24-layer kv generation is now semantically normal after the runtime
+  cache zero-point initialization fix and a fresh QNN 2.45 export:
+  - Prompt: "描述一下这张图片"
+  - max_seq_len = 256
+  - Current output starts with a normal Chinese image description:
+    "这张图片展示了一个充满生活气息的场景：..."
+  - The stale "axon" and mixed-gibberish outputs came from older PTE/runtime
+    combinations that did not initialize quantized cache inputs with their
+    zero points.
+- Direct imports of decoder_utils now work after adding the transformers
+  LazyModule compatibility helper locally.
+
+Tests
+-----
+- Passed:
+  source /home/hunter/anaconda3/etc/profile.d/conda.sh && conda activate et_npu && source env.sh && python -m py_compile
+  examples/qualcomm/oss_scripts/llama/model/layernorm.py
+  examples/qualcomm/oss_scripts/llama/model/static_llama.py
+  examples/qualcomm/oss_scripts/llama/model/vision_encoder.py
+  examples/qualcomm/oss_scripts/llama/encoder/encoder_quant_recipe.py
+  examples/qualcomm/oss_scripts/llama/encoder/encoder_config.py
+  examples/qualcomm/oss_scripts/llama/static_llm_quant_recipe.py
+  examples/qualcomm/oss_scripts/llama/__init__.py
+  examples/qualcomm/oss_scripts/llama/decoder_constants.py
+  examples/qualcomm/oss_scripts/llama/dataset.py
+  examples/qualcomm/oss_scripts/llama/tokenizer.py
+  examples/qualcomm/oss_scripts/llama/decoder_utils.py
+  examples/qualcomm/oss_scripts/llama/llama.py
+  examples/qualcomm/oss_scripts/llama/wrappers/llm_wrappers.py
+- Passed:
+  source /home/hunter/anaconda3/etc/profile.d/conda.sh && conda activate et_npu && source env.sh && cmake --build build-x86/examples/qualcomm --target
+  qnn_llama_runner qnn_multimodal_runner -j2
+- Passed:
+  source /home/hunter/anaconda3/etc/profile.d/conda.sh && conda activate et_npu && source env.sh && git diff --check
+- Passed:
+  source /home/hunter/anaconda3/etc/profile.d/conda.sh && conda activate et_npu && source env.sh &&
+  python -m py_compile
+  examples/qualcomm/oss_scripts/llama/decoder_utils.py
+  examples/qualcomm/oss_scripts/llama/decoder_runtime_evaluator.py
+- Passed:
+  source /home/hunter/anaconda3/etc/profile.d/conda.sh && conda activate et_npu && source env.sh &&
+  python -m py_compile examples/qualcomm/oss_scripts/llama/wrappers/llm_wrappers.py
+- Passed:
+  source /home/hunter/anaconda3/etc/profile.d/conda.sh && conda activate et_npu && source env.sh &&
+  git diff --check -- examples/qualcomm/oss_scripts/llama/wrappers/llm_wrappers.py
+- Passed:
+  Compared KV/cache input and output qparams from exported decode_qdq.pt2 files:
+  - Old block1 artifact:
+    llama-output/qwen3_5-0_8b-m256-ar4-block1-kv/decode_qdq.pt2
+    matched 2/8 cache outputs to matching cache inputs.
+  - Current m1024 artifact:
+    llama-output/qwen3_5-0_8b-m1024-kv/decode_qdq.pt2
+    matched 45/48 cache outputs to matching cache inputs.
+    The mismatches were V-cache outputs for layers 6, 10, and 13.
+  - LuxiRT adapted reference:
+    /hunter/LuxiRT/executorch/llama-output/qwen3_5-0_8b-m256-b1-kv-export/decode_qdq.pt2
+    matched 48/48 cache outputs to matching cache inputs.
+  - New block1 artifact after the KV qparam alignment fix:
+    llama-output/qwen3_5-0_8b-m256-ar4-block1-kv-kvqaligned/decode_qdq.pt2
+    matched 8/8 cache outputs to matching cache inputs.
+  Conclusion: KV/cache qparams, not logits qparams/bitwidth metadata, were a
+  real mismatch in stale artifacts.
+- Passed:
+  Re-exported block1 after the KV qparam alignment fix:
+  source /home/hunter/anaconda3/etc/profile.d/conda.sh && conda activate et_npu && source env.sh &&
+  python examples/qualcomm/oss_scripts/llama/llama.py \
+    -b build-android \
+    -m SM8850 \
+    --artifact ./llama-output/qwen3_5-0_8b-m256-ar4-block1-kv-kvqaligned \
+    --decoder_model qwen3_5-0_8b \
+    --model_mode kv \
+    --prefill_ar_len 4 \
+    --max_seq_len 256 \
+    --params ./llama-output/qwen3_5-0_8b-m256-ar4-block1-kv/qwen3_5_0_8b_block1_params.json \
+    --prompt "描述一下这张图片" \
+    --image_path "/home/hunter/下载/test.jpg" \
+    --compile_only \
+    > run.log-0525-qwen3_5-0_8b-m256-ar4-block1-kv-kvqaligned.txt 2>&1
+  Log result:
+  - KV cache qparam alignment visited 8 outputs and reported no changes needed
+    for this fresh block1 export.
+  - Post-export graph check confirmed 8/8 cache input/output qparam matches.
+- Passed:
+  Re-exported full 24-layer kv after the KV qparam alignment fix:
+  source /home/hunter/anaconda3/etc/profile.d/conda.sh && conda activate et_npu && source env.sh &&
+  python examples/qualcomm/oss_scripts/llama/llama.py \
+    -b build-android \
+    -m SM8850 \
+    --artifact ./llama-output/qwen3_5-0_8b-m256-ar4-full-kv-kvqaligned \
+    --decoder_model qwen3_5-0_8b \
+    --model_mode kv \
+    --prefill_ar_len 4 \
+    --max_seq_len 256 \
+    --prompt "描述一下这张图片" \
+    --image_path "/home/hunter/下载/test.jpg" \
+    --compile_only \
+    > run.log-0525-qwen3_5-0_8b-m256-ar4-full-kv-kvqaligned.txt 2>&1
+  Result:
+  - Export exited successfully.
+  - Log reported: Aligned 6 KV cache output qparams to matching input qparams.
+  - Post-export graph check confirmed 48/48 cache input/output qparam matches.
+  - Per-layer check confirmed all 24 layers have matching K-cache and V-cache
+    qparams between output and the next-step input.
+  - kv_llama_qnn.pte size: 602,183,552 bytes.
+  - decode_qdq.pt2 size: 3,907,910,055 bytes.
+  - Logits qparam remained dynamically exported:
+    scale = 0.0008444182458333671, zero_point = 26238.
+- Passed structurally, still bad quality:
+  Ran the fresh full 24-layer kv PTE on device:
+  source /home/hunter/anaconda3/etc/profile.d/conda.sh && conda activate et_npu && source env.sh &&
+  python examples/qualcomm/oss_scripts/llama/llama.py \
+    -b build-android \
+    -m SM8850 \
+    -s 3B15AK00GLW00000 \
+    --artifact ./llama-output/qwen3_5-0_8b-m256-ar4-full-kv-kvqaligned-run \
+    --decoder_model qwen3_5-0_8b \
+    --model_mode kv \
+    --prefill_ar_len 4 \
+    --max_seq_len 256 \
+    --prompt "描述一下这张图片" \
+    --image_path "/home/hunter/下载/test.jpg" \
+    --pre_gen_pte ./llama-output/qwen3_5-0_8b-m256-ar4-full-kv-kvqaligned \
+    > run.log-0525-qwen3_5-0_8b-m256-ar4-full-kv-kvqaligned-run.txt 2>&1
+  Result:
+  - Prompt tokens: 214; generated tokens: 41.
+  - Prompt evaluation: 52.5669 tokens/sec.
+  - Decode: 29.0368 tokens/sec.
+  - Total inference: 7.47766 tokens/sec.
+  - Output is still semantically bad/mixed-language gibberish, but no longer the
+    stale "axon" repeat pattern.
+- Passed:
+  source /home/hunter/anaconda3/etc/profile.d/conda.sh && conda activate et_npu && source env.sh &&
+  python examples/qualcomm/oss_scripts/llama/llama.py --help
+- Passed:
+  source /home/hunter/anaconda3/etc/profile.d/conda.sh && conda activate et_npu && source env.sh &&
+  python - <<'PY' ... retrieve_info_from_pte(...) ...
+  confirmed direct decoder_utils import works and current PTE metadata reports:
+  - block1 logits_scale = 0.000370977243, logits_zero_point = 37081,
+    kv_io_bit_width = 16.
+  - block2 logits_scale = 0.000407945539, logits_zero_point = 37705,
+    kv_io_bit_width = 16.
+- Blocked:
+  source /home/hunter/anaconda3/etc/profile.d/conda.sh && conda activate et_npu && source env.sh && python - <<'PY' ... import Qwen3_5_0_8B ...
+  failed with ModuleNotFoundError: No module named 'flatbuffers'.
+- Blocked:
+  source /home/hunter/anaconda3/etc/profile.d/conda.sh && conda activate et_npu && source env.sh && PYTHONPATH=$PWD/third-party/flatbuffers/python:$PYTHONPATH
+  python - <<'PY' ... import Qwen3_5_0_8B ...
+  failed with ModuleNotFoundError: No module named 'torchao'.
+- Failed then fixed:
+  source /home/hunter/anaconda3/etc/profile.d/conda.sh && conda activate et_npu && source env.sh &&
+  python examples/qualcomm/oss_scripts/llama/llama.py ... --params
+  ./llama-output/qwen3_5-0_8b-m256-ar4-block1-kv/qwen3_5_0_8b_block1_params.json
+  ... > run.log-0525-qwen3_5-0_8b-m256-ar4-block1-kv.txt 2>&1
+  failed because Qwen35VLVisionEncoder.preprocess removed the batch dimension
+  expected by the exported encoder graph.
+- Passed:
+  source /home/hunter/anaconda3/etc/profile.d/conda.sh && conda activate et_npu && source env.sh &&
+  python examples/qualcomm/oss_scripts/llama/llama.py \
+    -b build-android \
+    -m SM8850 \
+    --artifact ./llama-output/qwen3_5-0_8b-m256-ar4-block1-kv \
+    --decoder_model qwen3_5-0_8b \
+    --params ./llama-output/qwen3_5-0_8b-m256-ar4-block1-kv/qwen3_5_0_8b_block1_params.json \
+    --model_mode kv \
+    --prefill_ar_len 4 \
+    --max_seq_len 256 \
+    --prompt "描述一下这张图片" \
+    --image_path "/home/hunter/下载/test.jpg" \
+    --compile_only \
+    > run.log-0525-qwen3_5-0_8b-m256-ar4-block1-kv.txt 2>&1
+  generated:
+  ./llama-output/qwen3_5-0_8b-m256-ar4-block1-kv/kv_llama_qnn.pte
+  ./llama-output/qwen3_5-0_8b-m256-ar4-block1-kv/tok_embedding_qnn.pte
+  ./llama-output/qwen3_5-0_8b-m256-ar4-block1-kv/vision_encoder_qnn.pte
+  ./llama-output/qwen3_5-0_8b-m256-ar4-block1-kv/decode_qdq.pt2
+- Passed:
+  source /home/hunter/anaconda3/etc/profile.d/conda.sh && conda activate et_npu && source env.sh && adb devices
+  completed after attaching 3B15AK00GLW00000; the device is listed as online.
+- Failed:
+  source /home/hunter/anaconda3/etc/profile.d/conda.sh && conda activate et_npu && source env.sh &&
+  python examples/qualcomm/oss_scripts/llama/llama.py \
+    -b build-android \
+    -m SM8850 \
+    -s 3B15AK00GLW00000 \
+    --artifact ./llama-output/qwen3_5-0_8b-m256-ar4-block1-kv-run \
+    --decoder_model qwen3_5-0_8b \
+    --params ./llama-output/qwen3_5-0_8b-m256-ar4-block1-kv/qwen3_5_0_8b_block1_params.json \
+    --model_mode kv \
+    --prefill_ar_len 4 \
+    --max_seq_len 256 \
+    --prompt "描述一下这张图片" \
+    --image_path "/home/hunter/下载/test.jpg" \
+    --pre_gen_pte ./llama-output/qwen3_5-0_8b-m256-ar4-block1-kv \
+    > run.log-0525-qwen3_5-0_8b-m256-ar4-block1-kv-run.txt 2>&1
+  pushed PTEs and inputs successfully, but device-side qnn_multimodal_runner
+  failed with "Unsupported Decoder Model" for --decoder_model_version qwen3_5.
+  This indicates the Android runner binary in build-android is stale or was not
+  rebuilt with the Qwen3.5 runtime branch.
+- Passed:
+  source /home/hunter/anaconda3/etc/profile.d/conda.sh && conda activate et_npu && source env.sh &&
+  cmake --build build-android/examples/qualcomm --target
+  qnn_multimodal_runner qnn_llama_runner -j2
+  rebuilt the Android runners with the Qwen3.5 runtime branch.
+- Passed:
+  Reused the already-pushed first-block PTEs and pushed only the rebuilt
+  qnn_multimodal_runner, then ran directly on device:
+  adb -s 3B15AK00GLW00000 shell 'cd /data/local/tmp/hunter/executorch/static_llm && ./qnn_multimodal_runner ... --decoder_model_version qwen3_5 ... --eval_mode 0 --seq_len 256 ...'
+  Result:
+  - qwen3_5 model version is accepted by qnn_multimodal_runner.
+  - vision_encoder_qnn.pte executed and produced hidden states.
+  - tok_embedding_qnn.pte and kv_llama_qnn.pte executed through the
+    embedding + one 3+1 decoder block + lm_head path.
+  - Prompt tokens: 214; generated tokens: 41.
+  - Prompt evaluation: 185.121 tokens/sec.
+  - Decode: 137.124 tokens/sec.
+  - Total inference speed file: 28.1787 tokens/sec.
+  - Output reached the max_seq_len=256 limit without EOS. This is expected to
+    be possible for a one-block truncated model and is not treated as a full
+    model quality result.
+- Passed:
+  Reused the same first-block PTEs on device and dumped prompt logits with
+  `--dump_logits_path`:
+  adb -s 3B15AK00GLW00000 shell 'cd /data/local/tmp/hunter/executorch/static_llm && ./qnn_multimodal_runner ... --decoder_model_version qwen3_5 ... --seq_len 215 --dump_logits_path outputs/all_logits_block1.raw ...'
+  Result:
+  - Prompt tokens: 214; generated tokens: 0.
+  - Prompt evaluation: 177.741 tokens/sec.
+  - QNN raw logits: ./llama-output/qwen3_5-0_8b-m256-ar4-block1-kv-run/outputs/all_logits_block1.raw
+  - Raw logits size: 106,280,960 bytes = 214 * 248,320 * uint16.
+- Passed:
+  Ran CPU-side first-block SQNR comparison with the temporary 4-layer params
+  JSON and the exported decode_qdq.pt2:
+  - FP32 logits shape: (1, 214, 248320).
+  - CPU QDQ logits shape: (1, 214, 248320).
+  - QNN logits shape: (1, 214, 248320).
+  - FP32 vs QNN SQNR: 1.887378 dB.
+  - CPU QDQ vs QNN SQNR: 18.293079 dB.
+  - FP32 vs CPU QDQ SQNR: 1.877025 dB.
+  - Result JSON:
+    ./llama-output/qwen3_5-0_8b-m256-ar4-block1-kv-run/outputs/sqnr_block1_results.json
+- Passed:
+  Verified the first-block FP32 manager is using the temporary params JSON:
+  - params = ./llama-output/qwen3_5-0_8b-m256-ar4-block1-kv/qwen3_5_0_8b_block1_params.json
+  - decode_n_layers = 4
+  - decode_layer_types =
+    linear_attention, linear_attention, linear_attention, full_attention
+- Passed:
+  Generated the second-block temporary params JSON without modifying the
+  original config:
+  ./llama-output/qwen3_5-0_8b-m256-ar4-block2-kv/qwen3_5_0_8b_block2_params.json
+  - n_layers = 8
+  - layer_types =
+    linear_attention, linear_attention, linear_attention, full_attention,
+    linear_attention, linear_attention, linear_attention, full_attention
+- Passed:
+  Exported block2 kv with max_seq_len=256 and prefill_ar_len=4:
+  source /home/hunter/anaconda3/etc/profile.d/conda.sh && conda activate et_npu && source env.sh &&
+  python examples/qualcomm/oss_scripts/llama/llama.py \
+    -b build-android \
+    -m SM8850 \
+    --artifact ./llama-output/qwen3_5-0_8b-m256-ar4-block2-kv \
+    --decoder_model qwen3_5-0_8b \
+    --params ./llama-output/qwen3_5-0_8b-m256-ar4-block2-kv/qwen3_5_0_8b_block2_params.json \
+    --model_mode kv \
+    --prefill_ar_len 4 \
+    --max_seq_len 256 \
+    --prompt "描述一下这张图片" \
+    --image_path "/home/hunter/下载/test.jpg" \
+    --compile_only \
+    > run.log-0525-qwen3_5-0_8b-m256-ar4-block2-kv.txt 2>&1
+  generated:
+  ./llama-output/qwen3_5-0_8b-m256-ar4-block2-kv/kv_llama_qnn.pte
+  ./llama-output/qwen3_5-0_8b-m256-ar4-block2-kv/tok_embedding_qnn.pte
+  ./llama-output/qwen3_5-0_8b-m256-ar4-block2-kv/vision_encoder_qnn.pte
+  ./llama-output/qwen3_5-0_8b-m256-ar4-block2-kv/decode_qdq.pt2
+  Notes:
+  - output.conv is annotated as QuantDtype.use_16a8w.
+  - The same "scale too large for requant qu16->qu16: 19999.916016" QNN
+    compile diagnostics remain present, but export exits successfully.
+- Passed:
+  Ran block2 kv prompt/runtime on device using the generated PTEs:
+  - Prompt tokens: 214; generated tokens: 41.
+  - Prompt evaluation: 122.706 tokens/sec.
+  - Decode: 43.524 tokens/sec.
+  - Total inference speed file: 15.2643 tokens/sec.
+  - Output reached max_seq_len=256 without EOS. This remains expected for a
+    truncated block test and is not treated as a full model quality result.
+- Passed:
+  Reused the same block2 PTEs on device and dumped prompt logits:
+  - Prompt tokens: 214; generated tokens: 0.
+  - Prompt evaluation: 92.043 tokens/sec.
+  - QNN raw logits: ./llama-output/qwen3_5-0_8b-m256-ar4-block2-kv-run/outputs/all_logits_block2.raw
+  - Raw logits size: 106,280,960 bytes = 214 * 248,320 * uint16.
+- Passed:
+  Ran CPU-side block2 SQNR comparison with the temporary 8-layer params JSON
+  and the exported decode_qdq.pt2:
+  - FP32 logits shape: (1, 214, 248320).
+  - CPU QDQ logits shape: (1, 214, 248320).
+  - QNN logits shape: (1, 214, 248320).
+  - FP32 vs QNN SQNR: 0.807635 dB.
+  - CPU QDQ vs QNN SQNR: 18.053808 dB.
+  - FP32 vs CPU QDQ SQNR: 0.789265 dB.
+  - Result JSON:
+    ./llama-output/qwen3_5-0_8b-m256-ar4-block2-kv-run/outputs/sqnr_block2_results.json
+- Passed with bad-quality output:
+  Exported the full 24-layer kv model with the original
+  examples/models/qwen3_5/config/0_8b_config.json, max_seq_len=256 and
+  prefill_ar_len=4:
+  source /home/hunter/anaconda3/etc/profile.d/conda.sh && conda activate et_npu && source env.sh &&
+  python examples/qualcomm/oss_scripts/llama/llama.py \
+    -b build-android \
+    -m SM8850 \
+    --artifact ./llama-output/qwen3_5-0_8b-m256-ar4-full-kv \
+    --decoder_model qwen3_5-0_8b \
+    --model_mode kv \
+    --prefill_ar_len 4 \
+    --max_seq_len 256 \
+    --prompt "描述一下这张图片" \
+    --image_path "/home/hunter/下载/test.jpg" \
+    --compile_only \
+    > run.log-0525-qwen3_5-0_8b-m256-ar4-full-kv.txt 2>&1
+  generated:
+  ./llama-output/qwen3_5-0_8b-m256-ar4-full-kv/kv_llama_qnn.pte
+  ./llama-output/qwen3_5-0_8b-m256-ar4-full-kv/tok_embedding_qnn.pte
+  ./llama-output/qwen3_5-0_8b-m256-ar4-full-kv/vision_encoder_qnn.pte
+  ./llama-output/qwen3_5-0_8b-m256-ar4-full-kv/decode_qdq.pt2
+  Notes:
+  - kv_llama_qnn.pte size: 569M.
+  - decode_qdq.pt2 size: 3.7G.
+  - output.conv is annotated as QuantDtype.use_16a8w.
+  - The same "scale too large for requant qu16->qu16: 19999.916016" QNN
+    compile diagnostics remain present, but export exits successfully.
+- Passed with bad-quality output:
+  Ran the full 24-layer kv model on device:
+  source /home/hunter/anaconda3/etc/profile.d/conda.sh && conda activate et_npu && source env.sh &&
+  python examples/qualcomm/oss_scripts/llama/llama.py \
+    -b build-android \
+    -m SM8850 \
+    -s 3B15AK00GLW00000 \
+    --artifact ./llama-output/qwen3_5-0_8b-m256-ar4-full-kv-run \
+    --decoder_model qwen3_5-0_8b \
+    --model_mode kv \
+    --prefill_ar_len 4 \
+    --max_seq_len 256 \
+    --prompt "描述一下这张图片" \
+    --image_path "/home/hunter/下载/test.jpg" \
+    --pre_gen_pte ./llama-output/qwen3_5-0_8b-m256-ar4-full-kv \
+    > run.log-0525-qwen3_5-0_8b-m256-ar4-full-kv-run.txt 2>&1
+  Result:
+  - Prompt tokens: 214; generated tokens: 41.
+  - Prompt evaluation: 57.112 tokens/sec.
+  - Decode: 30.597 tokens/sec.
+  - Total inference speed file: 8.05976 tokens/sec.
+  - Output:
+    <think>
+    </think>
+    axonaxonaxon...
+- Passed with bad-quality output:
+  Reused the same full 24-layer PTEs on device and reran direct inference with
+  temperature=0:
+  adb -s 3B15AK00GLW00000 shell 'cd /data/local/tmp/hunter/executorch/static_llm && ./qnn_multimodal_runner ... --decoder_model_version qwen3_5 ... --temperature 0 --seq_len 256 ...'
+  Result:
+  - Prompt tokens: 214; generated tokens: 41.
+  - Prompt evaluation: 53.102 tokens/sec.
+  - Decode: 46.485 tokens/sec.
+  - Total inference speed file: 8.34691 tokens/sec.
+  - Output still repeats "axon", so the bad output is not caused by sampling
+    randomness.
+
+Next
+----
+- Keep the KV/cache qparam alignment and runtime cache zero-point
+  initialization fixes. Do not add logits/attention-mask bitwidth metadata for
+  this issue.
+- Treat kv mode as functionally stable for the current full 24-layer
+  max_seq_len=256 smoke test. The next kv work should focus on repeatability
+  and a maintained multimodal SQNR path rather than the old "axon" failure.
+- If the speed recipe remains the 0.8B default, document that it is
+  structurally correct and produces normal full-model generation, while the
+  truncated block FP32-vs-QDQ SQNR tests are still lossy versus FP32.
+- Install/fix the missing flatbuffers/torchao Python dependencies or use the
+  intended ExecuTorch Python environment, then rerun import smoke tests.
+- Add or run a suitable maintained multimodal SQNR path for tok_embedding +
+  decoder logits; the existing llama.py sqnr_eval path still asserts out for
+  multimodal models.
+- After kv mode is stable, run the same SQNR flow in hybrid mode.
+
+Most Recent Test Command
+------------------------
+- Fresh full kv export after KV qparam alignment, runtime cache zero-point
+  initialization, and QNN SDK 2.45 env update:
+  source /home/hunter/anaconda3/etc/profile.d/conda.sh && conda activate et_npu && source env.sh && \
+  python examples/qualcomm/oss_scripts/llama/llama.py \
+    -b build-android \
+    -m SM8850 \
+    --artifact ./llama-output/qwen3_5-0_8b-m256-ar4-full-kv-qnn245-kvzpfixed \
+    --decoder_model qwen3_5-0_8b \
+    --model_mode kv \
+    --prefill_ar_len 4 \
+    --max_seq_len 256 \
+    --prompt "描述一下这张图片" \
+    --image_path "/home/hunter/下载/test.jpg" \
+    --compile_only \
+    > run.log-0525-qwen3_5-0_8b-m256-ar4-full-kv-qnn245-kvzpfixed.txt 2>&1
+- Fresh full kv device run of that current-repo PTE:
+  source /home/hunter/anaconda3/etc/profile.d/conda.sh && conda activate et_npu && source env.sh && \
+  python examples/qualcomm/oss_scripts/llama/llama.py \
+    -b build-android \
+    -m SM8850 \
+    -s 3B15AK00GLW00000 \
+    --artifact ./llama-output/qwen3_5-0_8b-m256-ar4-full-kv-qnn245-kvzpfixed-run \
+    --decoder_model qwen3_5-0_8b \
+    --model_mode kv \
+    --prefill_ar_len 4 \
+    --max_seq_len 256 \
+    --prompt "描述一下这张图片" \
+    --image_path "/home/hunter/下载/test.jpg" \
+    --pre_gen_pte ./llama-output/qwen3_5-0_8b-m256-ar4-full-kv-qnn245-kvzpfixed \
+    > run.log-0525-qwen3_5-0_8b-m256-ar4-full-kv-qnn245-kvzpfixed-run.txt 2>&1
+
+Most Recent Test Result
+-----------------------
+- Passed:
+  Rebuilt qnn_multimodal_runner and qnn_llama_runner after the runtime cache
+  zero-point fix.
+- Passed:
+  QNN SDK path after sourcing env.sh:
+  /hunter/qnn_sdk/src/backends/qnn/2.45.0.260326.
+- Passed:
+  The fresh current-repo kv_llama_qnn.pte contains get_kv_input_0_zero_point,
+  get_kv_input_24_zero_point, and the other Qwen3.5 cache input qparam
+  metadata entries.
+- Passed:
+  Full 24-layer kv export produced:
+  ./llama-output/qwen3_5-0_8b-m256-ar4-full-kv-qnn245-kvzpfixed/kv_llama_qnn.pte
+  ./llama-output/qwen3_5-0_8b-m256-ar4-full-kv-qnn245-kvzpfixed/tok_embedding_qnn.pte
+  ./llama-output/qwen3_5-0_8b-m256-ar4-full-kv-qnn245-kvzpfixed/vision_encoder_qnn.pte
+  ./llama-output/qwen3_5-0_8b-m256-ar4-full-kv-qnn245-kvzpfixed/decode_qdq.pt2
+- Passed:
+  Full 24-layer kv device run generated normal Chinese output:
+  "<think>\n\n</think>\n\n这张图片展示了一个充满生活气息的场景：..."
+  Runtime stats:
+  - Prompt tokens: 214; generated tokens: 41.
+  - Prompt evaluation: 56.764 tokens/sec.
+  - Decode: 30.461 tokens/sec.
+  - Total inference: 8.014 tokens/sec.
+  - Model load time: 4.809 seconds.
+- Passed:
+  Removed the fixed Qwen3.5 logits qparam override and rebuilt the Android
+  runners:
+  source /home/hunter/anaconda3/etc/profile.d/conda.sh && conda activate et_npu && source env.sh &&
+  cmake --build build-android/examples/qualcomm --target qnn_multimodal_runner qnn_llama_runner -j2
+- Passed:
+  Re-ran the same current-repo Qwen3.5 full kv PTE with runtime-required cache
+  zero-point metadata:
+  source /home/hunter/anaconda3/etc/profile.d/conda.sh && conda activate et_npu && source env.sh && \
+  python examples/qualcomm/oss_scripts/llama/llama.py \
+    -b build-android \
+    -m SM8850 \
+    -s 3B15AK00GLW00000 \
+    --artifact ./llama-output/qwen3_5-0_8b-m256-ar4-full-kv-qnn245-kvzpfixed-requiredmeta-run \
+    --decoder_model qwen3_5-0_8b \
+    --model_mode kv \
+    --prefill_ar_len 4 \
+    --max_seq_len 256 \
+    --prompt "描述一下这张图片" \
+    --image_path "/home/hunter/下载/test.jpg" \
+    --pre_gen_pte ./llama-output/qwen3_5-0_8b-m256-ar4-full-kv-qnn245-kvzpfixed \
+    > run.log-0526-qwen3_5-0_8b-m256-ar4-full-kv-qnn245-kvzpfixed-requiredmeta-run.txt 2>&1
+  Result:
+  - Required metadata check passed; no fallback zero was used.
+  - Output remained normal Chinese:
+    "这张图片展示了一个充满生活气息的场景：..."
+  - Prompt tokens: 214; generated tokens: 41.
+  - Prompt evaluation: 56.870 tokens/sec.
+  - Decode: 39.614 tokens/sec.
+  - Total inference: 8.545 tokens/sec.
+
+Hybrid AR8 Test - 2026-05-26
+----------------------------
+Command
+-------
+- Full hybrid export with max_seq_len=256 and prefill_ar_len=8:
+  source /home/hunter/anaconda3/etc/profile.d/conda.sh && conda activate et_npu && source env.sh && \
+  python examples/qualcomm/oss_scripts/llama/llama.py \
+    -b build-android \
+    -m SM8850 \
+    --artifact ./llama-output/qwen3_5-0_8b-m256-ar8-hybrid-qnn245-kvzpfixed \
+    --decoder_model qwen3_5-0_8b \
+    --model_mode hybrid \
+    --prefill_ar_len 8 \
+    --max_seq_len 256 \
+    --prompt "描述一下这张图片" \
+    --image_path "/home/hunter/下载/test.jpg" \
+    --compile_only \
+    > run.log-0526-qwen3_5-0_8b-m256-ar8-hybrid-qnn245-kvzpfixed.txt 2>&1
+- Device run reusing the generated hybrid PTEs:
+  source /home/hunter/anaconda3/etc/profile.d/conda.sh && conda activate et_npu && source env.sh && \
+  python examples/qualcomm/oss_scripts/llama/llama.py \
+    -b build-android \
+    -m SM8850 \
+    -s 3B15AK00GLW00000 \
+    --artifact ./llama-output/qwen3_5-0_8b-m256-ar8-hybrid-qnn245-kvzpfixed-run \
+    --decoder_model qwen3_5-0_8b \
+    --model_mode hybrid \
+    --prefill_ar_len 8 \
+    --max_seq_len 256 \
+    --prompt "描述一下这张图片" \
+    --image_path "/home/hunter/下载/test.jpg" \
+    --pre_gen_pte ./llama-output/qwen3_5-0_8b-m256-ar8-hybrid-qnn245-kvzpfixed \
+    > run.log-0526-qwen3_5-0_8b-m256-ar8-hybrid-qnn245-kvzpfixed-run.txt 2>&1
+
+Result
+------
+- Export passed:
+  - hybrid_llama_qnn.pte: 600M.
+  - tok_embedding_qnn.pte: 486M.
+  - vision_encoder_qnn.pte: 196M.
+  - decode_qdq.pt2: 3.7G.
+  - Generated PTE metadata contains get_kv_input_*_zero_point entries and
+    dynamic logits qparams.
+- Export warning:
+  QNN SDK 2.45 emitted repeated non-fatal
+  "wtshare_operation.cc:1057::ERROR:small.is_shared()" diagnostics.
+- Device runtime structurally passed:
+  - Loaded hybrid_llama_qnn.pte, tok_embedding_qnn.pte, and
+    vision_encoder_qnn.pte.
+  - Metadata extraction and IO/cache allocation completed.
+  - Prompt Processor reported 214 prompt tokens (AR-8 * 27 iters).
+  - Decode ran until max_seq_len=256 and generated 41 tokens.
+  - Prompt evaluation: 149.441 tokens/sec.
+  - Decode: 28.512 tokens/sec.
+  - Total inference: 14.286 tokens/sec.
+- Device run failed quality/UTF-8 validation:
+  - The wrapper pulled outputs/outputs.txt but failed to decode it as UTF-8:
+    "'utf-8' codec can't decode byte 0xab in position 130".
+  - The output file contains mixed invalid/gibberish text after the assistant
+    header, so this is not a successful generation-quality result.
+
+Current Issue
+-------------
+- kv mode with the same Qwen3.5 model, max_seq_len=256, and current cache
+  zero-point fixes produces normal Chinese.
+- hybrid+ar8 reaches runtime successfully, but generation is semantically bad
+  and includes invalid UTF-8 bytes.
+- This points to a hybrid-specific mismatch rather than a basic PTE load,
+  tokenizer, device deployment, or required cache-zero-point metadata failure.
+
+Next
+----
+- Compare hybrid prefill and decode quantization/cache handoff behavior. The
+  Qwen3.5 hybrid path currently cannot reuse the old encoding-override flow
+  because prefill and decode graphs are not isomorphic.
+- Test whether the issue follows hybrid mode itself or AR length by trying
+  hybrid+ar4+max_seq256 with the same fixed-cache runtime.
+- If hybrid+ar4 also fails, focus on prefill-to-decode qparam/cache transfer.
+  If hybrid+ar4 passes, isolate the AR8 prefill path.
+
+Hybrid KV QParam Alignment Fix - 2026-05-26
+-------------------------------------------
+Implemented
+-----------
+- Compared against the adapted reference repository at:
+  /hunter/LuxiRT/executorch/examples/qualcomm/oss_scripts/llama
+- Found that Qwen3.5 hybrid must align prefill KV cache qparams to decode KV
+  input qparams after quantization. The previous current-repo hybrid path only
+  aligned each graph's KV input/output qparams internally and skipped the old
+  full encoding override because Qwen3.5 prefill/decode graphs are not
+  isomorphic.
+- Added TextDecoder._align_input_kv_cache_qparams().
+- Updated HybridTextDecoder.compile() for qwen3_5:
+  - collect decode KV input qparams;
+  - align prefill KV input qparams to decode input qparams;
+  - align prefill KV output qparams to decode input qparams;
+  - continue skipping the full encoding override for non-isomorphic graphs.
+
+Validation
+----------
+- Passed:
+  source /home/hunter/anaconda3/etc/profile.d/conda.sh && conda activate et_npu && source env.sh && \
+  python -m py_compile examples/qualcomm/oss_scripts/llama/wrappers/llm_wrappers.py
+- Passed:
+  source /home/hunter/anaconda3/etc/profile.d/conda.sh && conda activate et_npu && source env.sh && \
+  git diff --check -- examples/qualcomm/oss_scripts/llama/wrappers/llm_wrappers.py
+
+Export Command
+--------------
+- Re-exported full Qwen3.5 hybrid with max_seq_len=256 and prefill_ar_len=8:
+  source /home/hunter/anaconda3/etc/profile.d/conda.sh && conda activate et_npu && source env.sh && \
+  python examples/qualcomm/oss_scripts/llama/llama.py \
+    -b build-android \
+    -m SM8850 \
+    --artifact ./llama-output/qwen3_5-0_8b-m256-ar8-hybrid-qnn245-kvqalign \
+    --decoder_model qwen3_5-0_8b \
+    --model_mode hybrid \
+    --prefill_ar_len 8 \
+    --max_seq_len 256 \
+    --prompt "描述一下这张图片" \
+    --image_path "/home/hunter/下载/test.jpg" \
+    --compile_only \
+    > run.log-0526-qwen3_5-0_8b-m256-ar8-hybrid-qnn245-kvqalign.txt 2>&1
+
+Export Result
+-------------
+- Passed:
+  - decode graph internal alignment:
+    "Aligned 6 KV cache output qparams to matching input qparams."
+  - prefill graph internal alignment:
+    "Aligned 14 KV cache output qparams to matching input qparams."
+  - hybrid cross-graph alignment:
+    "Aligned 45 KV cache input qparams to decode input qparams."
+    "Aligned 90 KV cache output qparams to decode input qparams."
+  - compile_only finished and saved to:
+    ./llama-output/qwen3_5-0_8b-m256-ar8-hybrid-qnn245-kvqalign
+- Generated files:
+  - hybrid_llama_qnn.pte: 601M.
+  - tok_embedding_qnn.pte: 486M.
+  - vision_encoder_qnn.pte: 196M.
+  - decode_qdq.pt2: 3.7G.
+- QNN SDK 2.45 still emitted repeated non-fatal
+  "wtshare_operation.cc:1057::ERROR:small.is_shared()" diagnostics.
+
+Device Run Command
+------------------
+- Ran the fixed hybrid artifact on device:
+  source /home/hunter/anaconda3/etc/profile.d/conda.sh && conda activate et_npu && source env.sh && \
+  python examples/qualcomm/oss_scripts/llama/llama.py \
+    -b build-android \
+    -m SM8850 \
+    -s 3B15AK00GLW00000 \
+    --artifact ./llama-output/qwen3_5-0_8b-m256-ar8-hybrid-qnn245-kvqalign-run \
+    --decoder_model qwen3_5-0_8b \
+    --model_mode hybrid \
+    --prefill_ar_len 8 \
+    --max_seq_len 256 \
+    --prompt "描述一下这张图片" \
+    --image_path "/home/hunter/下载/test.jpg" \
+    --pre_gen_pte ./llama-output/qwen3_5-0_8b-m256-ar8-hybrid-qnn245-kvqalign \
+    > run.log-0526-qwen3_5-0_8b-m256-ar8-hybrid-qnn245-kvqalign-run.txt 2>&1
+
+Device Run Result
+-----------------
+- Passed:
+  - No UnicodeDecodeError.
+  - outputs/outputs.txt decodes as valid UTF-8.
+  - Output returned to normal Chinese:
+    "这张图片展示了一个充满生活气息的场景：..."
+  - Prompt Processor: 214 prompt tokens (AR-8 * 27 iters).
+  - Generated tokens: 41.
+  - Prompt evaluation: 135.959 tokens/sec.
+  - Decode: 28.217 tokens/sec.
+  - Total inference: 13.545 tokens/sec.
+
+Current Status
+--------------
+- kv mode max_seq_len=256 works with normal Chinese output.
+- hybrid+ar8+max_seq_len=256 now also works after cross-graph KV qparam
+  alignment.
+- The previous hybrid invalid UTF-8/gibberish output was caused by mismatched
+  KV cache qparams between prefill output and decode input.
+
+Next
+----
+- Keep the cross-graph Qwen3.5 KV qparam alignment as part of the hybrid path.
+- Consider adding a small export-time assertion/log check that the decode KV
+  input qparam count is exactly 2 * n_layers before compiling hybrid.
+- Optional follow-up: compare the reference repo's per-layer cache
+  num_heads/head_dim handling for Qwen3.5 attention/state caches. It is not
+  required for the successful hybrid+ar8 smoke test above, but it may make the
+  runtime cache metadata more robust for other Qwen3.5 variants.
+
+Hybrid SHA + Temperature 0 Test - 2026-05-26
+--------------------------------------------
+Implemented
+-----------
+- Compared against the adapted reference repository and changed the Qwen3.5
+  text decoder compile spec from MHA to SHA by enabling:
+  use_mha2sha=True
+- Kept the existing Qwen3.5 hybrid cross-graph KV qparam alignment.
+- Kept runtime generation deterministic by passing --temperature 0 for export
+  smoke testing and device inference.
+
+Validation
+----------
+- Passed:
+  source /home/hunter/anaconda3/etc/profile.d/conda.sh && conda activate et_npu && source env.sh && \
+  python -m py_compile examples/qualcomm/oss_scripts/llama/llama.py
+- Passed:
+  source /home/hunter/anaconda3/etc/profile.d/conda.sh && conda activate et_npu && source env.sh && \
+  git diff --check -- examples/qualcomm/oss_scripts/llama/llama.py examples/qualcomm/oss_scripts/llama/wrappers/llm_wrappers.py
+
+Export Command
+--------------
+- Re-exported full Qwen3.5 hybrid SHA with max_seq_len=256, prefill_ar_len=8,
+  and temperature=0:
+  source /home/hunter/anaconda3/etc/profile.d/conda.sh && conda activate et_npu && source env.sh && \
+  python examples/qualcomm/oss_scripts/llama/llama.py \
+    -b build-android \
+    -m SM8850 \
+    --artifact ./llama-output/qwen3_5-0_8b-m256-ar8-hybrid-sha-qnn245-kvqalign \
+    --decoder_model qwen3_5-0_8b \
+    --model_mode hybrid \
+    --prefill_ar_len 8 \
+    --max_seq_len 256 \
+    --temperature 0 \
+    --prompt "描述一下这张图片" \
+    --image_path "/home/hunter/下载/test.jpg" \
+    --compile_only \
+    > run.log-0526-qwen3_5-0_8b-m256-ar8-hybrid-sha-qnn245-kvqalign.txt 2>&1
+
+Export Result
+-------------
+- Passed:
+  - decode graph internal alignment:
+    "Aligned 6 KV cache output qparams to matching input qparams."
+  - prefill graph internal alignment:
+    "Aligned 14 KV cache output qparams to matching input qparams."
+  - hybrid cross-graph alignment:
+    "Aligned 45 KV cache input qparams to decode input qparams."
+    "Aligned 90 KV cache output qparams to decode input qparams."
+  - compile_only finished and saved to:
+    ./llama-output/qwen3_5-0_8b-m256-ar8-hybrid-sha-qnn245-kvqalign
+- Generated files:
+  - hybrid_llama_qnn.pte: 601M.
+  - tok_embedding_qnn.pte: 486M.
+  - vision_encoder_qnn.pte: 196M.
+  - decode_qdq.pt2: 3.7G.
+- QNN SDK 2.45 still emitted repeated non-fatal
+  "wtshare_operation.cc:1057::ERROR:small.is_shared()" diagnostics.
+
+Device Run Command
+------------------
+- Ran the SHA hybrid artifact on device with temperature=0:
+  source /home/hunter/anaconda3/etc/profile.d/conda.sh && conda activate et_npu && source env.sh && \
+  python examples/qualcomm/oss_scripts/llama/llama.py \
+    -b build-android \
+    -m SM8850 \
+    -s 3B15AK00GLW00000 \
+    --artifact ./llama-output/qwen3_5-0_8b-m256-ar8-hybrid-sha-qnn245-kvqalign-run-temp0 \
+    --decoder_model qwen3_5-0_8b \
+    --model_mode hybrid \
+    --prefill_ar_len 8 \
+    --max_seq_len 256 \
+    --temperature 0 \
+    --prompt "描述一下这张图片" \
+    --image_path "/home/hunter/下载/test.jpg" \
+    --pre_gen_pte ./llama-output/qwen3_5-0_8b-m256-ar8-hybrid-sha-qnn245-kvqalign \
+    > run.log-0526-qwen3_5-0_8b-m256-ar8-hybrid-sha-qnn245-kvqalign-run-temp0.txt 2>&1
+
+Device Run Result
+-----------------
+- Passed:
+  - No UnicodeDecodeError.
+  - outputs/outputs.txt decodes as valid UTF-8.
+  - Output remained normal Chinese:
+    "这张图片展示了一个充满生活气息的场景：..."
+  - Prompt Processor: 214 prompt tokens (AR-8 * 27 iters).
+  - Generated tokens: 41.
+  - Prompt evaluation: 147.484 tokens/sec.
+  - Decode: 46.750 tokens/sec.
+  - Total inference: 17.612 tokens/sec.
+
+Current Status
+--------------
+- hybrid+ar8+max_seq_len=256 works with SHA and temperature=0.
+- SHA keeps output quality correct and improves decode speed compared with the
+  previous hybrid MHA run.
+
+Linear State In-Place Overwrite - 2026-05-26
+--------------------------------------------
+Implemented
+-----------
+- Optimized Qwen3.5 linear-attention recurrent state cache in the C++ runtime:
+  - kFullOverwrite cache entries now bind input and output state tensors to the
+    same backing buffer.
+  - update_full_overwrite_cache() keeps a fallback memcpy path, but becomes a
+    no-op when input/output pointers are already shared.
+  - reset_state() preserves per-cache uint16 zero points and avoids clearing a
+    shared output pointer back to raw zero.
+  - total_cache_size_in_bytes() now counts kFullOverwrite state buffers once
+    instead of counting separate input and output buffers.
+- kAppend full-attention KV caches and kCircular true-SWA caches are unchanged.
+
+Validation
+----------
+- Passed Android runner rebuild:
+  source /home/hunter/anaconda3/etc/profile.d/conda.sh && conda activate et_npu && source env.sh && \
+  cmake --build build-android/examples/qualcomm --target qnn_llama_runner qnn_multimodal_runner -j2
+
+Device Run Command
+------------------
+- Reused the already exported hybrid SHA artifact; no PTE re-export was needed:
+  source /home/hunter/anaconda3/etc/profile.d/conda.sh && conda activate et_npu && source env.sh && \
+  python examples/qualcomm/oss_scripts/llama/llama.py \
+    -b build-android \
+    -m SM8850 \
+    -s 3B15AK00GLW00000 \
+    --artifact ./llama-output/qwen3_5-0_8b-m256-ar8-hybrid-sha-qnn245-kvqalign-run-temp0-inplace \
+    --decoder_model qwen3_5-0_8b \
+    --model_mode hybrid \
+    --prefill_ar_len 8 \
+    --max_seq_len 256 \
+    --temperature 0 \
+    --prompt "描述一下这张图片" \
+    --image_path "/home/hunter/下载/test.jpg" \
+    --pre_gen_pte ./llama-output/qwen3_5-0_8b-m256-ar8-hybrid-sha-qnn245-kvqalign \
+    > run.log-0526-qwen3_5-0_8b-m256-ar8-hybrid-sha-qnn245-kvqalign-run-temp0-inplace.txt 2>&1
+
+Device Run Result
+-----------------
+- Passed:
+  - No UnicodeDecodeError.
+  - outputs/outputs.txt decodes as valid UTF-8.
+  - Output remained normal Chinese:
+    "这张图片展示了一个充满生活气息的场景：..."
+  - Prompt Processor: 214 prompt tokens (AR-8 * 27 iters).
+  - Generated tokens: 41.
+  - Static runtime buffers improved:
+    - before: kv_cache=45.54 MiB, total=54.14 MiB.
+    - after:  kv_cache=25.85 MiB, total=34.45 MiB.
+  - Prompt evaluation improved from 147.484 to 159.701 tokens/sec.
+  - Decode improved from 46.750 to 57.504 tokens/sec.
+  - Total inference improved from 17.612 to 19.971 tokens/sec.
+
+Current Status
+--------------
+- Qwen3.5 kFullOverwrite linear-attention state can run in-place on device with
+  the current QNN 2.45 environment.
+- This removes the per-step host memcpy for linear state recurrence while
+  preserving the existing uint16 runtime path.
+
+RpcMem Mixed Cache Sizing - 2026-05-26
+--------------------------------------
+Implemented
+-----------
+- Tightened shared-buffer sizing for mixed Qwen3.5 cache layouts:
+  - KVManager now counts each cache allocation with the same 4KB alignment used
+    by RpcMem::allocate().
+  - kFullOverwrite linear-attention state still counts only input buffers
+    because output tensors share the same backing buffer.
+  - kAppend full-attention cache still counts input and output buffers
+    separately.
+  - Standard non-Qwen cache sizing and true-SWA sizing also use per-layer
+    aligned allocation accounting.
+- Tightened non-cache IO sizing for shared buffer:
+  - multimodal prompt processor, multimodal token generator, and token
+    embedding IO totals now count each actual allocation with 4KB alignment.
+  - RpcMem no longer adds a fixed 8 MiB slack block. It reserves the aligned
+    sum passed in by the runner.
+
+Validation
+----------
+- Passed:
+  source /home/hunter/anaconda3/etc/profile.d/conda.sh && conda activate et_npu && source env.sh && \
+  cmake --build build-android/examples/qualcomm --target qnn_llama_runner qnn_multimodal_runner -j2
+- Passed device run with the existing hybrid SHA artifact:
+  source /home/hunter/anaconda3/etc/profile.d/conda.sh && conda activate et_npu && source env.sh && \
+  python examples/qualcomm/oss_scripts/llama/llama.py \
+    -b build-android \
+    -m SM8850 \
+    -s 3B15AK00GLW00000 \
+    --artifact ./llama-output/qwen3_5-0_8b-m256-ar8-hybrid-sha-qnn245-kvqalign-run-temp0-inplace-alignmem \
+    --decoder_model qwen3_5-0_8b \
+    --model_mode hybrid \
+    --prefill_ar_len 8 \
+    --max_seq_len 256 \
+    --temperature 0 \
+    --prompt "描述一下这张图片" \
+    --image_path "/home/hunter/下载/test.jpg" \
+    --pre_gen_pte ./llama-output/qwen3_5-0_8b-m256-ar8-hybrid-sha-qnn245-kvqalign \
+    > run.log-0526-qwen3_5-0_8b-m256-ar8-hybrid-sha-qnn245-kvqalign-run-temp0-inplace-alignmem.txt 2>&1
+
+Device Run Result
+-----------------
+- Passed:
+  - No RpcMem overflow.
+  - No shared-buffer pointer registration error.
+  - Output remained normal Chinese.
+  - Aligned static buffer accounting:
+    kv_cache=25.88 MiB, prompt_io=7.62 MiB, token_io=0.96 MiB,
+    embedding_prefill_io=0.04 MiB, embedding_decode_io=0.01 MiB,
+    total=34.50 MiB.
+  - This replaces the previous fixed 8 MiB hidden slack with explicit
+    per-allocation alignment accounting.
+
+Text-Only Runner Cleanup - 2026-05-26
+-------------------------------------
+Implemented
+-----------
+- Removed Qwen3.5 VLM-specific handling from the text-only runner path:
+  - Removed qnn_llama_runner.cpp Qwen3.5 chat template handling.
+  - Removed runner.h/runner.cpp kQwen3_5 parsing and text-only cache metadata
+    branches.
+  - Restored base PromptProcessor and TokenGenerator IO size accounting to the
+    pre-Qwen3.5 raw-size behavior.
+- Kept the Qwen3.5 support only on the multimodal path used by the VLM flow:
+  qnn_multimodal_runner, QNNMultimodalRunner, multimodal prompt/token
+  processors, token embedding, KVManager, and RpcMem.
+
+Validation
+----------
+- Passed:
+  rg -n "Qwen3_5|qwen3_5|kQwen3_5|Qwen3\\.5" \
+    examples/qualcomm/oss_scripts/llama/qnn_llama_runner.cpp \
+    examples/qualcomm/oss_scripts/llama/runner/runner.h \
+    examples/qualcomm/oss_scripts/llama/runner/runner.cpp \
+    examples/qualcomm/oss_scripts/llama/runner/prompt_processor.h \
+    examples/qualcomm/oss_scripts/llama/runner/token_generator.h
+  returned no matches.
+- Passed:
+  source /home/hunter/anaconda3/etc/profile.d/conda.sh && conda activate et_npu && source env.sh && \
+  cmake --build build-android/examples/qualcomm --target qnn_llama_runner qnn_multimodal_runner -j2

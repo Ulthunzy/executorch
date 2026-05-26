@@ -9,6 +9,7 @@
 #pragma once
 #include <executorch/examples/qualcomm/oss_scripts/llama/runner/multimodal_runner/tok_embedding_processor.h>
 #include <executorch/examples/qualcomm/oss_scripts/llama/runner/prompt_processor.h>
+#include <vector>
 
 namespace example {
 
@@ -29,6 +30,7 @@ class MultimodalPromptProcessor : public example::PromptProcessor<T> {
     int sliding_window;
     CacheMode cache_mode;
     int32_t embedding_dim = 0;
+    int32_t position_id_dim = 1;
   };
 
   MultimodalPromptProcessor(
@@ -67,20 +69,31 @@ class MultimodalPromptProcessor : public example::PromptProcessor<T> {
       const TensorStruct<float>& prompt_embedding,
       int64_t start_pos,
       bool dump_logits,
-      AttentionSinkRopeRunner* attention_sink_rope_runner);
+      AttentionSinkRopeRunner* attention_sink_rope_runner,
+      const std::vector<int32_t>* position_ids = nullptr);
 
   /**
    * @brief Get total I/O size in bytes (excluding the KV cache size)
    * @return Total I/O size in bytes.
    */
   inline const size_t total_prompt_processor_io_size_in_bytes() const {
+    const size_t window_attention_mask_size =
+        metadata_.cache_mode == CacheMode::HybridCache
+        ? align_shared_buffer_allocation_size(window_attention_mask_.size)
+        : 0;
     if (metadata_.cache_mode == CacheMode::HybridCache) {
-      return input_toks_.size + input_pos_.size + attention_mask_.size +
-          window_attention_mask_.size + logits_.size + input_embedding_.size;
-    } else {
-      return input_toks_.size + input_pos_.size + attention_mask_.size +
-          logits_.size + input_embedding_.size;
+      return align_shared_buffer_allocation_size(input_toks_.size) +
+          align_shared_buffer_allocation_size(input_pos_.size) +
+          align_shared_buffer_allocation_size(attention_mask_.size) +
+          window_attention_mask_size +
+          align_shared_buffer_allocation_size(logits_.size) +
+          align_shared_buffer_allocation_size(input_embedding_.size);
     }
+    return align_shared_buffer_allocation_size(input_toks_.size) +
+        align_shared_buffer_allocation_size(input_pos_.size) +
+        align_shared_buffer_allocation_size(attention_mask_.size) +
+        align_shared_buffer_allocation_size(logits_.size) +
+        align_shared_buffer_allocation_size(input_embedding_.size);
   }
 
  private:
@@ -113,7 +126,8 @@ class MultimodalPromptProcessor : public example::PromptProcessor<T> {
       const TensorStruct<float>& prompt_embedding,
       int32_t num_prompt_tokens,
       int64_t prompt_pos,
-      int64_t start_pos);
+      int64_t start_pos,
+      const std::vector<int32_t>* position_ids);
 
   // metadata specific to multimodal
   Metadata metadata_;

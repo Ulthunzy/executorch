@@ -32,6 +32,10 @@ from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import (
     Qwen2_5_VLMLP,
     Qwen2_5_VisionTransformerPretrainedModel,
 )
+from transformers.models.qwen3_vl.modeling_qwen3_vl import (
+    Qwen3VLVisionMLP,
+    Qwen3VLVisionModel,
+)
 
 
 # Custom implementation based on `transformers/models/idefics3/modeling_idefics3/Idefics3VisionEmbeddings.py` (Transformers v5.0.0rc1)
@@ -379,6 +383,187 @@ class InternVL3VisionEncoder(torch.nn.Module):
         # Project features through multi-modal projector
         vision_features = self.multi_modal_projector(vision_features)
         return vision_features
+
+
+def _rotate_half_vision(x: torch.Tensor) -> torch.Tensor:
+    x1 = x[..., : x.shape[-1] // 2]
+    x2 = x[..., x.shape[-1] // 2 :]
+    return torch.cat((-x2, x1), dim=-1)
+
+
+class StaticQwen35VLVisionAttention(nn.Module):
+    def __init__(self, config) -> None:
+        super().__init__()
+        self.dim = config.hidden_size
+        self.num_heads = config.num_heads
+        self.head_dim = self.dim // self.num_heads
+        self.qkv = nn.Linear(self.dim, self.dim * 3, bias=True)
+        self.proj = nn.Linear(self.dim, self.dim)
+        self.scaling = self.head_dim**-0.5
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        position_embeddings: tuple[torch.Tensor, torch.Tensor],
+    ) -> torch.Tensor:
+        seq_length = hidden_states.shape[0]
+        query_states, key_states, value_states = (
+            self.qkv(hidden_states)
+            .reshape(seq_length, 3, self.num_heads, self.head_dim)
+            .permute(1, 0, 2, 3)
+            .unbind(0)
+        )
+        cos, sin = position_embeddings
+        cos = cos.unsqueeze(1).to(dtype=query_states.dtype)
+        sin = sin.unsqueeze(1).to(dtype=query_states.dtype)
+        query_states = query_states * cos + _rotate_half_vision(query_states) * sin
+        key_states = key_states * cos + _rotate_half_vision(key_states) * sin
+
+        query_states = query_states.transpose(0, 1)
+        key_states = key_states.transpose(0, 1)
+        value_states = value_states.transpose(0, 1)
+        attn_weights = torch.matmul(query_states, key_states.transpose(-2, -1))
+        attn_weights = attn_weights * self.scaling
+        attn_weights = torch.softmax(attn_weights, dim=-1)
+        attn_output = torch.matmul(attn_weights, value_states)
+        attn_output = attn_output.transpose(0, 1).reshape(seq_length, self.dim)
+        return self.proj(attn_output).contiguous()
+
+
+class StaticQwen35VLVisionBlock(nn.Module):
+    def __init__(self, config) -> None:
+        super().__init__()
+        self.norm1 = nn.LayerNorm(config.hidden_size, eps=1e-6)
+        self.norm2 = nn.LayerNorm(config.hidden_size, eps=1e-6)
+        self.attn = StaticQwen35VLVisionAttention(config)
+        self.mlp = Qwen3VLVisionMLP(config)
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        position_embeddings: tuple[torch.Tensor, torch.Tensor],
+    ) -> torch.Tensor:
+        hidden_states = hidden_states + self.attn(
+            self.norm1(hidden_states),
+            position_embeddings=position_embeddings,
+        )
+        hidden_states = hidden_states + self.mlp(self.norm2(hidden_states))
+        return hidden_states
+
+
+class StaticQwen35VLVisionModel(Qwen3VLVisionModel):
+    def __init__(self, config, grid_thw: torch.Tensor):
+        super().__init__(config)
+        proj = self.patch_embed.proj
+        self.patch_embed_weight_flat = nn.Parameter(
+            proj.weight.detach().flatten(1).clone()
+        )
+        self.patch_embed_bias = nn.Parameter(proj.bias.detach().clone())
+
+        self.blocks = nn.ModuleList(
+            [StaticQwen35VLVisionBlock(config) for _ in range(config.depth)]
+        )
+
+        static_grid_thw = grid_thw.to(dtype=torch.int64)
+        static_rotary_pos_emb = super().rot_pos_emb(static_grid_thw).detach()
+        static_pos_embeds = super().fast_pos_embed_interpolate(static_grid_thw).detach()
+        self.register_buffer("static_grid_thw", static_grid_thw, persistent=False)
+        self.register_buffer(
+            "static_rotary_pos_emb", static_rotary_pos_emb, persistent=False
+        )
+        self.register_buffer("static_pos_embeds", static_pos_embeds, persistent=False)
+
+        def _sync_static_vision_buffers(module, _incompatible_keys):
+            with torch.no_grad():
+                module.patch_embed_weight_flat.copy_(
+                    module.patch_embed.proj.weight.flatten(1)
+                )
+                module.patch_embed_bias.copy_(module.patch_embed.proj.bias)
+                module.static_pos_embeds.copy_(
+                    Qwen3VLVisionModel.fast_pos_embed_interpolate(
+                        module, module.static_grid_thw
+                    )
+                )
+
+        self.register_load_state_dict_post_hook(_sync_static_vision_buffers)
+
+    def forward(self, hidden_states: torch.Tensor, grid_thw: torch.Tensor = None):
+        del grid_thw
+        target_dtype = self.patch_embed_weight_flat.dtype
+        hidden_states = F.linear(
+            hidden_states.to(dtype=target_dtype),
+            self.patch_embed_weight_flat,
+            self.patch_embed_bias,
+        )
+        hidden_states = hidden_states + self.static_pos_embeds.to(
+            dtype=hidden_states.dtype, device=hidden_states.device
+        )
+
+        rotary_pos_emb = self.static_rotary_pos_emb.to(hidden_states.device)
+        emb = torch.cat((rotary_pos_emb, rotary_pos_emb), dim=-1)
+        position_embeddings = (
+            emb.cos().to(dtype=hidden_states.dtype),
+            emb.sin().to(dtype=hidden_states.dtype),
+        )
+
+        for blk in self.blocks:
+            hidden_states = blk(
+                hidden_states,
+                position_embeddings=position_embeddings,
+            )
+
+        return self.merger(hidden_states)
+
+
+class Qwen35VLVisionEncoder(torch.nn.Module):
+    def __init__(self, config, img_resized_h: int = 448, img_resized_w: int = 448):
+        super().__init__()
+        patch_size = config.vision_config.patch_size
+        self.image_grid_thw = torch.tensor(
+            [[1, img_resized_h // patch_size, img_resized_w // patch_size]],
+            dtype=torch.int64,
+        )
+        self.visual = StaticQwen35VLVisionModel._from_config(
+            config.vision_config,
+            grid_thw=self.image_grid_thw,
+        )
+        self.config = config
+        self.img_resized_h = img_resized_h
+        self.img_resized_w = img_resized_w
+
+        temporal_patch_size = config.vision_config.temporal_patch_size
+        self.image_seq_len = int(
+            self.image_grid_thw.prod(-1).item()
+            // (config.vision_config.spatial_merge_size**2)
+        )
+        self.input_seq_len = int(self.image_grid_thw.prod(-1).item())
+        self.input_feature_dim = (
+            config.vision_config.in_channels
+            * temporal_patch_size
+            * patch_size
+            * patch_size
+        )
+
+    def preprocess(self, pixel_values: Tuple[torch.FloatTensor]) -> Tuple[torch.Tensor]:
+        return pixel_values
+
+    def get_example_inputs(self):
+        return (
+            torch.randn(
+                (1, self.input_seq_len, self.input_feature_dim),
+                dtype=torch.float32,
+            ),
+        )
+
+    def forward(self, pixel_values: torch.FloatTensor):
+        if pixel_values.dim() == 3 and pixel_values.shape[0] == 1:
+            pixel_values = pixel_values.squeeze(0)
+        image_embeds = self.visual(
+            pixel_values,
+            grid_thw=self.image_grid_thw.to(pixel_values.device),
+        )
+        image_embeds = image_embeds[: self.image_seq_len]
+        return image_embeds.unsqueeze(0)
 
 
 class StaticQwen2_5VLVisionAttention(nn.Module):

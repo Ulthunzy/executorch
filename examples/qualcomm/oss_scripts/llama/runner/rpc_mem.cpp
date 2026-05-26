@@ -21,11 +21,7 @@ RpcMem::RpcMem(
     : calculated_offsets_(0) {
   size_t total_bytes = total_cache_size + total_prompt_processor_io_size +
       total_token_generator_io_size;
-  // Round up and add slack to ensure per-allocation alignment padding doesn't
-  // overrun the shared buffer.
-  total_bytes_ =
-      ((total_bytes + kRpcMemAlignment - 1) / kRpcMemAlignment) * kRpcMemAlignment +
-      kRpcMemSlackBytes;
+  total_bytes_ = align_shared_buffer_allocation_size(total_bytes);
   shared_buffer_base_ptr_ = QnnExecuTorchAllocCustomMem(
       total_bytes_, MemoryAllocator::kDefaultAlignment);
 }
@@ -39,9 +35,7 @@ RpcMem::RpcMem(
   size_t total_bytes = total_cache_size + total_prompt_processor_io_size +
       total_token_generator_io_size + total_embedding_processor_io_size +
       total_embedding_generator_io_size;
-  total_bytes_ =
-      ((total_bytes + kRpcMemAlignment - 1) / kRpcMemAlignment) * kRpcMemAlignment +
-      kRpcMemSlackBytes;
+  total_bytes_ = align_shared_buffer_allocation_size(total_bytes);
   shared_buffer_base_ptr_ = QnnExecuTorchAllocCustomMem(
       total_bytes_, MemoryAllocator::kDefaultAlignment);
 }
@@ -50,9 +44,8 @@ RpcMem::~RpcMem() {
 }
 
 std::byte* RpcMem::allocate(size_t data_size) {
-  const size_t aligned_offset = ((calculated_offsets_ + kRpcMemAlignment - 1) /
-                                 kRpcMemAlignment) *
-      kRpcMemAlignment;
+  const size_t aligned_offset =
+      align_shared_buffer_allocation_size(calculated_offsets_);
   ET_CHECK_MSG(
       aligned_offset + data_size <= total_bytes_,
       "RpcMem overflow: request=%zu aligned_offset=%zu total_bytes=%zu",

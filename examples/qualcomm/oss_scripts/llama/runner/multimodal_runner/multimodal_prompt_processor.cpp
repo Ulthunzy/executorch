@@ -37,6 +37,8 @@ MultimodalPromptProcessor<T>::MultimodalPromptProcessor(
       metadata_(metadata) {
   // Set input_toks_.size to 0 since we use embeddings instead
   input_toks_.size = 0;
+  input_pos_.size =
+      metadata_.ar_len * metadata_.position_id_dim * sizeof(int32_t);
   input_embedding_.size =
       metadata_.ar_len * metadata_.embedding_dim * sizeof(float);
 };
@@ -191,11 +193,19 @@ void MultimodalPromptProcessor<T>::prepare_io(
     const TensorStruct<float>& prompt_embedding,
     int32_t num_prompt_tokens,
     int64_t prompt_pos,
-    int64_t start_pos) {
+    int64_t start_pos,
+    const std::vector<int32_t>* position_ids) {
   for (int i = 0; i < metadata_.ar_len; i++) {
     if (!is_bert()) {
       // Prepare pos data
-      input_pos_.data[i] = start_pos + i;
+      for (int dim = 0; dim < metadata_.position_id_dim; ++dim) {
+        int32_t pos = static_cast<int32_t>(start_pos + i);
+        if (position_ids != nullptr && prompt_pos + i < num_prompt_tokens) {
+          pos = (*position_ids)[(prompt_pos + i) * metadata_.position_id_dim +
+                                dim];
+        }
+        input_pos_.data[dim * metadata_.ar_len + i] = pos;
+      }
     }
 
     // Prepare input token data
@@ -203,6 +213,11 @@ void MultimodalPromptProcessor<T>::prepare_io(
       std::memcpy(
           input_embedding_.data + i * metadata_.embedding_dim,
           prompt_embedding.data + (prompt_pos + i) * metadata_.embedding_dim,
+          metadata_.embedding_dim * sizeof(float));
+    } else {
+      std::memset(
+          input_embedding_.data + i * metadata_.embedding_dim,
+          0,
           metadata_.embedding_dim * sizeof(float));
     }
   }
@@ -213,7 +228,8 @@ Result<uint64_t> MultimodalPromptProcessor<T>::prefill(
     const TensorStruct<float>& prompt_embedding,
     int64_t start_pos,
     bool dump_logits,
-    AttentionSinkRopeRunner* attention_sink_rope_runner) {
+    AttentionSinkRopeRunner* attention_sink_rope_runner,
+    const std::vector<int32_t>* position_ids) {
   int32_t num_prompt_tokens = prompt_embedding.tensor->size(1);
   if (!is_bert()) {
     ET_CHECK_MSG(
@@ -263,7 +279,8 @@ Result<uint64_t> MultimodalPromptProcessor<T>::prefill(
       method_name_.c_str());
   for (int i = 0; i < num_iters; ++i) {
     // Fill in the embedding and position data
-    prepare_io(prompt_embedding, num_prompt_tokens, prompt_pos, pos);
+    prepare_io(
+        prompt_embedding, num_prompt_tokens, prompt_pos, pos, position_ids);
 
     // Run inference
     decoder_runner_->step(method_name_, inputs_);
