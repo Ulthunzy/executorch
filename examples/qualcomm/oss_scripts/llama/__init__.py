@@ -101,6 +101,7 @@ from executorch.examples.qualcomm.oss_scripts.llama.static_llm_quant_recipe impo
     Qwen3_0_6BQuantRecipe,
     Qwen3_1_7BQuantRecipe,
     Qwen3_5_0_8BQuantRecipe,
+    Qwen3_5_2BQuantRecipe,
     Qwen3_4BQuantRecipe,
     Lincal_0_6BQuantRecipe,
     Lincal_1_7BQuantRecipe,
@@ -127,6 +128,7 @@ LLM_VARIANT_ARCHS: Dict[str, Type[LlamaModel]] = {
     "qwen2_5_vl-3b_instruct": LlamaModelWithoutEmbedding,
     "lincal_vl-3b_instruct": MultiScopeAwareLlamaModelWithoutEmbedding,
     "qwen3_5-0_8b": Qwen35ModelWithoutEmbedding,
+    "qwen3_5-2b": Qwen35ModelWithoutEmbedding,
     "gemma2-2b": MultiScopeAwareLlamaModel,
 }
 
@@ -588,6 +590,25 @@ class Qwen3_5_0_8B(LLMModelConfig):
     r2 = False
     r3 = False
     quant_recipe = Qwen3_5_0_8BQuantRecipe
+
+
+@register_llm_model("qwen3_5-2b", modality_encoders=Qwen35VLEncoder)
+@dataclass(init=False, frozen=True)
+class Qwen3_5_2B(LLMModelConfig):
+    repo_id: str = "/hunter/model/Qwen/Qwen3.5-2B"
+    params_path: str = os.path.join(
+        BASE_DIR, "../../../models/qwen3_5/config/2b_config.json"
+    )
+    convert_weights = convert_qwen3_5_weights
+    transform_weight = False
+    instruct_model = True
+    num_sharding = 1
+    masked_softmax = True
+    seq_mse_candidates = 50
+    r1 = False
+    r2 = False
+    r3 = False
+    quant_recipe = Qwen3_5_2BQuantRecipe
 
 
 @register_llm_model("smollm2_135m")

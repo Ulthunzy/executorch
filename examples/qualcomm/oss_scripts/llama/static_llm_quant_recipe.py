@@ -853,6 +853,10 @@ class Qwen3_5_0_8BQuantRecipe(StaticLLMQuantRecipe):
         )
 
 
+class Qwen3_5_2BQuantRecipe(Qwen3_5_0_8BQuantRecipe):
+    pass
+
+
 class Smollm2QuantRecipe(StaticLLMQuantRecipe):
     default_quant_dtype = QuantDtype.use_16a8w
 
