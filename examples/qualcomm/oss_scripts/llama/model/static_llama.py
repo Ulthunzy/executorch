@@ -599,6 +599,7 @@ class Qwen35DeltaNet(nn.Module):
         self.in_proj_z = nn.Linear(self.hidden_size, self.value_dim, bias=False)
         self.in_proj_b = nn.Linear(self.hidden_size, self.num_v_heads, bias=False)
         self.in_proj_a = nn.Linear(self.hidden_size, self.num_v_heads, bias=False)
+        self.use_fused_linear_in_proj = False
         self.conv1d = nn.Conv1d(
             in_channels=self.conv_dim,
             out_channels=self.conv_dim,
@@ -613,12 +614,62 @@ class Qwen35DeltaNet(nn.Module):
         self.norm = Qwen35RMSNormGated(self.head_v_dim, eps=config.norm_eps)
         self.out_proj = nn.Linear(self.value_dim, self.hidden_size, bias=False)
 
+    def prepare_fused_linear_in_proj(self) -> None:
+        self.in_proj_qkv_z = nn.Linear(
+            self.hidden_size, self.conv_dim + self.value_dim, bias=False
+        )
+        weights = [self.in_proj_qkv.weight.data, self.in_proj_z.weight.data]
+        self.in_proj_qkv_z.weight.data.copy_(torch.cat(weights, dim=0))
+        del self.in_proj_qkv
+        del self.in_proj_z
+        self.use_fused_linear_in_proj = True
+
+    def prepare_attention_conv(self) -> None:
+        self.causal_conv2d = nn.Conv2d(
+            self.conv_dim,
+            self.conv_dim,
+            (1, self.conv_kernel_size),
+            groups=self.conv_dim,
+            bias=False,
+            padding=0,
+        )
+        self.causal_conv2d.weight.data.copy_(self.conv1d.weight.data.unsqueeze(2))
+        del self.conv1d
+
+    def _apply_input_projections(
+        self, hidden_states: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        batch_size, seq_len, _ = hidden_states.shape
+        if self.use_fused_linear_in_proj:
+            fused = self.in_proj_qkv_z(hidden_states)
+            mixed_qkv, z = torch.split(
+                fused,
+                [self.conv_dim, self.value_dim],
+                dim=-1,
+            )
+            b = self.in_proj_b(hidden_states)
+        else:
+            mixed_qkv = self.in_proj_qkv(hidden_states)
+            z = self.in_proj_z(hidden_states)
+            b = self.in_proj_b(hidden_states)
+
+        z = z.reshape(batch_size, seq_len, -1, self.head_v_dim)
+        a = self.in_proj_a(hidden_states)
+        return mixed_qkv, z, b, a
+
     def _apply_causal_conv(
         self, mixed_qkv: torch.Tensor, conv_state: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         batch_size, seq_len, _ = mixed_qkv.shape
         mixed_qkv = mixed_qkv.transpose(1, 2)
         conv_state = conv_state[:batch_size]
+        if hasattr(self, "causal_conv2d"):
+            hidden_states_new = torch.cat([conv_state, mixed_qkv], dim=-1)
+            new_conv_state = hidden_states_new[:, :, -self.conv_kernel_size :]
+            out = self.causal_conv2d(hidden_states_new[:, :, None, 1:]).squeeze(2)
+            out = F.silu(out).to(mixed_qkv.dtype)
+            return out.transpose(1, 2).contiguous(), new_conv_state
+
         conv_weight = self.conv1d.weight.squeeze(1).to(mixed_qkv.dtype)
 
         if seq_len == 1:
@@ -724,12 +775,7 @@ class Qwen35DeltaNet(nn.Module):
                 device=hidden_states.device,
             )
 
-        mixed_qkv = self.in_proj_qkv(hidden_states)
-        z = self.in_proj_z(hidden_states).reshape(
-            batch_size, seq_len, -1, self.head_v_dim
-        )
-        b = self.in_proj_b(hidden_states)
-        a = self.in_proj_a(hidden_states)
+        mixed_qkv, z, b, a = self._apply_input_projections(hidden_states)
 
         mixed_qkv, new_conv_state = self._apply_causal_conv(mixed_qkv, conv_state)
         query, key, value = torch.split(

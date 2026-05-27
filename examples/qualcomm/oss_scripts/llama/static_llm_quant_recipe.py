@@ -822,7 +822,7 @@ class Qwen3_5_0_8BQuantRecipe(StaticLLMQuantRecipe):
             )
             .add_regex_node_target(
                 {
-                    r"layers\.\d+\.attention\.(in_proj_qkv|in_proj_z|in_proj_b)(\.|$)",
+                    r"layers\.\d+\.attention\.(in_proj_qkv_z|in_proj_b)(\.|$)",
                     r"layers\.\d+\.attention\.(wq|wk|wv)(_conv)?(\.|$)",
                     r"layers\.\d+\.feed_forward\.(w1_conv|w3_conv)(\.|$)"
                 },
@@ -838,6 +838,7 @@ class Qwen3_5_0_8BQuantRecipe(StaticLLMQuantRecipe):
             .add_regex_node_target(
                 {
                     r"layers\.\d+\.attention\.(in_proj_a|out_proj)(\.|$)",
+                    r"layers\.\d+\.attention\.causal_conv2d(\.|$)",
                     r"layers\.\d+\.attention\.wo(_conv)?(\.|$)",
                     r"layers\.\d+\.feed_forward\.(w2_conv)(\.|$)",
                     r"output\.conv",
@@ -848,7 +849,7 @@ class Qwen3_5_0_8BQuantRecipe(StaticLLMQuantRecipe):
                 act_observer=MinMaxObserver,
                 granularity=QuantGranularity.PER_CHANNEL,
                 priority=11,
-                note="Qwen3.5 sensitive projection convs use 16a8w per-channel.",
+                note="Qwen3.5 causal depthwise conv and sensitive projection convs use 16a8w per-channel.",
             )
         )
 

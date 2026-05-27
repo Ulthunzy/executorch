@@ -1,7 +1,7 @@
 Qwen3.5-0.8B VLM Qualcomm 适配状态
 ===================================
 
-更新时间：2026-05-26
+更新时间：2026-05-27
 
 当前结论
 --------
@@ -93,6 +93,12 @@ Qwen3.5-0.8B VLM Qualcomm 适配状态
   - Qwen3.5 linear-attention state 使用 `kFullOverwrite`。
   - `kFullOverwrite` input/output 可以共享 backing buffer。
   - RpcMem/shared-buffer 按每次 allocation 做 4KB 对齐计数。
+- DeltaNet 图优化：
+  - 当前仓库已接入 linear qkv/z fused projection。
+  - 当前仓库已接入 causal conv2d 替换原 causal Conv1d/手写窗口求和。
+  - 导出前会自动准备 fused projection 和 causal conv2d。
+  - Quant recipe 已显式将转换后的 `causal_conv2d` 按 16a8w per-channel
+    量化。
 - Runner 作用域：
   - Qwen3.5 VLM 逻辑保留在 multimodal runner。
   - text-only runner 中的 Qwen3.5 VLM 分支已收回。
@@ -114,6 +120,8 @@ Qwen3.5-0.8B VLM Qualcomm 适配状态
 | hybrid ar8，未做 cross-graph qparam 对齐 | 失败质量 | 出现非法 UTF-8 |
 | hybrid ar8，完成 cross-graph qparam 对齐 | 通过 | 正常中文 |
 | hybrid ar8 + SHA + temperature 0 | 通过 | 正常中文，速度明显提升 |
+| hybrid ar8 + max_seq_len=256 + temperature 0 复测 | 通过 | 正常中文，输出文件为合法 UTF-8 |
+| 旧 hybrid b128 context4096 PTE，运行限制到 256 + temperature 0 | 失败质量 | 仍从首 token 开始乱码，说明不是生成长度导致 |
 | hybrid SHA + runtime in-place | 通过 | cache 内存下降，decode 速度提升 |
 | hybrid SHA + aligned RpcMem sizing | 通过 | 无 RpcMem overflow，无注册错误 |
 | runtime alias benchmark | 有收益但非最终结论 | cache update 时间显著下降 |
@@ -157,11 +165,55 @@ KV / Hybrid 性能
   - Prompt evaluation：147.484 tokens/s。
   - Decode：46.750 tokens/s。
   - Total inference：17.612 tokens/s。
+- hybrid ar8 + max_seq_len=256 + temperature 0 复测：
+  - Prompt tokens：214。
+  - Generated tokens：41。
+  - Prompt evaluation：165.379 tokens/s。
+  - Decode：65.705 tokens/s。
+  - Total inference：21.376 tokens/s。
+  - 输出文件为合法 UTF-8，内容为正常中文描述；由于 max_seq_len=256，
+    生成到上限后截断，未命中 EOS。
+- 旧 hybrid b128 context4096 PTE，运行限制到 256 + temperature 0：
+  - Prompt tokens：214。
+  - Generated tokens：41。
+  - Prompt evaluation：198.885 tokens/s。
+  - Decode：12.087 tokens/s。
+  - 输出文件为合法 UTF-8，但内容从第一个生成 token 开始就是乱码。
+  - 结论：问题不是运行时 seq_len=4096 或随机采样导致，而是这份 PTE
+    自身的导出图、AR128 路径或导出时 qparam 状态不正确。
 - hybrid SHA + runtime in-place + aligned RpcMem：
   - Prompt evaluation：146.776 tokens/s。
   - Decode：55.858 tokens/s。
   - Total inference：18.704 tokens/s。
   - 静态 buffer 总量：34.50 MiB。
+
+Linear qkv/z 融合优化记录
+~~~~~~~~~~~~~~~~~~~~~~~~~
+- 优化含义：
+  - 将 linear-attention 中的 qkv 和 z 相关投影合并，减少图内碎片和调度开销。
+  - 与 causal conv2d、runtime inplace state 配合时，正常图上有明确收益。
+- Full no-lmhead speed：
+
+  | 路径 | decoder step ms/token | decode tokens/s | prompt eval tokens/s |
+  | --- | ---: | ---: | ---: |
+  | historical baseline | 12.463415 | 73.608618 | 72.321730 |
+  | qkv_z | 12.048780 | 76.066790 | 76.840215 |
+  | qkv_z + causal_conv2d | 11.268293 | 81.188119 | 84.518167 |
+
+- Normal image generation speed：
+
+  | 路径 | 设备 | 输出 | decoder step ms/token | decode tokens/s | prompt eval tokens/s |
+  | --- | --- | --- | ---: | ---: | ---: |
+  | baseline commit | SM8750 | 正常中文 | 16.756098 | 43.340381 | 48.165654 |
+  | qkv_z + causal_conv2d float core | SM8750 | 正常中文 | 15.341463 | 56.396149 | 57.604307 |
+  | qkv_z + causal_conv2d + bmm | SM8850 | 乱码 | 11.829268 | 72.438163 | 75.832743 |
+  | qkv_z + causal_conv2d + runtime inplace state | SM8850 | 正常中文 | 11.926829 | 77.798861 | 83.139083 |
+
+- 结论：
+  - qkv_z 与 causal conv2d 对 no-lmhead 路径稳定提速。
+  - bmm 路径虽然速度高，但输出乱码，不能作为默认正确路径。
+  - 当前正常中文且速度最好的记录是 qkv_z + causal_conv2d +
+    runtime inplace state。
 
 Mutable-buffer 实验
 ~~~~~~~~~~~~~~~~~~~

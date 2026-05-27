@@ -359,6 +359,8 @@ class TextDecoder(Component):
 
         # perform model transformation
         for layer in decoder.layers:
+            if getattr(layer.attention, "prepare_fused_linear_in_proj", None):
+                layer.attention.prepare_fused_linear_in_proj()
             if getattr(layer.attention, "prepare_attention_conv", None):
                 layer.attention.prepare_attention_conv()
             if getattr(layer.feed_forward, "prepare_feedfoward_conv", None):
