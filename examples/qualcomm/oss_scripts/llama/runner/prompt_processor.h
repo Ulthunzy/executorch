@@ -79,12 +79,21 @@ class PromptProcessor {
    * @return Total I/O size in bytes.
    */
   inline const size_t total_prompt_processor_io_size_in_bytes() const {
+    const size_t window_attention_mask_size =
+        metadata_.cache_mode == CacheMode::HybridCache
+        ? align_shared_buffer_allocation_size(window_attention_mask_.size)
+        : 0;
     if (metadata_.cache_mode == CacheMode::HybridCache) {
-      return input_toks_.size + input_pos_.size + attention_mask_.size +
-          window_attention_mask_.size + logits_.size;
+      return align_shared_buffer_allocation_size(input_toks_.size) +
+          align_shared_buffer_allocation_size(input_pos_.size) +
+          align_shared_buffer_allocation_size(attention_mask_.size) +
+          window_attention_mask_size +
+          align_shared_buffer_allocation_size(logits_.size);
     } else {
-      return input_toks_.size + input_pos_.size + attention_mask_.size +
-          logits_.size;
+      return align_shared_buffer_allocation_size(input_toks_.size) +
+          align_shared_buffer_allocation_size(input_pos_.size) +
+          align_shared_buffer_allocation_size(attention_mask_.size) +
+          align_shared_buffer_allocation_size(logits_.size);
     }
   }
 

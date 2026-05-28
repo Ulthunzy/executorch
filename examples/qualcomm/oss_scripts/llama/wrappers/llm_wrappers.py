@@ -110,6 +110,11 @@ from transformers import AutoModel, AutoModelForSpeechSeq2Seq
 _HF_VLM_MODEL_CACHE: Dict[str, Any] = {}
 
 
+def _is_attention_mask_placeholder(node):
+    names = (str(node.name), str(node.target))
+    return any("atten_mask" in name or "attention_mask" in name for name in names)
+
+
 def _get_cached_qwen2_5_vl_for_conditional_generation(repo_id: str):
     model = _HF_VLM_MODEL_CACHE.get(repo_id)
     if model is not None:
@@ -805,7 +810,10 @@ class TextDecoder(Component):
                 quant_io_type = fixed_point_type["kv_type"]
             elif node_shape in self.io_shape:
                 quant_io_type = fixed_point_type["io_type"]
-            elif node_shape in atten_mask_shape:
+            elif (
+                _is_attention_mask_placeholder(node)
+                and node_shape in atten_mask_shape
+            ):
                 quant_io_type = fixed_point_type["io_type"]
 
         if is_graph_output(node):

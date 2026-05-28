@@ -122,6 +122,7 @@ Qwen3.5-0.8B VLM Qualcomm 适配状态
 | hybrid ar8 + SHA + temperature 0 | 通过 | 正常中文，速度明显提升 |
 | hybrid ar8 + max_seq_len=256 + temperature 0 复测 | 通过 | 正常中文，输出文件为合法 UTF-8 |
 | 旧 hybrid b128 context4096 PTE，运行限制到 256 + temperature 0 | 失败质量 | 仍从首 token 开始乱码，说明不是生成长度导致 |
+| SM8750 context2048 b128 PTE direct KV 复测 | 失败质量 | 同一份 PTE 走 kv_forward 也从首 token 开始乱码 |
 | hybrid SHA + runtime in-place | 通过 | cache 内存下降，decode 速度提升 |
 | hybrid SHA + aligned RpcMem sizing | 通过 | 无 RpcMem overflow，无注册错误 |
 | runtime alias benchmark | 有收益但非最终结论 | cache update 时间显著下降 |
@@ -181,6 +182,15 @@ KV / Hybrid 性能
   - 输出文件为合法 UTF-8，但内容从第一个生成 token 开始就是乱码。
   - 结论：问题不是运行时 seq_len=4096 或随机采样导致，而是这份 PTE
     自身的导出图、AR128 路径或导出时 qparam 状态不正确。
+- SM8750 context2048 b128 PTE direct KV 复测：
+  - 使用同一份 hybrid PTE 的 `kv_forward`，runner 侧 `eval_mode=0`。
+  - Prompt tokens：214。
+  - Generated tokens：809。
+  - Prompt evaluation：16.740 tokens/s。
+  - Decode：16.713 tokens/s。
+  - 输出包含非法 UTF-8/乱码。
+  - 结论：问题不只在 hybrid prefill/cache cross-graph；这份 PTE 的
+    `kv_forward` 本身也不正确。
 - hybrid SHA + runtime in-place + aligned RpcMem：
   - Prompt evaluation：146.776 tokens/s。
   - Decode：55.858 tokens/s。
