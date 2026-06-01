@@ -7,6 +7,7 @@
 # TODO: reenable pyre after fixing the issues
 # pyre-ignore-all-errors
 
+import argparse
 import json
 import logging
 import os
@@ -441,12 +442,14 @@ def inference(
     assert args.model_mode in EVAL_MODE, f"Unknown model_mode: {args.model_mode}."
 
     pte_paths = {TEXT_DECODER: text_decoder_pte_path}
+    _validate_pte_paths(pte_paths)
     eval_results = {
         "pte_size": os.path.getsize(text_decoder_pte_path),
     }
 
     if args.use_attention_sink:
         pte_paths.update({ATTENTION_SINK_EVICTOR: attention_sink_evictor_pte_path})
+        _validate_pte_paths({ATTENTION_SINK_EVICTOR: attention_sink_evictor_pte_path})
         eval_results.update(
             {
                 "attention_sink_evictor_pte_size": os.path.getsize(
@@ -456,6 +459,9 @@ def inference(
         )
 
     if is_multimodal:
+        required_multimodal_pte_paths = {TOK_EMBEDDING: tok_embedding_pte_path}
+        required_multimodal_pte_paths.update(encoder_pte_paths)
+        _validate_pte_paths(required_multimodal_pte_paths)
         eval_results.update(
             {
                 "tok_embedding_pte_size": os.path.getsize(tok_embedding_pte_path),
@@ -587,6 +593,29 @@ def inference(
             conn.send(json.dumps(eval_results))
 
 
+def _normalize_decoder_model_name(name: str) -> str:
+    canonical = name.lower().replace(".", "_")
+    if canonical in SUPPORTED_LLM_MODELS:
+        return canonical
+    raise argparse.ArgumentTypeError(
+        f"Unknown decoder_model: {name}. Available options are: "
+        f"{', '.join(SUPPORTED_LLM_MODELS.keys())}"
+    )
+
+
+def _validate_pte_paths(pte_paths: Dict[str, str]) -> None:
+    missing = [
+        f"{component}: {path}"
+        for component, path in pte_paths.items()
+        if not os.path.exists(path)
+    ]
+    if missing:
+        raise FileNotFoundError(
+            "Missing required pre-generated PTE artifact(s):\n"
+            + "\n".join(missing)
+        )
+
+
 def _build_parser():
     parser = setup_common_args_and_variables()
     parser.add_argument(
@@ -600,6 +629,7 @@ def _build_parser():
     parser.add_argument(
         "--decoder_model",
         choices=list(SUPPORTED_LLM_MODELS.keys()),
+        type=_normalize_decoder_model_name,
         help=f"The llm model to export. Current available options are: { SUPPORTED_LLM_MODELS.keys()}",
         required=True,
     )

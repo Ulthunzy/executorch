@@ -1,0 +1,388 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<OpDefCollection
+        PackageName="DeltaNetOpPackage"
+        Domain="aisw"
+        Version="1.0"
+>
+    <OpDefList>
+        <OpDef>
+            <Name>DeltaNet</Name>
+            <Description>
+                <Content>
+                    Gated DeltaNet recurrent rule. Inputs are pre-projected
+                    query, key, value, gate, beta, and recurrent state tensors.
+                </Content>
+            </Description>
+
+            <Input>
+                <Name>query</Name>
+                <Mandatory>true</Mandatory>
+                <Datatype>QNN_DATATYPE_FLOAT_32</Datatype>
+                <Datatype>QNN_DATATYPE_FLOAT_16</Datatype>
+                <Datatype>QNN_DATATYPE_UFIXED_POINT_16</Datatype>
+                <Datatype>QNN_DATATYPE_UFIXED_POINT_8</Datatype>
+                <Shape>
+                    <Rank>4D</Rank>
+                    <Text>[batch, sequence, heads, key_dim]</Text>
+                </Shape>
+            </Input>
+
+            <Input>
+                <Name>key</Name>
+                <Mandatory>true</Mandatory>
+                <Datatype>QNN_DATATYPE_FLOAT_32</Datatype>
+                <Datatype>QNN_DATATYPE_FLOAT_16</Datatype>
+                <Datatype>QNN_DATATYPE_UFIXED_POINT_16</Datatype>
+                <Datatype>QNN_DATATYPE_UFIXED_POINT_8</Datatype>
+                <Shape>
+                    <Rank>4D</Rank>
+                    <Text>[batch, sequence, heads, key_dim]</Text>
+                </Shape>
+            </Input>
+
+            <Input>
+                <Name>value</Name>
+                <Mandatory>true</Mandatory>
+                <Datatype>QNN_DATATYPE_FLOAT_32</Datatype>
+                <Datatype>QNN_DATATYPE_FLOAT_16</Datatype>
+                <Datatype>QNN_DATATYPE_UFIXED_POINT_16</Datatype>
+                <Datatype>QNN_DATATYPE_UFIXED_POINT_8</Datatype>
+                <Shape>
+                    <Rank>4D</Rank>
+                    <Text>[batch, sequence, heads, value_dim]</Text>
+                </Shape>
+            </Input>
+
+            <Input>
+                <Name>g</Name>
+                <Mandatory>true</Mandatory>
+                <Datatype>QNN_DATATYPE_FLOAT_32</Datatype>
+                <Datatype>QNN_DATATYPE_FLOAT_16</Datatype>
+                <Datatype>QNN_DATATYPE_UFIXED_POINT_16</Datatype>
+                <Datatype>QNN_DATATYPE_UFIXED_POINT_8</Datatype>
+                <Shape>
+                    <Rank>3D</Rank>
+                    <Text>[batch, sequence, heads]</Text>
+                </Shape>
+            </Input>
+
+            <Input>
+                <Name>beta</Name>
+                <Mandatory>true</Mandatory>
+                <Datatype>QNN_DATATYPE_FLOAT_32</Datatype>
+                <Datatype>QNN_DATATYPE_FLOAT_16</Datatype>
+                <Datatype>QNN_DATATYPE_UFIXED_POINT_16</Datatype>
+                <Datatype>QNN_DATATYPE_UFIXED_POINT_8</Datatype>
+                <Shape>
+                    <Rank>3D</Rank>
+                    <Text>[batch, sequence, heads]</Text>
+                </Shape>
+            </Input>
+
+            <Input>
+                <Name>recurrent_state</Name>
+                <Mandatory>true</Mandatory>
+                <Datatype>QNN_DATATYPE_FLOAT_32</Datatype>
+                <Datatype>QNN_DATATYPE_FLOAT_16</Datatype>
+                <Datatype>QNN_DATATYPE_UFIXED_POINT_16</Datatype>
+                <Datatype>QNN_DATATYPE_UFIXED_POINT_8</Datatype>
+                <Shape>
+                    <Rank>4D</Rank>
+                    <Text>[batch, heads, key_dim, value_dim]</Text>
+                </Shape>
+            </Input>
+
+            <Output>
+                <Name>core_attn_out</Name>
+                <Mandatory>true</Mandatory>
+                <Datatype>QNN_DATATYPE_FLOAT_32</Datatype>
+                <Datatype>QNN_DATATYPE_FLOAT_16</Datatype>
+                <Datatype>QNN_DATATYPE_UFIXED_POINT_16</Datatype>
+                <Datatype>QNN_DATATYPE_UFIXED_POINT_8</Datatype>
+                <Shape>
+                    <Rank>4D</Rank>
+                    <Text>[batch, sequence, heads, value_dim]</Text>
+                </Shape>
+            </Output>
+
+            <Output>
+                <Name>new_recurrent_state</Name>
+                <Mandatory>true</Mandatory>
+                <Datatype>QNN_DATATYPE_FLOAT_32</Datatype>
+                <Datatype>QNN_DATATYPE_FLOAT_16</Datatype>
+                <Datatype>QNN_DATATYPE_UFIXED_POINT_16</Datatype>
+                <Datatype>QNN_DATATYPE_UFIXED_POINT_8</Datatype>
+                <Shape>
+                    <Rank>4D</Rank>
+                    <Text>[batch, heads, key_dim, value_dim]</Text>
+                </Shape>
+            </Output>
+
+            <Parameter>
+                <Name>scaling</Name>
+                <Mandatory>true</Mandatory>
+                <Datatype>QNN_DATATYPE_FLOAT_32</Datatype>
+                <Shape>
+                    <Rank>SCALAR</Rank>
+                    <Text>scalar</Text>
+                </Shape>
+            </Parameter>
+
+            <Parameter>
+                <Name>epsilon</Name>
+                <Mandatory>true</Mandatory>
+                <Datatype>QNN_DATATYPE_FLOAT_32</Datatype>
+                <Shape>
+                    <Rank>SCALAR</Rank>
+                    <Text>scalar</Text>
+                </Shape>
+            </Parameter>
+
+            <SupportedBackend>HTP</SupportedBackend>
+        </OpDef>
+
+        <OpDef>
+            <Name>DeltaNetPacked</Name>
+            <Description>
+                <Content>
+                    Gated DeltaNet recurrent rule with pre-normalized query and
+                    key tensors. The single output packs core attention output
+                    followed by the updated recurrent state.
+                </Content>
+            </Description>
+
+            <Input>
+                <Name>query</Name>
+                <Mandatory>true</Mandatory>
+                <Datatype>QNN_DATATYPE_FLOAT_32</Datatype>
+                <Datatype>QNN_DATATYPE_FLOAT_16</Datatype>
+                <Datatype>QNN_DATATYPE_UFIXED_POINT_16</Datatype>
+                <Datatype>QNN_DATATYPE_UFIXED_POINT_8</Datatype>
+                <Shape>
+                    <Rank>4D</Rank>
+                    <Text>[batch, sequence, heads, key_dim]</Text>
+                </Shape>
+            </Input>
+
+            <Input>
+                <Name>key</Name>
+                <Mandatory>true</Mandatory>
+                <Datatype>QNN_DATATYPE_FLOAT_32</Datatype>
+                <Datatype>QNN_DATATYPE_FLOAT_16</Datatype>
+                <Datatype>QNN_DATATYPE_UFIXED_POINT_16</Datatype>
+                <Datatype>QNN_DATATYPE_UFIXED_POINT_8</Datatype>
+                <Shape>
+                    <Rank>4D</Rank>
+                    <Text>[batch, sequence, heads, key_dim]</Text>
+                </Shape>
+            </Input>
+
+            <Input>
+                <Name>value</Name>
+                <Mandatory>true</Mandatory>
+                <Datatype>QNN_DATATYPE_FLOAT_32</Datatype>
+                <Datatype>QNN_DATATYPE_FLOAT_16</Datatype>
+                <Datatype>QNN_DATATYPE_UFIXED_POINT_16</Datatype>
+                <Datatype>QNN_DATATYPE_UFIXED_POINT_8</Datatype>
+                <Shape>
+                    <Rank>4D</Rank>
+                    <Text>[batch, sequence, heads, value_dim]</Text>
+                </Shape>
+            </Input>
+
+            <Input>
+                <Name>g</Name>
+                <Mandatory>true</Mandatory>
+                <Datatype>QNN_DATATYPE_FLOAT_32</Datatype>
+                <Datatype>QNN_DATATYPE_FLOAT_16</Datatype>
+                <Datatype>QNN_DATATYPE_UFIXED_POINT_16</Datatype>
+                <Datatype>QNN_DATATYPE_UFIXED_POINT_8</Datatype>
+                <Shape>
+                    <Rank>3D</Rank>
+                    <Text>[batch, sequence, heads]</Text>
+                </Shape>
+            </Input>
+
+            <Input>
+                <Name>beta</Name>
+                <Mandatory>true</Mandatory>
+                <Datatype>QNN_DATATYPE_FLOAT_32</Datatype>
+                <Datatype>QNN_DATATYPE_FLOAT_16</Datatype>
+                <Datatype>QNN_DATATYPE_UFIXED_POINT_16</Datatype>
+                <Datatype>QNN_DATATYPE_UFIXED_POINT_8</Datatype>
+                <Shape>
+                    <Rank>3D</Rank>
+                    <Text>[batch, sequence, heads]</Text>
+                </Shape>
+            </Input>
+
+            <Input>
+                <Name>recurrent_state</Name>
+                <Mandatory>true</Mandatory>
+                <Datatype>QNN_DATATYPE_FLOAT_32</Datatype>
+                <Datatype>QNN_DATATYPE_FLOAT_16</Datatype>
+                <Datatype>QNN_DATATYPE_UFIXED_POINT_16</Datatype>
+                <Datatype>QNN_DATATYPE_UFIXED_POINT_8</Datatype>
+                <Shape>
+                    <Rank>4D</Rank>
+                    <Text>[batch, heads, key_dim, value_dim]</Text>
+                </Shape>
+            </Input>
+
+            <Output>
+                <Name>packed_out</Name>
+                <Mandatory>true</Mandatory>
+                <Datatype>QNN_DATATYPE_FLOAT_32</Datatype>
+                <Datatype>QNN_DATATYPE_FLOAT_16</Datatype>
+                <Datatype>QNN_DATATYPE_UFIXED_POINT_16</Datatype>
+                <Datatype>QNN_DATATYPE_UFIXED_POINT_8</Datatype>
+                <Shape>
+                    <Rank>1D</Rank>
+                    <Text>[batch * sequence * heads * value_dim + batch * heads * key_dim * value_dim]</Text>
+                </Shape>
+            </Output>
+
+            <SupportedBackend>HTP</SupportedBackend>
+        </OpDef>
+
+        <OpDef>
+            <Name>DeltaNetIdentity</Name>
+            <Description>
+                <Content>
+                    Minimal DeltaNet package probe. Copies one 4D input tensor
+                    to one 4D output tensor.
+                </Content>
+            </Description>
+
+            <Input>
+                <Name>input</Name>
+                <Mandatory>true</Mandatory>
+                <Datatype>QNN_DATATYPE_FLOAT_32</Datatype>
+                <Datatype>QNN_DATATYPE_FLOAT_16</Datatype>
+                <Datatype>QNN_DATATYPE_UFIXED_POINT_16</Datatype>
+                <Datatype>QNN_DATATYPE_UFIXED_POINT_8</Datatype>
+                <Shape>
+                    <Rank>4D</Rank>
+                    <Text>[d0, d1, d2, d3]</Text>
+                </Shape>
+            </Input>
+
+            <Output>
+                <Name>output</Name>
+                <Mandatory>true</Mandatory>
+                <Datatype>QNN_DATATYPE_FLOAT_32</Datatype>
+                <Datatype>QNN_DATATYPE_FLOAT_16</Datatype>
+                <Datatype>QNN_DATATYPE_UFIXED_POINT_16</Datatype>
+                <Datatype>QNN_DATATYPE_UFIXED_POINT_8</Datatype>
+                <Shape>
+                    <Rank>4D</Rank>
+                    <Text>[d0, d1, d2, d3]</Text>
+                </Shape>
+            </Output>
+
+            <SupportedBackend>HTP</SupportedBackend>
+        </OpDef>
+
+        <OpDef>
+            <Name>DeltaNetDecayState</Name>
+            <Description>
+                <Content>
+                    First DeltaNet sub-op probe. Multiplies recurrent state by
+                    exp(g) for the first sequence position.
+                </Content>
+            </Description>
+
+            <Input>
+                <Name>recurrent_state</Name>
+                <Mandatory>true</Mandatory>
+                <Datatype>QNN_DATATYPE_FLOAT_32</Datatype>
+                <Datatype>QNN_DATATYPE_FLOAT_16</Datatype>
+                <Datatype>QNN_DATATYPE_UFIXED_POINT_16</Datatype>
+                <Datatype>QNN_DATATYPE_UFIXED_POINT_8</Datatype>
+                <Shape>
+                    <Rank>4D</Rank>
+                    <Text>[batch, heads, key_dim, value_dim]</Text>
+                </Shape>
+            </Input>
+
+            <Input>
+                <Name>g</Name>
+                <Mandatory>true</Mandatory>
+                <Datatype>QNN_DATATYPE_FLOAT_32</Datatype>
+                <Datatype>QNN_DATATYPE_FLOAT_16</Datatype>
+                <Datatype>QNN_DATATYPE_UFIXED_POINT_16</Datatype>
+                <Datatype>QNN_DATATYPE_UFIXED_POINT_8</Datatype>
+                <Shape>
+                    <Rank>3D</Rank>
+                    <Text>[batch, sequence, heads]</Text>
+                </Shape>
+            </Input>
+
+            <Output>
+                <Name>output</Name>
+                <Mandatory>true</Mandatory>
+                <Datatype>QNN_DATATYPE_FLOAT_32</Datatype>
+                <Datatype>QNN_DATATYPE_FLOAT_16</Datatype>
+                <Datatype>QNN_DATATYPE_UFIXED_POINT_16</Datatype>
+                <Datatype>QNN_DATATYPE_UFIXED_POINT_8</Datatype>
+                <Shape>
+                    <Rank>4D</Rank>
+                    <Text>[batch, heads, key_dim, value_dim]</Text>
+                </Shape>
+            </Output>
+
+            <SupportedBackend>HTP</SupportedBackend>
+        </OpDef>
+
+        <OpDef>
+            <Name>DeltaNetStatePassthrough</Name>
+            <Description>
+                <Content>
+                    Two-input probe. Copies recurrent_state to output while
+                    accepting g as a second input.
+                </Content>
+            </Description>
+
+            <Input>
+                <Name>recurrent_state</Name>
+                <Mandatory>true</Mandatory>
+                <Datatype>QNN_DATATYPE_FLOAT_32</Datatype>
+                <Datatype>QNN_DATATYPE_FLOAT_16</Datatype>
+                <Datatype>QNN_DATATYPE_UFIXED_POINT_16</Datatype>
+                <Datatype>QNN_DATATYPE_UFIXED_POINT_8</Datatype>
+                <Shape>
+                    <Rank>4D</Rank>
+                    <Text>[batch, heads, key_dim, value_dim]</Text>
+                </Shape>
+            </Input>
+
+            <Input>
+                <Name>g</Name>
+                <Mandatory>true</Mandatory>
+                <Datatype>QNN_DATATYPE_FLOAT_32</Datatype>
+                <Datatype>QNN_DATATYPE_FLOAT_16</Datatype>
+                <Datatype>QNN_DATATYPE_UFIXED_POINT_16</Datatype>
+                <Datatype>QNN_DATATYPE_UFIXED_POINT_8</Datatype>
+                <Shape>
+                    <Rank>3D</Rank>
+                    <Text>[batch, sequence, heads]</Text>
+                </Shape>
+            </Input>
+
+            <Output>
+                <Name>output</Name>
+                <Mandatory>true</Mandatory>
+                <Datatype>QNN_DATATYPE_FLOAT_32</Datatype>
+                <Datatype>QNN_DATATYPE_FLOAT_16</Datatype>
+                <Datatype>QNN_DATATYPE_UFIXED_POINT_16</Datatype>
+                <Datatype>QNN_DATATYPE_UFIXED_POINT_8</Datatype>
+                <Shape>
+                    <Rank>4D</Rank>
+                    <Text>[batch, heads, key_dim, value_dim]</Text>
+                </Shape>
+            </Output>
+
+            <SupportedBackend>HTP</SupportedBackend>
+        </OpDef>
+    </OpDefList>
+</OpDefCollection>
