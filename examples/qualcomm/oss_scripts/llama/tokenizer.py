@@ -42,6 +42,11 @@ VLM_SPECIAL_TOKENS = {
         "fake_wrap_start": "<|vision_start|>",
         "fake_wrap_end": "<|vision_end|>",
     },
+    "qwen3_vl-2b_instruct": {
+        IMG_TOKEN: "<|image_pad|>",
+        "fake_wrap_start": "<|vision_start|>",
+        "fake_wrap_end": "<|vision_end|>",
+    },
     "lincal_vl-3b_instruct": {
         IMG_TOKEN: "<|image_pad|>",
         "fake_wrap_start": "<|vision_start|>",
@@ -362,7 +367,11 @@ class TokenizerWrapper:
             Formatted prompt string
         """
 
-        if self.decoder_model in {"qwen2_5_vl-3b_instruct", "lincal_vl-3b_instruct"}:
+        if self.decoder_model in {
+            "qwen2_5_vl-3b_instruct",
+            "qwen3_vl-2b_instruct",
+            "lincal_vl-3b_instruct",
+        }:
             image_count = prompt.count(IMG_TOKEN)
             prompt = prompt.replace(IMG_TOKEN, "").lstrip()
             template_prompt = ""

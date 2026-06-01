@@ -37,6 +37,9 @@ from executorch.examples.models.qwen2_5 import (
 from executorch.examples.models.qwen2_5_vl import (
     convert_weights as convert_qwen2_5_vl_weights,
 )
+from executorch.examples.models.qwen3_vl import (
+    convert_weights as convert_qwen3_vl_weights,
+)
 from executorch.examples.models.lincal_vl import (
     convert_weights as convert_lincal_vl_weights,
 )
@@ -66,6 +69,7 @@ from executorch.examples.qualcomm.oss_scripts.llama.encoder.encoder_config impor
     InternVL3Encoder,
     MultiModalityConfig,
     Qwen2_5VL3BEncoder,
+    Qwen3VL2BEncoder,
     SmolVLMEncoder,
     VisionModalityConfig,
 )
@@ -119,6 +123,7 @@ LLM_VARIANT_ARCHS: Dict[str, Type[LlamaModel]] = {
     "smolvlm_500m_instruct": LlamaModelWithoutEmbedding,
     "internvl3_1b": LlamaModelWithoutEmbedding,
     "qwen2_5_vl-3b_instruct": LlamaModelWithoutEmbedding,
+    "qwen3_vl-2b_instruct": LlamaModelWithoutEmbedding,
     "lincal_vl-3b_instruct": MultiScopeAwareLlamaModelWithoutEmbedding,
     "gemma2-2b": MultiScopeAwareLlamaModel,
 }
@@ -702,6 +707,28 @@ class Qwen2_5_VL_3B(LLMModelConfig):
     r2 = False
     r3 = False
     quant_recipe = Qwen2_5_VL_3BQuantRecipe
+
+
+@register_llm_model(
+    "qwen3_vl-2b_instruct",
+    modality_encoders=Qwen3VL2BEncoder,
+)
+@dataclass(init=False, frozen=True)
+class Qwen3_VL_2B(LLMModelConfig):
+    repo_id: str = "/hunter/model/Qwen/Qwen3-VL-2B-Instruct"
+    params_path: str = os.path.join(
+        BASE_DIR, "../../../models/qwen3_vl/config/2b_config.json"
+    )
+    convert_weights = convert_qwen3_vl_weights
+    transform_weight = False
+    instruct_model = True
+    num_sharding = 2
+    masked_softmax = True
+    seq_mse_candidates = 0
+    r1 = False
+    r2 = False
+    r3 = False
+    quant_recipe = Qwen3_1_7BQuantRecipe
 
 
 @register_llm_model(

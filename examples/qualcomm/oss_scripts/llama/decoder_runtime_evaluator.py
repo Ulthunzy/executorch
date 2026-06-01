@@ -21,7 +21,6 @@ from executorch.backends.qualcomm.export_utils import (
     QnnConfig,
     SimpleADB,
 )
-from executorch.examples.models.llama.evaluate.eager_eval import EagerEvalWrapper
 from executorch.examples.qualcomm.oss_scripts.llama.decoder_constants import (
     ATTENTION_SINK_EVICTOR,
     AUDIO_ENCODER,
@@ -44,12 +43,14 @@ from pytorch_tokenizers.llama2c import Llama2cTokenizer as SentencePieceTokenize
 from pytorch_tokenizers.tiktoken import TiktokenTokenizer
 from torchao.quantization.utils import compute_error
 
+_LM_EVAL_IMPORT_ERROR = None
 try:
+    from executorch.examples.models.llama.evaluate.eager_eval import EagerEvalWrapper
     from lm_eval.evaluator import simple_evaluate
-except ImportError:
-    raise ImportError(
-        "Please install the llm eval dependency via examples/models/llama/install_requirements.sh"
-    )
+except Exception as exc:
+    EagerEvalWrapper = object
+    simple_evaluate = None
+    _LM_EVAL_IMPORT_ERROR = exc
 
 
 def post_process_model_output(output_holder: List, host_output_response_path: str):
@@ -546,6 +547,12 @@ class TaskEval(EvalBase):
             ],
             runtime_tokenizer_path,
         ):
+            if _LM_EVAL_IMPORT_ERROR is not None:
+                raise ImportError(
+                    "Please install compatible llm eval dependencies via "
+                    "examples/models/llama/install_requirements.sh"
+                ) from _LM_EVAL_IMPORT_ERROR
+
             self.inference_speed = None
 
             self.args = args

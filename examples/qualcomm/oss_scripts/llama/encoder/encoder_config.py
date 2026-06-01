@@ -21,6 +21,7 @@ from executorch.examples.qualcomm.oss_scripts.llama.model.vision_encoder import 
     Idefics3VisionEncoder,
     InternVL3VisionEncoder,
     Qwen2_5VLVisionEncoder,
+    Qwen3VLVisionEncoder,
 )
 
 
@@ -137,6 +138,20 @@ class Qwen2_5VL3BEncoder(VisionModalityConfig):
 
     encoder_class = Qwen2_5VLVisionEncoder
     img_seq_len = 256
+    img_resized_h = 448
+    img_resized_w = 448
+    img_url = "http://images.cocodataset.org/val2017/000000039769.jpg"
+    quant_recipe = Qwen2_5_VL_Encoder_QuantRecipe
+
+
+@dataclass(init=False, frozen=True)
+class Qwen3VL2BEncoder(VisionModalityConfig):
+    """
+    Config for Qwen3-VL 2B vision encoder.
+    """
+
+    encoder_class = Qwen3VLVisionEncoder
+    img_seq_len = 196
     img_resized_h = 448
     img_resized_w = 448
     img_url = "http://images.cocodataset.org/val2017/000000039769.jpg"

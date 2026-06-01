@@ -11,7 +11,6 @@ from typing import Callable, List, Optional, Tuple, Union
 
 import torch
 from executorch.backends.qualcomm._passes import SeqMSE
-from executorch.examples.models.llama.evaluate.eager_eval import EagerEvalWrapper
 from executorch.examples.qualcomm.oss_scripts.llama.masking_utils import AttentionMask
 
 from executorch.exir._serialize._program import deserialize_pte_binary
@@ -19,12 +18,14 @@ from pytorch_tokenizers.hf_tokenizer import HuggingFaceTokenizer
 from pytorch_tokenizers.llama2c import Llama2cTokenizer as SentencePieceTokenizer
 from pytorch_tokenizers.tiktoken import TiktokenTokenizer
 
+_LM_EVAL_IMPORT_ERROR = None
 try:
+    from executorch.examples.models.llama.evaluate.eager_eval import EagerEvalWrapper
     from lm_eval.evaluator import simple_evaluate
-except ImportError:
-    raise ImportError(
-        "Please install the llm eval dependency via examples/models/llama/install_requirements.sh"
-    )
+except Exception as exc:
+    EagerEvalWrapper = object
+    simple_evaluate = None
+    _LM_EVAL_IMPORT_ERROR = exc
 
 
 INFERENCE_REGISTRY = {}
@@ -95,6 +96,12 @@ class GraphModuleCalibrationWrapper(EagerEvalWrapper):
         use_i64_token: bool,
         seq_mse_candidates: int,
     ):
+        if _LM_EVAL_IMPORT_ERROR is not None:
+            raise ImportError(
+                "Please install compatible llm eval dependencies via "
+                "examples/models/llama/install_requirements.sh"
+            ) from _LM_EVAL_IMPORT_ERROR
+
         # n seq len = n-1 cache len, so we len(inps) = n-1 during _model_call
         assert max_seq_length is not None, "max_seq_length must be provided"
         super().__init__(

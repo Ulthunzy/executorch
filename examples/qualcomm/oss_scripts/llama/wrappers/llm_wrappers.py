@@ -5,6 +5,7 @@
 # LICENSE file in the root directory of this source tree.
 import argparse
 import copy
+import gc
 import inspect
 import json
 import logging
@@ -107,6 +108,12 @@ from torchao.quantization.pt2e.quantize_pt2e import convert_pt2e, prepare_pt2e
 from transformers import AutoModel, AutoModelForSpeechSeq2Seq
 
 
+def _release_memory():
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+
 _HF_VLM_MODEL_CACHE: Dict[str, Any] = {}
 
 
@@ -147,11 +154,16 @@ def _flatten_model_args_for_static_llama(model_config: Dict[str, Any]) -> Dict[s
         ),
         "vocab_size": text_config["vocab_size"],
         "hidden_dim": text_config["intermediate_size"],
-        "head_dim": text_config["hidden_size"] // text_config["num_attention_heads"],
+        "head_dim": text_config.get(
+            "head_dim", text_config["hidden_size"] // text_config["num_attention_heads"]
+        ),
         "norm_eps": text_config.get("rms_norm_eps", 1e-5),
         "rope_theta": text_config.get("rope_theta", model_config.get("rope_theta")),
         "attention_qkv_bias": text_config.get(
-            "attention_qkv_bias", model_config.get("attention_qkv_bias", True)
+            "attention_qkv_bias",
+            text_config.get(
+                "attention_bias", model_config.get("attention_qkv_bias", True)
+            ),
         ),
         "use_qk_norm": text_config.get(
             "use_qk_norm", model_config.get("use_qk_norm", False)
@@ -206,6 +218,14 @@ def _overlay_local_vision_config(
         auto_model.config.vision_config.fullatt_block_indexes = [
             idx for idx in fullatt_block_indexes if idx < depth
         ]
+
+
+def _get_vision_num_layers(auto_model) -> int:
+    vision_config = auto_model.config.vision_config
+    num_layers = getattr(vision_config, "num_hidden_layers", None)
+    if num_layers is not None:
+        return num_layers
+    return getattr(vision_config, "depth")
 
 
 class TextDecoder(Component):
@@ -521,24 +541,16 @@ class TextDecoder(Component):
                 ]
                 kv_idx += 1
 
+    def _is_attention_mask_placeholder(self, node) -> bool:
+        if node.op != "placeholder":
+            return False
+        name = str(node.name)
+        target = str(node.target)
+        return "atten_mask" in name or "atten_mask" in target
+
     def _tag_ios(self, node, fixed_point_type):
         max_context_len = self.meta["get_max_context_len"]
         max_seq_len = self.meta.get("get_max_seq_len", max_context_len)
-        atten_mask_shape = {
-            (
-                self.meta["get_max_batch_size"],
-                self.meta["get_ar_len"],
-                max_context_len,
-            ),
-        }
-        if max_context_len != max_seq_len:
-            atten_mask_shape.add(
-                (
-                    self.meta["get_max_batch_size"],
-                    self.meta["get_ar_len"],
-                    max_seq_len,
-                )
-            )
 
         if getattr(self.control_args, "enable_true_swa", False) and (
             "get_sliding_window" in self.meta
@@ -551,13 +563,6 @@ class TextDecoder(Component):
                 (self.meta["get_head_dim"], window_context_len),
                 (window_context_len, self.meta["get_head_dim"]),
             }
-            atten_mask_shape.add(
-                (
-                    self.meta["get_max_batch_size"],
-                    self.meta["get_ar_len"],
-                    window_context_len,
-                )
-            )
 
         freq_shape = {
             (self.meta["get_ar_len"], self.meta["get_head_dim"] // 2),
@@ -569,14 +574,14 @@ class TextDecoder(Component):
         quant_io_type = None
 
         if node.op == "placeholder":
-            if (
+            if self._is_attention_mask_placeholder(node):
+                quant_io_type = fixed_point_type["io_type"]
+            elif (
                 len(users := list(node.users)) == 1
                 and users[0].meta["val"].size()[-2:] in self.kv_cache_shape
             ):
                 quant_io_type = fixed_point_type["kv_type"]
             elif node.meta["val"].size() in self.io_shape:
-                quant_io_type = fixed_point_type["io_type"]
-            elif node.meta["val"].size() in atten_mask_shape:
                 quant_io_type = fixed_point_type["io_type"]
 
         if is_graph_output(node):
@@ -1150,6 +1155,12 @@ class HybridTextDecoder(Component):
                 f"{self.control_args.artifact}/{data.pte_filename}.pte", "wb"
             ) as file:
                 tok_embedding_exec_prog_mgr.write_to_file(file)
+            del tok_embedding_edge_prog_mgr, tok_embedding_exec_prog_mgr
+            if not self.control_args.optrace:
+                for model in models:
+                    model.tok_embedding = None
+                    model.tok_embedding_export_input = None
+            _release_memory()
 
         # decoder lowering
         edge_prog_mgr = to_edge_transform_and_lower_to_qnn(
@@ -1184,6 +1195,8 @@ class HybridTextDecoder(Component):
             f"{self.control_args.artifact}/{data.pte_filename}.pte", "wb"
         ) as file:
             exec_prog_mgr.write_to_file(file)
+        del edge_prog_mgr, exec_prog_mgr
+        _release_memory()
 
 
 class Modality(Component):
@@ -1220,7 +1233,7 @@ class Modality(Component):
                     )
                     backbone = auto_model
                 _overlay_local_vision_config(auto_model, local_model_config)
-                self.num_layers = auto_model.config.vision_config.num_hidden_layers
+                self.num_layers = _get_vision_num_layers(auto_model)
             else:
                 raise NotImplementedError(f"Find no {modality}")
 
@@ -1229,6 +1242,7 @@ class Modality(Component):
             self.model.load_state_dict(
                 backbone.state_dict(), strict=False
             )  # set strict to false to simplify parameter loading for non-text models
+            self.model = self.model.to(torch.float32).eval()
             self.example_input = self.model.get_example_inputs()
             self.preprocess = getattr(self.model, "preprocess", lambda data: data)
 
@@ -1316,6 +1330,11 @@ class Modality(Component):
             f"{self.control_args.artifact}/{data.pte_filename}.pte", "wb"
         ) as file:
             exec_prog_mgr.write_to_file(file)
+        del edge_prog_mgr, exec_prog_mgr
+        if not self.control_args.optrace:
+            self.model = None
+            self.example_input = None
+        _release_memory()
 
     def _calibrate(self, model, calibration_datasets):
         outputs = []
@@ -1444,3 +1463,5 @@ class MultiModalManager(Component):
             },
         )
         self.process(quantize_request)
+        quantize_request = None
+        _release_memory()

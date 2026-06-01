@@ -11,6 +11,7 @@ from typing import Callable, Dict, List, Optional
 
 import requests
 
+import numpy as np
 import torch
 from executorch.examples.qualcomm.oss_scripts.llama import LLMModelConfig
 from executorch.examples.qualcomm.oss_scripts.llama.decoder_constants import (
@@ -30,6 +31,56 @@ from huggingface_hub import hf_hub_download
 from PIL import Image
 from transformers import AutoProcessor
 from transformers.image_utils import load_image
+
+
+def _qwen_vl_image_to_patches(
+    image: Image.Image,
+    img_resized_h: int,
+    img_resized_w: int,
+    patch_size: int,
+    temporal_patch_size: int,
+    merge_size: int,
+) -> torch.Tensor:
+    image = image.convert("RGB").resize(
+        (img_resized_w, img_resized_h), Image.Resampling.BICUBIC
+    )
+    array = np.asarray(image, dtype=np.float32) / 255.0
+    array = (array - 0.5) / 0.5
+    array = np.transpose(array, (2, 0, 1))
+
+    patches = np.expand_dims(np.expand_dims(array, axis=0), axis=1)
+    if patches.shape[1] % temporal_patch_size != 0:
+        repeats = np.repeat(
+            patches[:, -1:],
+            temporal_patch_size - (patches.shape[1] % temporal_patch_size),
+            axis=1,
+        )
+        patches = np.concatenate([patches, repeats], axis=1)
+
+    batch_size = patches.shape[0]
+    grid_t = patches.shape[1] // temporal_patch_size
+    channel = patches.shape[2]
+    grid_h = img_resized_h // patch_size
+    grid_w = img_resized_w // patch_size
+
+    patches = patches.reshape(
+        batch_size,
+        grid_t,
+        temporal_patch_size,
+        channel,
+        grid_h // merge_size,
+        merge_size,
+        patch_size,
+        grid_w // merge_size,
+        merge_size,
+        patch_size,
+    )
+    patches = patches.transpose(0, 1, 4, 7, 5, 8, 3, 2, 6, 9)
+    flatten_patches = patches.reshape(
+        batch_size * grid_t * grid_h * grid_w,
+        channel * temporal_patch_size * patch_size * patch_size,
+    )
+    return torch.from_numpy(flatten_patches).to(torch.float32)
 
 
 class DatasetBuilder:
@@ -127,6 +178,20 @@ class DatasetBuilder:
         """
 
         images = [load_image(image_path) for image_path in files_path]
+        if self.control_args.decoder_model == "qwen3_vl-2b_instruct":
+            return [
+                (
+                    _qwen_vl_image_to_patches(
+                        image,
+                        config.img_resized_h,
+                        config.img_resized_w,
+                        patch_size=16,
+                        temporal_patch_size=2,
+                        merge_size=2,
+                    ),
+                )
+                for image in images
+            ]
 
         # Process image with text prompt using HuggingFace processor
         # Some HF processors (e.g. InternVL3) need to pass text arg or it will cause error and process failed

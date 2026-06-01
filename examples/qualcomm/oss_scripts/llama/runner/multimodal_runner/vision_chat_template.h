@@ -65,16 +65,19 @@ inline VisionSpecialTokens get_special_tokens(
 inline std::string expand_image_tokens(
     const std::string& prompt,
     const VisionSpecialTokens& specials) {
-  // Create image prompt with repeated image tokens
+  // Keep IMG_TOKEN as a runtime-only dispatch marker for models whose tokenizer
+  // uses a different placeholder token, e.g. Qwen-VL's <|image_pad|>.
+  const std::string dispatch_marker =
+      specials.image_token == IMG_TOKEN ? "" : IMG_TOKEN;
   const std::string image_prompt = specials.fake_wrap_start +
-      specials.global_img + specials.image_token + specials.fake_wrap_end;
+      specials.global_img + specials.image_token + dispatch_marker +
+      specials.fake_wrap_end;
 
-  // Replace single image token with expanded version
+  // Replace the user-facing image marker with the model-specific prompt.
   size_t pos = 0;
   std::string expanded = prompt;
-  while ((pos = expanded.find(specials.image_token, pos)) !=
-         std::string::npos) {
-    expanded.replace(pos, specials.image_token.size(), image_prompt);
+  while ((pos = expanded.find(IMG_TOKEN, pos)) != std::string::npos) {
+    expanded.replace(pos, IMG_TOKEN.size(), image_prompt);
     pos += image_prompt.size();
   }
   ET_LOG(Info, "Prompt after expanding image token: %s", expanded.c_str());
