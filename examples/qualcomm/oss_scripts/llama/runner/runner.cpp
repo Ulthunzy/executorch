@@ -85,6 +85,65 @@ void save_logits(
   }
 }
 
+size_t aligned_input_nbytes(
+    const Result<MethodMeta>& method_meta,
+    size_t index) {
+  ET_CHECK_MSG(method_meta.ok(), "Failed to get method metadata");
+  auto tensor_meta = method_meta->input_tensor_meta(index);
+  ET_CHECK_MSG(tensor_meta.ok(), "Failed to get input tensor metadata");
+  return align_shared_buffer_allocation_size(tensor_meta->nbytes());
+}
+
+size_t aligned_output_nbytes(
+    const Result<MethodMeta>& method_meta,
+    size_t index) {
+  ET_CHECK_MSG(method_meta.ok(), "Failed to get method metadata");
+  auto tensor_meta = method_meta->output_tensor_meta(index);
+  ET_CHECK_MSG(tensor_meta.ok(), "Failed to get output tensor metadata");
+  return align_shared_buffer_allocation_size(tensor_meta->nbytes());
+}
+
+size_t prompt_processor_io_size_from_meta(
+    const Result<MethodMeta>& method_meta,
+    int32_t ar_len,
+    bool is_bert,
+    CacheMode cache_mode) {
+  size_t total_bytes = 0;
+  size_t idx = 0;
+  total_bytes += align_shared_buffer_allocation_size(
+      static_cast<size_t>(ar_len) * sizeof(int64_t));
+  ++idx;
+  total_bytes += aligned_input_nbytes(method_meta, idx++);
+  if (cache_mode == CacheMode::HybridCache) {
+    total_bytes += aligned_input_nbytes(method_meta, idx++);
+  }
+  if (!is_bert) {
+    total_bytes += align_shared_buffer_allocation_size(
+        static_cast<size_t>(ar_len) * sizeof(int32_t));
+  }
+  total_bytes += aligned_output_nbytes(method_meta, 0);
+  return total_bytes;
+}
+
+size_t token_generator_io_size_from_meta(
+    const Result<MethodMeta>& method_meta,
+    int32_t ar_len,
+    CacheMode cache_mode) {
+  size_t total_bytes = 0;
+  size_t idx = 0;
+  total_bytes += align_shared_buffer_allocation_size(
+      static_cast<size_t>(ar_len) * sizeof(int64_t));
+  ++idx;
+  total_bytes += aligned_input_nbytes(method_meta, idx++);
+  if (cache_mode == CacheMode::HybridCache) {
+    total_bytes += aligned_input_nbytes(method_meta, idx++);
+  }
+  total_bytes += align_shared_buffer_allocation_size(
+      static_cast<size_t>(ar_len) * sizeof(int32_t));
+  total_bytes += aligned_output_nbytes(method_meta, 0);
+  return total_bytes;
+}
+
 } // namespace
 
 template <typename T>
@@ -500,12 +559,22 @@ Error Runner<T>::load() {
         &stats_);
   }
 
+  auto prompt_processor_method_meta =
+      module_->method_meta(prompt_processor_method_name);
+  auto token_generator_method_meta =
+      module_->method_meta(token_generator_method_name);
+
   buffer_manager_ = std::make_unique<ClientMem>();
   if (shared_buffer_) {
     buffer_manager_ = std::make_unique<RpcMem>(
         kv_manager_->total_cache_size_in_bytes(),
-        prompt_processor_->total_prompt_processor_io_size_in_bytes(),
-        token_generator_->total_token_generator_io_size_in_bytes());
+        prompt_processor_io_size_from_meta(
+            prompt_processor_method_meta,
+            prompt_processor_ar_len,
+            prompt_processor_ar_len == context_len_,
+            cache_mode_),
+        token_generator_io_size_from_meta(
+            token_generator_method_meta, token_generator_ar_len, cache_mode_));
   }
   ET_LOG(Info, "creating io_memory");
   // prepare io
