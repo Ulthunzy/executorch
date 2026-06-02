@@ -53,10 +53,32 @@ class QnnBackend(BackendDetails):
                 # pop certain keys in meta for not affecting the passes in compilation
                 node.meta.pop(QCOM_AXIS_ORDER, "")
         # QNN Delegate Specific Passes
+        logger.info("QNN preprocess use_mha2sha=%s", use_mha2sha)
         graph_module = QnnPassManager().transform_for_preprocess_pipeline(
             edge_program, use_mha2sha=use_mha2sha
         )
         assert graph_module is not None
+        if use_mha2sha:
+            has_sha_nodes = any(
+                node.op == "call_function"
+                and ("_h_" in node.name or node.name.endswith("_sha_concat"))
+                for node in graph_module.graph.nodes
+            )
+            has_attention_like_nodes = any(
+                node.op == "call_function"
+                and node.target.__name__
+                in {"aten._softmax.default", "aten._safe_softmax.default"}
+                for node in graph_module.graph.nodes
+            ) and any(
+                node.op == "call_function"
+                and node.target.__name__ == "aten.expand_copy.default"
+                for node in graph_module.graph.nodes
+            )
+            if not has_sha_nodes and has_attention_like_nodes:
+                logger.warning(
+                    "MHA2SHA was enabled but did not split this graph; "
+                    "attention softmax and expand nodes remain."
+                )
 
         nodes_to_wrappers = defaultdict(dict)
         node_visitors = get_node_visitors(

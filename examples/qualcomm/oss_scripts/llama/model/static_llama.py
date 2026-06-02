@@ -902,7 +902,7 @@ class LlamaModelWithoutEmbedding(LlamaModel):
             (self.max_batch_size, self.ar_len, self.dim), dtype=torch.float32
         )
         atten_mask = AttentionMask(
-            CausalAttentionMask(self.max_batch_size, self.ar_len, self.max_seq_len)
+            CausalAttentionMask(self.max_batch_size, self.ar_len, self.max_context_len)
         )
         if self.use_kv_cache:
             pos_ids = torch.zeros((self.max_batch_size, self.ar_len), dtype=torch.int32)
@@ -915,14 +915,14 @@ class LlamaModelWithoutEmbedding(LlamaModel):
                         self.max_batch_size,
                         self.n_kv_heads,
                         self.head_dim,
-                        self.max_seq_len - self.ar_len,
+                        self.max_context_len - self.ar_len,
                     )
                 )
                 v_cache.append(
                     torch.zeros(
                         self.max_batch_size,
                         self.n_kv_heads,
-                        self.max_seq_len - self.ar_len,
+                        self.max_context_len - self.ar_len,
                         self.head_dim,
                     )
                 )
