@@ -359,9 +359,10 @@ def compile(
         if is_multimodal and modality in {AUDIO_ENCODER, TEXT_ENCODER, VISION_ENCODER}:
             # Skip encoder quantization for multi-image prompts and for Qwen3.5
             # vision while its encoder path is validated through fp16 first.
-            to_skip = len(args.image_path) > 1 or (
-                args.decoder_model.startswith("qwen3_5") and modality == VISION_ENCODER
-            )
+            # to_skip = len(args.image_path) > 1 or (
+            #     args.decoder_model.startswith("qwen3_5") and modality == VISION_ENCODER
+            # )
+            to_skip = False
             backend_options = generate_htp_compiler_spec(
                 use_fp16=to_skip,
             )

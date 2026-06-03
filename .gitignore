@@ -119,3 +119,5 @@ examples/qualcomm/oss_scripts/llama/qwen35_adaptation_status.txt
 
 test.sh
 export.sh
+
+export.log-*
