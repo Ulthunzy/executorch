@@ -824,7 +824,10 @@ class Qwen3_5_0_8BQuantRecipe(StaticLLMQuantRecipe):
                 {
                     r"layers\.\d+\.attention\.(in_proj_qkv_z|in_proj_b)(\.|$)",
                     r"layers\.\d+\.attention\.(wq|wk|wv)(_conv)?(\.|$)",
-                    r"layers\.\d+\.feed_forward\.(w1_conv|w3_conv)(\.|$)"
+                    (
+                        r"layers\.\d+\.feed_forward\."
+                        r"(?:forward\.__self__\.)?(w1_conv|w3_conv)(\.|$)"
+                    ),
                 },
                 conv2d_ops,
                 QuantDtype.use_16a4w_block,
@@ -840,7 +843,10 @@ class Qwen3_5_0_8BQuantRecipe(StaticLLMQuantRecipe):
                     r"layers\.\d+\.attention\.(in_proj_a|out_proj)(\.|$)",
                     r"layers\.\d+\.attention\.causal_conv2d(\.|$)",
                     r"layers\.\d+\.attention\.wo(_conv)?(\.|$)",
-                    r"layers\.\d+\.feed_forward\.(w2_conv)(\.|$)",
+                    (
+                        r"layers\.\d+\.feed_forward\."
+                        r"(?:forward\.__self__\.)?(w2_conv)(\.|$)"
+                    ),
                     r"output\.conv",
                 },
                 conv2d_ops,
