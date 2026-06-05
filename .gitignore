@@ -121,3 +121,4 @@ test.sh
 export.sh
 
 export.log-*
+examples/qualcomm/oss_scripts/llama/qwen35_qualcomm_adaptation_ppt_outline.txt

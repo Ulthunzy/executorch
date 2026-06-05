@@ -73,6 +73,7 @@ CMAKE_OE_LINUX="build-oe-linux"
 CLEAN="true"
 BUILD_TYPE="RelWithDebInfo"
 BUILD_JOB_NUMBER="16"
+ET_QNN_RUNNER_DEV_MEM_LOG="${ET_QNN_RUNNER_DEV_MEM_LOG:-OFF}"
 
 # Default DSP_TYPE=-1 means direct mode is disabled.
 DSP_TYPE=-1
@@ -198,6 +199,7 @@ if [ "$BUILD_ANDROID" = true ]; then
         -DCMAKE_FIND_ROOT_PATH_MODE_PACKAGE=BOTH \
         -DPYTHON_EXECUTABLE=$PYTHON_EXECUTABLE \
         -DDSP_TYPE=$DSP_TYPE \
+        -DET_QNN_RUNNER_DEV_MEM_LOG=$ET_QNN_RUNNER_DEV_MEM_LOG \
         $DIRECT_MODE_FLAG \
         -B$EXAMPLE_ROOT
 

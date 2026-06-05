@@ -402,12 +402,7 @@ Result<int64_t> TokenGenerator<T>::generate(
     token_callback(
         ET_UNWRAP_TOKENIZER(tokenizer_->decode(prev_token, cur_token)));
 
-    // data-dependent terminating condition: we have n_eos_ number of EOS
-    if (eos_ids_->count(cur_token) > 0) {
-      printf("\n");
-      ET_LOG(Info, "\nReached to the end of generation");
-      break;
-    }
+    // Benchmark fixed decode length by continuing through EOS until seq_len.
   }
 
   // Check if generation was truncated due to seq_len limit (no EOS token)
