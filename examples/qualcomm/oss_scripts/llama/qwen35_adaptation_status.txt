@@ -1,0 +1,405 @@
+Qwen3.5-0.8B VLM Qualcomm 适配状态
+===================================
+
+更新时间：2026-05-27
+
+当前结论
+--------
+- 当前默认路径：Qwen3.5 VLM 走 multimodal runner，保持 uint16 runtime。
+- 不新增 `Runner<float>` / `QNNMultimodalRunner<float>`。
+- 不新增 logits bitwidth、attention-mask bitwidth、固定 logits scale/zp、
+  Qwen3.5 cache shape 这类额外 metadata。
+- `kv` 模式在 `max_seq_len=256` 下已经可以输出正常中文。
+- `hybrid + ar8 + max_seq_len=256` 在完成 prefill/decode KV qparam 对齐后，
+  已经可以输出正常中文。
+- hybrid SHA 路径比 MHA 路径更快，当前推荐使用 SHA。
+- runtime 层面的 `kFullOverwrite` 原地共享 buffer 有收益：
+  - 保持正确输出。
+  - 减少线性层 state cache 内存。
+  - decode 速度提升到约 55 tokens/s。
+- mutable-buffer export 实验已经完成并保留结论，但相关代码已回退：
+  - correctness 可以做对。
+  - 速度不如当前 non-mutable + runtime in-place 路径。
+  - 后续只有在做 fused/custom DeltaNet state update 时才建议重新打开。
+
+环境规则
+--------
+- 所有命令先进入环境：
+
+  ```bash
+  source /home/hunter/anaconda3/etc/profile.d/conda.sh && conda activate et_npu && source env.sh && ...
+  ```
+
+- 当前 QNN SDK 版本由 `env.sh` 提供，为 QNN 2.45。
+- 手机序列号：`3B15AK00GLW00000`。
+- 启动新导出前必须先检查是否已有导出进程：
+
+  ```bash
+  ps -eo pid,ppid,stat,etime,cmd | rg 'examples/qualcomm/oss_scripts/llama/llama.py' | rg -v 'rg ' || true
+  ```
+
+- 如果已有导出进程，不要再启动新的导出；只记录命令，等已有导出结束。
+- 测试日志和导出产物目录是临时文件，不应写入本文档的具体路径。
+
+原始适配计划
+------------
+- 注册并适配 `qwen3_5-0_8b`。
+- 接入 Qwen3.5 text decoder：
+  - DeltaNet linear-attention。
+  - Qwen35 RMSNorm / gated RMSNorm。
+  - M-RoPE。
+  - `Qwen35ModelWithoutEmbedding`。
+- 接入 Qwen35 vision encoder/config/quant recipe。
+- 添加 Qwen3.5 quant recipe：
+  - 增加 `Qwen3_5_0_8BQuantRecipeSpeed`。
+  - speed recipe 中 `output.conv` 使用 `QuantDtype.use_16a8w`。
+  - 不修改 logits bitwidth 策略。
+- Runtime cache 行为：
+  - `kAppend`：full-attention KV append/update。
+  - `kCircular`：true-SWA circular update。
+  - `kFullOverwrite`：linear-attention state 全量覆盖旧 state。
+- 测试策略：
+  - 不直接修改原始 Qwen3.5 配置文件。
+  - 层数测试使用临时 params JSON。
+  - 先测 `embedding + 3 linear_attention + 1 full_attention + lm_head`。
+  - 再加一个 `3+1` block。
+  - 对比 FP32、CPU QDQ、QNN 的 lm_head logits SQNR。
+  - 先稳定 `kv`，再稳定 `hybrid`。
+
+已经完成的功能
+--------------
+- Python/export 侧：
+  - Qwen3.5 model 注册。
+  - Qwen35 RMSNorm、gated RMSNorm。
+  - Qwen35 DeltaNet linear-attention。
+  - Qwen35 decoder layer。
+  - M-RoPE position 处理。
+  - Qwen35 vision encoder/config。
+  - Qwen3.5 multimodal tokenizer special-token 映射。
+  - Qwen3.5 vision patch preprocessing。
+- 量化侧：
+  - 增加 Qwen3.5 speed recipe。
+  - `output.conv` 设置为 `use_16a8w`。
+  - 移除固定 logits qparam override。
+  - logits scale/zp 由导出时的 PTQ/convert 流程计算。
+- KV/cache qparam：
+  - 收集 cache input 的 quantize qparam。
+  - 对齐 decode cache output qparam 到 decode cache input qparam。
+  - 对齐 hybrid prefill cache input/output qparam 到 decode input qparam。
+  - runtime 按每个 cache tensor 的 zero point 初始化 uint16 cache buffer。
+  - Qwen3.5 缺失 cache qparam metadata 时直接报错，不再 silent fallback 到 0。
+- Runtime：
+  - 增加 `kAppend`、`kCircular`、`kFullOverwrite` cache update 语义。
+  - Qwen3.5 linear-attention state 使用 `kFullOverwrite`。
+  - `kFullOverwrite` input/output 可以共享 backing buffer。
+  - RpcMem/shared-buffer 按每次 allocation 做 4KB 对齐计数。
+- DeltaNet 图优化：
+  - 当前仓库已接入 linear qkv/z fused projection。
+  - 当前仓库已接入 causal conv2d 替换原 causal Conv1d/手写窗口求和。
+  - 导出前会自动准备 fused projection 和 causal conv2d。
+  - Quant recipe 已显式将转换后的 `causal_conv2d` 按 16a8w per-channel
+    量化。
+- Runner 作用域：
+  - Qwen3.5 VLM 逻辑保留在 multimodal runner。
+  - text-only runner 中的 Qwen3.5 VLM 分支已收回。
+
+关键测试矩阵
+------------
+
+| 场景 | 结果 | 备注 |
+| --- | --- | --- |
+| 第一组 `3+1` block 导出 | 通过 | 使用临时 params JSON |
+| 第一组 `3+1` block 运行 | 通过 | 截断模型达到 seq limit 是预期现象 |
+| 第一组 `3+1` block SQNR | QDQ 与 QNN 对齐，FP32 差 | 量化 recipe 对截断模型较激进 |
+| 两组 `3+1` block 导出 | 通过 | 使用临时 params JSON |
+| 两组 `3+1` block 运行 | 通过 | 截断模型达到 seq limit 是预期现象 |
+| 两组 `3+1` block SQNR | QDQ 与 QNN 对齐，FP32 差 | 问题主要在 FP32 到 QDQ |
+| 早期 full kv | 失败质量 | 出现重复/乱码模式 |
+| full kv + QNN 2.45 + cache zp | 通过 | 正常中文 |
+| full kv + required metadata | 通过 | 正常中文，缺 metadata 不再 fallback |
+| hybrid ar8，未做 cross-graph qparam 对齐 | 失败质量 | 出现非法 UTF-8 |
+| hybrid ar8，完成 cross-graph qparam 对齐 | 通过 | 正常中文 |
+| hybrid ar8 + SHA + temperature 0 | 通过 | 正常中文，速度明显提升 |
+| hybrid ar8 + max_seq_len=256 + temperature 0 复测 | 通过 | 正常中文，输出文件为合法 UTF-8 |
+| 旧 hybrid b128 context4096 PTE，运行限制到 256 + temperature 0 | 失败质量 | 仍从首 token 开始乱码，说明不是生成长度导致 |
+| SM8750 context2048 b128 PTE direct KV 复测 | 失败质量 | 同一份 PTE 走 kv_forward 也从首 token 开始乱码 |
+| hybrid SHA + runtime in-place | 通过 | cache 内存下降，decode 速度提升 |
+| hybrid SHA + aligned RpcMem sizing | 通过 | 无 RpcMem overflow，无注册错误 |
+| runtime alias benchmark | 有收益但非最终结论 | cache update 时间显著下降 |
+| mutable-buffer export full-anchor | 正确但慢 | 已作为实验记录归档 |
+| mutable-buffer export full-copyalias | 正确但慢 | 已作为实验记录归档 |
+
+关键数值
+--------
+
+SQNR
+~~~~
+- 第一组 `3+1` block：
+  - FP32 vs QNN logits SQNR：1.887378 dB。
+  - CPU QDQ vs QNN logits SQNR：18.293079 dB。
+  - FP32 vs CPU QDQ logits SQNR：1.877025 dB。
+- 两组 `3+1` block：
+  - FP32 vs QNN logits SQNR：0.807635 dB。
+  - CPU QDQ vs QNN logits SQNR：18.053808 dB。
+  - FP32 vs CPU QDQ logits SQNR：0.789265 dB。
+- 解释：
+  - QNN 与导出的 QDQ 图基本对齐。
+  - 当前 speed recipe 对截断 block 的 FP32 到 QDQ 精度损失较大。
+
+KV / Hybrid 性能
+~~~~~~~~~~~~~~~~
+- full kv + required metadata：
+  - Prompt tokens：214。
+  - Generated tokens：41。
+  - Prompt evaluation：56.870 tokens/s。
+  - Decode：39.614 tokens/s。
+  - Total inference：8.545 tokens/s。
+- hybrid ar8，未做 cross-graph qparam 对齐：
+  - Prompt evaluation：149.441 tokens/s。
+  - Decode：28.512 tokens/s。
+  - 输出 UTF-8 decode 失败。
+- hybrid ar8，完成 cross-graph qparam 对齐：
+  - Prompt evaluation：135.959 tokens/s。
+  - Decode：28.217 tokens/s。
+  - 输出正常中文。
+- hybrid ar8 + SHA + temperature 0：
+  - Prompt evaluation：147.484 tokens/s。
+  - Decode：46.750 tokens/s。
+  - Total inference：17.612 tokens/s。
+- hybrid ar8 + max_seq_len=256 + temperature 0 复测：
+  - Prompt tokens：214。
+  - Generated tokens：41。
+  - Prompt evaluation：165.379 tokens/s。
+  - Decode：65.705 tokens/s。
+  - Total inference：21.376 tokens/s。
+  - 输出文件为合法 UTF-8，内容为正常中文描述；由于 max_seq_len=256，
+    生成到上限后截断，未命中 EOS。
+- 旧 hybrid b128 context4096 PTE，运行限制到 256 + temperature 0：
+  - Prompt tokens：214。
+  - Generated tokens：41。
+  - Prompt evaluation：198.885 tokens/s。
+  - Decode：12.087 tokens/s。
+  - 输出文件为合法 UTF-8，但内容从第一个生成 token 开始就是乱码。
+  - 结论：问题不是运行时 seq_len=4096 或随机采样导致，而是这份 PTE
+    自身的导出图、AR128 路径或导出时 qparam 状态不正确。
+- SM8750 context2048 b128 PTE direct KV 复测：
+  - 使用同一份 hybrid PTE 的 `kv_forward`，runner 侧 `eval_mode=0`。
+  - Prompt tokens：214。
+  - Generated tokens：809。
+  - Prompt evaluation：16.740 tokens/s。
+  - Decode：16.713 tokens/s。
+  - 输出包含非法 UTF-8/乱码。
+  - 结论：问题不只在 hybrid prefill/cache cross-graph；这份 PTE 的
+    `kv_forward` 本身也不正确。
+- hybrid SHA + runtime in-place + aligned RpcMem：
+  - Prompt evaluation：146.776 tokens/s。
+  - Decode：55.858 tokens/s。
+  - Total inference：18.704 tokens/s。
+  - 静态 buffer 总量：34.50 MiB。
+
+Linear qkv/z 融合优化记录
+~~~~~~~~~~~~~~~~~~~~~~~~~
+- 优化含义：
+  - 将 linear-attention 中的 qkv 和 z 相关投影合并，减少图内碎片和调度开销。
+  - 与 causal conv2d、runtime inplace state 配合时，正常图上有明确收益。
+- Full no-lmhead speed：
+
+  | 路径 | decoder step ms/token | decode tokens/s | prompt eval tokens/s |
+  | --- | ---: | ---: | ---: |
+  | historical baseline | 12.463415 | 73.608618 | 72.321730 |
+  | qkv_z | 12.048780 | 76.066790 | 76.840215 |
+  | qkv_z + causal_conv2d | 11.268293 | 81.188119 | 84.518167 |
+
+- Normal image generation speed：
+
+  | 路径 | 设备 | 输出 | decoder step ms/token | decode tokens/s | prompt eval tokens/s |
+  | --- | --- | --- | ---: | ---: | ---: |
+  | baseline commit | SM8750 | 正常中文 | 16.756098 | 43.340381 | 48.165654 |
+  | qkv_z + causal_conv2d float core | SM8750 | 正常中文 | 15.341463 | 56.396149 | 57.604307 |
+  | qkv_z + causal_conv2d + bmm | SM8850 | 乱码 | 11.829268 | 72.438163 | 75.832743 |
+  | qkv_z + causal_conv2d + runtime inplace state | SM8850 | 正常中文 | 11.926829 | 77.798861 | 83.139083 |
+
+- 结论：
+  - qkv_z 与 causal conv2d 对 no-lmhead 路径稳定提速。
+  - bmm 路径虽然速度高，但输出乱码，不能作为默认正确路径。
+  - 当前正常中文且速度最好的记录是 qkv_z + causal_conv2d +
+    runtime inplace state。
+
+Mutable-buffer 实验
+~~~~~~~~~~~~~~~~~~~
+- 实验目的：
+  - 验证 QNN delegated mutable buffer 能否在图内部保存 Qwen3.5 linear state。
+  - 尝试减少 recurrent state IO/copy 成本。
+- correctness 结论：
+  - 通过 dynamic anchor 或 full-buffer `copy_`，QDQ/QNN state retention 可以做对。
+  - 连续 `kv_forward` 和 fresh `kv_forward` 的 raw logits 不同，说明 QNN 确实保留了 state。
+- 性能结论：
+  - 正确版本比当前 non-mutable runtime in-place 路径慢。
+  - full-anchor 版本生成 41 tokens 约 1.056s。
+  - full-copyalias 版本生成 41 tokens 约 1.023s。
+  - 都低于当前 hybrid SHA runtime in-place 路径。
+- 最终决策：
+  - mutable-buffer 测试结论保留。
+  - mutable-buffer 相关代码和接口已从当前默认代码中回退。
+  - 后续只有在做 fused/custom DeltaNet state update 时才建议重新引入。
+
+关键问题与修复
+--------------
+
+KV qparam 对齐
+~~~~~~~~~~~~~~
+- 问题：
+  - 早期导出中 cache input/output qparam 不一致。
+  - hybrid prefill output 与 decode input qparam 不一致。
+- 修复：
+  - decode 图内部 cache output 对齐到 decode cache input。
+  - hybrid 中 prefill cache input/output 对齐到 decode input。
+- 结果：
+  - full kv 输出恢复正常中文。
+  - hybrid ar8 从非法 UTF-8/乱码恢复为正常中文。
+
+Cache zero point 初始化
+~~~~~~~~~~~~~~~~~~~~~~~
+- 问题：
+  - uint16 cache buffer 被当成 raw zero 初始化，但 raw zero 不是量化零点。
+- 修复：
+  - 导出每个 cache input 的 scale/zp。
+  - runtime 使用对应 zp 初始化和 reset cache。
+  - 缺少 metadata 时直接报错。
+- 结果：
+  - 早期重复/乱码模式消失。
+
+SHA vs MHA
+~~~~~~~~~~
+- MHA hybrid 在 qparam 对齐后可以正常输出，但 decode 慢。
+- SHA hybrid + temperature 0 仍然正常输出，decode 明显提升。
+- 当前推荐 hybrid SHA。
+
+Runtime in-place FullOverwrite
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+- `kFullOverwrite` state input/output 共享 backing buffer。
+- input/output 已 alias 时，update 退化为 no-op。
+- full-attention KV append 和 true-SWA circular 不变。
+- 结果：
+  - static kv cache 从约 45.54 MiB 降到约 25.85 MiB。
+  - decode 从约 46.750 tokens/s 提升到约 57.504 tokens/s。
+  - aligned RpcMem 后总静态 buffer 为 34.50 MiB。
+
+仍需关注
+--------
+- 当前 speed recipe 下，截断 block 的 FP32 vs QDQ SQNR 较低。
+- QNN compile 中仍可能出现非 fatal 诊断：
+  - `scale too large for requant qu16->qu16`
+  - `wtshare_operation.cc:1057::ERROR:small.is_shared()`
+- 需要一个维护良好的 multimodal SQNR 工具，用于比较：
+  `tok_embedding + decoder norm + lm_head logits`。
+- Python import smoke test 之前被依赖问题挡住，需要在正确环境中重跑。
+
+命令模板
+--------
+
+导出前检查
+~~~~~~~~~~
+```bash
+source /home/hunter/anaconda3/etc/profile.d/conda.sh && conda activate et_npu && source env.sh && \
+ps -eo pid,ppid,stat,etime,cmd | rg 'examples/qualcomm/oss_scripts/llama/llama.py' | rg -v 'rg ' || true
+```
+
+Full KV 导出模板
+~~~~~~~~~~~~~~~~
+```bash
+source /home/hunter/anaconda3/etc/profile.d/conda.sh && conda activate et_npu && source env.sh && \
+python examples/qualcomm/oss_scripts/llama/llama.py \
+  -b build-android \
+  -m SM8850 \
+  --artifact <导出目录> \
+  --decoder_model qwen3_5-0_8b \
+  --model_mode kv \
+  --prefill_ar_len 4 \
+  --max_seq_len 256 \
+  --prompt "描述一下这张图片" \
+  --image_path "/home/hunter/下载/test.jpg" \
+  --compile_only \
+  > <导出日志文件> 2>&1
+```
+
+Full KV 运行模板
+~~~~~~~~~~~~~~~~
+```bash
+source /home/hunter/anaconda3/etc/profile.d/conda.sh && conda activate et_npu && source env.sh && \
+python examples/qualcomm/oss_scripts/llama/llama.py \
+  -b build-android \
+  -m SM8850 \
+  -s 3B15AK00GLW00000 \
+  --artifact <运行输出目录> \
+  --decoder_model qwen3_5-0_8b \
+  --model_mode kv \
+  --prefill_ar_len 4 \
+  --max_seq_len 256 \
+  --prompt "描述一下这张图片" \
+  --image_path "/home/hunter/下载/test.jpg" \
+  --pre_gen_pte <已导出目录> \
+  > <运行日志文件> 2>&1
+```
+
+Hybrid SHA AR8 导出模板
+~~~~~~~~~~~~~~~~~~~~~~~
+```bash
+source /home/hunter/anaconda3/etc/profile.d/conda.sh && conda activate et_npu && source env.sh && \
+python examples/qualcomm/oss_scripts/llama/llama.py \
+  -b build-android \
+  -m SM8850 \
+  --artifact <导出目录> \
+  --decoder_model qwen3_5-0_8b \
+  --model_mode hybrid \
+  --prefill_ar_len 8 \
+  --max_seq_len 256 \
+  --temperature 0 \
+  --prompt "描述一下这张图片" \
+  --image_path "/home/hunter/下载/test.jpg" \
+  --compile_only \
+  > <导出日志文件> 2>&1
+```
+
+Hybrid SHA AR8 运行模板
+~~~~~~~~~~~~~~~~~~~~~~~
+```bash
+source /home/hunter/anaconda3/etc/profile.d/conda.sh && conda activate et_npu && source env.sh && \
+python examples/qualcomm/oss_scripts/llama/llama.py \
+  -b build-android \
+  -m SM8850 \
+  -s 3B15AK00GLW00000 \
+  --artifact <运行输出目录> \
+  --decoder_model qwen3_5-0_8b \
+  --model_mode hybrid \
+  --prefill_ar_len 8 \
+  --max_seq_len 256 \
+  --temperature 0 \
+  --prompt "描述一下这张图片" \
+  --image_path "/home/hunter/下载/test.jpg" \
+  --pre_gen_pte <已导出目录> \
+  > <运行日志文件> 2>&1
+```
+
+重新编译 runner
+~~~~~~~~~~~~~~~
+```bash
+source /home/hunter/anaconda3/etc/profile.d/conda.sh && conda activate et_npu && source env.sh && \
+cmake --build build-android/examples/qualcomm --target qnn_llama_runner qnn_multimodal_runner -j2
+```
+
+基础验证
+~~~~~~~~
+```bash
+source /home/hunter/anaconda3/etc/profile.d/conda.sh && conda activate et_npu && source env.sh && \
+git diff --check
+```
+
+下一步建议
+----------
+- 默认继续使用 non-mutable multimodal runtime 路径。
+- smoke test 主路径使用 `hybrid + SHA + ar8 + max_seq_len=256`。
+- 补一个稳定的 multimodal SQNR 工具，比较 lm_head logits。
+- 如果要继续提升 FP32 对齐质量，优先调 quant recipe。
+- 如果要继续做 linear state 大幅提速，再考虑 fused/custom DeltaNet state
+  update；不要把旧 mutable-buffer API 作为默认路径重新引入。

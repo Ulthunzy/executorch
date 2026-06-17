@@ -1,0 +1,77 @@
+python examples/qualcomm/oss_scripts/llama/llama.py \
+  -b build-android \
+  -m SM8850 \
+  -s 3B15AK00GLW00000 \
+  --decoder_model qwen3_5-0_8b \
+  --model_mode kv \
+  --prefill_ar_len 1 \
+  --max_seq_len 1024 \
+  --prompt "讲个500字的故事" \
+  --pre_gen_pte ./llama-output/qwen3_5-0_8b-m1024-kv-SM8850 \
+  --temperature 0 \
+  > run.log-0602-qwen3_5-0_8b-m1024-kv-SM8850-run.txt 2>&1
+
+python examples/qualcomm/oss_scripts/llama/llama.py \
+  -b build-android \
+  -m SM8850 \
+  -s 3B15AK00GLW00000 \
+  --decoder_model qwen3_5-0_8b \
+  --model_mode kv \
+  --prefill_ar_len 1 \
+  --max_seq_len 1024 \
+  --prompt "讲个500字的故事" \
+  --pre_gen_pte ./llama-output/qwen3_5-0_8b-m2048-kv-SM8850 \
+  --temperature 0 \
+  > run.log-0602-qwen3_5-0_8b-m2048-kv-SM8850-run.txt 2>&1
+
+python examples/qualcomm/oss_scripts/llama/llama.py \
+  -b build-android \
+  -m SM8850 \
+  -s 3B15AK00GLW00000 \
+  --decoder_model qwen3_5-0_8b \
+  --model_mode kv \
+  --prefill_ar_len 1 \
+  --max_seq_len 1024 \
+  --prompt "讲个500字的故事" \
+  --pre_gen_pte ./llama-output/qwen3_5-0_8b-m4096-kv-SM8850 \
+  --temperature 0 \
+  > run.log-0602-qwen3_5-0_8b-m4096-kv-SM8850-run.txt 2>&1
+
+python examples/qualcomm/oss_scripts/llama/llama.py \
+  -b build-android \
+  -m SM8850 \
+  -s 3B15AK00GLW00000 \
+  --decoder_model qwen3-0_6b \
+  --model_mode kv \
+  --prefill_ar_len 1 \
+  --max_seq_len 1024 \
+  --prompt "讲个500字的故事" \
+  --pre_gen_pte ./llama-output/qwen3-0_6b-m1024-kv-SM8850 \
+  --temperature 0 \
+  > run.log-0602-qwen3-0_6b-m1024-kv-SM8850-run.txt 2>&1
+
+python examples/qualcomm/oss_scripts/llama/llama.py \
+  -b build-android \
+  -m SM8850 \
+  -s 3B15AK00GLW00000 \
+  --decoder_model qwen3-0_6b \
+  --model_mode kv \
+  --prefill_ar_len 1 \
+  --max_seq_len 1024 \
+  --prompt "讲个500字的故事" \
+  --pre_gen_pte ./llama-output/qwen3-0_6b-m2048-kv-SM8850 \
+  --temperature 0 \
+  > run.log-0602-qwen3-0_6b-m2048-kv-SM8850-run.txt 2>&1
+
+python examples/qualcomm/oss_scripts/llama/llama.py \
+  -b build-android \
+  -m SM8850 \
+  -s 3B15AK00GLW00000 \
+  --decoder_model qwen3-0_6b \
+  --model_mode kv \
+  --prefill_ar_len 1 \
+  --max_seq_len 1024 \
+  --prompt "讲个500字的故事" \
+  --pre_gen_pte ./llama-output/qwen3-0_6b-m4096-kv-SM8850 \
+  --temperature 0 \
+  > run.log-0602-qwen3-0_6b-m4096-kv-SM8850-run.txt 2>&1

@@ -114,3 +114,11 @@ transformers_test.py
 
 .claude/skills/hunter-qualcomm-refresh
 .claude/skills/hunter-qualcomm-merge
+
+examples/qualcomm/oss_scripts/llama/qwen35_adaptation_status.txt
+
+test.sh
+export.sh
+
+export.log-*
+examples/qualcomm/oss_scripts/llama/qwen35_qualcomm_adaptation_ppt_outline.txt

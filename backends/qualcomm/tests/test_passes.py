@@ -102,6 +102,62 @@ class TestPasses(unittest.TestCase):
         # one quantize (input) and one dequantize (output) = +2 nodes.
         self.assertEqual(node_count_after, node_count_before + 2)
 
+    def test_llama_attention_mask_tag_uses_placeholder_name(self):
+        import types
+
+        from executorch.examples.qualcomm.oss_scripts.llama.wrappers.llm_wrappers import (
+            TextDecoder,
+        )
+
+        class FakeNode:
+            def __init__(self, name, shape):
+                self.name = name
+                self.target = name
+                self.op = "placeholder"
+                self.users = {}
+                self.meta = {"val": torch.empty(shape)}
+
+        decoder = object.__new__(TextDecoder)
+        decoder.control_args = types.SimpleNamespace(
+            decoder_model="test_model",
+            enable_true_swa=False,
+        )
+        decoder.cache_io_shape = set()
+        decoder.kv_cache_shape = set()
+        decoder.io_shape = set()
+        fixed_point_type = {"io_type": torch.uint16, "kv_type": torch.uint8}
+
+        for max_batch_size, ar_len, hidden_dim, head_dim in (
+            (1, 1, 128, 32),
+            (1, 4, 256, 64),
+            (2, 8, 512, 128),
+        ):
+            with self.subTest(
+                max_batch_size=max_batch_size,
+                ar_len=ar_len,
+                hidden_dim=hidden_dim,
+            ):
+                decoder.meta = {
+                    "get_max_batch_size": max_batch_size,
+                    "get_ar_len": ar_len,
+                    "get_max_context_len": hidden_dim,
+                    "get_max_seq_len": hidden_dim,
+                    "get_head_dim": head_dim,
+                }
+                shape = (max_batch_size, ar_len, hidden_dim)
+
+                self.assertIsNone(
+                    TextDecoder._tag_ios(
+                        decoder, FakeNode("hidden_states", shape), fixed_point_type
+                    )
+                )
+                self.assertEqual(
+                    TextDecoder._tag_ios(
+                        decoder, FakeNode("atten_mask", shape), fixed_point_type
+                    ),
+                    torch.uint16,
+                )
+
     def test_insert_reshape_for_argmax(self):
         class ArgmaxModule(torch.nn.Module):
             def forward(self, x):

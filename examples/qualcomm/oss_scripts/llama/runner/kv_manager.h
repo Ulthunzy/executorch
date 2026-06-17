@@ -8,6 +8,7 @@
 
 #pragma once
 #include <executorch/examples/qualcomm/oss_scripts/llama/runner/imem_alloc.h>
+#include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <vector>
@@ -29,12 +30,29 @@ template <typename T>
 class KVManager {
  public:
   struct Metadata {
+    enum CacheUpdateMode {
+      kAppend,
+      kCircular,
+      kFullOverwrite,
+    };
+
+    struct CacheSpec {
+      size_t k_input_bytes;
+      size_t k_output_bytes;
+      size_t v_input_bytes;
+      size_t v_output_bytes;
+      CacheUpdateMode update_mode;
+      int32_t k_zero_point = 0;
+      int32_t v_zero_point = 0;
+    };
+
     int32_t context_len;
     int64_t head_dim;
     int32_t max_ar_len;
     int32_t max_cache_len;
     int64_t num_heads;
     int64_t num_layers;
+    std::vector<CacheSpec> cache_specs;
   };
   KVManager(Metadata metadata);
 
@@ -263,6 +281,11 @@ class KVManager {
       int32_t n_past,
       int32_t n_update,
       const std::vector<int32_t>& selected_indices);
+
+  void update_full_overwrite_cache(
+      const KVCache<T>& k_cache,
+      const KVCache<T>& v_cache,
+      int32_t layer);
 
   void update_key_swa(
       KVCache<T>& k_cache,

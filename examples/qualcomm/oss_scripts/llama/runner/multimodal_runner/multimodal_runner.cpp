@@ -25,6 +25,7 @@
 #include <pytorch/tokenizers/hf_tokenizer.h>
 #include <pytorch/tokenizers/llama2c_tokenizer.h>
 #include <algorithm>
+#include <cmath>
 #include <fstream>
 
 #if defined(__aarch64__)
@@ -43,6 +44,7 @@ using executorch::extension::llm::time_in_ms;
 using executorch::runtime::Error;
 using executorch::runtime::MethodMeta;
 using executorch::runtime::Result;
+using executorch::runtime::TensorInfo;
 namespace llm = ::executorch::extension::llm;
 
 namespace example {
@@ -90,6 +92,81 @@ void save_logits(
   } else {
     ET_CHECK_MSG(false, "Error saving the dump logits file");
   }
+}
+
+int32_t get_position_id_dim(
+    const Result<MethodMeta>& method_meta,
+    size_t input_pos_idx,
+    int32_t ar_len) {
+  if (!method_meta.ok() || ar_len <= 0) {
+    return 1;
+  }
+  Result<TensorInfo> input_pos = method_meta->input_tensor_meta(input_pos_idx);
+  if (!input_pos.ok()) {
+    return 1;
+  }
+  const size_t base_bytes = static_cast<size_t>(ar_len) * sizeof(int32_t);
+  if (base_bytes == 0 || input_pos->nbytes() % base_bytes != 0) {
+    return 1;
+  }
+  return static_cast<int32_t>(input_pos->nbytes() / base_bytes);
+}
+
+bool is_qwen35_vlm(const ModelVersion& model_version) {
+  const auto* vlm = std::get_if<VisionLanguageModel>(&model_version);
+  return vlm != nullptr && *vlm == VisionLanguageModel::kQwen3_5;
+}
+
+int32_t read_required_int_metadata(
+    Module* module,
+    const std::string& method_name) {
+  ET_CHECK_MSG(
+      module->method_names()->count(method_name) != 0,
+      "Required metadata %s is missing from Qwen3.5 PTE",
+      method_name.c_str());
+  auto value = module->get(method_name.c_str());
+  ET_CHECK_MSG(
+      value.ok(),
+      "Failed to read required metadata %s from Qwen3.5 PTE",
+      method_name.c_str());
+  return static_cast<int32_t>(value.get().toScalar().to<int64_t>());
+}
+
+void append_text_position_ids(
+    std::vector<int32_t>& position_ids,
+    int32_t position_id_dim,
+    int32_t& rope_pos,
+    int32_t num_tokens) {
+  for (int32_t i = 0; i < num_tokens; ++i) {
+    for (int32_t dim = 0; dim < position_id_dim; ++dim) {
+      position_ids.push_back(rope_pos + i);
+    }
+  }
+  rope_pos += num_tokens;
+}
+
+void append_qwen35_image_position_ids(
+    std::vector<int32_t>& position_ids,
+    int32_t position_id_dim,
+    int32_t& rope_pos,
+    int32_t num_tokens) {
+  const int32_t grid = static_cast<int32_t>(std::sqrt(num_tokens));
+  ET_CHECK_MSG(
+      grid * grid == num_tokens,
+      "Qwen3.5 image token count (%d) must form a square grid.",
+      num_tokens);
+  for (int32_t h = 0; h < grid; ++h) {
+    for (int32_t w = 0; w < grid; ++w) {
+      position_ids.push_back(rope_pos);
+      if (position_id_dim > 1) {
+        position_ids.push_back(rope_pos + h);
+      }
+      if (position_id_dim > 2) {
+        position_ids.push_back(rope_pos + w);
+      }
+    }
+  }
+  rope_pos += grid;
 }
 
 } // namespace
@@ -144,6 +221,8 @@ QNNMultimodalRunner<T>::QNNMultimodalRunner(
   } else if (
       model_version == "qwen2_5_vl" || model_version == "lincal_vl") {
     model_version_ = VisionLanguageModel::kQwen2_5_VL;
+  } else if (model_version == "qwen3_5") {
+    model_version_ = VisionLanguageModel::kQwen3_5;
   } else {
     ET_CHECK_MSG(false, "Unsupported Decoder Model");
   }
@@ -213,7 +292,8 @@ Error QNNMultimodalRunner<T>::load() {
       eos_ids->insert(tokenizer_->encode("<end_of_utterance>", 0, 0).get()[0]);
     } else if (
         *vlm == VisionLanguageModel::kInternvl3 ||
-        *vlm == VisionLanguageModel::kQwen2_5_VL) {
+        *vlm == VisionLanguageModel::kQwen2_5_VL ||
+        *vlm == VisionLanguageModel::kQwen3_5) {
       eos_ids->insert(tokenizer_->encode("<|im_end|>", 0, 0).get()[0]);
     }
   } else if (
@@ -225,6 +305,8 @@ Error QNNMultimodalRunner<T>::load() {
 
   Result<MethodMeta> method_meta =
       text_decoder_->method_meta(token_generator_method_name);
+  Result<MethodMeta> prompt_method_meta =
+      text_decoder_->method_meta(prompt_processor_method_name);
 
   // For some tokenizer.json, runtime vocab_size might be different, use output
   // shape to get vocab size.
@@ -244,10 +326,23 @@ Error QNNMultimodalRunner<T>::load() {
       ET_UNWRAP(text_decoder_->get("get_n_layers")).toScalar().to<int64_t>();
 
   ET_CHECK_MSG(num_layers != -1, "Could not retrieve num layers");
-  // k_cache: [1, n_heads, head_dim, seq_len]
-  auto k_cache_shape = method_meta->output_tensor_meta(1)->sizes();
-  int64_t num_heads = k_cache_shape[1];
-  int64_t head_dim = k_cache_shape[2];
+  int64_t num_heads = 0;
+  int64_t head_dim = 0;
+  if (is_qwen35_vlm(model_version_) &&
+      text_decoder_->method_names()->count("get_n_kv_heads") > 0 &&
+      text_decoder_->method_names()->count("get_head_dim") > 0) {
+    num_heads = ET_UNWRAP(text_decoder_->get("get_n_kv_heads"))
+                    .toScalar()
+                    .to<int64_t>();
+    head_dim = ET_UNWRAP(text_decoder_->get("get_head_dim"))
+                   .toScalar()
+                   .to<int64_t>();
+  } else {
+    // k_cache: [1, n_heads, head_dim, seq_len]
+    auto k_cache_shape = method_meta->output_tensor_meta(1)->sizes();
+    num_heads = k_cache_shape[1];
+    head_dim = k_cache_shape[2];
+  }
 
   // hidden_state: [1, ar_len, dim]
   int64_t dim = tok_embedding_->method_meta(tok_embedding_method_name)
@@ -273,9 +368,7 @@ Error QNNMultimodalRunner<T>::load() {
   } else if (
       eval_mode_ == EvalMode::kHybrid ||
       eval_mode_ == EvalMode::kLookaheadDecoding) {
-    auto atten_mask_meta_prompt =
-        text_decoder_->method_meta(prompt_processor_method_name)
-            ->input_tensor_meta(1);
+    auto atten_mask_meta_prompt = prompt_method_meta->input_tensor_meta(1);
     prompt_processor_ar_len = atten_mask_meta_prompt->sizes()[1];
   }
   if (prompt_processor_ar_len == context_len_)
@@ -284,6 +377,79 @@ Error QNNMultimodalRunner<T>::load() {
     max_cache_len = context_len_ -
         std::min(token_generator_ar_len, prompt_processor_ar_len);
   max_ar_len = std::max(token_generator_ar_len, prompt_processor_ar_len);
+
+  const size_t input_pos_idx = cache_mode_ == CacheMode::HybridCache ? 3 : 2;
+  const int32_t token_position_id_dim =
+      get_position_id_dim(method_meta, input_pos_idx, token_generator_ar_len);
+  const int32_t prompt_position_id_dim = get_position_id_dim(
+      prompt_method_meta, input_pos_idx, prompt_processor_ar_len);
+  ET_CHECK_MSG(
+      token_position_id_dim == prompt_position_id_dim,
+      "Prompt/token position id dim mismatch: %d vs %d",
+      prompt_position_id_dim,
+      token_position_id_dim);
+  position_id_dim_ = prompt_position_id_dim;
+
+  std::vector<typename KVManager<T>::Metadata::CacheSpec> cache_specs;
+  if (is_qwen35_vlm(model_version_)) {
+    using CacheSpec = typename KVManager<T>::Metadata::CacheSpec;
+    cache_specs.resize(
+        num_layers,
+        CacheSpec{0, 0, 0, 0, KVManager<T>::Metadata::kAppend});
+
+    for (const std::string& method_name : method_names) {
+      Result<MethodMeta> cache_method_meta =
+          text_decoder_->method_meta(method_name);
+      if (!cache_method_meta.ok()) {
+        ET_LOG(
+            Error,
+            "Failed to fetch method metadata for %s",
+            method_name.c_str());
+        return Error::Internal;
+      }
+
+      const size_t input_cache_start =
+          cache_method_meta->num_inputs() - 2 * static_cast<size_t>(num_layers);
+      for (int64_t layer = 0; layer < num_layers; ++layer) {
+        Result<TensorInfo> k_in = cache_method_meta->input_tensor_meta(
+            input_cache_start + static_cast<size_t>(layer));
+        Result<TensorInfo> v_in = cache_method_meta->input_tensor_meta(
+            input_cache_start + static_cast<size_t>(num_layers + layer));
+        Result<TensorInfo> k_out = cache_method_meta->output_tensor_meta(
+            1 + static_cast<size_t>(layer));
+        Result<TensorInfo> v_out = cache_method_meta->output_tensor_meta(
+            1 + static_cast<size_t>(num_layers + layer));
+        if (!k_in.ok() || !v_in.ok() || !k_out.ok() || !v_out.ok()) {
+          ET_LOG(
+              Error,
+              "Failed to fetch cache tensor metadata for %s layer %lld",
+              method_name.c_str(),
+              static_cast<long long>(layer));
+          return Error::Internal;
+        }
+
+        auto& spec = cache_specs[layer];
+        spec.k_input_bytes = std::max(spec.k_input_bytes, k_in->nbytes());
+        spec.v_input_bytes = std::max(spec.v_input_bytes, v_in->nbytes());
+        spec.k_output_bytes = std::max(spec.k_output_bytes, k_out->nbytes());
+        spec.v_output_bytes = std::max(spec.v_output_bytes, v_out->nbytes());
+
+        const bool same_size_cache =
+            k_in->nbytes() == k_out->nbytes() &&
+            v_in->nbytes() == v_out->nbytes();
+        if (same_size_cache) {
+          spec.update_mode = KVManager<T>::Metadata::kFullOverwrite;
+        }
+        spec.k_zero_point = read_required_int_metadata(
+            text_decoder_.get(),
+            "get_kv_input_" + std::to_string(layer) + "_zero_point");
+        spec.v_zero_point = read_required_int_metadata(
+            text_decoder_.get(),
+            "get_kv_input_" + std::to_string(num_layers + layer) +
+                "_zero_point");
+      }
+    }
+  }
 
   // Initialize Encoder
   encoder_runner_ = std::make_unique<EncoderRunner>(encoder_.get());
@@ -328,7 +494,8 @@ Error QNNMultimodalRunner<T>::load() {
       max_ar_len,
       max_cache_len,
       num_heads,
-      num_layers});
+      num_layers,
+      std::move(cache_specs)});
 
   prompt_processor_ = std::make_unique<MultimodalPromptProcessor<T>>(
       decoder_runner_.get(),
@@ -343,7 +510,8 @@ Error QNNMultimodalRunner<T>::load() {
           use_int64_token,
           sliding_window,
           cache_mode_,
-          static_cast<int32_t>(dim)});
+          static_cast<int32_t>(dim),
+          position_id_dim_});
 
   // Initialize EmbeddingGenerator
   tok_embedding_generator_ = std::make_unique<TokenEmbeddingProcessor>(
@@ -376,7 +544,8 @@ Error QNNMultimodalRunner<T>::load() {
             gcap_,
             sliding_window,
             cache_mode_,
-            static_cast<int32_t>(dim)},
+            static_cast<int32_t>(dim),
+            position_id_dim_},
         &stats_);
   } else {
     token_generator_ = std::make_unique<MultimodalTokenGenerator<T>>(
@@ -395,7 +564,8 @@ Error QNNMultimodalRunner<T>::load() {
             use_int64_token,
             sliding_window,
             cache_mode_,
-            static_cast<int32_t>(dim)},
+            static_cast<int32_t>(dim),
+            position_id_dim_},
         &stats_);
   }
 
@@ -533,8 +703,13 @@ executorch::runtime::Error QNNMultimodalRunner<T>::generate(
 
   // Reset merger for new generation
   embedding_merger_->reset();
+  const bool use_qwen35_mrope = is_qwen35_vlm(model_version_) &&
+      position_id_dim_ == 3;
   const bool placeholder_merge =
-      modality_of(model_version_) == Modality::kVision && image_token_id_ != 0;
+      modality_of(model_version_) == Modality::kVision && image_token_id_ != 0 &&
+      !is_qwen35_vlm(model_version_);
+  std::vector<int32_t> prompt_position_ids;
+  int32_t mrope_pos = 0;
 
   // Process each input and add embeddings to merger
   for (const MultimodalInput& input : inputs) {
@@ -557,6 +732,13 @@ executorch::runtime::Error QNNMultimodalRunner<T>::generate(
         embedding_merger_->add_text_embeddings(text_embeddings);
       } else {
         embedding_merger_->add_embeddings(text_embeddings);
+      }
+      if (use_qwen35_mrope) {
+        append_text_position_ids(
+            prompt_position_ids,
+            position_id_dim_,
+            mrope_pos,
+            static_cast<int32_t>(tokens.size()));
       }
 
       prompt_tokens.insert(prompt_tokens.end(), tokens.begin(), tokens.end());
@@ -583,6 +765,13 @@ executorch::runtime::Error QNNMultimodalRunner<T>::generate(
       } else {
         embedding_merger_->add_embeddings(image_embeddings_tensor);
       }
+      if (use_qwen35_mrope) {
+        append_qwen35_image_position_ids(
+            prompt_position_ids,
+            position_id_dim_,
+            mrope_pos,
+            static_cast<int32_t>(image_embeddings_tensor.size(1)));
+      }
 
     } else {
       ET_CHECK_MSG(false, "Unsupported input data type");
@@ -593,6 +782,16 @@ executorch::runtime::Error QNNMultimodalRunner<T>::generate(
       ? embedding_merger_->merge(prompt_tokens, image_token_id_)
       : embedding_merger_->get_merged_embeddings();
   int num_prompt_tokens = embedding_merger_->get_total_tokens();
+  if (use_qwen35_mrope) {
+    ET_CHECK_MSG(
+        prompt_position_ids.size() ==
+            static_cast<size_t>(num_prompt_tokens * position_id_dim_),
+        "Qwen3.5 M-RoPE position ids mismatch: got %zu, expected %d",
+        prompt_position_ids.size(),
+        num_prompt_tokens * position_id_dim_);
+  }
+  token_generator_->set_position_delta(
+      use_qwen35_mrope ? mrope_pos - num_prompt_tokens : 0);
 
   ET_CHECK_MSG(num_prompt_tokens >= 1, "Expected at least 1 prompt token");
   ET_CHECK_MSG(
@@ -607,7 +806,11 @@ executorch::runtime::Error QNNMultimodalRunner<T>::generate(
   const dev_mem::RssSample prefill_before = dev_mem::sample_rss();
 #endif
   auto prefill_res = prompt_processor_->prefill(
-      merged_embeddings, cur_pos_, dump_logits, nullptr);
+      merged_embeddings,
+      cur_pos_,
+      dump_logits,
+      nullptr,
+      use_qwen35_mrope ? &prompt_position_ids : nullptr);
   ET_CHECK_OK_OR_RETURN_ERROR(prefill_res.error());
   uint64_t cur_token = prefill_res.get();
   cur_pos_ += num_prompt_tokens;

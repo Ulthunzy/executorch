@@ -50,6 +50,11 @@ inline VisionSpecialTokens get_special_tokens(
       tokens.fake_wrap_start = "<|vision_start|>";
       tokens.fake_wrap_end = "<|vision_end|>";
       break;
+    case example::VisionLanguageModel::kQwen3_5:
+      tokens.global_img = "";
+      tokens.fake_wrap_start = "<|vision_start|>";
+      tokens.fake_wrap_end = "<|vision_end|>";
+      break;
     default:
       break;
   }
@@ -139,6 +144,19 @@ inline std::string apply_chat_template(
       formatted_prompt.append(expanded_prompt);
       formatted_prompt.append("<|im_end|>\n");
       formatted_prompt.append("<|im_start|>assistant\n");
+      break;
+    }
+    case example::VisionLanguageModel::kQwen3_5: {
+      if (!system_prompt.empty()) {
+        formatted_prompt.append("<|im_start|>system\n");
+        formatted_prompt.append(system_prompt);
+        formatted_prompt.append("<|im_end|>\n");
+      }
+      formatted_prompt.append("<|im_start|>user\n");
+      formatted_prompt.append(expand_image_tokens(prompt, specials));
+      formatted_prompt.append("<|im_end|>\n");
+      formatted_prompt.append("<|im_start|>assistant\n");
+      formatted_prompt.append("<think>\n\n</think>\n\n");
       break;
     }
     default:

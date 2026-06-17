@@ -32,6 +32,7 @@ class MultimodalLhdTokenGenerator
     int sliding_window;
     CacheMode cache_mode;
     int32_t embedding_dim = 0;
+    int32_t position_id_dim = 1;
   };
   MultimodalLhdTokenGenerator(
       tokenizers::Tokenizer* tokenizer,
@@ -58,7 +59,8 @@ class MultimodalLhdTokenGenerator
                 metadata.use_int64_token,
                 metadata.sliding_window,
                 metadata.cache_mode,
-                metadata.embedding_dim},
+                metadata.embedding_dim,
+                metadata.position_id_dim},
             stats),
         tok_embedding_runner_(embedding_runner),
         metadata_(metadata),

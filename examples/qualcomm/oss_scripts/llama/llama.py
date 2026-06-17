@@ -7,6 +7,7 @@
 # TODO: reenable pyre after fixing the issues
 # pyre-ignore-all-errors
 
+import argparse
 import json
 import logging
 import os
@@ -49,11 +50,18 @@ from executorch.examples.qualcomm.oss_scripts.llama.decoder_constants import (
     TOK_EMBEDDING_GRAPH_NAMES,
     VISION_ENCODER,
 )
-from executorch.examples.qualcomm.oss_scripts.llama.decoder_runtime_evaluator import (
-    DefaultEval,
-    SqnrEval,
-    TaskEval,
-)
+
+
+def _ensure_transformers_vlm_eval_compat():
+    import transformers
+
+    if not hasattr(transformers, "AutoModelForVision2Seq") and hasattr(
+        transformers, "AutoModelForImageTextToText"
+    ):
+        transformers.AutoModelForVision2Seq = transformers.AutoModelForImageTextToText
+
+
+_ensure_transformers_vlm_eval_compat()
 
 from executorch.examples.qualcomm.oss_scripts.llama.tokenizer import TokenizerWrapper
 from executorch.examples.qualcomm.oss_scripts.llama.wrappers import (
@@ -71,6 +79,18 @@ logging.basicConfig(level=logging.INFO, format=FORMAT)
 logging.getLogger().setLevel(logging.INFO)
 # Avoid the error message "Could not initialize NNPACK! Reason: Unsupported hardware."
 torch.backends.nnpack.set_flags(False)
+
+
+def _load_runtime_evaluators():
+    _ensure_transformers_vlm_eval_compat()
+
+    from executorch.examples.qualcomm.oss_scripts.llama.decoder_runtime_evaluator import (
+        DefaultEval,
+        SqnrEval,
+        TaskEval,
+    )
+
+    return DefaultEval, SqnrEval, TaskEval
 
 
 def _dumpfile_to_method_name(dump_file: str) -> str:
@@ -332,13 +352,17 @@ def compile(
         TOK_EMBEDDING: None,
         TEXT_DECODER: None,
     }
+    # Weight sharing is only useful when both decode and prefill graphs are
+    # emitted. x86 emulator also does not support it.
+    use_weight_sharing = not args.enable_x86_64 and args.model_mode != "kv"
     for modality in compile_specs:
         if is_multimodal and modality in {AUDIO_ENCODER, TEXT_ENCODER, VISION_ENCODER}:
-            # Encoder quantization is enabled only when the input contains a single image in each conversation.
-            # In multi‑image scenarios, we skip encoder quantization by default to preserve modality feature quality,
-            # because the encoder is quite sensitive and quantization can make it harder for the model to distinguish
-            # between images within the same conversation.
-            to_skip = len(args.image_path) > 1
+            # Skip encoder quantization for multi-image prompts and for Qwen3.5
+            # vision while its encoder path is validated through fp16 first.
+            # to_skip = len(args.image_path) > 1 or (
+            #     args.decoder_model.startswith("qwen3_5") and modality == VISION_ENCODER
+            # )
+            to_skip = False
             backend_options = generate_htp_compiler_spec(
                 use_fp16=to_skip,
             )
@@ -355,8 +379,7 @@ def compile(
         elif is_multimodal and modality == TOK_EMBEDDING:
             backend_options = generate_htp_compiler_spec(
                 use_fp16=False,
-                # x86 emulator does not support weight sharing
-                use_weight_sharing=not args.enable_x86_64,
+                use_weight_sharing=use_weight_sharing,
             )
             compile_specs[modality] = [
                 generate_qnn_executorch_compiler_spec(
@@ -373,8 +396,7 @@ def compile(
             backend_options = generate_htp_compiler_spec(
                 use_fp16=False,
                 use_multi_contexts=decoder_model_config.num_sharding > 1,
-                # x86 emulator does not support weight sharing
-                use_weight_sharing=not args.enable_x86_64,
+                use_weight_sharing=use_weight_sharing,
             )
             compile_specs[modality] = [
                 generate_qnn_executorch_compiler_spec(
@@ -416,16 +438,19 @@ def inference(
     calibration_data,
     is_multimodal,
 ):
+    DefaultEval, SqnrEval, TaskEval = _load_runtime_evaluators()
 
     assert args.model_mode in EVAL_MODE, f"Unknown model_mode: {args.model_mode}."
 
     pte_paths = {TEXT_DECODER: text_decoder_pte_path}
+    _validate_pte_paths(pte_paths)
     eval_results = {
         "pte_size": os.path.getsize(text_decoder_pte_path),
     }
 
     if args.use_attention_sink:
         pte_paths.update({ATTENTION_SINK_EVICTOR: attention_sink_evictor_pte_path})
+        _validate_pte_paths({ATTENTION_SINK_EVICTOR: attention_sink_evictor_pte_path})
         eval_results.update(
             {
                 "attention_sink_evictor_pte_size": os.path.getsize(
@@ -435,6 +460,9 @@ def inference(
         )
 
     if is_multimodal:
+        required_multimodal_pte_paths = {TOK_EMBEDDING: tok_embedding_pte_path}
+        required_multimodal_pte_paths.update(encoder_pte_paths)
+        _validate_pte_paths(required_multimodal_pte_paths)
         eval_results.update(
             {
                 "tok_embedding_pte_size": os.path.getsize(tok_embedding_pte_path),
@@ -566,6 +594,29 @@ def inference(
             conn.send(json.dumps(eval_results))
 
 
+def _normalize_decoder_model_name(name: str) -> str:
+    canonical = name.lower().replace(".", "_")
+    if canonical in SUPPORTED_LLM_MODELS:
+        return canonical
+    raise argparse.ArgumentTypeError(
+        f"Unknown decoder_model: {name}. Available options are: "
+        f"{', '.join(SUPPORTED_LLM_MODELS.keys())}"
+    )
+
+
+def _validate_pte_paths(pte_paths: Dict[str, str]) -> None:
+    missing = [
+        f"{component}: {path}"
+        for component, path in pte_paths.items()
+        if not os.path.exists(path)
+    ]
+    if missing:
+        raise FileNotFoundError(
+            "Missing required pre-generated PTE artifact(s):\n"
+            + "\n".join(missing)
+        )
+
+
 def _build_parser():
     parser = setup_common_args_and_variables()
     parser.add_argument(
@@ -579,6 +630,7 @@ def _build_parser():
     parser.add_argument(
         "--decoder_model",
         choices=list(SUPPORTED_LLM_MODELS.keys()),
+        type=_normalize_decoder_model_name,
         help=f"The llm model to export. Current available options are: { SUPPORTED_LLM_MODELS.keys()}",
         required=True,
     )

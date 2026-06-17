@@ -44,6 +44,8 @@ MultimodalTokenGenerator<T>::MultimodalTokenGenerator(
       metadata_(metadata) {
   // Set input_toks_.size to 0 since we use embeddings instead
   input_toks_.size = 0;
+  input_pos_.size =
+      metadata_.ar_len * metadata_.position_id_dim * sizeof(int32_t);
   input_embedding_.size =
       metadata_.ar_len * metadata_.embedding_dim * sizeof(float);
 }
@@ -206,7 +208,12 @@ void MultimodalTokenGenerator<T>::prepare_io(
       metadata_.ar_len * embedding_dim * sizeof(float));
 
   // update position_ids
-  *input_pos_.data = static_cast<int32_t>(start_pos);
+  for (int i = 0; i < metadata_.ar_len; ++i) {
+    const int32_t pos = static_cast<int32_t>(start_pos + position_delta_ + i);
+    for (int dim = 0; dim < metadata_.position_id_dim; ++dim) {
+      input_pos_.data[dim * metadata_.ar_len + i] = pos;
+    }
+  }
 }
 
 // Explicit instantiations

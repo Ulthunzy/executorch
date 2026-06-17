@@ -139,3 +139,26 @@ class Qwen2_5_VL_Encoder_QuantRecipe(EncoderQuantRecipe):
             act_observer=MinMaxObserver,
             granularity=QuantGranularity.PER_CHANNEL,
         )
+
+
+class Qwen35VLEncoderQuantRecipe(EncoderQuantRecipe):
+    default_quant_dtype = QuantDtype.use_16a8w
+
+    def __init__(self, verbose: bool = False):
+        super().__init__()
+
+        self.recipe = QuantRecipe(
+            self.default_quant_dtype,
+            False,
+            act_observer=MinMaxObserver,
+            granularity=QuantGranularity.PER_TENSOR,
+            verbose=verbose,
+        ).add_node_target(
+            {
+                torch.ops.aten.linear.default,
+            },
+            QuantDtype.use_16a8w,
+            False,
+            act_observer=MinMaxObserver,
+            granularity=QuantGranularity.PER_TENSOR,
+        )

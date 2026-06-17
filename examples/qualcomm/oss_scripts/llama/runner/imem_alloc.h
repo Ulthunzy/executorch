@@ -11,6 +11,13 @@
 #include <cstddef>
 
 namespace example {
+
+inline size_t align_shared_buffer_allocation_size(size_t data_size) {
+  constexpr size_t kSharedBufferAlignment = 4096;
+  return ((data_size + kSharedBufferAlignment - 1) / kSharedBufferAlignment) *
+      kSharedBufferAlignment;
+}
+
 /**
  * @class IMemAlloc
  * @brief Interface for buffer allocation.

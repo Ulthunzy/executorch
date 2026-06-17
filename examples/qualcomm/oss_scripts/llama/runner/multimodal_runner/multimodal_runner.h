@@ -46,6 +46,7 @@ enum class VisionLanguageModel {
   kSmolvlm = 0,
   kInternvl3,
   kQwen2_5_VL,
+  kQwen3_5,
 };
 
 enum class AudioLanguageModel {
@@ -121,6 +122,7 @@ class QNNMultimodalRunner
   inline static const std::string kEncoderForwardName = "forward";
 
   int32_t context_len_{0};
+  int32_t position_id_dim_{1};
 
   int ngram_{0};
   int window_{0};

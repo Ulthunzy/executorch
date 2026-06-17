@@ -29,6 +29,7 @@ class MultimodalTokenGenerator : public example::TokenGenerator<T> {
     int sliding_window;
     CacheMode cache_mode;
     int32_t embedding_dim = 0;
+    int32_t position_id_dim = 1;
   };
 
   // Constructor with embedding generator support
@@ -54,13 +55,27 @@ class MultimodalTokenGenerator : public example::TokenGenerator<T> {
       override;
 
   inline const size_t total_token_generator_io_size_in_bytes() const {
+    const size_t window_attention_mask_size =
+        metadata_.cache_mode == CacheMode::HybridCache
+        ? align_shared_buffer_allocation_size(window_attention_mask_.size)
+        : 0;
     if (metadata_.cache_mode == CacheMode::HybridCache) {
-      return input_toks_.size + input_pos_.size + attention_mask_.size +
-          window_attention_mask_.size + logits_.size + input_embedding_.size;
-    } else {
-      return input_toks_.size + input_pos_.size + attention_mask_.size +
-          logits_.size + input_embedding_.size;
+      return align_shared_buffer_allocation_size(input_toks_.size) +
+          align_shared_buffer_allocation_size(input_pos_.size) +
+          align_shared_buffer_allocation_size(attention_mask_.size) +
+          window_attention_mask_size +
+          align_shared_buffer_allocation_size(logits_.size) +
+          align_shared_buffer_allocation_size(input_embedding_.size);
     }
+    return align_shared_buffer_allocation_size(input_toks_.size) +
+        align_shared_buffer_allocation_size(input_pos_.size) +
+        align_shared_buffer_allocation_size(attention_mask_.size) +
+        align_shared_buffer_allocation_size(logits_.size) +
+        align_shared_buffer_allocation_size(input_embedding_.size);
+  }
+
+  void set_position_delta(int32_t position_delta) {
+    position_delta_ = position_delta;
   }
 
  protected:
@@ -75,6 +90,7 @@ class MultimodalTokenGenerator : public example::TokenGenerator<T> {
 
   // Additional members specific to multimodal
   TensorStruct<float> input_embedding_;
+  int32_t position_delta_{0};
 
  private:
   // Reuse members from token_generator

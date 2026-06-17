@@ -6,11 +6,13 @@
 
 from .apply_rope import ROTARY_EMB_REGISTRY
 from .feed_forward import FeedForward_REGISTRY
-from .layernorm import NORM_REGISTRY
+from .layernorm import NORM_REGISTRY, Qwen35RMSNorm, Qwen35RMSNormGated
 
 
 __all__ = [
     "FeedForward_REGISTRY",
     "ROTARY_EMB_REGISTRY",
     "NORM_REGISTRY",
+    "Qwen35RMSNorm",
+    "Qwen35RMSNormGated",
 ]
