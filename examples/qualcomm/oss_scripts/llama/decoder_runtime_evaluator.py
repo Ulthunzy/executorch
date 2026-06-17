@@ -216,7 +216,7 @@ class EvalBase(ABC):
                     f"--tokenizer_path {os.path.basename(self.runtime_tokenizer_path)}",
                     f"--output_path {self.device_output_response_path}",
                     f"--performance_output_path {self.device_performance_path}",
-                    "--shared_buffer",
+                    "--shared_buffer" if args.shared_buffer else "",
                 ]
             )
 

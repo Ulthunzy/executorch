@@ -218,9 +218,11 @@ QNNMultimodalRunner<T>::QNNMultimodalRunner(
     model_version_ = VisionLanguageModel::kInternvl3;
   } else if (model_version == "granite_speech") {
     model_version_ = AudioLanguageModel::kGraniteSpeech;
-  } else if (
-      model_version == "qwen2_5_vl" || model_version == "lincal_vl") {
+  } else if (model_version == "qwen2_5_vl") {
     model_version_ = VisionLanguageModel::kQwen2_5_VL;
+  } else if (model_version == "lincal_vl") {
+    model_version_ = VisionLanguageModel::kQwen2_5_VL;
+    cache_mode_ = CacheMode::HybridCache;
   } else if (model_version == "qwen3_5") {
     model_version_ = VisionLanguageModel::kQwen3_5;
   } else {

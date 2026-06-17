@@ -371,8 +371,7 @@ def compile(
                 backend_options=backend_options,
                 online_prepare=args.online_prepare,
                 profile_level=3 if args.optrace else 0,
-                # x86 emulator does not support shared buffer
-                shared_buffer=not args.enable_x86_64,
+                shared_buffer=args.shared_buffer and not args.enable_x86_64,
             )
             skip_quantize[modality] = to_skip
             compile_specs[modality] = encoder_compile_specs
@@ -387,8 +386,7 @@ def compile(
                     backend_options=backend_options,
                     online_prepare=args.online_prepare,
                     profile_level=3 if args.optrace else 0,
-                    # x86 emulator does not support shared buffer
-                    shared_buffer=not args.enable_x86_64,
+                    shared_buffer=args.shared_buffer and not args.enable_x86_64,
                 )
             ] * len(TOK_EMBEDDING_GRAPH_NAMES)
         elif modality == TEXT_DECODER:
@@ -404,8 +402,7 @@ def compile(
                     backend_options=backend_options,
                     online_prepare=args.online_prepare,
                     profile_level=3 if args.optrace else 0,
-                    # x86 emulator does not support shared buffer
-                    shared_buffer=not args.enable_x86_64,
+                    shared_buffer=args.shared_buffer and not args.enable_x86_64,
                     use_mha2sha=True,
                 )
             ] * len(DECODER_GRAPH_NAMES)

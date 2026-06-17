@@ -1476,6 +1476,7 @@ class HybridTextDecoder(Component):
             _release_memory()
 
         # decoder lowering
+        data = request.method_data[TEXT_DECODER]
         edge_prog_mgr = to_edge_transform_and_lower_to_qnn(
             module=dict(zip(graph_names, [model.decoder for model in models])),
             inputs=dict(zip(graph_names, example_inputs)),
