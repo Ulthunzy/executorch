@@ -149,11 +149,23 @@ def _load_local_model_config(
         return json.load(f)
 
 
+def _is_qwen35_decoder_model(decoder_model: str) -> bool:
+    return decoder_model.startswith(("qwen3_5", "lincal3_5"))
+
+
 def _flatten_model_args_for_static_llama(model_config: Dict[str, Any]) -> Dict[str, Any]:
     if "text_config" not in model_config:
-        return model_config
+        flattened = dict(model_config)
+        flattened.pop("vision_config", None)
+        return flattened
 
     text_config = model_config["text_config"]
+    text_model_type = text_config.get("model_type")
+    is_qwen35_text = text_model_type == "qwen3_5_text"
+    rope_parameters = text_config.get("rope_parameters") or {}
+    rope_theta = text_config.get(
+        "rope_theta", rope_parameters.get("rope_theta", model_config.get("rope_theta"))
+    )
     flattened = {
         "dim": text_config["hidden_size"],
         "n_layers": text_config["num_hidden_layers"],
@@ -167,7 +179,7 @@ def _flatten_model_args_for_static_llama(model_config: Dict[str, Any]) -> Dict[s
             "head_dim", text_config["hidden_size"] // text_config["num_attention_heads"]
         ),
         "norm_eps": text_config.get("rms_norm_eps", 1e-5),
-        "rope_theta": text_config.get("rope_theta", model_config.get("rope_theta")),
+        "rope_theta": rope_theta,
         "attention_qkv_bias": text_config.get(
             "attention_qkv_bias",
             text_config.get(
@@ -175,11 +187,11 @@ def _flatten_model_args_for_static_llama(model_config: Dict[str, Any]) -> Dict[s
             ),
         ),
         "use_qk_norm": text_config.get(
-            "use_qk_norm", model_config.get("use_qk_norm", False)
+            "use_qk_norm", model_config.get("use_qk_norm", is_qwen35_text)
         ),
         "qk_norm_before_rope": text_config.get(
             "qk_norm_before_rope",
-            model_config.get("qk_norm_before_rope", False),
+            model_config.get("qk_norm_before_rope", is_qwen35_text),
         ),
         "use_hf_rope": True,
         "use_scaled_rope": False,
@@ -191,8 +203,51 @@ def _flatten_model_args_for_static_llama(model_config: Dict[str, Any]) -> Dict[s
     if layer_types is not None:
         flattened["layer_types"] = layer_types
 
+    partial_rotary_factor = text_config.get(
+        "partial_rotary_factor",
+        rope_parameters.get(
+            "partial_rotary_factor", model_config.get("partial_rotary_factor")
+        ),
+    )
+    if partial_rotary_factor is not None:
+        flattened["partial_rotary_factor"] = partial_rotary_factor
+
+    mrope_section = text_config.get(
+        "mrope_section",
+        rope_parameters.get("mrope_section", model_config.get("mrope_section")),
+    )
+    if mrope_section is not None:
+        flattened["mrope_section"] = mrope_section
+
+    for key in (
+        "rms_norm_add_unit_offset",
+        "linear_conv_kernel_dim",
+        "linear_key_head_dim",
+        "linear_value_head_dim",
+        "linear_num_key_heads",
+        "linear_num_value_heads",
+    ):
+        if key in text_config:
+            flattened[key] = text_config[key]
+        elif key in model_config:
+            flattened[key] = model_config[key]
+
+    if is_qwen35_text:
+        flattened["rms_norm_add_unit_offset"] = text_config.get(
+            "rms_norm_add_unit_offset",
+            model_config.get("rms_norm_add_unit_offset", True),
+        )
+        flattened["attention_type"] = text_config.get(
+            "attention_type", model_config.get("attention_type", "mha")
+        )
+        flattened["use_q_gate"] = text_config.get(
+            "attn_output_gate", model_config.get("use_q_gate", True)
+        )
+
     use_sliding_window = bool(
         text_config.get("use_sliding_window") or model_config.get("use_sliding_window")
+        or text_config.get("sliding_window")
+        or (layer_types is not None and "sliding_attention" in layer_types)
     )
     if use_sliding_window:
         flattened["sliding_window"] = text_config.get(
@@ -200,7 +255,7 @@ def _flatten_model_args_for_static_llama(model_config: Dict[str, Any]) -> Dict[s
         )
         flattened["local_rope_theta"] = text_config.get(
             "local_rope_theta",
-            model_config.get("local_rope_theta", flattened.get("rope_theta")),
+            model_config.get("local_rope_theta", rope_theta),
         )
 
     return flattened
@@ -359,14 +414,11 @@ class TextDecoder(Component):
                     partial_rotary_dim,
                 )
 
-        if self.control_args.decoder_model.startswith("qwen3_5"):
-            decoder_state_keys = set(decoder.state_dict().keys())
-            if set(state_dict.keys()) - decoder_state_keys:
-                state_dict = {
-                    key: value
-                    for key, value in state_dict.items()
-                    if key in decoder_state_keys
-                }
+        decoder_state_keys = set(decoder.state_dict().keys())
+        if set(state_dict.keys()) - decoder_state_keys:
+            state_dict = {
+                key: value for key, value in state_dict.items() if key in decoder_state_keys
+            }
         decoder.load_state_dict(state_dict, strict=True, assign=True)
 
         # apply spin quant if required
@@ -822,10 +874,8 @@ class TextDecoder(Component):
                 if not (isinstance(user.target, str) and user.target == "_guards_fn")
             ]
             node_shape = tuple(node.meta["val"].size())
-            if _is_attention_mask_placeholder(node, atten_mask_shape):
-                quant_io_type = fixed_point_type["io_type"]
-            elif (
-                self.control_args.decoder_model.startswith("qwen3_5")
+            if (
+                _is_qwen35_decoder_model(self.control_args.decoder_model)
                 and node_shape in self.cache_io_shape
             ):
                 quant_io_type = fixed_point_type["kv_type"]
@@ -836,11 +886,13 @@ class TextDecoder(Component):
                 quant_io_type = fixed_point_type["kv_type"]
             elif node_shape in self.io_shape:
                 quant_io_type = fixed_point_type["io_type"]
+            elif _is_attention_mask_placeholder(node, atten_mask_shape):
+                quant_io_type = fixed_point_type["io_type"]
 
         if is_graph_output(node):
             node_shape = tuple(node.meta["val"].size())
             if (
-                self.control_args.decoder_model.startswith("qwen3_5")
+                _is_qwen35_decoder_model(self.control_args.decoder_model)
                 and node_shape in self.cache_io_shape
             ):
                 quant_io_type = fixed_point_type["kv_type"]
@@ -857,7 +909,7 @@ class TextDecoder(Component):
 
         # tag select op as quantized tensors for freq_sin and freq_cos. It is caused by sharding
         if (
-            not self.control_args.decoder_model.startswith("qwen3_5")
+            not _is_qwen35_decoder_model(self.control_args.decoder_model)
             and node.target in freq_op
             and node.meta["val"].size() in freq_shape
         ):
@@ -1109,7 +1161,7 @@ class TextDecoder(Component):
             # runs on the exported model without observers — no risk of
             # polluting observer state with synthetic inputs.
             qwen35_prefill_with_kv = (
-                self.control_args.decoder_model.startswith("qwen3_5")
+                _is_qwen35_decoder_model(self.control_args.decoder_model)
                 and self.mode == Mode.PREFILL
                 and self.model_args.use_kv_cache
             )
@@ -1162,7 +1214,7 @@ class TextDecoder(Component):
                 self.decoder(*self.export_input)
 
             self.decoder = convert_pt2e(self.decoder)
-            if self.control_args.decoder_model.startswith("qwen3_5"):
+            if _is_qwen35_decoder_model(self.control_args.decoder_model):
                 self._align_kv_cache_io_qparams()
 
             if self.control_args.quant_recipe_suggestion:
@@ -1217,7 +1269,7 @@ class TextDecoder(Component):
         self._save_logits_quant_attrs()
 
         # save KV cache input quantization attributes for qzero initialization
-        if self.control_args.decoder_model.startswith("qwen3_5"):
+        if _is_qwen35_decoder_model(self.control_args.decoder_model):
             self._save_input_kv_cache_quant_attrs()
 
         # save output KV cache's quantization attributes to meta for attention sink
@@ -1370,7 +1422,7 @@ class HybridTextDecoder(Component):
             and self.prefill.model_args.use_kv_cache
             and self.decode.quant_recipe is not None
         ):
-            if self.control_args.decoder_model.startswith("qwen3_5"):
+            if _is_qwen35_decoder_model(self.control_args.decoder_model):
                 decode_cache_qparams = self.decode._collect_input_kv_cache_qparams()
                 expected_cache_qparams = 2 * self.decode.meta["get_n_layers"]
                 if len(decode_cache_qparams) == expected_cache_qparams:

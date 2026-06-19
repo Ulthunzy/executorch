@@ -1,0 +1,18 @@
+load("@fbcode_macros//build_defs:build_file_migration.bzl", "fbcode_target", "non_fbcode_target")
+load("@fbsource//xplat/executorch/build:runtime_wrapper.bzl", "runtime")
+
+oncall("executorch")
+
+fbcode_target(_kind = runtime.python_library,
+    name = "lincal3_5",
+    srcs = [
+        "__init__.py",
+        "convert_weights.py",
+    ],
+    base_module = "executorch.examples.models.lincal3_5",
+    visibility = ["PUBLIC"],
+    deps = [
+        "//executorch/examples/models/qwen3_5:qwen3_5",
+        "//executorch/examples/models/llama:llama2_model",
+    ],
+)

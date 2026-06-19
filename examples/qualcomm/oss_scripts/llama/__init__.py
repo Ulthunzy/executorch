@@ -47,6 +47,9 @@ from executorch.examples.models.qwen3 import convert_weights as convert_qwen3_we
 from executorch.examples.models.qwen3_5 import (
     convert_weights as convert_qwen3_5_weights,
 )
+from executorch.examples.models.lincal3_5 import (
+    convert_weights as convert_lincal3_5_weights,
+)
 from executorch.examples.models.lincal import (
     convert_weights as convert_lincal_weights,
 )
@@ -134,6 +137,8 @@ LLM_VARIANT_ARCHS: Dict[str, Type[LlamaModel]] = {
     "lincal_vl-3b_instruct": MultiScopeAwareLlamaModelWithoutEmbedding,
     "qwen3_5-0_8b": Qwen35ModelWithoutEmbedding,
     "qwen3_5-2b": Qwen35ModelWithoutEmbedding,
+    "lincal3_5-0_8b": Qwen35ModelWithoutEmbedding,
+    "lincal3_5-2b": Qwen35ModelWithoutEmbedding,
     "gemma2-2b": MultiScopeAwareLlamaModel,
 }
 
@@ -605,6 +610,44 @@ class Qwen3_5_2B(LLMModelConfig):
         BASE_DIR, "../../../models/qwen3_5/config/2b_config.json"
     )
     convert_weights = convert_qwen3_5_weights
+    transform_weight = False
+    instruct_model = True
+    num_sharding = 1
+    masked_softmax = True
+    seq_mse_candidates = 50
+    r1 = False
+    r2 = False
+    r3 = False
+    quant_recipe = Qwen3_5_2BQuantRecipe
+
+
+@register_llm_model("lincal3_5-0_8b", modality_encoders=Qwen35VLEncoder)
+@dataclass(init=False, frozen=True)
+class Lincal3_5_0_8B(LLMModelConfig):
+    repo_id: str = "/hunter/model/lincal3_5/lincal3_5-0.8B"
+    params_path: str = os.path.join(
+        BASE_DIR, "../../../models/lincal3_5/config/0_8b_config.json"
+    )
+    convert_weights = convert_lincal3_5_weights
+    transform_weight = False
+    instruct_model = True
+    num_sharding = 1
+    masked_softmax = True
+    seq_mse_candidates = 50
+    r1 = False
+    r2 = False
+    r3 = False
+    quant_recipe = Qwen3_5_0_8BQuantRecipe
+
+
+@register_llm_model("lincal3_5-2b", modality_encoders=Qwen35VLEncoder)
+@dataclass(init=False, frozen=True)
+class Lincal3_5_2B(LLMModelConfig):
+    repo_id: str = "/hunter/model/lincal3_5/lincal3_5-2B"
+    params_path: str = os.path.join(
+        BASE_DIR, "../../../models/lincal3_5/config/2b_config.json"
+    )
+    convert_weights = convert_lincal3_5_weights
     transform_weight = False
     instruct_model = True
     num_sharding = 1

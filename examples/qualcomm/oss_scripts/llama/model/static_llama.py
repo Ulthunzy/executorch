@@ -930,7 +930,7 @@ class Qwen35DecoderLayer(nn.Module):
                 config=config,
                 output_new_cache_only=output_new_cache_only,
             )
-        elif layer_type == "full_attention":
+        elif layer_type in {"full_attention", "sliding_attention"}:
             self.attention = LlamaAttention(
                 layer_idx=layer_idx,
                 config=config,
@@ -1237,6 +1237,11 @@ class Qwen35Model(LlamaModel):
             f"Length of layer_types ({len(self.layer_types)}) must match "
             f"n_layers ({self.n_layers})"
         )
+        self.has_full_attention = "full_attention" in self.layer_types
+        self.has_sliding_attention = "sliding_attention" in self.layer_types
+        self.sliding_window = config.sliding_window
+        if self.has_sliding_attention and self.sliding_window is None:
+            raise ValueError("Qwen3.5 sliding_attention requires sliding_window.")
 
         self.layers = nn.ModuleList(
             [
@@ -1285,6 +1290,20 @@ class Qwen35Model(LlamaModel):
         )
         self.linear_conv_dim = self.linear_key_dim * 2 + self.linear_value_dim
 
+    def _get_attention_mask(self) -> AttentionMask:
+        if self.has_sliding_attention and not self.has_full_attention:
+            return AttentionMask(
+                SlidingWindowAttentionMask(
+                    self.max_batch_size,
+                    self.ar_len,
+                    self.max_context_len,
+                    sliding_window=self.sliding_window,
+                )
+            )
+        return AttentionMask(
+            CausalAttentionMask(self.max_batch_size, self.ar_len, self.max_context_len)
+        )
+
     def _apply_interleaved_mrope(
         self,
         temporal_freqs: torch.Tensor,
@@ -1329,9 +1348,7 @@ class Qwen35Model(LlamaModel):
         tokens = torch.randint(
             self.vocab_size, (self.max_batch_size, self.ar_len), dtype=dtype
         )
-        atten_mask = AttentionMask(
-            CausalAttentionMask(self.max_batch_size, self.ar_len, self.max_context_len)
-        )
+        atten_mask = self._get_attention_mask()
         if self.use_kv_cache:
             pos_ids = torch.zeros((self.max_batch_size, self.ar_len), dtype=torch.int32)
             k_cache, v_cache = [], []
@@ -1388,6 +1405,8 @@ class Qwen35Model(LlamaModel):
         meta_data["get_eos_id"] = 248046
         meta_data["get_eos_ids"] = [248046, 248044]
         meta_data["get_n_eos"] = 2
+        if self.has_sliding_attention and not self.has_full_attention:
+            meta_data["get_sliding_window"] = self.sliding_window
         return meta_data
 
 
@@ -1458,9 +1477,7 @@ class Qwen35ModelWithoutEmbedding(Qwen35Model):
         hidden_states = torch.randn(
             (self.max_batch_size, self.ar_len, self.dim), dtype=torch.float32
         )
-        atten_mask = AttentionMask(
-            CausalAttentionMask(self.max_batch_size, self.ar_len, self.max_context_len)
-        )
+        atten_mask = self._get_attention_mask()
         if self.use_kv_cache:
             pos_ids = torch.zeros(
                 (3, self.max_batch_size, self.ar_len), dtype=torch.int32

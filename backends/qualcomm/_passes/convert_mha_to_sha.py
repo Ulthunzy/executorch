@@ -6,6 +6,8 @@
 
 
 import logging
+import math
+import operator
 from dataclasses import dataclass
 from typing import List, Optional, Tuple
 
@@ -273,6 +275,57 @@ class ConvertMhaToSha(ExportPass):
             new_args = [(arg0, *arg1) for arg0, arg1 in zip(new_arg0s, new_arg1s)]
 
             new_nodes = _split_call(node, sha, new_args, out_shape)
+            return new_nodes
+
+        def _visit_getitem(node, sha):
+            source = node.args[0]
+            index = node.args[1] if len(node.args) > 1 else None
+            split_targets = {
+                exir_ops.edge.aten.chunk.default,
+                exir_ops.edge.aten.split_with_sizes.default,
+                exir_ops.edge.aten.split_with_sizes_copy.default,
+            }
+            if (
+                not isinstance(index, int)
+                or not _is_call(source)
+                or source.target not in split_targets
+            ):
+                return _visit_default(node, sha)
+
+            split_input = source.args[0]
+            in_shape = _shape(split_input)
+            out_shape = _shape(node)
+            split_dim = source.args[2] if len(source.args) > 2 else 0
+            split_dim = split_dim + len(in_shape) if split_dim < 0 else split_dim
+
+            if source.target == exir_ops.edge.aten.chunk.default:
+                chunks = int(source.args[1])
+                chunk_size = math.ceil(in_shape[split_dim] / chunks)
+                start = index * chunk_size
+                end = min(start + chunk_size, in_shape[split_dim])
+            else:
+                split_sizes = source.args[1]
+                start = sum(int(size) for size in split_sizes[:index])
+                end = start + int(split_sizes[index])
+
+            if out_shape[sha.axis] != 1:
+                assert (
+                    out_shape[sha.axis] % sha.heads == 0
+                ), f"mismatching num_heads, {out_shape[sha.axis]} % {sha.heads} != 0"
+                out_shape[sha.axis] //= sha.heads
+
+            split_inputs = _visit(split_input, sha)
+            slicers = _get_slicers(sha.heads, sha.axis, out_shape[sha.axis])
+            with graph_module.graph.inserting_after(node):
+                new_nodes = []
+                for head, (arg, slicer) in enumerate(zip(split_inputs, slicers)):
+                    new_node = _create_call(
+                        exir_ops.edge.aten.slice_copy.Tensor,
+                        (arg, split_dim, start, end),
+                        name=f"{node.name}_h_{head}",
+                    )
+                    _copy_meta(new_node, node, slicer)
+                    new_nodes.append(new_node)
             return new_nodes
 
         def _visit_default(node, sha):
@@ -570,6 +623,7 @@ class ConvertMhaToSha(ExportPass):
                 exir_ops.edge.aten.add.Tensor: _visit_binary,
                 exir_ops.edge.aten.mul.Tensor: _visit_binary,
                 exir_ops.edge.aten.eq.Tensor: _no_split,
+                operator.getitem: _visit_getitem,
             }
 
             target = node.target if _is_call(node) else node.op
