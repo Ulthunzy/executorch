@@ -162,8 +162,11 @@ class ConvertMhaToSha(ExportPass):
             new_dict = {}
             for original_key in node.meta[QCOM_REQUANTIZE]:
                 for new_key in user_node_list:
-                    # new_keys are the name of the split nodes whose naming pattern follows: <original_key>_h_xxx
-                    if original_key in new_key:
+                    if (
+                        new_key == original_key
+                        or new_key.startswith(f"{original_key}_h_")
+                        or new_key == f"{original_key}_sha_concat"
+                    ):
                         new_dict.update(
                             {new_key: node.meta[QCOM_REQUANTIZE][original_key]}
                         )
@@ -428,7 +431,7 @@ class ConvertMhaToSha(ExportPass):
             dst, src = dst_node.meta, src_node.meta
             if "val" in src:
                 dst["val"] = src["val"].clone()[slicer]
-                if src_tensor_meta := src.get("tensor_meta", None) is not None:
+                if (src_tensor_meta := src.get("tensor_meta", None)) is not None:
                     tensor_meta = dict(zip(src_tensor_meta._fields, [*src_tensor_meta]))
                     tensor_meta["shape"] = dst["val"].shape
                     tensor_meta["stride"] = dst["val"].stride()
@@ -673,7 +676,16 @@ class ConvertMhaToSha(ExportPass):
             for node in graph_module.graph.nodes:
                 self._update_requantize_user(node)
             graph_module.graph.eliminate_dead_code()
-            constant_prop_pass(self.edge_program)  # need to fuse sha weights
+            skip_targets = {
+                node.target
+                for node in graph_module.graph.nodes
+                if _is_call(node)
+                and node.target != exir_ops.edge.aten.slice_copy.Tensor
+            }
+            constant_prop_pass(
+                self.edge_program,
+                custom_skip_targets=skip_targets,
+            )  # need to fuse sha weights
         graph_module.recompile()
         graph_module.graph.lint()
 
