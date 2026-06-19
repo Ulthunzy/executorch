@@ -85,6 +85,15 @@ void MultimodalPromptProcessor<T>::init_io(
   if (metadata_.cache_mode == CacheMode::HybridCache) {
     Result<TensorInfo> window_attention_mask =
         method_meta->input_tensor_meta(idx++);
+    window_attention_mask_.size = window_attention_mask->nbytes();
+    window_context_len_swa_ = window_attention_mask->sizes()[2];
+    true_swa_enabled_swa_ = window_context_len_swa_ != metadata_.context_len;
+    ET_LOG(
+        Info,
+        "[SWA_DEBUG] multimodal init_io(): window_context_len_swa=%d, context_len=%d, true_swa_enabled=%d",
+        window_context_len_swa_,
+        metadata_.context_len,
+        true_swa_enabled_swa_);
     window_attention_mask_.data = reinterpret_cast<uint16_t*>(
         buffer_manager->allocate(window_attention_mask_.size));
     window_attention_mask_.tensor = std::make_unique<TensorImpl>(
@@ -255,7 +264,11 @@ Result<uint64_t> MultimodalPromptProcessor<T>::prefill(
       num_iters);
 
   // Rearrange KV cache first
-  kv_manager_->rearrange_cache(metadata_.ar_len);
+  if (true_swa_enabled_swa_) {
+    kv_manager_->rearrange_cache_swa(metadata_.ar_len);
+  } else {
+    kv_manager_->rearrange_cache(metadata_.ar_len);
+  }
   std::vector<int32_t> attention_map(metadata_.ar_len);
   std::iota(attention_map.begin(), attention_map.end(), -1);
   // Initialize attention mask with current position
@@ -263,12 +276,22 @@ Result<uint64_t> MultimodalPromptProcessor<T>::prefill(
       attention_mask_.data, attention_map, metadata_.ar_len, pos);
   // Initialize window attention mask with current position
   if (metadata_.cache_mode == CacheMode::HybridCache) {
-    kv_manager_->init_attention_mask(
-        window_attention_mask_.data,
-        attention_map,
-        metadata_.ar_len,
-        pos,
-        metadata_.sliding_window);
+    if (true_swa_enabled_swa_) {
+      kv_manager_->init_attention_mask_swa(
+          window_attention_mask_.data,
+          attention_map,
+          metadata_.ar_len,
+          pos,
+          window_context_len_swa_,
+          metadata_.sliding_window);
+    } else {
+      kv_manager_->init_attention_mask(
+          window_attention_mask_.data,
+          attention_map,
+          metadata_.ar_len,
+          pos,
+          metadata_.sliding_window);
+    }
   }
 
   // Initialize the output of the module
@@ -295,18 +318,33 @@ Result<uint64_t> MultimodalPromptProcessor<T>::prefill(
       n_update = 1 + ((num_prompt_tokens - 1) % metadata_.ar_len);
     }
     // Update KV Cache with the output results
-    kv_manager_->update_cache(metadata_.ar_len, pos, n_update, {});
+    if (true_swa_enabled_swa_) {
+      kv_manager_->update_cache_swa(metadata_.ar_len, pos, n_update, {});
+    } else {
+      kv_manager_->update_cache(metadata_.ar_len, pos, n_update, {});
+    }
 
     // Update attention mask with current position
     kv_manager_->update_attention_mask(
         attention_mask_.data, metadata_.ar_len, pos, n_update);
     if (metadata_.cache_mode == CacheMode::HybridCache) {
-      kv_manager_->update_attention_mask(
-          window_attention_mask_.data,
-          metadata_.ar_len,
-          pos,
-          n_update,
-          metadata_.sliding_window);
+      if (true_swa_enabled_swa_) {
+        kv_manager_->update_attention_mask_swa(
+            window_attention_mask_.data,
+            attention_map,
+            metadata_.ar_len,
+            pos,
+            n_update,
+            window_context_len_swa_,
+            metadata_.sliding_window);
+      } else {
+        kv_manager_->update_attention_mask(
+            window_attention_mask_.data,
+            metadata_.ar_len,
+            pos,
+            n_update,
+            metadata_.sliding_window);
+      }
     }
     prompt_pos += metadata_.ar_len;
     pos += metadata_.ar_len;

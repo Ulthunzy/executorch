@@ -80,6 +80,129 @@ Local findings before this script:
 }
 
 {
+  "time": "2026-06-19T22:23:00+08:00",
+  "type": "weight_sharing_ab_test",
+  "variant": "qwen3_5-0_8b",
+  "mode": "hybrid",
+  "ar_len": 4,
+  "max_seq_len": 1024,
+  "use_mha2sha": true,
+  "changed_variable": "QNN HTP weight sharing disabled; shared_buffer compile spec unchanged",
+  "code_change": "A temporary --disable_weight_sharing flag was used for this A/B test; final llama.py defaults use_weight_sharing to false and removes the flag.",
+  "compile_command_used_for_ab": "python examples/qualcomm/oss_scripts/llama/llama.py -b build-android -m SM8850 -s 3B15AK00GLW00000 -a ./llama-output/mha2sha_compare/qwen3_5-0_8b-m1024-hybrid-ar4-SM8850-mha2sha-on-convert-only-no-wtshare --decoder_model qwen3_5-0_8b --model_mode hybrid --prefill_ar_len 4 --max_seq_len 1024 --prompt \"描述一下这张图片\" --image_path \"/home/hunter/下载/test.jpg\" --disable_weight_sharing --compile_only",
+  "equivalent_compile_command_after_default_off": "python examples/qualcomm/oss_scripts/llama/llama.py -b build-android -m SM8850 -s 3B15AK00GLW00000 -a ./llama-output/mha2sha_compare/qwen3_5-0_8b-m1024-hybrid-ar4-SM8850-mha2sha-on-convert-only-no-wtshare --decoder_model qwen3_5-0_8b --model_mode hybrid --prefill_ar_len 4 --max_seq_len 1024 --prompt \"描述一下这张图片\" --image_path \"/home/hunter/下载/test.jpg\" --compile_only",
+  "compile_log": "run.log-0619-export-qwen3_5-0_8b-m1024-hybrid-ar4-mha2sha-on-convert-only-no-wtshare-compile.txt",
+  "artifact": "llama-output/mha2sha_compare/qwen3_5-0_8b-m1024-hybrid-ar4-SM8850-mha2sha-on-convert-only-no-wtshare",
+  "compile_observations": {
+    "text_decoder_mha2sha_true_lines": [
+      27572,
+      32770
+    ],
+    "wtshare_operation_errors": 0,
+    "small_is_shared_errors": 0,
+    "finish_compile_only": true,
+    "hybrid_llama_qnn_pte_bytes": 1231227776
+  },
+  "run_command": "python examples/qualcomm/oss_scripts/llama/llama.py -b build-android -m SM8850 -s 3B15AK00GLW00000 --decoder_model qwen3_5-0_8b --model_mode hybrid --prefill_ar_len 4 --max_seq_len 1024 --prompt \"描述一下这张图片\" --image_path \"/home/hunter/下载/test.jpg\" --pre_gen_pte ./llama-output/mha2sha_compare/qwen3_5-0_8b-m1024-hybrid-ar4-SM8850-mha2sha-on-convert-only-no-wtshare",
+  "run_log": "run.log-0619-run-qwen3_5-0_8b-m1024-hybrid-ar4-mha2sha-on-convert-only-no-wtshare.txt",
+  "run_result": {
+    "prompt_tokens": 214,
+    "generated_tokens": 809,
+    "total_time_s": 12.88,
+    "total_rate_tok_s": 62.810559,
+    "prompt_eval_time_s": 1.136,
+    "prompt_eval_rate_tok_s": 188.380282,
+    "decode_time_s": 11.744,
+    "decode_rate_tok_s": 68.88624,
+    "output_status": "normal Chinese image description; still repeats until max_seq_len, EOS issue unchanged"
+  },
+  "shared_buffer_runtime_result": {
+    "run_log": "run.log-0619-run-qwen3_5-0_8b-m1024-hybrid-ar4-mha2sha-on-convert-only-no-wtshare-sharedbuf.txt",
+    "prompt_tokens": 214,
+    "generated_tokens": 809,
+    "total_time_s": 12.091,
+    "total_rate_tok_s": 66.909271,
+    "prompt_eval_time_s": 0.989,
+    "prompt_eval_rate_tok_s": 216.380182,
+    "decode_time_s": 11.102,
+    "decode_rate_tok_s": 72.869753,
+    "output_status": "normal Chinese image description; same max_seq_len/EOS repetition behavior"
+  },
+  "baseline_weight_sharing_on_from_manual_log": {
+    "run_log": "run.log-0619-run-qwen3_5-0_8b-m1024-hybrid-ar4-mha2sha-on-convert-only-manual.txt",
+    "total_time_s": 19.246,
+    "total_rate_tok_s": 42.034709,
+    "prompt_eval_time_s": 1.305,
+    "prompt_eval_rate_tok_s": 163.984674,
+    "decode_time_s": 17.941,
+    "decode_rate_tok_s": 45.092247
+  },
+  "comparison": {
+    "decode_rate_delta_tok_s": 23.793993,
+    "decode_rate_ratio_no_wtshare_vs_wtshare": 1.5277,
+    "shared_buffer_runtime_decode_rate_tok_s": 72.869753,
+    "conclusion": "The hybrid slowdown and wtshare_operation small.is_shared error are caused by QNN HTP weight sharing, not by runtime shared_buffer. Disabling weight sharing keeps MHA2SHA enabled and restores decode speed to KV-level; enabling runtime shared_buffer on the no-wtshare artifact does not reproduce the slowdown."
+  }
+}
+
+{
+  "time": "2026-06-19T23:53:00+08:00",
+  "type": "weight_sharing_ab_test",
+  "variant": "qwen3-0_6b",
+  "mode": "hybrid",
+  "ar_len": 4,
+  "max_seq_len": 1024,
+  "use_mha2sha": true,
+  "prompt": "hello",
+  "no_weight_sharing": {
+    "compile_log": "run.log-0619-export-qwen3-0_6b-m1024-hybrid-ar4-mha2sha-on-no-wtshare-compile.txt",
+    "artifact": "llama-output/mha2sha_compare/qwen3-0_6b-m1024-hybrid-ar4-SM8850-mha2sha-on-no-wtshare",
+    "text_decoder_mha2sha_true_lines": [
+      14162,
+      32433
+    ],
+    "wtshare_operation_errors": 0,
+    "small_is_shared_errors": 0,
+    "hybrid_llama_qnn_pte_bytes": 1364278272,
+    "run_log": "run.log-0619-run-qwen3-0_6b-m1024-hybrid-ar4-mha2sha-on-no-wtshare.txt",
+    "prompt_tokens": 8,
+    "generated_tokens": 1015,
+    "total_time_s": 12.929,
+    "total_rate_tok_s": 78.505685,
+    "prompt_eval_time_s": 0.036,
+    "prompt_eval_rate_tok_s": 222.222222,
+    "decode_time_s": 12.893,
+    "decode_rate_tok_s": 78.724889
+  },
+  "weight_sharing_on": {
+    "compile_log": "run.log-0619-export-qwen3-0_6b-m1024-hybrid-ar4-mha2sha-on-wtshare-compile.txt",
+    "artifact": "llama-output/mha2sha_compare/qwen3-0_6b-m1024-hybrid-ar4-SM8850-mha2sha-on-wtshare",
+    "text_decoder_mha2sha_true_lines": [
+      14162,
+      32433
+    ],
+    "wtshare_operation_errors": 3,
+    "small_is_shared_errors": 3,
+    "hybrid_llama_qnn_pte_bytes": 690822144,
+    "run_log": "run.log-0619-run-qwen3-0_6b-m1024-hybrid-ar4-mha2sha-on-wtshare.txt",
+    "prompt_tokens": 8,
+    "generated_tokens": 1015,
+    "total_time_s": 14.42,
+    "total_rate_tok_s": 70.38835,
+    "prompt_eval_time_s": 0.039,
+    "prompt_eval_rate_tok_s": 205.128205,
+    "decode_time_s": 14.381,
+    "decode_rate_tok_s": 70.579236
+  },
+  "comparison": {
+    "decode_rate_delta_tok_s": 8.145653,
+    "decode_rate_ratio_no_wtshare_vs_wtshare": 1.1154,
+    "pte_size_ratio_no_wtshare_vs_wtshare": 1.9748,
+    "conclusion": "qwen3-0.6B is also affected by QNN HTP weight sharing in hybrid AR=4 MHA2SHA mode. The slowdown is smaller than qwen3.5: decode drops from 78.72 tok/s to 70.58 tok/s, while wtshare_operation small.is_shared appears only with weight sharing enabled."
+  }
+}
+
+{
   "time": "2026-06-19T13:31:00",
   "type": "manual_mha2sha_pairwise_compare",
   "command": "python examples/qualcomm/oss_scripts/qwen_mha2sha_attention.py -b build-android -m SM8850 -s 3B15AK00GLW00000 --variants qwen35 --quant_modes recipe --mha2sha off,on --ar_len 1 --context_len 16 --num_layers 6 --calibration_samples 4 --iteration 20 --record qwen_mha2sha_attention_test_record.txt",
@@ -9273,5 +9396,33 @@ Local findings before this script:
       "mean_abs_diff": 0.0,
       "p99_abs_diff": 0.0
     }
+  ]
+}
+
+{
+  "time": "2026-06-20T01:24:36+08:00",
+  "type": "full_model_lincal35_true_swa_mha2sha",
+  "artifact": "llama-output/mha2sha_compare/lincal3_5-0_8b-m1024-hybrid-ar4-SM8850-mha2sha-on-no-wtshare-loadfix-true-swa",
+  "export_log": "run.log-0620-export-lincal3_5-0_8b-m1024-hybrid-ar4-mha2sha-on-no-wtshare-loadfix-true-swa-compile.txt",
+  "run_log": "run.log-0620-run-lincal3_5-0_8b-m1024-hybrid-ar4-mha2sha-on-no-wtshare-loadfix-true-swa.txt",
+  "decoder_model_version": "lincal3_5",
+  "mha2sha": true,
+  "true_swa_runtime": {
+    "cache_mode": 1,
+    "prefill_window_context_len": 515,
+    "decode_window_context_len": 512,
+    "full_context_len": 1024,
+    "swa_layers": "6/24"
+  },
+  "speed": {
+    "total_tok_s": 63.902054,
+    "prefill_tok_s": 187.884109,
+    "decode_tok_s": 70.219599
+  },
+  "result": "runs on device and output is no longer blank, but generation is still repetitive and reaches the 1024-token sequence limit without EOS",
+  "notes": [
+    "runtime config reports decoder_model_version=lincal3_5 instead of qwen3_5",
+    "multimodal runner reports true_swa_enabled=1 and uses circular cache specs for sliding_attention layers",
+    "decoder QNN preprocess has use_mha2sha=True for both prefill and decode methods"
   ]
 }

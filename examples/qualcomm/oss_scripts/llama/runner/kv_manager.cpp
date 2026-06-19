@@ -286,10 +286,50 @@ void KVManager<T>::init_cache(IMemAlloc* buffer_manager, int32_t ar_len) {
         "cache_specs size (%zu) must match num_layers (%ld)",
         metadata_.cache_specs.size(),
         metadata_.num_layers);
+    has_swa_layers_swa_ = false;
+    swa_cache_len_swa_ = 0;
+    swa_write_pos_swa_ = 0;
+    swa_valid_len_swa_ = 0;
+    layer_is_swa_.assign(metadata_.num_layers, false);
+    layer_cache_len_swa_.assign(metadata_.num_layers, 0);
+
     for (int layer = 0; layer < metadata_.num_layers; ++layer) {
       const auto& spec = metadata_.cache_specs[layer];
       const bool in_place_overwrite =
           spec.update_mode == Metadata::kFullOverwrite;
+      if (spec.update_mode == Metadata::kCircular) {
+        const size_t cache_len_denom = static_cast<size_t>(metadata_.num_heads) *
+            static_cast<size_t>(metadata_.head_dim) * sizeof(T);
+        ET_CHECK_MSG(
+            cache_len_denom > 0 && spec.k_input_bytes % cache_len_denom == 0,
+            "Circular key cache bytes (%zu) are not divisible by heads*head_dim*sizeof(T) (%zu)",
+            spec.k_input_bytes,
+            cache_len_denom);
+        ET_CHECK_MSG(
+            spec.v_input_bytes % cache_len_denom == 0,
+            "Circular value cache bytes (%zu) are not divisible by heads*head_dim*sizeof(T) (%zu)",
+            spec.v_input_bytes,
+            cache_len_denom);
+        const int32_t k_cache_len =
+            static_cast<int32_t>(spec.k_input_bytes / cache_len_denom);
+        const int32_t v_cache_len =
+            static_cast<int32_t>(spec.v_input_bytes / cache_len_denom);
+        ET_CHECK_MSG(
+            k_cache_len == v_cache_len,
+            "Circular key/value cache length mismatch: %d vs %d",
+            k_cache_len,
+            v_cache_len);
+        layer_is_swa_[layer] = true;
+        layer_cache_len_swa_[layer] = k_cache_len;
+        has_swa_layers_swa_ = true;
+        if (swa_cache_len_swa_ == 0) {
+          swa_cache_len_swa_ = k_cache_len;
+        } else {
+          ET_CHECK_MSG(
+              swa_cache_len_swa_ == k_cache_len,
+              "All circular SWA cache specs must share the same cache length");
+        }
+      }
       if (in_place_overwrite) {
         ET_CHECK_MSG(
             spec.k_input_bytes == spec.k_output_bytes &&
@@ -688,7 +728,19 @@ void KVManager<T>::init_cache_swa(
 template <typename T>
 void KVManager<T>::rearrange_cache_swa(int32_t ar_len_dst) {
   if (!metadata_.cache_specs.empty()) {
-    rearrange_cache(ar_len_dst);
+    if (cur_ar_len_ == ar_len_dst) {
+      return;
+    }
+    for (int layer = 0; layer < metadata_.num_layers; ++layer) {
+      const auto update_mode = metadata_.cache_specs[layer].update_mode;
+      if (update_mode == Metadata::kFullOverwrite ||
+          update_mode == Metadata::kCircular) {
+        continue;
+      }
+      rearrange_key(k_cache_[layer], ar_len_dst);
+      rearrange_value(v_cache_[layer], ar_len_dst);
+    }
+    cur_ar_len_ = ar_len_dst;
     return;
   }
   if (!has_swa_layers_swa_ || layer_is_swa_.empty()) {
@@ -715,7 +767,45 @@ void KVManager<T>::update_cache_swa(
     int32_t n_update,
     const std::vector<bool>& selected) {
   if (!metadata_.cache_specs.empty()) {
-    update_cache(ar_len, n_past, n_update, selected);
+    ET_CHECK_MSG(
+        cur_ar_len_ == ar_len,
+        "Current AR length (%d) is not matched with target AR length (%d). Please rearrange cache first.",
+        cur_ar_len_,
+        ar_len);
+    const std::vector<int32_t> selected_indices =
+        collect_selected_indices(selected, n_update);
+    ET_CHECK_MSG(
+        selected.empty() ||
+            static_cast<int32_t>(selected_indices.size()) == n_update,
+        "selected contains %zu true values, expected at least n_update (%d)",
+        selected_indices.size(),
+        n_update);
+
+    bool updated_circular_cache = false;
+    for (int layer = 0; layer < metadata_.num_layers; ++layer) {
+      const auto& spec = metadata_.cache_specs[layer];
+      if (spec.update_mode == Metadata::kFullOverwrite) {
+        update_full_overwrite_cache(k_cache_[layer], v_cache_[layer], layer);
+        continue;
+      }
+      if (spec.update_mode == Metadata::kCircular) {
+        const int32_t cache_len =
+            !layer_cache_len_swa_.empty() ? layer_cache_len_swa_[layer] : 0;
+        update_key_swa(k_cache_[layer], cache_len, n_update, selected_indices);
+        update_value_swa(v_cache_[layer], cache_len, n_update, selected_indices);
+        updated_circular_cache = true;
+        continue;
+      }
+      update_key(k_cache_[layer], n_past, n_update, selected_indices);
+      update_value(v_cache_[layer], n_past, n_update, selected_indices);
+    }
+
+    if (updated_circular_cache && swa_cache_len_swa_ > 0 && n_update > 0) {
+      swa_write_pos_swa_ =
+          (swa_write_pos_swa_ + n_update) % swa_cache_len_swa_;
+      swa_valid_len_swa_ =
+          std::min(swa_cache_len_swa_, swa_valid_len_swa_ + n_update);
+    }
     return;
   }
   if (!has_swa_layers_swa_ || layer_is_swa_.empty()) {

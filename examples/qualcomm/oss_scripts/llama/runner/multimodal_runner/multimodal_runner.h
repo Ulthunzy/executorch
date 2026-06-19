@@ -47,6 +47,7 @@ enum class VisionLanguageModel {
   kInternvl3,
   kQwen2_5_VL,
   kQwen3_5,
+  kLincal3_5,
 };
 
 enum class AudioLanguageModel {

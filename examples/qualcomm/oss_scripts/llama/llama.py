@@ -352,9 +352,9 @@ def compile(
         TOK_EMBEDDING: None,
         TEXT_DECODER: None,
     }
-    # Weight sharing is only useful when both decode and prefill graphs are
-    # emitted. x86 emulator also does not support it.
-    use_weight_sharing = not args.enable_x86_64 and args.model_mode != "kv"
+    # Keep QNN weight sharing disabled while hybrid prefill/decode sharing
+    # regresses qwen3.5 decode performance.
+    use_weight_sharing = False
     for modality in compile_specs:
         if is_multimodal and modality in {AUDIO_ENCODER, TEXT_ENCODER, VISION_ENCODER}:
             # Skip encoder quantization for multi-image prompts and for Qwen3.5
@@ -877,6 +877,13 @@ def export_llama(args) -> None:
     ), f"Unknown decoder_model: {args.decoder_model}."
     decoder_model_config = SUPPORTED_LLM_MODELS[args.decoder_model]
     logging.info(f"*** {args.decoder_model} ***\n%s", str(decoder_model_config))
+
+    if args.decoder_model.startswith("lincal3_5") and not args.enable_true_swa:
+        logging.info(
+            "Enabling true SWA for %s because it uses sliding_attention layers.",
+            args.decoder_model,
+        )
+        args.enable_true_swa = True
 
     if args.max_context_len is None:
         args.max_context_len = args.max_seq_len

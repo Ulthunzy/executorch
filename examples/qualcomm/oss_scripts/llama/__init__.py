@@ -583,14 +583,31 @@ class Qwen3_4B(LLMModelConfig):
     quant_recipe = Qwen3_4BQuantRecipe
 
 
+@dataclass(init=False, frozen=True)
+class _Qwen3_5_0_8BBase(LLMModelConfig):
+    transform_weight = False
+    instruct_model = True
+    num_sharding = 1
+    masked_softmax = True
+    seq_mse_candidates = 50
+    r1 = False
+    r2 = False
+    r3 = False
+    quant_recipe = Qwen3_5_0_8BQuantRecipe
+
+
 @register_llm_model("qwen3_5-0_8b", modality_encoders=Qwen35VLEncoder)
 @dataclass(init=False, frozen=True)
-class Qwen3_5_0_8B(LLMModelConfig):
+class Qwen3_5_0_8B(_Qwen3_5_0_8BBase):
     repo_id: str = "/hunter/model/Qwen/Qwen3.5-0.8B"
     params_path: str = os.path.join(
         BASE_DIR, "../../../models/qwen3_5/config/0_8b_config.json"
     )
     convert_weights = convert_qwen3_5_weights
+
+
+@dataclass(init=False, frozen=True)
+class _Qwen3_5_2BBase(LLMModelConfig):
     transform_weight = False
     instruct_model = True
     num_sharding = 1
@@ -599,64 +616,37 @@ class Qwen3_5_0_8B(LLMModelConfig):
     r1 = False
     r2 = False
     r3 = False
-    quant_recipe = Qwen3_5_0_8BQuantRecipe
+    quant_recipe = Qwen3_5_2BQuantRecipe
 
 
 @register_llm_model("qwen3_5-2b", modality_encoders=Qwen35VLEncoder)
 @dataclass(init=False, frozen=True)
-class Qwen3_5_2B(LLMModelConfig):
+class Qwen3_5_2B(_Qwen3_5_2BBase):
     repo_id: str = "/hunter/model/Qwen/Qwen3.5-2B"
     params_path: str = os.path.join(
         BASE_DIR, "../../../models/qwen3_5/config/2b_config.json"
     )
     convert_weights = convert_qwen3_5_weights
-    transform_weight = False
-    instruct_model = True
-    num_sharding = 1
-    masked_softmax = True
-    seq_mse_candidates = 50
-    r1 = False
-    r2 = False
-    r3 = False
-    quant_recipe = Qwen3_5_2BQuantRecipe
 
 
 @register_llm_model("lincal3_5-0_8b", modality_encoders=Qwen35VLEncoder)
 @dataclass(init=False, frozen=True)
-class Lincal3_5_0_8B(LLMModelConfig):
+class Lincal3_5_0_8B(_Qwen3_5_0_8BBase):
     repo_id: str = "/hunter/model/lincal3_5/lincal3_5-0.8B"
     params_path: str = os.path.join(
         BASE_DIR, "../../../models/lincal3_5/config/0_8b_config.json"
     )
     convert_weights = convert_lincal3_5_weights
-    transform_weight = False
-    instruct_model = True
-    num_sharding = 1
-    masked_softmax = True
-    seq_mse_candidates = 50
-    r1 = False
-    r2 = False
-    r3 = False
-    quant_recipe = Qwen3_5_0_8BQuantRecipe
 
 
 @register_llm_model("lincal3_5-2b", modality_encoders=Qwen35VLEncoder)
 @dataclass(init=False, frozen=True)
-class Lincal3_5_2B(LLMModelConfig):
+class Lincal3_5_2B(_Qwen3_5_2BBase):
     repo_id: str = "/hunter/model/lincal3_5/lincal3_5-2B"
     params_path: str = os.path.join(
         BASE_DIR, "../../../models/lincal3_5/config/2b_config.json"
     )
     convert_weights = convert_lincal3_5_weights
-    transform_weight = False
-    instruct_model = True
-    num_sharding = 1
-    masked_softmax = True
-    seq_mse_candidates = 50
-    r1 = False
-    r2 = False
-    r3 = False
-    quant_recipe = Qwen3_5_2BQuantRecipe
 
 
 @register_llm_model("smollm2_135m")

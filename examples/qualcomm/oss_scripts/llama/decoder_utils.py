@@ -856,6 +856,7 @@ def kv_inference(  # noqa: C901
     collect_logits=False,
     seq_mse_candidates=0,
     lookahead_config=None,
+    generate_after_prefill=True,
 ):
     input_samples = []  # Record input sample for quantization error analysis
     is_multimodal = all(
@@ -973,23 +974,26 @@ def kv_inference(  # noqa: C901
             total_token_list,
         )
 
-        # Phase 2: Generate tokens until the EOS token is generated or max_seq_len is reached.
-        # When run on wikitext for ppl evaluation, this while-loop is not expected to run.
-        generate_input_sample = _generate(
-            inputs,
-            cur_pos,
-            module,
-            tokenizer,
-            tok_embedding,
-            ar_len,
-            max_seq_len,
-            k_caches,
-            v_caches,
-            total_token_list,
-            lookahead_config,
-        )
-        if generate_input_sample is not None:
-            input_samples.append(generate_input_sample)
+        if generate_after_prefill:
+            # Phase 2: Generate tokens until the EOS token is generated or max_seq_len is reached.
+            # When run on wikitext for ppl evaluation, this while-loop is not expected to run.
+            generate_input_sample = _generate(
+                inputs,
+                cur_pos,
+                module,
+                tokenizer,
+                tok_embedding,
+                ar_len,
+                max_seq_len,
+                k_caches,
+                v_caches,
+                total_token_list,
+                lookahead_config,
+            )
+            if generate_input_sample is not None:
+                input_samples.append(generate_input_sample)
+            else:
+                input_samples.append(prefill_input_sample)
         else:
             input_samples.append(prefill_input_sample)
 
@@ -1102,6 +1106,7 @@ def graph_module_inference(
     event_name: Optional[str] = None,
     seq_mse_candidates: int = 0,
     lookahead_config: Optional[Tuple[int]] = None,
+    generate_after_prefill: bool = True,
 ):
     """
     This function supports model execution from static nn.Module decoder model
@@ -1117,6 +1122,7 @@ def graph_module_inference(
         if use_kv_cache:
             kwargs["ar_len"] = ar_len
             kwargs["lookahead_config"] = lookahead_config
+            kwargs["generate_after_prefill"] = generate_after_prefill
 
         _, input_samples = INFERENCE_REGISTRY[use_kv_cache](
             get_example_inputs,

@@ -83,6 +83,8 @@ from executorch.examples.qualcomm.oss_scripts.llama.model.static_llama import (
     MultiScopeAwareLlamaModel_swa,
     MultiScopeAwareLlamaModelWithoutEmbedding,
     MultiScopeAwareLlamaModelWithoutEmbedding_swa,
+    Qwen35ModelWithoutEmbedding,
+    Qwen35ModelWithoutEmbedding_swa,
 )
 from executorch.examples.qualcomm.oss_scripts.llama.static_llm_quant_recipe import (
     StaticLLMQuantRecipe,
@@ -105,7 +107,7 @@ from executorch.extension.llm.export.builder import DType
 from torchao.prototype.spinquant import apply_spinquant
 from torchao.quantization.pt2e import MinMaxObserver
 from torchao.quantization.pt2e.quantize_pt2e import convert_pt2e, prepare_pt2e
-from transformers import AutoModel, AutoModelForSpeechSeq2Seq
+from transformers import AutoConfig, AutoModel, AutoModelForSpeechSeq2Seq
 
 
 def _release_memory():
@@ -151,6 +153,84 @@ def _load_local_model_config(
 
 def _is_qwen35_decoder_model(decoder_model: str) -> bool:
     return decoder_model.startswith(("qwen3_5", "lincal3_5"))
+
+
+def _is_lincal35_decoder_model(decoder_model: str) -> bool:
+    return decoder_model.startswith("lincal3_5")
+
+
+def _load_safetensor_tensors(repo_id: str, keys: List[str]) -> Dict[str, torch.Tensor]:
+    from safetensors import safe_open
+
+    repo_path = os.path.expanduser(repo_id)
+    index_path = os.path.join(repo_path, "model.safetensors.index.json")
+    if os.path.exists(index_path):
+        with open(index_path) as f:
+            weight_map = json.load(f)["weight_map"]
+        missing = [key for key in keys if key not in weight_map]
+        if missing:
+            raise KeyError(f"Missing safetensors keys in {repo_id}: {missing}")
+
+        shard_to_keys: Dict[str, List[str]] = {}
+        for key in keys:
+            shard_to_keys.setdefault(weight_map[key], []).append(key)
+
+        tensors = {}
+        for shard, shard_keys in shard_to_keys.items():
+            with safe_open(
+                os.path.join(repo_path, shard), framework="pt", device="cpu"
+            ) as f:
+                for key in shard_keys:
+                    tensors[key] = f.get_tensor(key)
+        return tensors
+
+    model_path = os.path.join(repo_path, "model.safetensors")
+    if os.path.exists(model_path):
+        with safe_open(model_path, framework="pt", device="cpu") as f:
+            available = set(f.keys())
+            missing = [key for key in keys if key not in available]
+            if missing:
+                raise KeyError(f"Missing safetensors keys in {model_path}: {missing}")
+            return {key: f.get_tensor(key) for key in keys}
+
+    raise FileNotFoundError(f"Could not find safetensors checkpoint in {repo_id}")
+
+
+def _load_safetensor_state_dict_by_prefix(
+    repo_id: str, prefix: str, strip_prefix: str = ""
+) -> Dict[str, torch.Tensor]:
+    repo_path = os.path.expanduser(repo_id)
+    index_path = os.path.join(repo_path, "model.safetensors.index.json")
+    if os.path.exists(index_path):
+        with open(index_path) as f:
+            keys = [
+                key
+                for key in json.load(f)["weight_map"]
+                if key.startswith(prefix)
+            ]
+    else:
+        from safetensors import safe_open
+
+        model_path = os.path.join(repo_path, "model.safetensors")
+        if not os.path.exists(model_path):
+            raise FileNotFoundError(
+                f"Could not find safetensors checkpoint in {repo_id}"
+            )
+        with safe_open(model_path, framework="pt", device="cpu") as f:
+            keys = [key for key in f.keys() if key.startswith(prefix)]
+
+    tensors = _load_safetensor_tensors(repo_id, keys)
+    return {
+        key.removeprefix(strip_prefix): value.to(torch.float32)
+        for key, value in tensors.items()
+    }
+
+
+def _load_lincal35_input_embedding(repo_id: str) -> torch.nn.Embedding:
+    weight = _load_safetensor_tensors(
+        repo_id, ["model.language_model.embed_tokens.weight"]
+    )["model.language_model.embed_tokens.weight"].to(torch.float32)
+    return torch.nn.Embedding.from_pretrained(weight, freeze=True)
 
 
 def _flatten_model_args_for_static_llama(model_config: Dict[str, Any]) -> Dict[str, Any]:
@@ -494,12 +574,18 @@ class TextDecoder(Component):
                 auto_model = _get_cached_qwen2_5_vl_for_conditional_generation(
                     self.config.repo_id
                 )
+            elif _is_lincal35_decoder_model(self.control_args.decoder_model):
+                auto_model = None
+                input_embeddings = _load_lincal35_input_embedding(self.config.repo_id)
             else:
                 auto_model = AutoModel.from_pretrained(
                     self.config.repo_id, _attn_implementation="eager"
                 )
+                input_embeddings = auto_model.get_input_embeddings().to(torch.float32)
+            if auto_model is not None:
+                input_embeddings = auto_model.get_input_embeddings().to(torch.float32)
             tok_embedding = TokenEmbedding(
-                auto_model.get_input_embeddings().to(torch.float32),
+                input_embeddings,
                 self.model_args.max_batch_size,
                 self.model_args.ar_len,
                 self.model_args.vocab_size,
@@ -519,6 +605,11 @@ class TextDecoder(Component):
                 decoder_cls = MultiScopeAwareLlamaModel_swa
             elif issubclass(decoder_cls, MultiScopeAwareLlamaModelWithoutEmbedding):
                 decoder_cls = MultiScopeAwareLlamaModelWithoutEmbedding_swa
+            elif issubclass(decoder_cls, Qwen35ModelWithoutEmbedding) and (
+                getattr(self.model_args, "sliding_window", None) is not None
+                and "sliding_attention" in (self.model_args.layer_types or [])
+            ):
+                decoder_cls = Qwen35ModelWithoutEmbedding_swa
 
         decoder: LlamaModel = decoder_cls(
             self.model_args,
@@ -582,7 +673,10 @@ class TextDecoder(Component):
                 max_seq_len,
                 self.meta["get_sliding_window"] + self.meta["get_ar_len"] - 1,
             )
+            window_cache_len = max(0, window_context_len - self.meta["get_ar_len"])
             self.kv_cache_shape |= {
+                (self.meta["get_head_dim"], window_cache_len),
+                (window_cache_len, self.meta["get_head_dim"]),
                 (self.meta["get_head_dim"], window_context_len),
                 (window_context_len, self.meta["get_head_dim"]),
             }
@@ -846,7 +940,10 @@ class TextDecoder(Component):
                 max_seq_len,
                 self.meta["get_sliding_window"] + self.meta["get_ar_len"] - 1,
             )
+            window_cache_len = max(0, window_context_len - self.meta["get_ar_len"])
             self.kv_cache_shape |= {
+                (self.meta["get_head_dim"], window_cache_len),
+                (window_cache_len, self.meta["get_head_dim"]),
                 (self.meta["get_head_dim"], window_context_len),
                 (window_context_len, self.meta["get_head_dim"]),
             }
@@ -1063,6 +1160,11 @@ class TextDecoder(Component):
             )
             else None
         )
+        generate_after_prefill = not (
+            self.mode == Mode.PREFILL
+            and self.control_args.model_mode == "hybrid"
+            and self.meta["get_use_kv_cache"]
+        )
         # check user's prompt which helps calibrate special token
         for turn in zip(intermediate_outputs, user_calibration_data):
             hidden_states, prompt = turn
@@ -1081,6 +1183,7 @@ class TextDecoder(Component):
                 use_i64_token=self.control_args.embedding_quantize is not None,
                 event_name=f"{event}_prompt",
                 lookahead_config=lookahead_config,
+                generate_after_prefill=generate_after_prefill,
             )
             input_samples.extend(input_sample)
         return input_samples
@@ -1435,12 +1538,12 @@ class HybridTextDecoder(Component):
                 else:
                     logging.warning(
                         "Expected %d decode cache input qparams, found %d; "
-                        "skip qwen3.5 hybrid cross-graph KV qparam alignment.",
+                        "skip qwen3.5-family hybrid cross-graph KV qparam alignment.",
                         expected_cache_qparams,
                         len(decode_cache_qparams),
                     )
                 logging.info(
-                    "Skipping hybrid encoding override for qwen3.5 because "
+                    "Skipping hybrid encoding override for qwen3.5-family because "
                     "decode and prefill graphs are not isomorphic; only KV cache "
                     "qparams are aligned across graphs."
                 )
@@ -1593,24 +1696,56 @@ class Modality(Component):
                         repo_id
                     )
                     backbone = auto_model.model
+                    _overlay_local_vision_config(auto_model, local_model_config)
+                    vision_config = auto_model.config.vision_config
+                    auto_model.config.dtype = torch.float32
+                    vision_config.dtype = torch.float32
+                    self.num_layers = _get_vision_num_layers(auto_model)
+                    auto_model = auto_model.to(torch.float32).eval()
+                    self.model = config().create_encoder(auto_model.config).eval()
+                    self.model.load_state_dict(
+                        backbone.state_dict(), strict=False
+                    )  # set strict to false to simplify parameter loading for non-text models
                 else:
-                    auto_model = AutoModel.from_pretrained(
-                        repo_id, _attn_implementation="eager"
-                    )
-                    backbone = auto_model
-                _overlay_local_vision_config(auto_model, local_model_config)
-                vision_config = auto_model.config.vision_config
-                auto_model.config.dtype = torch.float32
-                vision_config.dtype = torch.float32
-                self.num_layers = _get_vision_num_layers(auto_model)
+                    if _is_lincal35_decoder_model(control_args.decoder_model):
+                        auto_config = AutoConfig.from_pretrained(repo_id)
+                        config_holder = types.SimpleNamespace(config=auto_config)
+                        _overlay_local_vision_config(config_holder, local_model_config)
+                        vision_config = auto_config.vision_config
+                        auto_config.dtype = torch.float32
+                        vision_config.dtype = torch.float32
+                        self.num_layers = _get_vision_num_layers(config_holder)
+                        self.model = config().create_encoder(auto_config).eval()
+                        self.model.load_state_dict(
+                            _load_safetensor_state_dict_by_prefix(
+                                repo_id, "model.visual.", strip_prefix="model."
+                            ),
+                            strict=False,
+                        )
+                    else:
+                        auto_model = AutoModel.from_pretrained(
+                            repo_id, _attn_implementation="eager"
+                        )
+                        backbone = auto_model
+                        _overlay_local_vision_config(auto_model, local_model_config)
+                        vision_config = auto_model.config.vision_config
+                        auto_model.config.dtype = torch.float32
+                        vision_config.dtype = torch.float32
+                        self.num_layers = _get_vision_num_layers(auto_model)
+                        auto_model = auto_model.to(torch.float32).eval()
+                        self.model = config().create_encoder(auto_model.config).eval()
+                        self.model.load_state_dict(
+                            backbone.state_dict(), strict=False
+                        )  # set strict to false to simplify parameter loading for non-text models
             else:
                 raise NotImplementedError(f"Find no {modality}")
 
-            auto_model = auto_model.to(torch.float32).eval()
-            self.model = config().create_encoder(auto_model.config).eval()
-            self.model.load_state_dict(
-                backbone.state_dict(), strict=False
-            )  # set strict to false to simplify parameter loading for non-text models
+            if self.model is None:
+                auto_model = auto_model.to(torch.float32).eval()
+                self.model = config().create_encoder(auto_model.config).eval()
+                self.model.load_state_dict(
+                    backbone.state_dict(), strict=False
+                )  # set strict to false to simplify parameter loading for non-text models
             self.model = self.model.to(torch.float32).eval()
             self.example_input = self.model.get_example_inputs()
             self.preprocess = getattr(self.model, "preprocess", lambda data: data)

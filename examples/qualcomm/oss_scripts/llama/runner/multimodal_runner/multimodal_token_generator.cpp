@@ -92,6 +92,9 @@ void MultimodalTokenGenerator<T>::init_io(
   if (metadata_.cache_mode == CacheMode::HybridCache) {
     Result<TensorInfo> window_attention_mask =
         method_meta->input_tensor_meta(idx++);
+    window_attention_mask_.size = window_attention_mask->nbytes();
+    window_context_len_swa_ = window_attention_mask->sizes()[2];
+    true_swa_enabled_swa_ = window_context_len_swa_ != metadata_.context_len;
     window_attention_mask_.data = reinterpret_cast<uint16_t*>(
         buffer_manager->allocate(window_attention_mask_.size));
     window_attention_mask_.tensor = std::make_unique<TensorImpl>(

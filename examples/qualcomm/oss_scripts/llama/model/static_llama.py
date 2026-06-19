@@ -1539,6 +1539,136 @@ class Qwen35ModelWithoutEmbedding(Qwen35Model):
         return meta_data
 
 
+class Qwen35ModelWithoutEmbedding_swa(Qwen35ModelWithoutEmbedding):
+    def _get_window_context_len_swa(self) -> int:
+        return min(self.max_seq_len, self.sliding_window + self.ar_len - 1)
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        atten_mask: torch.Tensor,
+        window_atten_mask: torch.Tensor,
+        input_pos: Optional[torch.Tensor] = None,
+        *args,
+    ) -> Tuple[torch.Tensor, List[torch.Tensor], List[torch.Tensor]]:
+        output_k_cache = []
+        output_v_cache = []
+        freqs_cos, freqs_sin = self._get_qwen35_freqs(input_pos)
+
+        hidden_states = self.embedding_scale_factor * hidden_states
+
+        for ind, decoder_layer in enumerate(self.layers):
+            k_caches = None
+            v_caches = None
+            if self.use_kv_cache:
+                offset_k = ind
+                offset_v = self.n_layers + offset_k
+                k_caches = args[offset_k]
+                v_caches = args[offset_v]
+
+            hidden_states, k, v = decoder_layer(
+                hidden_states,
+                freqs_cos=freqs_cos,
+                freqs_sin=freqs_sin,
+                atten_mask=(
+                    window_atten_mask
+                    if self.layer_types[ind] == "sliding_attention"
+                    else atten_mask
+                ),
+                k_caches=k_caches,
+                v_caches=v_caches,
+            )
+            output_k_cache.extend(k)
+            output_v_cache.extend(v)
+
+        hidden_states = self.norm(hidden_states)
+        logits = self.output(hidden_states)
+
+        if self.logits_scaling:
+            logits = logits / self.logits_scaling
+
+        if self.output_cache:
+            return logits, output_k_cache, output_v_cache
+        return logits
+
+    def get_example_inputs(self):
+        if not self.has_sliding_attention:
+            return super().get_example_inputs()
+
+        hidden_states = torch.randn(
+            (self.max_batch_size, self.ar_len, self.dim), dtype=torch.float32
+        )
+        window_context_len = self._get_window_context_len_swa()
+        causal_mask = CausalAttentionMask(
+            self.max_batch_size, self.ar_len, self.max_seq_len
+        )
+        sliding_window_mask = SlidingWindowAttentionMask(
+            self.max_batch_size,
+            self.ar_len,
+            window_context_len,
+            sliding_window=self.sliding_window,
+        )
+        atten_mask = AttentionMask([causal_mask, sliding_window_mask])
+        if self.use_kv_cache:
+            pos_ids = torch.zeros(
+                (3, self.max_batch_size, self.ar_len), dtype=torch.int32
+            )
+            k_cache, v_cache = [], []
+            full_cache_len = self.max_seq_len - self.ar_len
+            window_cache_len = max(0, window_context_len - self.ar_len)
+            for layer_type in self.layer_types:
+                if layer_type == "linear_attention":
+                    k_cache.append(
+                        torch.zeros(
+                            self.max_batch_size,
+                            self.linear_conv_dim,
+                            self.linear_conv_kernel_dim,
+                        )
+                    )
+                    v_cache.append(
+                        torch.zeros(
+                            self.max_batch_size,
+                            self.linear_num_value_heads,
+                            self.linear_key_head_dim,
+                            self.linear_value_head_dim,
+                        )
+                    )
+                else:
+                    cache_len = (
+                        window_cache_len
+                        if layer_type == "sliding_attention"
+                        else full_cache_len
+                    )
+                    k_cache.append(
+                        torch.zeros(
+                            self.max_batch_size,
+                            self.n_kv_heads,
+                            self.head_dim,
+                            cache_len,
+                        )
+                    )
+                    v_cache.append(
+                        torch.zeros(
+                            self.max_batch_size,
+                            self.n_kv_heads,
+                            cache_len,
+                            self.head_dim,
+                        )
+                    )
+            return (
+                hidden_states,
+                atten_mask,
+                pos_ids,
+                k_cache,
+                v_cache,
+            )
+
+        return (
+            hidden_states,
+            atten_mask,
+        )
+
+
 class LlamaModelWithoutEmbedding(LlamaModel):
     def __init__(
         self,

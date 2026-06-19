@@ -109,6 +109,8 @@ class MultimodalPromptProcessor : public example::PromptProcessor<T> {
   using PromptProcessor<T>::input_pos_;
   using PromptProcessor<T>::attention_mask_;
   using PromptProcessor<T>::window_attention_mask_;
+  using PromptProcessor<T>::true_swa_enabled_swa_;
+  using PromptProcessor<T>::window_context_len_swa_;
   using PromptProcessor<T>::logits_;
   using PromptProcessor<T>::inputs_;
   using PromptProcessor<T>::input_tensors_;

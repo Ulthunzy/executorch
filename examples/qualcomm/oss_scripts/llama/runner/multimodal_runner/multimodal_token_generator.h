@@ -84,6 +84,8 @@ class MultimodalTokenGenerator : public example::TokenGenerator<T> {
   using TokenGenerator<T>::input_pos_;
   using TokenGenerator<T>::attention_mask_;
   using TokenGenerator<T>::window_attention_mask_;
+  using TokenGenerator<T>::true_swa_enabled_swa_;
+  using TokenGenerator<T>::window_context_len_swa_;
   using TokenGenerator<T>::inputs_;
   using TokenGenerator<T>::input_tensors_;
   using TokenGenerator<T>::output_tensors_;

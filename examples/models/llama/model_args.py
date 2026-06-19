@@ -119,6 +119,7 @@ class ModelArgs:
     local_rope_theta: Optional[float] = (
         None  # For sliding window attention. e.g., gemma3-1b
     )
+    mrope_section: Optional[list] = None  # Multi-axis RoPE section sizes.
     rope_freq_base: float = 10000.0  # The base frequency for RoPE. Keep it for BC.
     use_scaled_rope: bool = False  # Use scaled RoPE, introduced in llama3.1.
     rope_scale_factor: int = 8

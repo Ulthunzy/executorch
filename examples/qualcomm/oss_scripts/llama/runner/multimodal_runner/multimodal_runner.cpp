@@ -112,9 +112,11 @@ int32_t get_position_id_dim(
   return static_cast<int32_t>(input_pos->nbytes() / base_bytes);
 }
 
-bool is_qwen35_vlm(const ModelVersion& model_version) {
+bool is_qwen35_family_vlm(const ModelVersion& model_version) {
   const auto* vlm = std::get_if<VisionLanguageModel>(&model_version);
-  return vlm != nullptr && *vlm == VisionLanguageModel::kQwen3_5;
+  return vlm != nullptr &&
+      (*vlm == VisionLanguageModel::kQwen3_5 ||
+       *vlm == VisionLanguageModel::kLincal3_5);
 }
 
 int32_t read_required_int_metadata(
@@ -122,12 +124,12 @@ int32_t read_required_int_metadata(
     const std::string& method_name) {
   ET_CHECK_MSG(
       module->method_names()->count(method_name) != 0,
-      "Required metadata %s is missing from Qwen3.5 PTE",
+      "Required metadata %s is missing from Qwen3.5-family PTE",
       method_name.c_str());
   auto value = module->get(method_name.c_str());
   ET_CHECK_MSG(
       value.ok(),
-      "Failed to read required metadata %s from Qwen3.5 PTE",
+      "Failed to read required metadata %s from Qwen3.5-family PTE",
       method_name.c_str());
   return static_cast<int32_t>(value.get().toScalar().to<int64_t>());
 }
@@ -225,6 +227,9 @@ QNNMultimodalRunner<T>::QNNMultimodalRunner(
     cache_mode_ = CacheMode::HybridCache;
   } else if (model_version == "qwen3_5") {
     model_version_ = VisionLanguageModel::kQwen3_5;
+  } else if (model_version == "lincal3_5") {
+    model_version_ = VisionLanguageModel::kLincal3_5;
+    cache_mode_ = CacheMode::HybridCache;
   } else {
     ET_CHECK_MSG(false, "Unsupported Decoder Model");
   }
@@ -295,7 +300,8 @@ Error QNNMultimodalRunner<T>::load() {
     } else if (
         *vlm == VisionLanguageModel::kInternvl3 ||
         *vlm == VisionLanguageModel::kQwen2_5_VL ||
-        *vlm == VisionLanguageModel::kQwen3_5) {
+        *vlm == VisionLanguageModel::kQwen3_5 ||
+        *vlm == VisionLanguageModel::kLincal3_5) {
       eos_ids->insert(tokenizer_->encode("<|im_end|>", 0, 0).get()[0]);
     }
   } else if (
@@ -330,7 +336,7 @@ Error QNNMultimodalRunner<T>::load() {
   ET_CHECK_MSG(num_layers != -1, "Could not retrieve num layers");
   int64_t num_heads = 0;
   int64_t head_dim = 0;
-  if (is_qwen35_vlm(model_version_) &&
+  if (is_qwen35_family_vlm(model_version_) &&
       text_decoder_->method_names()->count("get_n_kv_heads") > 0 &&
       text_decoder_->method_names()->count("get_head_dim") > 0) {
     num_heads = ET_UNWRAP(text_decoder_->get("get_n_kv_heads"))
@@ -392,8 +398,59 @@ Error QNNMultimodalRunner<T>::load() {
       token_position_id_dim);
   position_id_dim_ = prompt_position_id_dim;
 
+  bool enable_true_swa = false;
+  std::vector<int32_t> layer_cache_len;
+  std::vector<bool> layer_is_swa;
+  int32_t window_context_len = context_len_;
+  if (cache_mode_ == CacheMode::HybridCache) {
+    window_context_len = method_meta->input_tensor_meta(2)->sizes()[2];
+    if (window_context_len != context_len_) {
+      enable_true_swa = true;
+    }
+
+    const size_t input_cache_start =
+        method_meta->num_inputs() - 2 * static_cast<size_t>(num_layers);
+    const int32_t full_cache_len = context_len_ - token_generator_ar_len;
+    layer_cache_len.resize(num_layers, 0);
+    layer_is_swa.assign(num_layers, false);
+    for (int64_t layer = 0; layer < num_layers; ++layer) {
+      Result<TensorInfo> k_in = method_meta->input_tensor_meta(
+          input_cache_start + static_cast<size_t>(layer));
+      if (!k_in.ok()) {
+        ET_LOG(
+            Error,
+            "Failed to fetch kv_forward key cache metadata for layer %lld",
+            static_cast<long long>(layer));
+        return Error::Internal;
+      }
+      if (k_in->sizes().size() == 4) {
+        const int32_t cache_len = k_in->sizes()[3];
+        layer_cache_len[layer] = cache_len;
+        if (cache_len != full_cache_len) {
+          layer_is_swa[layer] = true;
+          enable_true_swa = true;
+        }
+      }
+    }
+  }
+  if (enable_true_swa) {
+    int64_t swa_layers = 0;
+    for (bool is_swa : layer_is_swa) {
+      if (is_swa) {
+        ++swa_layers;
+      }
+    }
+    ET_LOG(
+        Info,
+        "True SWA enabled for multimodal runner: window_context_len=%d, full_context_len=%d, swa_layers=%lld/%lld",
+        window_context_len,
+        context_len_,
+        static_cast<long long>(swa_layers),
+        static_cast<long long>(num_layers));
+  }
+
   std::vector<typename KVManager<T>::Metadata::CacheSpec> cache_specs;
-  if (is_qwen35_vlm(model_version_)) {
+  if (is_qwen35_family_vlm(model_version_)) {
     using CacheSpec = typename KVManager<T>::Metadata::CacheSpec;
     cache_specs.resize(
         num_layers,
@@ -439,7 +496,9 @@ Error QNNMultimodalRunner<T>::load() {
         const bool same_size_cache =
             k_in->nbytes() == k_out->nbytes() &&
             v_in->nbytes() == v_out->nbytes();
-        if (same_size_cache) {
+        if (!layer_is_swa.empty() && layer_is_swa[layer]) {
+          spec.update_mode = KVManager<T>::Metadata::kCircular;
+        } else if (same_size_cache) {
           spec.update_mode = KVManager<T>::Metadata::kFullOverwrite;
         }
         spec.k_zero_point = read_required_int_metadata(
@@ -449,6 +508,38 @@ Error QNNMultimodalRunner<T>::load() {
             text_decoder_.get(),
             "get_kv_input_" + std::to_string(num_layers + layer) +
                 "_zero_point");
+      }
+    }
+  }
+
+  if (enable_true_swa &&
+      (eval_mode_ == EvalMode::kHybrid ||
+       eval_mode_ == EvalMode::kLookaheadDecoding)) {
+    const size_t input_cache_start =
+        prompt_method_meta->num_inputs() - 2 * static_cast<size_t>(num_layers);
+    for (int64_t layer = 0; layer < num_layers; ++layer) {
+      if (!layer_is_swa.empty() && layer_is_swa[layer]) {
+        Result<TensorInfo> k_in = prompt_method_meta->input_tensor_meta(
+            input_cache_start + static_cast<size_t>(layer));
+        if (!k_in.ok()) {
+          ET_LOG(
+              Error,
+              "Failed to fetch prefill key cache metadata for layer %lld",
+              static_cast<long long>(layer));
+          return Error::Internal;
+        }
+        const int32_t prefill_cache_len =
+            k_in->sizes().size() == 4 ? k_in->sizes()[3] : 0;
+        if (prefill_cache_len != layer_cache_len[layer]) {
+          ET_LOG(
+              Error,
+              "Unsupported true SWA export: prefill_forward and kv_forward use different cache layouts "
+              "(layer=%lld prefill_cache_len=%d decode_cache_len=%d).",
+              static_cast<long long>(layer),
+              prefill_cache_len,
+              layer_cache_len[layer]);
+          return Error::NotSupported;
+        }
       }
     }
   }
@@ -583,7 +674,15 @@ Error QNNMultimodalRunner<T>::load() {
 
   ET_LOG(Info, "creating io_memory");
   // prepare io
-  kv_manager_->init_cache(buffer_manager_.get(), prompt_processor_ar_len);
+  if (enable_true_swa) {
+    kv_manager_->init_cache_swa(
+        buffer_manager_.get(),
+        prompt_processor_ar_len,
+        layer_cache_len,
+        layer_is_swa);
+  } else {
+    kv_manager_->init_cache(buffer_manager_.get(), prompt_processor_ar_len);
+  }
   prompt_processor_->init_io(
       buffer_manager_.get(),
       text_decoder_->method_meta(prompt_processor_method_name));
@@ -705,11 +804,11 @@ executorch::runtime::Error QNNMultimodalRunner<T>::generate(
 
   // Reset merger for new generation
   embedding_merger_->reset();
-  const bool use_qwen35_mrope = is_qwen35_vlm(model_version_) &&
+  const bool use_qwen35_mrope = is_qwen35_family_vlm(model_version_) &&
       position_id_dim_ == 3;
   const bool placeholder_merge =
       modality_of(model_version_) == Modality::kVision && image_token_id_ != 0 &&
-      !is_qwen35_vlm(model_version_);
+      !is_qwen35_family_vlm(model_version_);
   std::vector<int32_t> prompt_position_ids;
   int32_t mrope_pos = 0;
 
