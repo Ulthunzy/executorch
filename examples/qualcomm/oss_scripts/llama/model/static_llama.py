@@ -1276,7 +1276,7 @@ class Qwen35Model(LlamaModel):
             )
         self.register_buffer("freqs_cos", freqs_cos, persistent=False)
         self.register_buffer("freqs_sin", freqs_sin, persistent=False)
-        self.mrope_section = getattr(config, "mrope_section", [11, 11, 10])
+        self.mrope_section = config.mrope_section or [11, 11, 10]
         self.rotary_freq_dim = freqs_cos.shape[-1]
 
         self.linear_conv_kernel_dim = config.linear_conv_kernel_dim

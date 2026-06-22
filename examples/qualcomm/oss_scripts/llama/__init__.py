@@ -599,7 +599,7 @@ class _Qwen3_5_0_8BBase(LLMModelConfig):
 @register_llm_model("qwen3_5-0_8b", modality_encoders=Qwen35VLEncoder)
 @dataclass(init=False, frozen=True)
 class Qwen3_5_0_8B(_Qwen3_5_0_8BBase):
-    repo_id: str = "/hunter/model/Qwen/Qwen3.5-0.8B"
+    repo_id: str = "/home/ubuntu/workspace/xiaoyi/model/Qwen/Qwen3.5-0.8B"
     params_path: str = os.path.join(
         BASE_DIR, "../../../models/qwen3_5/config/0_8b_config.json"
     )
@@ -622,7 +622,7 @@ class _Qwen3_5_2BBase(LLMModelConfig):
 @register_llm_model("qwen3_5-2b", modality_encoders=Qwen35VLEncoder)
 @dataclass(init=False, frozen=True)
 class Qwen3_5_2B(_Qwen3_5_2BBase):
-    repo_id: str = "/hunter/model/Qwen/Qwen3.5-2B"
+    repo_id: str = "/home/ubuntu/workspace/xiaoyi/model/Qwen/Qwen3.5-2B"
     params_path: str = os.path.join(
         BASE_DIR, "../../../models/qwen3_5/config/2b_config.json"
     )
@@ -632,7 +632,7 @@ class Qwen3_5_2B(_Qwen3_5_2BBase):
 @register_llm_model("lincal3_5-0_8b", modality_encoders=Qwen35VLEncoder)
 @dataclass(init=False, frozen=True)
 class Lincal3_5_0_8B(_Qwen3_5_0_8BBase):
-    repo_id: str = "/hunter/model/lincal3_5/lincal3_5-0.8B"
+    repo_id: str = "/home/ubuntu/workspace/xiaoyi/model/Lincal/Lincal3_5/lincal3_5-0.8B"
     params_path: str = os.path.join(
         BASE_DIR, "../../../models/lincal3_5/config/0_8b_config.json"
     )
@@ -642,7 +642,7 @@ class Lincal3_5_0_8B(_Qwen3_5_0_8BBase):
 @register_llm_model("lincal3_5-2b", modality_encoders=Qwen35VLEncoder)
 @dataclass(init=False, frozen=True)
 class Lincal3_5_2B(_Qwen3_5_2BBase):
-    repo_id: str = "/hunter/model/lincal3_5/lincal3_5-2B"
+    repo_id: str = "/home/ubuntu/workspace/xiaoyi/model/Lincal/Lincal3_5/lincal3_5-2B"
     params_path: str = os.path.join(
         BASE_DIR, "../../../models/lincal3_5/config/2b_config.json"
     )

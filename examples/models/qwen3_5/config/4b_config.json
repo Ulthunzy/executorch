@@ -11,6 +11,11 @@
   "vocab_size": 248320,
   "use_hf_rope": true,
   "partial_rotary_factor": 0.25,
+  "mrope_section": [
+    11,
+    11,
+    10
+  ],
   "attention_qkv_bias": false,
   "use_qk_norm": true,
   "qk_norm_before_rope": true,
