@@ -122,3 +122,8 @@ export.sh
 
 export.log-*
 examples/qualcomm/oss_scripts/llama/qwen35_qualcomm_adaptation_ppt_outline.txt
+
+bench_0622_0620_test/
+charts/
+qwen_mha2sha_attention_test_record.txt
+draw_lincal_qwen_vl_speed.py

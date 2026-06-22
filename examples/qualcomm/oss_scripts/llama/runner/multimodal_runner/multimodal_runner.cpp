@@ -112,6 +112,57 @@ int32_t get_position_id_dim(
   return static_cast<int32_t>(input_pos->nbytes() / base_bytes);
 }
 
+size_t aligned_input_nbytes(
+    const Result<MethodMeta>& method_meta,
+    size_t index) {
+  ET_CHECK_MSG(method_meta.ok(), "Failed to get method metadata");
+  auto tensor_meta = method_meta->input_tensor_meta(index);
+  ET_CHECK_MSG(tensor_meta.ok(), "Failed to get input tensor metadata");
+  return align_shared_buffer_allocation_size(tensor_meta->nbytes());
+}
+
+size_t aligned_output_nbytes(
+    const Result<MethodMeta>& method_meta,
+    size_t index) {
+  ET_CHECK_MSG(method_meta.ok(), "Failed to get method metadata");
+  auto tensor_meta = method_meta->output_tensor_meta(index);
+  ET_CHECK_MSG(tensor_meta.ok(), "Failed to get output tensor metadata");
+  return align_shared_buffer_allocation_size(tensor_meta->nbytes());
+}
+
+size_t multimodal_prompt_processor_io_size_from_meta(
+    const Result<MethodMeta>& method_meta,
+    bool is_bert,
+    CacheMode cache_mode) {
+  size_t total_bytes = 0;
+  size_t idx = 0;
+  total_bytes += aligned_input_nbytes(method_meta, idx++);
+  total_bytes += aligned_input_nbytes(method_meta, idx++);
+  if (cache_mode == CacheMode::HybridCache) {
+    total_bytes += aligned_input_nbytes(method_meta, idx++);
+  }
+  if (!is_bert) {
+    total_bytes += aligned_input_nbytes(method_meta, idx++);
+  }
+  total_bytes += aligned_output_nbytes(method_meta, 0);
+  return total_bytes;
+}
+
+size_t multimodal_token_generator_io_size_from_meta(
+    const Result<MethodMeta>& method_meta,
+    CacheMode cache_mode) {
+  size_t total_bytes = 0;
+  size_t idx = 0;
+  total_bytes += aligned_input_nbytes(method_meta, idx++);
+  total_bytes += aligned_input_nbytes(method_meta, idx++);
+  if (cache_mode == CacheMode::HybridCache) {
+    total_bytes += aligned_input_nbytes(method_meta, idx++);
+  }
+  total_bytes += aligned_input_nbytes(method_meta, idx++);
+  total_bytes += aligned_output_nbytes(method_meta, 0);
+  return total_bytes;
+}
+
 bool is_qwen35_family_vlm(const ModelVersion& model_version) {
   const auto* vlm = std::get_if<VisionLanguageModel>(&model_version);
   return vlm != nullptr &&
@@ -661,13 +712,19 @@ Error QNNMultimodalRunner<T>::load() {
             position_id_dim_},
         &stats_);
   }
+  if (enable_true_swa) {
+    kv_manager_->configure_cache_size_swa(layer_cache_len, layer_is_swa);
+  }
 
   buffer_manager_ = std::make_unique<ClientMem>();
   if (shared_buffer_) {
     buffer_manager_ = std::make_unique<RpcMem>(
         kv_manager_->total_cache_size_in_bytes(),
-        prompt_processor_->total_prompt_processor_io_size_in_bytes(),
-        token_generator_->total_token_generator_io_size_in_bytes(),
+        multimodal_prompt_processor_io_size_from_meta(
+            prompt_method_meta,
+            prompt_processor_ar_len == context_len_,
+            cache_mode_),
+        multimodal_token_generator_io_size_from_meta(method_meta, cache_mode_),
         tok_embedding_processor_->total_embedding_processor_io_size_in_bytes(),
         tok_embedding_generator_->total_embedding_processor_io_size_in_bytes());
   }

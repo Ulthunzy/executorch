@@ -1,10 +1,10 @@
 import os
 
-import numpy as np
 import matplotlib.patheffects as pe
 import matplotlib.pyplot as plt
-from matplotlib.patches import FancyBboxPatch, Patch
+import numpy as np
 from matplotlib import font_manager as fm
+from matplotlib.patches import FancyBboxPatch, Patch
 
 
 def set_chinese_font():
@@ -64,43 +64,44 @@ plt.rcParams.update(
     }
 )
 
-
-def hex_to_rgb01(hex_color):
-    hex_color = hex_color.lstrip("#")
-    return np.array([int(hex_color[i : i + 2], 16) for i in (0, 2, 4)]) / 255.0
-
-
-def mix_with_white(hex_color, mix=0.68):
-    rgb = hex_to_rgb01(hex_color)
-    return (1 - mix) * rgb + mix * np.ones(3)
-
-
-models = ["lincal-vl-3B", "qwen2.5-vl-3B"]
+CONTEXTS = ["1k", "2k", "4k", "8k"]
+PARAM_GROUPS = {
+    "0.8B": ["lincal3.5-0.8B", "qwen3.5-0.8B"],
+    "2B": ["lincal3.5-2B", "qwen3.5-2B"],
+}
 DISPLAY_NAME = {
-    "lincal-vl-3B": "LuxiVLM-3B",
-    "qwen2.5-vl-3B": "qwen2.5-vl-3B",
+    "lincal3.5-0.8B": "LinCal3.5-0.8B",
+    "lincal3.5-2B": "LinCal3.5-2B",
+    "qwen3.5-0.8B": "Qwen3.5-0.8B",
+    "qwen3.5-2B": "Qwen3.5-2B",
 }
-contexts_eff = ["1K", "2K", "3K", "4K", "8K"]
 
-speed = np.array(
-    [
-        [25.97, 20.44, 17.79, 12.68, 7.79],
-        [27.32, 14.98, 13.41, 7.75, 4.13],
-    ]
-)
-
-prefill = np.array(
-    [
-        [1128.46, 589.31, 445.99, 436.04, 250.34],
-        [1144.31, 465.56, 305.61, 304.06, 170.45],
-    ]
-)
-
-kv_cache_mib = {
-    "lincal-vl-3B": [20.23, 29.23, 38.23, 47.23, 83.23],
-    "qwen2.5-vl-3B": [20.23, 38.23, 56.23, 74.23, 146.23],
+DATA = {
+    "decode": {
+        "qwen3.5-0.8B": [78.747, 71.801, 64.074, 53.4],
+        "qwen3.5-2B": [37.407, 35.939, 34.616, 32.7],
+        "lincal3.5-0.8B": [86.994, 86.956, 86.971, 86.654],
+        "lincal3.5-2B": [37.578, 36.859, 37.387, 37.133],
+    },
+    "prefill": {
+        "qwen3.5-0.8B": [599.331, 567.544, 503.841, 409.0],
+        "qwen3.5-2B": [488.816, 465.473, 454.267, 446.0],
+        "lincal3.5-0.8B": [592.595, 598.131, 603.134, 603.537],
+        "lincal3.5-2B": [494.756, 498.684, 508.035, 511.027],
+    },
+    "cache": {
+        "qwen3.5-0.8B": [46.69, 70.69, 118.69, 214.69],
+        "qwen3.5-2B": [46.69, 70.69, 118.69, 214.69],
+        "lincal3.5-0.8B": [34.69, 34.69, 34.69, 34.69],
+        "lincal3.5-2B": [34.69, 34.69, 34.69, 34.69],
+    },
 }
-kv_cache = np.array([kv_cache_mib[model] for model in models])
+
+METRICS = [
+    ("decode", "解码速度（Decode）", "token/s"),
+    ("prefill", "预填充速度（Prefill）", "token/s"),
+    ("cache", "Cache/State 占用", "MiB"),
+]
 
 THEME = {
     "bg": "#FFFFFF",
@@ -110,14 +111,14 @@ THEME = {
     "text": "#111827",
     "muted": "#6B7280",
     "accent": "#2563EB",
-    "good": "#0F766E",
 }
 
 COLOR = {
-    "lincal-vl-3B": "#6D5EF5",
-    "qwen2.5-vl-3B": "#2BB3C0",
+    "lincal": "#6D5EF5",
+    "qwen": "#D1D5DB",
 }
-HATCH = {"lincal-vl-3B": ".."}
+QWEN_EDGE = "#F3F4F6"
+HATCH = {"lincal": ".."}
 
 
 def add_card(ax):
@@ -156,36 +157,32 @@ def beautify_axes(ax, ylabel):
     ax.tick_params(axis="y", colors=THEME["muted"], length=0)
 
 
-def fmt_value(value):
-    if value >= 100:
-        return f"{value:.0f}"
-    if value >= 10:
-        return f"{value:.1f}"
-    return f"{value:.2f}"
+def model_kind(model):
+    return "qwen" if model.startswith("qwen") else "lincal"
 
 
-def draw_grouped(ax, values, ylabel, *, ratio_color=None):
+def draw_grouped(ax, models, values, ylabel):
     add_card(ax)
     beautify_axes(ax, ylabel)
 
     width = 0.36
-    x = np.arange(len(contexts_eff))
+    x = np.arange(len(CONTEXTS))
     vmax = values.max()
 
     for i, model in enumerate(models):
         off = (i - (len(models) - 1) / 2) * width
-        is_qwen = model == "qwen2.5-vl-3B"
+        is_qwen = model_kind(model) == "qwen"
 
         if is_qwen:
-            face = mix_with_white(COLOR[model], mix=0.68)
-            edge = mix_with_white(COLOR[model], mix=0.82)
+            face = COLOR["qwen"]
+            edge = QWEN_EDGE
             hatch = None
-            alpha = 0.95
-            zorder = 2.8
+            alpha = 0.70
+            zorder = 2.75
         else:
-            face = COLOR[model]
+            face = COLOR["lincal"]
             edge = "#FFFFFF"
-            hatch = HATCH.get(model)
+            hatch = HATCH["lincal"]
             alpha = 0.92
             zorder = 3.0
 
@@ -201,9 +198,22 @@ def draw_grouped(ax, values, ylabel, *, ratio_color=None):
             zorder=zorder,
         )
 
-        for bar in bars:
-            if not is_qwen:
-                bar.set_path_effects(
+        for rect in bars:
+            if is_qwen:
+                rect.set_path_effects(
+                    [
+                        pe.Stroke(linewidth=3.2, foreground="white", alpha=0.80),
+                        pe.Stroke(linewidth=1.1, foreground=QWEN_EDGE, alpha=1.0),
+                        pe.withSimplePatchShadow(
+                            offset=(0, -0.8),
+                            alpha=0.05,
+                            shadow_rgbFace=(0, 0, 0),
+                        ),
+                        pe.Normal(),
+                    ]
+                )
+            else:
+                rect.set_path_effects(
                     [
                         pe.withSimplePatchShadow(
                             offset=(0, -1.4),
@@ -213,25 +223,14 @@ def draw_grouped(ax, values, ylabel, *, ratio_color=None):
                         pe.Normal(),
                     ]
                 )
-            else:
-                bar.set_path_effects(
-                    [
-                        pe.Stroke(linewidth=3.2, foreground="white", alpha=0.65),
-                        pe.Stroke(linewidth=1.2, foreground=edge, alpha=0.95),
-                        pe.withSimplePatchShadow(
-                            offset=(0, -0.8), alpha=0.08, shadow_rgbFace=(0, 0, 0)
-                        ),
-                        pe.Normal(),
-                    ]
-                )
 
-        txt_color = THEME["text"] if not is_qwen else THEME["muted"]
-        txt_alpha = 0.92 if not is_qwen else 0.55
+        txt_color = THEME["muted"] if is_qwen else THEME["text"]
+        txt_alpha = 0.70 if is_qwen else 0.92
         for rect, value in zip(bars, values[i]):
             ax.text(
                 rect.get_x() + rect.get_width() / 2,
                 rect.get_height() + vmax * 0.014,
-                fmt_value(float(value)),
+                f"{value:.2f}",
                 ha="center",
                 va="bottom",
                 fontsize=9,
@@ -240,7 +239,7 @@ def draw_grouped(ax, values, ylabel, *, ratio_color=None):
                 zorder=6,
             )
 
-    for j in range(len(contexts_eff)):
+    for j in range(len(CONTEXTS)):
         v0, v1 = values[0][j], values[1][j]
         if v0 >= v1:
             ratio = v0 / v1
@@ -254,19 +253,17 @@ def draw_grouped(ax, values, ylabel, *, ratio_color=None):
             "",
             xy=(x[j] + lower_off, y),
             xytext=(x[j] + higher_off, y),
-            arrowprops=dict(
-                arrowstyle="<->", color=ratio_color or THEME["accent"], lw=1.6
-            ),
+            arrowprops=dict(arrowstyle="<->", color=THEME["accent"], lw=1.6),
             zorder=7,
         )
         ax.text(
             x[j],
             y + vmax * 0.025,
-            f"{ratio:.2f}x",
+            f"{ratio:.2f}×",
             ha="center",
             va="bottom",
             fontsize=10,
-            color=ratio_color or THEME["accent"],
+            color=THEME["accent"],
             fontweight="bold",
             bbox=dict(
                 boxstyle="round,pad=0.22,rounding_size=0.18",
@@ -279,26 +276,33 @@ def draw_grouped(ax, values, ylabel, *, ratio_color=None):
         )
 
     ax.set_xticks(x)
-    ax.set_xticklabels(contexts_eff)
+    ax.set_xticklabels(CONTEXTS)
     ax.set_ylim(0, vmax * 1.28)
 
 
-def legend_handles():
-    return [
-        Patch(
-            facecolor=COLOR["lincal-vl-3B"],
-            edgecolor="#FFFFFF",
-            linewidth=1.0,
-            hatch=HATCH.get("lincal-vl-3B"),
-            label=DISPLAY_NAME["lincal-vl-3B"],
-        ),
-        Patch(
-            facecolor=mix_with_white(COLOR["qwen2.5-vl-3B"], mix=0.68),
-            edgecolor=mix_with_white(COLOR["qwen2.5-vl-3B"], mix=0.82),
-            linewidth=1.0,
-            label=DISPLAY_NAME["qwen2.5-vl-3B"],
-        ),
-    ]
+def legend_handles(models):
+    handles = []
+    for model in models:
+        if model_kind(model) == "qwen":
+            handles.append(
+                Patch(
+                    facecolor=COLOR["qwen"],
+                    edgecolor=QWEN_EDGE,
+                    linewidth=1.0,
+                    label=DISPLAY_NAME[model],
+                )
+            )
+        else:
+            handles.append(
+                Patch(
+                    facecolor=COLOR["lincal"],
+                    edgecolor="#FFFFFF",
+                    linewidth=1.0,
+                    hatch=HATCH["lincal"],
+                    label=DISPLAY_NAME[model],
+                )
+            )
+    return handles
 
 
 def style_legend(legend):
@@ -308,21 +312,20 @@ def style_legend(legend):
     legend.get_frame().set_alpha(1.0)
 
 
-def save_speed(out_dir):
-    fig, axes = plt.subplots(1, 2, figsize=(16.2, 5.8), gridspec_kw={"wspace": 0.18})
+def save_param_group(out_dir, param_size, models):
+    fig, axes = plt.subplots(1, 3, figsize=(17.8, 5.7), gridspec_kw={"wspace": 0.18})
     fig.patch.set_facecolor(THEME["bg"])
 
-    axes[0].set_title("解码速度（Decode）", color=THEME["text"], pad=12)
-    draw_grouped(axes[0], speed, "token/s")
-
-    axes[1].set_title("预填充速度（Prefill）", color=THEME["text"], pad=12)
-    draw_grouped(axes[1], prefill, "token/s")
+    for ax, (key, title, ylabel) in zip(axes, METRICS):
+        values = np.array([DATA[key][model] for model in models], dtype=float)
+        ax.set_title(title, color=THEME["text"], pad=12)
+        draw_grouped(ax, models, values, ylabel)
 
     legend = fig.legend(
-        handles=legend_handles(),
+        handles=legend_handles(models),
         loc="upper center",
         ncol=2,
-        bbox_to_anchor=(0.5, 0.92),
+        bbox_to_anchor=(0.5, 0.925),
         frameon=True,
         fancybox=True,
         borderpad=0.55,
@@ -335,56 +338,51 @@ def save_speed(out_dir):
     fig.text(
         0.5,
         0.995,
-        "推理速度对比（NPU Snapdragon 8Elite Gen5）",
+        "推理速度与内存占用对比（NPU: Snapdragon 8Elite Gen5）",
         ha="center",
         fontsize=20,
         fontweight="bold",
         color=THEME["text"],
     )
-    fig.subplots_adjust(left=0.045, right=0.98, bottom=0.11, top=0.82, wspace=0.18)
-    fig.savefig(os.path.join(out_dir, "lincal_qwen_vl_speed.png"), dpi=600, bbox_inches="tight")
-    fig.savefig(os.path.join(out_dir, "lincal_qwen_vl_speed.pdf"), bbox_inches="tight")
-    plt.close(fig)
-
-
-def save_memory(out_dir):
-    fig, ax = plt.subplots(1, 1, figsize=(10.8, 5.8))
-    fig.patch.set_facecolor(THEME["bg"])
-    draw_grouped(ax, kv_cache, "MiB", ratio_color=THEME["good"])
-
-    legend = fig.legend(
-        handles=legend_handles(),
-        loc="upper center",
-        ncol=2,
-        bbox_to_anchor=(0.5, 0.835),
-        frameon=True,
-        fancybox=True,
-        borderpad=0.55,
-        columnspacing=1.6,
-        handlelength=1.6,
-        fontsize=11,
-    )
-    style_legend(legend)
     fig.text(
-        0.5,
-        0.93,
-        "KV Cache 占用对比（NPU Snapdragon 8Elite Gen5）",
+        0.145,
+        0.948,
+        "速度越高越好 ↑ / Cache越低越好 ↓",
         ha="center",
-        fontsize=20,
+        va="center",
+        fontsize=13.0,
         fontweight="bold",
-        color=THEME["text"],
+        color=THEME["accent"],
+        bbox=dict(
+            boxstyle="round,pad=0.35,rounding_size=0.25",
+            facecolor="white",
+            edgecolor=THEME["accent"],
+            linewidth=1.2,
+            alpha=0.98,
+        ),
     )
-    fig.subplots_adjust(left=0.08, right=0.975, bottom=0.12, top=0.765)
-    fig.savefig(os.path.join(out_dir, "lincal_qwen_vl_memory.png"), dpi=600, bbox_inches="tight")
-    fig.savefig(os.path.join(out_dir, "lincal_qwen_vl_memory.pdf"), bbox_inches="tight")
+
+    fig.subplots_adjust(left=0.04, right=0.98, bottom=0.11, top=0.78, wspace=0.18)
+
+    safe_param_size = param_size.replace(".", "_").lower()
+    fig.savefig(
+        os.path.join(out_dir, f"lincal_qwen_{safe_param_size}_compare.png"),
+        dpi=600,
+        bbox_inches="tight",
+    )
+    fig.savefig(
+        os.path.join(out_dir, f"lincal_qwen_{safe_param_size}_compare.pdf"),
+        dpi=600,
+        bbox_inches="tight",
+    )
     plt.close(fig)
 
 
 def main():
     out_dir = "charts"
     os.makedirs(out_dir, exist_ok=True)
-    save_speed(out_dir)
-    save_memory(out_dir)
+    for param_size, models in PARAM_GROUPS.items():
+        save_param_group(out_dir, param_size, models)
 
 
 if __name__ == "__main__":
