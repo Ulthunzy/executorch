@@ -8,8 +8,8 @@ export ANDROID_NDK=$ANDROID_NDK_ROOT
 export LD_LIBRARY_PATH=$QNN_SDK_ROOT/lib/x86_64-linux-clang:${LD_LIBRARY_PATH:-}
 export PYTHONPATH=".."
 export CUDA_VISIBLE_DEVICES=""
-export EXECUTORCH_ROOT=/home/ubuntu/workspace/xiaoyi/executorch
-export PYTHONPATH=/home/ubuntu/workspace/xiaoyi/executorch:$PYTHONPATH
+export EXECUTORCH_ROOT=/hunter/cpp_code/ET/npu/executorch
+export PYTHONPATH=/hunter/cpp_code/ET/npu/executorch:$PYTHONPATH
 export FLATC_EXECUTABLE=$EXECUTORCH_ROOT/data/bin/flatc
 export PATH="$EXECUTORCH_ROOT/data/bin:$PATH"
 export https_proxy=http://127.0.0.1:7897 http_proxy=http://127.0.0.1:7897 all_proxy=socks5://127.0.0.1:7897

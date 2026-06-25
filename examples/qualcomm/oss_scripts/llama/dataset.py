@@ -179,7 +179,10 @@ class DatasetBuilder:
         """
 
         images = [load_image(image_path) for image_path in files_path]
-        if self.control_args.decoder_model == "qwen3_vl-2b_instruct":
+        if self.control_args.decoder_model in {
+            "qwen3_vl-2b_instruct",
+            "lincal3_vl-2b_instruct",
+        }:
             return [
                 (
                     _qwen_vl_image_to_patches(

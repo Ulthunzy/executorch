@@ -52,6 +52,11 @@ VLM_SPECIAL_TOKENS = {
         "fake_wrap_start": "<|vision_start|>",
         "fake_wrap_end": "<|vision_end|>",
     },
+    "lincal3_vl-2b_instruct": {
+        IMG_TOKEN: "<|image_pad|>",
+        "fake_wrap_start": "<|vision_start|>",
+        "fake_wrap_end": "<|vision_end|>",
+    },
     "qwen3_5-0_8b": {
         IMG_TOKEN: "<|image_pad|>",
         "fake_wrap_start": "",
@@ -391,6 +396,7 @@ class TokenizerWrapper:
             "qwen2_5_vl-3b_instruct",
             "qwen3_vl-2b_instruct",
             "lincal_vl-3b_instruct",
+            "lincal3_vl-2b_instruct",
         }:
             image_count = prompt.count(IMG_TOKEN)
             prompt = prompt.replace(IMG_TOKEN, "").lstrip()

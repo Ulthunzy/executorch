@@ -878,7 +878,10 @@ def export_llama(args) -> None:
     decoder_model_config = SUPPORTED_LLM_MODELS[args.decoder_model]
     logging.info(f"*** {args.decoder_model} ***\n%s", str(decoder_model_config))
 
-    if args.decoder_model.startswith("lincal3_5") and not args.enable_true_swa:
+    if (
+        args.decoder_model.startswith(("lincal3_5", "lincal3_vl"))
+        and not args.enable_true_swa
+    ):
         logging.info(
             "Enabling true SWA for %s because it uses sliding_attention layers.",
             args.decoder_model,

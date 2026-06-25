@@ -5,7 +5,7 @@ from typing import Dict
 
 import torch
 from safetensors.torch import load_file
-from torchtune.models.convert_weights import get_mapped_key
+from executorch.examples.models.checkpoint import get_mapped_key
 
 # Map Lincal-VL's HF text decoder weights to ExecuTorch's static Llama-style
 # decoder naming. Vision weights are intentionally ignored here because the
@@ -20,8 +20,10 @@ _LINCAL_VL_TO_META = {
     "lm_head.weight": "output.weight",
     "model.language_model.layers.{}.self_attn.q_proj.weight": "layers.{}.attention.wq.weight",
     "model.language_model.layers.{}.self_attn.q_proj.bias": "layers.{}.attention.wq.bias",
+    "model.language_model.layers.{}.self_attn.q_norm.weight": "layers.{}.attention.q_norm_fn.weight",
     "model.language_model.layers.{}.self_attn.k_proj.weight": "layers.{}.attention.wk.weight",
     "model.language_model.layers.{}.self_attn.k_proj.bias": "layers.{}.attention.wk.bias",
+    "model.language_model.layers.{}.self_attn.k_norm.weight": "layers.{}.attention.k_norm_fn.weight",
     "model.language_model.layers.{}.self_attn.v_proj.weight": "layers.{}.attention.wv.weight",
     "model.language_model.layers.{}.self_attn.v_proj.bias": "layers.{}.attention.wv.bias",
     "model.language_model.layers.{}.self_attn.o_proj.weight": "layers.{}.attention.wo.weight",
@@ -32,8 +34,10 @@ _LINCAL_VL_TO_META = {
     "model.language_model.layers.{}.mlp.up_proj.weight": "layers.{}.feed_forward.w3.weight",
     "model.layers.{}.self_attn.q_proj.weight": "layers.{}.attention.wq.weight",
     "model.layers.{}.self_attn.q_proj.bias": "layers.{}.attention.wq.bias",
+    "model.layers.{}.self_attn.q_norm.weight": "layers.{}.attention.q_norm_fn.weight",
     "model.layers.{}.self_attn.k_proj.weight": "layers.{}.attention.wk.weight",
     "model.layers.{}.self_attn.k_proj.bias": "layers.{}.attention.wk.bias",
+    "model.layers.{}.self_attn.k_norm.weight": "layers.{}.attention.k_norm_fn.weight",
     "model.layers.{}.self_attn.v_proj.weight": "layers.{}.attention.wv.weight",
     "model.layers.{}.self_attn.v_proj.bias": "layers.{}.attention.wv.bias",
     "model.layers.{}.self_attn.o_proj.weight": "layers.{}.attention.wo.weight",
