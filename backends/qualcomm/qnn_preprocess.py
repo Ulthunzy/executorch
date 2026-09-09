@@ -9,7 +9,6 @@ from collections import defaultdict
 from typing import Dict, final, List
 
 import executorch.backends.qualcomm.python.PyQnnManagerAdaptor as PyQnnManager
-import torch  # noqa: F401
 from executorch.backends.qualcomm._passes.qnn_pass_manager import (
     get_qnn_pass_manager_cls,
 )
@@ -118,12 +117,12 @@ class QnnBackend(BackendDetails):
             )
             has_attention_like_nodes = any(
                 node.op == "call_function"
-                and node.target.__name__
-                in {"aten._softmax.default", "aten._safe_softmax.default"}
+                and getattr(node.target, "__name__", "")
+                in {"_softmax.default", "_safe_softmax.default"}
                 for node in graph_module.graph.nodes
             ) and any(
                 node.op == "call_function"
-                and node.target.__name__ == "aten.expand_copy.default"
+                and getattr(node.target, "__name__", "") == "expand_copy.default"
                 for node in graph_module.graph.nodes
             )
             if not has_sha_nodes and has_attention_like_nodes:
@@ -156,17 +155,14 @@ class QnnBackend(BackendDetails):
                         f"For {node}, {node.op}:{node.target.__name__} "
                         "is not supported in Qnn Delegate"
                     )
-                    try:
-                        op = unwrap_op_overload(node.target)
-                        context_loader_target = eval(
-                            f"torch.ops.{OpContextLoader.namespace}.{op.__name__}",
-                            globals().update(torch.__dict__),
-                        )
-                        assert op == context_loader_target, err_msg
-                        # if graph has context binary loader node, return directly
-                        return node.meta[OpContextLoader.meta_ctx_bin]
-                    except:
+                    op = unwrap_op_overload(node.target)
+                    if (
+                        getattr(op, "namespace", None) != OpContextLoader.namespace
+                        or OpContextLoader.meta_ctx_bin not in node.meta
+                    ):
                         raise RuntimeError(err_msg)
+                    # If the graph has a context binary loader node, return directly.
+                    return node.meta[OpContextLoader.meta_ctx_bin]
 
             elif node.op in [
                 "get_attr",

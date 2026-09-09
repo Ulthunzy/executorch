@@ -45,6 +45,7 @@ inline VisionSpecialTokens get_special_tokens(
       tokens.fake_wrap_end = "</img>";
       break;
     case example::VisionLanguageModel::kQwen2_5_VL:
+    case example::VisionLanguageModel::kLincal3_VL:
       tokens.image_token = "<|image_pad|>";
       tokens.global_img = "";
       tokens.fake_wrap_start = "<|vision_start|>";
@@ -125,7 +126,8 @@ inline std::string apply_chat_template(
       formatted_prompt.append("<|im_end|>assistant\n");
       break;
     }
-    case example::VisionLanguageModel::kQwen2_5_VL: {
+    case example::VisionLanguageModel::kQwen2_5_VL:
+    case example::VisionLanguageModel::kLincal3_VL: {
       if (!system_prompt.empty()) {
         formatted_prompt.append("<|im_start|>system\n");
         formatted_prompt.append(system_prompt);

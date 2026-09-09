@@ -46,6 +46,7 @@ enum class VisionLanguageModel {
   kSmolvlm = 0,
   kInternvl3,
   kQwen2_5_VL,
+  kLincal3_VL,
   kQwen3_5,
   kLincal3_5,
 };
@@ -92,7 +93,8 @@ class QNNMultimodalRunner
       const bool shared_buffer = false,
       const int ngram = 0,
       const int window = 0,
-      const int gcap = 0);
+      const int gcap = 0,
+      const float repetition_penalty = 1.0f);
 
   bool is_loaded() const override;
   executorch::runtime::Error load() override;
@@ -132,6 +134,7 @@ class QNNMultimodalRunner
   std::string performance_output_path_;
   std::string dump_logits_path_;
   float temperature_;
+  float repetition_penalty_;
   EvalMode eval_mode_;
   bool shared_buffer_;
 

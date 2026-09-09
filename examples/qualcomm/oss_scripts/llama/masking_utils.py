@@ -5,7 +5,7 @@
 # LICENSE file in the root directory of this source tree.
 
 from abc import ABC, abstractmethod
-from typing import List, Tuple, Union
+from typing import List, Optional, Tuple, Union
 
 import torch
 
@@ -176,10 +176,18 @@ class CausalAttentionMask(BaseAttentionMask):
 
     @classmethod
     def from_input_ids(
-        cls, input_ids: List[List[int]], max_seq_length: int, **kwargs
+        cls,
+        input_ids: List[List[int]],
+        max_seq_length: int,
+        max_context_len: Optional[int] = None,
+        **kwargs,
     ) -> "CausalAttentionMask":
         """Build a causal mask and apply padding for variable-length sequences."""
-        mask = cls(len(input_ids), max_seq_length, max_seq_length)
+        mask = cls(
+            len(input_ids),
+            max_seq_length,
+            max_seq_length if max_context_len is None else max_context_len,
+        )
         mask._mask = mask._mask.clone()
         mask._mask_padding_positions(input_ids, max_seq_length)
         return mask
@@ -262,10 +270,16 @@ class SlidingWindowAttentionMask(BaseAttentionMask):
         input_ids: List[List[int]],
         max_seq_length: int,
         sliding_window: int,
+        max_context_len: Optional[int] = None,
         **kwargs,
     ) -> "SlidingWindowAttentionMask":
         """Build a sliding-window mask and apply padding for variable-length sequences."""
-        mask = cls(len(input_ids), max_seq_length, max_seq_length, sliding_window)
+        mask = cls(
+            len(input_ids),
+            max_seq_length,
+            max_seq_length if max_context_len is None else max_context_len,
+            sliding_window,
+        )
         mask._mask = mask._mask.clone()
         mask._mask_padding_positions(input_ids, max_seq_length)
         return mask
@@ -305,7 +319,10 @@ class AttentionMask:
         """
         masks = [
             type(base_mask).from_input_ids(
-                input_ids, max_seq_length, **base_mask._extra_init_kwargs()
+                input_ids,
+                max_seq_length,
+                max_context_len=base_mask.max_context_len,
+                **base_mask._extra_init_kwargs(),
             )
             for base_mask in template.masks
         ]

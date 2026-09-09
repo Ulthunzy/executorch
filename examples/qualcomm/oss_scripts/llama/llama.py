@@ -10,6 +10,7 @@
 import argparse
 import json
 import logging
+import math
 import os
 import shutil
 import sys
@@ -19,9 +20,9 @@ from typing import Dict, List
 import torch
 from executorch.backends.qualcomm.debugger.utils import QnnTool
 from executorch.backends.qualcomm.export_utils import (
-    SimpleADB,
     get_backend_type,
     setup_common_args_and_variables,
+    SimpleADB,
 )
 
 from executorch.backends.qualcomm.utils.utils import (
@@ -659,6 +660,13 @@ def _validate_pte_paths(pte_paths: Dict[str, str]) -> None:
         )
 
 
+def _repetition_penalty(value):
+    penalty = float(value)
+    if not math.isfinite(penalty) or penalty < 1.0:
+        raise argparse.ArgumentTypeError("repetition_penalty must be finite and >= 1.0")
+    return penalty
+
+
 def _build_parser():
     parser = setup_common_args_and_variables()
     parser.add_argument(
@@ -728,6 +736,20 @@ def _build_parser():
     )
 
     parser.add_argument(
+        "--repetition_penalty",
+        type=_repetition_penalty,
+        default=1.0,
+        help="Runtime repetition penalty over prompt and generated tokens; 1.0 disables it. Does not affect calibration or compilation.",
+    )
+
+    parser.add_argument(
+        "--ignore_eos",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Ignore EOS during prompt evaluation and generate to max_seq_len for fixed-length benchmarking. Does not affect compilation or calibration.",
+    )
+
+    parser.add_argument(
         "-d",
         "--dtype-override",
         default="fp32",
@@ -774,8 +796,8 @@ def _build_parser():
 
     parser.add_argument(
         "--prefill_ar_len",
-        help="The auto-regression (AR) length determines the number of tokens to consume and the number of logits to produce. Use this option to process the prompt and generate the key-value (kv) cache, which serves as a prompt processor for hybrid and lookahead mode.",
-        default=32,
+        help="The auto-regression (AR) length determines the number of tokens to consume and the number of logits to produce. Use this option to process the prompt and generate the key-value (kv) cache, which serves as a prompt processor for hybrid and lookahead mode. Larger values can improve prompt throughput but require more device memory.",
+        default=128,
         type=int,
     )
 
@@ -927,6 +949,21 @@ def _build_parser():
     )
 
     parser.add_argument(
+        "--calib_text_datasets",
+        nargs="+",
+        default=None,
+        help="Raw-text calibration sources: cci3-hq, wikitext-2, or local JSON/JSONL files with a 'text' field. Hub sources stream from the train split.",
+    )
+
+    parser.add_argument(
+        "--calib_text_samples",
+        nargs="+",
+        type=int,
+        default=[128],
+        help="Number of packed calibration sequences per text source (default: 128 each). Supply one count for all sources or one per source.",
+    )
+
+    parser.add_argument(
         "--batch_size",
         type=int,
         default=1,
@@ -1017,6 +1054,26 @@ def _build_parser():
     parser.add_argument("-v", "--verbose", action="store_true")
 
     parser.add_argument(
+        "--calibration_device",
+        choices=["cpu", "cuda"],
+        default="cpu",
+        help="Device for decoder PTQ calibration only. CUDA requires a visible NVIDIA GPU; QNN compilation remains on CPU.",
+    )
+
+    parser.add_argument(
+        "--skip_qdq_save",
+        action="store_true",
+        help="Skip the full-sequence QDQ evaluation artifact to reduce host export memory and disk use. Does not skip calibration or change the deployed PTE. Incompatible with sqnr_eval.",
+    )
+
+    parser.add_argument(
+        "--calibration_num_threads",
+        type=int,
+        default=0,
+        help="Thread count for PTQ calibration. 0 = auto-tune (default).",
+    )
+
+    parser.add_argument(
         "--freeze_all_params",
         action="store_true",
         help="(QAT CI only) Freeze all model weight parameters during QAT training so that "
@@ -1036,6 +1093,24 @@ def _build_parser():
 
 
 def export_llama(args) -> None:
+    if args.skip_qdq_save and SQNR_EVAL in args.eval_methods:
+        raise ValueError("--skip_qdq_save cannot be combined with sqnr_eval")
+    if args.calib_text_datasets:
+        if any(n <= 0 for n in args.calib_text_samples) or len(
+            args.calib_text_samples
+        ) not in (1, len(args.calib_text_datasets)):
+            raise ValueError(
+                "--calib_text_samples requires positive counts: one for all sources or one per dataset."
+            )
+    if args.calibration_num_threads < 0:
+        raise ValueError("--calibration_num_threads must be >= 0")
+    if args.calibration_device == "cuda" and not args.pre_gen_pte:
+        if args.qat:
+            raise ValueError("--calibration_device cuda supports PTQ, not QAT")
+        if not torch.cuda.is_available():
+            raise RuntimeError(
+                "CUDA calibration requested but CUDA is unavailable. Check the PyTorch CUDA build and CUDA_VISIBLE_DEVICES, or use --calibration_device cpu."
+            )
     if args.compile_only and args.pre_gen_pte:
         raise RuntimeError("Cannot set both compile_only and pre_gen_pte as true")
     if args.optrace and args.enable_x86_64:
@@ -1145,6 +1220,10 @@ def export_llama(args) -> None:
         ]
     )
     if is_multimodal:
+        if args.calib_text_datasets:
+            raise ValueError(
+                "--calib_text_datasets currently supports text-only models."
+            )
         # TODO: Implement attention sink support for multimodal models (vision/audio).
         if args.use_attention_sink is not None:
             raise ValueError(
@@ -1164,7 +1243,12 @@ def export_llama(args) -> None:
                 )
         else:
             has_calib = any(
-                (args.calib_tasks, args.calib_samples, args.calib_hf_dataset)
+                (
+                    args.calib_tasks,
+                    args.calib_samples,
+                    args.calib_hf_dataset,
+                    args.calib_text_datasets,
+                )
             )
 
             if args.qat:
@@ -1180,7 +1264,7 @@ def export_llama(args) -> None:
             if not has_calib:
                 raise ValueError(
                     "For LLMs calibration data is required for compilation. "
-                    "Provide --calib_tasks or --calib_samples or --calib_hf_dataset."
+                    "Provide --calib_tasks, --calib_samples, --calib_hf_dataset or --calib_text_datasets."
                 )
 
     if args.pre_gen_pte:

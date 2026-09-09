@@ -227,11 +227,16 @@ Result<int64_t> TokenGenerator::generate(
     int32_t seq_len,
     std::function<void(const std::string&)> token_callback,
     bool dump_logits,
-    AttentionSinkRopeRunner* attention_sink_rope_runner) {
+    AttentionSinkRopeRunner* attention_sink_rope_runner,
+    bool ignore_eos) {
   ET_CHECK_MSG(
       !tokens.empty(), "Token generation loop shouldn't take empty tokens");
   if (dump_logits) {
     token_all_logits_.clear();
+  }
+  if (!ignore_eos && eos_ids_->count(tokens.back()) > 0) {
+    ET_LOG(Info, "Reached EOS after prefill; stopping generation");
+    return 0;
   }
   int64_t pos = start_pos; // position in the sequence
   int shifted_pos = start_pos;
@@ -356,6 +361,7 @@ Result<int64_t> TokenGenerator::generate(
     cur_token =
         decoder_runner_->logits_to_token(logits_tensor, metadata_.ar_len);
     stats_->on_sampling_end();
+    decoder_runner_->record_token(cur_token);
 
     // Update KV Cache with the output results
     if (true_swa_enabled_swa_) {
@@ -395,11 +401,16 @@ Result<int64_t> TokenGenerator::generate(
         decoded_token__, tokenizer_->decode(prev_token, cur_token));
     token_callback(decoded_token__);
 
-    // Benchmark fixed decode length by continuing through EOS until seq_len.
+    if (!ignore_eos && eos_ids_->count(cur_token) > 0) {
+      ET_LOG(Info, "Reached EOS; stopping generation");
+      break;
+    }
   }
 
   // Check if generation was truncated due to seq_len limit (no EOS token)
-  if (eos_ids_->count(cur_token) == 0 && pos >= seq_len - 1) {
+  if (ignore_eos && pos >= seq_len - 1) {
+    ET_LOG(Info, "Reached seq_len limit (%d) with ignore_eos enabled", seq_len);
+  } else if (eos_ids_->count(cur_token) == 0 && pos >= seq_len - 1) {
     printf("\n");
     ET_LOG(
         Info,

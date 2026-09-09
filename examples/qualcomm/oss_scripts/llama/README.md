@@ -45,6 +45,20 @@ We offer the following modes to execute the model:
 
 - Lookahead Mode: Lookahead Mode introduces [lookahead decoding](https://arxiv.org/abs/2402.02057) and uses AR-N model to process prompt to enhance token generation speed. While decoding multiple tokens in a single step is infeasible, an LLM can generate multiple guess tokens in parallel. These guess tokens may fit into future parts of the generated sequence. The lookahead decoder generates and verifies these guess tokens, integrating them into the sequence if suitable. In some cases, it can obtain more than one token in a single step. Result is lossless.
 
+### EOS stopping and fixed-length benchmarking
+
+Generation stops at EOS by default. For fixed-length benchmarking, add
+`--ignore_eos` to `llama.py`, or `--ignore_eos=true` to `qnn_llama_runner` /
+`qnn_multimodal_runner`. This continues generation until the total sequence
+length limit (prompt plus output), even after EOS. Use `--ignore_eos=false`
+with the runners to explicitly restore normal stopping; the Python equivalent
+is `--no-ignore_eos`.
+
+The switch applies to KV, hybrid, and lookahead generation, including an EOS
+sampled immediately after prefill. It only changes runtime behavior: the same
+PTE can be reused without recalibration or recompilation. Text generated after
+EOS in benchmark mode should not be used to assess response quality.
+
 ## Hardware Support
 
 We’ve validated this flow on the **Samsung Galaxy S23**, **Samsung Galaxy S24**, **Samsung Galaxy S25**, and **OnePlus 12**.
@@ -588,6 +602,79 @@ For LLMs, provide at least one of the two; for multimodal models, `--calib_sampl
 |---|---|
 | Calibration data (lm_eval tasks) | `--calib_tasks`, `--calib_limit`, `--calib_num_fewshot` |
 | Calibration data (custom samples) | `--calib_samples` (JSON files, HuggingFace message format) |
+
+##### CUDA PTQ calibration
+
+Add `--calibration_device cuda` to run decoder PTQ calibration on an NVIDIA GPU.
+For example, prefix the export command with `CUDA_VISIBLE_DEVICES=0` to select the
+first GPU. The default is `--calibration_device cpu`; `--calibration_num_threads`
+and CPU thread auto-tuning apply only to CPU calibration.
+
+CUDA calibration preserves the model dtype and disables TF32 during calibration.
+Model parameters, observer statistics and decoder inputs return to CPU before
+quantization conversion and QNN compilation. This does not change the deployment
+backend, prefill AR or SWA layout. `--backend gpu` selects a QNN deployment backend,
+not the calibration device. CUDA calibration is PTQ-only, not QAT. Multimodal
+encoder preprocessing/calibration still runs on CPU.
+
+Calibration needs floating-point weights and activations, not just the final
+4-bit model storage. If GPU memory is insufficient, reduce `--batch_size` or
+select CPU calibration; the exporter does not silently change sequence lengths.
+
+For device-only validation, add `--skip_qdq_save` to omit the full-sequence
+`decode_qdq.pt2` evaluation artifact. Serializing this graph can consume substantial
+host memory even with `--model_mode kv`. This option does not skip calibration or
+change the deployed PTE; it cannot be combined with `--eval_methods sqnr_eval`.
+The default still saves the QDQ artifact for later accuracy analysis.
+
+##### Mixed Chinese/English raw-text calibration
+
+For text-only models, add these options to the export command to calibrate on
+CCI3-HQ and WikiText-2:
+
+```bash
+--calib_text_datasets cci3-hq wikitext-2 \
+--calib_text_samples 128 128 \
+--calibration_device cuda
+```
+
+`cci3-hq` maps to [BAAI/CCI3-HQ](https://huggingface.co/datasets/BAAI/CCI3-HQ);
+`wikitext-2` maps to the `wikitext-2-raw-v1` configuration of
+[Salesforce/wikitext](https://huggingface.co/datasets/Salesforce/wikitext).
+Both use the training split and streaming reads with a bounded shuffle buffer,
+not a full-corpus download. `--seed` controls shuffling and long-document crops.
+Counts are **token sequences per source**, up to `max_context_len` tokens each,
+not document counts or deployment prefill AR. One count applies to all sources;
+multiple counts specify the mix (for example `192 64`). Short documents are
+packed with EOS separators; long documents contribute a randomly cropped window.
+Empty rows are skipped; an empty source fails, and a short source logs a warning.
+
+CCI3-HQ requires access approval on its dataset page and an authenticated local
+Hugging Face client. A permission error is not silently replaced with English-only
+calibration. Already downloaded data can be supplied as local JSON/JSONL files
+containing `{"text": "..."}` records instead of `cci3-hq`.
+`--calib_samples` can also be included for representative chat examples.
+Changing calibration data requires exporting a new PTE; use a new artifact directory
+to retain the previous model for comparison. It does not change deployment AR.
+
+##### Runtime repetition penalty
+
+Both `llama.py` and the QNN text/multimodal runners accept
+`--repetition_penalty 1.1`. The default `1.0` disables the penalty and preserves
+existing sampling. Values must be finite and at least `1.0`.
+The penalty is applied once per distinct token in the prompt and accepted output
+history, including earlier turns in the same runner conversation. Lookahead
+candidates do not enter history until accepted. History is not evicted with SWA.
+For seen tokens, positive logits are divided by the penalty and negative logits
+are multiplied by it, before temperature/top-p sampling. Quantized logits are
+dequantized using the PTE's `get_logits_scale` and `get_logits_zero_point` metadata
+when the penalty is enabled. Older quantized PTEs missing these metadata methods
+must be re-exported to use the penalty.
+
+Rebuild and update the runner once to add this option; subsequent changes to the
+penalty require neither runner rebuilding nor PTE export. EOS stopping remains
+independent (`--ignore_eos=false` on the native runner). Repetition penalty can
+reduce loops, but is not a substitute for validating model/quantization accuracy.
 
 ##### Custom calibration samples (`--calib_samples`)
 

@@ -213,16 +213,18 @@ class RemoveSeqMse(ExportPass):
                 if isinstance(module, SeqMseModule):
                     # rewrite observer method for pre-calculated scale
                     scale, zero_point = module.observer.calculate_qparams()
-                    module.observer.updated_encoding = (
-                        scale * module.best_candidate_step,
-                        zero_point,
+                    module.observer.register_buffer(
+                        "seq_mse_scale", scale * module.best_candidate_step
                     )
+                    module.observer.register_buffer("seq_mse_zero_point", zero_point)
                     module.observer.calculate_qparams = types.MethodType(
-                        lambda s: s.updated_encoding, module.observer
+                        lambda s: (s.seq_mse_scale, s.seq_mse_zero_point),
+                        module.observer,
                     )
                     node_to_erase.append(node)
 
         for node in node_to_erase:
+            graph_module.delete_submodule(node.target)
             graph_module.graph.erase_node(node)
 
     def call(self, graph_module: torch.fx.GraphModule):

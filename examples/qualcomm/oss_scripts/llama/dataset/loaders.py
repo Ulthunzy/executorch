@@ -8,6 +8,8 @@ import io
 import json
 import logging
 import os
+import random
+from itertools import islice
 from pathlib import Path
 from typing import List, Optional, Tuple, Union
 
@@ -19,6 +21,91 @@ from huggingface_hub import hf_hub_download
 from pytorch_tokenizers.hf_tokenizer import HuggingFaceTokenizer
 from pytorch_tokenizers.llama2c import Llama2cTokenizer as SentencePieceTokenizer
 from pytorch_tokenizers.tiktoken import TiktokenTokenizer
+
+
+def load_text_calibration_datasets(
+    sources: List[str],
+    sample_counts: List[int],
+    tokenizer,
+    max_context_len: int,
+    seed: int = 42,
+) -> List[List[int]]:
+    """Stream and pack raw text into bounded calibration sequences, then mix sources."""
+    if not sample_counts or any(n <= 0 for n in sample_counts):
+        raise ValueError("--calib_text_samples must contain positive sequence counts.")
+    if len(sample_counts) == 1:
+        sample_counts = sample_counts * len(sources)
+    if len(sample_counts) != len(sources):
+        raise ValueError("Provide one --calib_text_samples count, or one per dataset.")
+    if max_context_len < 2:
+        raise ValueError("Raw-text calibration requires max_context_len >= 2.")
+
+    presets = {
+        "cci3-hq": ("BAAI/CCI3-HQ", None),
+        "BAAI/CCI3-HQ": ("BAAI/CCI3-HQ", None),
+        "wikitext-2": ("Salesforce/wikitext", "wikitext-2-raw-v1"),
+    }
+    sequences = []
+    rng = random.Random(seed)
+    for source, count in zip(sources, sample_counts):
+        if source in presets:
+            repo, config = presets[source]
+            ds = hf_load_dataset(repo, name=config, split="train", streaming=True)
+        elif Path(source).is_file() and Path(source).suffix in (".json", ".jsonl"):
+            ds = hf_load_dataset(
+                "json", data_files={"train": source}, split="train", streaming=True
+            )
+        else:
+            raise ValueError(
+                f"Unknown text source {source!r}. Use cci3-hq, wikitext-2, "
+                "or a local JSON/JSONL file with a 'text' field."
+            )
+        ds = ds.shuffle(seed=seed, buffer_size=128)
+        packed = []
+        pending = []
+        # Bound scans as well as output size for empty or malformed corpora.
+        for sample in islice(ds, max(1000, count * 1000)):
+            raw_text = sample.get("text")
+            if not isinstance(raw_text, str) or not raw_text.strip():
+                continue
+            tokens = tokenizer.encode(raw_text, bos=False, eos=False)
+            if not tokens:
+                continue
+            if len(tokens) > max_context_len:
+                # Sample across documents instead of letting one long article
+                # occupy the entire calibration set.
+                start = rng.randrange(len(tokens) - max_context_len + 1)
+                tokens = tokens[start : start + max_context_len]
+            eos_id = tokenizer.eos_id
+            if eos_id is not None and eos_id >= 0 and tokens[-1] != eos_id:
+                tokens.append(eos_id)
+            pending.extend(tokens)
+            while len(pending) >= max_context_len and len(packed) < count:
+                packed.append(pending[:max_context_len])
+                pending = pending[max_context_len:]
+            if len(packed) == count:
+                break
+        if len(packed) < count and len(pending) >= 2:
+            packed.append(pending)
+        if not packed:
+            raise ValueError(f"{source}: no usable calibration text found.")
+        if len(packed) < count:
+            logging.warning(
+                "%s: only %d/%d calibration sequences available",
+                source,
+                len(packed),
+                count,
+            )
+        logging.info(
+            "%s: %d calibration sequences, %d tokens (train split, seed=%d)",
+            source,
+            len(packed),
+            sum(map(len, packed)),
+            seed,
+        )
+        sequences.extend(packed)
+    rng.shuffle(sequences)
+    return sequences
 
 
 def load_audio_file(path: str, repo_id: str) -> torch.Tensor:

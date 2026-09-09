@@ -89,6 +89,14 @@ DEFINE_string(
 DEFINE_string(system_prompt, "", "System prompt for the model.");
 
 // Generation parameters
+DEFINE_bool(
+    ignore_eos,
+    false,
+    "Ignore EOS and continue to seq_len for fixed-length benchmarking.");
+DEFINE_double(
+    repetition_penalty,
+    1.0,
+    "Penalty for previously seen tokens; >= 1.0, 1.0 disables it. Runtime only.");
 DEFINE_double(
     temperature,
     0.0f,
@@ -162,7 +170,8 @@ void start_multimodal_runner(
       FLAGS_shared_buffer,
       FLAGS_ngram,
       FLAGS_window,
-      FLAGS_gcap);
+      FLAGS_gcap,
+      static_cast<float>(FLAGS_repetition_penalty));
 
   auto model_version = runner.get_model_version().get();
 
@@ -177,7 +186,7 @@ void start_multimodal_runner(
   };
   executorch::extension::llm::GenerationConfig config;
   config.echo = true;
-  config.ignore_eos = false;
+  config.ignore_eos = FLAGS_ignore_eos;
   config.max_new_tokens = -1;
   config.warming = false;
   config.seq_len = FLAGS_seq_len;

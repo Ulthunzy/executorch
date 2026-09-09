@@ -4,8 +4,8 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-from dataclasses import dataclass
 import math
+from dataclasses import dataclass
 from typing import Callable, List, Optional, Tuple, Union
 
 import torch
@@ -81,7 +81,7 @@ def merge_modality_embeddings(
 @dataclass
 class DecoderInputs:
     pos_ids: torch.Tensor
-    atten_mask: AttentionMask
+    atten_mask: Union[AttentionMask, Tuple[torch.Tensor, ...]]
     k_caches: List[torch.Tensor]
     v_caches: List[torch.Tensor]
     input_ids: Optional[torch.Tensor] = None
@@ -149,6 +149,12 @@ class DecoderInference:
         )
         self._uses_mrope = example_pos_ids.dim() == 3 and image_token_id is not None
 
+    def to(self, device: Union[str, torch.device]) -> "DecoderInference":
+        self.pos_ids = self.pos_ids.to(device)
+        self._k_caches = [cache.to(device) for cache in self._k_caches]
+        self._v_caches = [cache.to(device) for cache in self._v_caches]
+        return self
+
     def get_inputs(
         self,
         input_ids: torch.Tensor,
@@ -158,6 +164,8 @@ class DecoderInference:
     ) -> "DecoderInputs":
         if attn_mask is None:
             attn_mask = self._default_attn_mask
+        device = self.pos_ids.device
+        input_ids = input_ids.to(device)
         raw_input_ids: Optional[torch.Tensor] = None
         inputs_embeds: Optional[torch.Tensor] = None
         if all(
@@ -187,8 +195,8 @@ class DecoderInference:
         return DecoderInputs(
             input_ids=raw_input_ids,
             inputs_embeds=inputs_embeds,
-            pos_ids=pos_ids,
-            atten_mask=attn_mask,
+            pos_ids=pos_ids.to(device),
+            atten_mask=tuple(mask.to(device) for mask in attn_mask),
             k_caches=self._k_caches,
             v_caches=self._v_caches,
         )

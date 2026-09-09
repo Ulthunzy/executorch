@@ -77,7 +77,8 @@ class TokenGenerator {
       int32_t seq_len,
       std::function<void(const std::string&)> token_callback,
       bool dump_logits,
-      AttentionSinkRopeRunner* attention_sink_rope_runner);
+      AttentionSinkRopeRunner* attention_sink_rope_runner,
+      bool ignore_eos = false);
   inline const size_t total_token_generator_io_size_in_bytes() const {
     return align_shared_buffer_allocation_size(input_toks_.size) +
         align_shared_buffer_allocation_size(input_pos_.size) +

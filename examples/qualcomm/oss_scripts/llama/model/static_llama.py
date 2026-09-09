@@ -1541,7 +1541,8 @@ class Qwen35ModelWithoutEmbedding(Qwen35Model):
 
 class Qwen35ModelWithoutEmbedding_swa(Qwen35ModelWithoutEmbedding):
     def _get_window_context_len_swa(self) -> int:
-        return min(self.max_seq_len, self.sliding_window + self.ar_len - 1)
+        # The mask includes the current AR chunk; the physical cache does not.
+        return min(self.max_seq_len, self.sliding_window) + self.ar_len - 1
 
     def forward(
         self,
@@ -1944,10 +1945,8 @@ class MultiScopeAwareLlamaModelWithoutEmbedding_swa(
     MultiScopeAwareLlamaModelWithoutEmbedding
 ):
     def _get_window_context_len_swa(self) -> int:
-        # Keep the decode KV cache length at (sliding_window - 1) while
-        # expanding the prompt-side attention span by (ar_len - 1) so the
-        # earliest token in a chunk still sees the full sliding window.
-        return min(self.max_seq_len, self.sliding_window + self.ar_len - 1)
+        # The mask includes the current AR chunk; the physical cache does not.
+        return min(self.max_seq_len, self.sliding_window) + self.ar_len - 1
 
     def get_example_inputs(self):
         hidden_states = torch.randn(
@@ -2154,10 +2153,8 @@ class MultiScopeAwareLlamaModel(LlamaModel):
 
 class MultiScopeAwareLlamaModel_swa(MultiScopeAwareLlamaModel):
     def _get_window_context_len_swa(self) -> int:
-        # Keep the decode KV cache length at (sliding_window - 1) while
-        # expanding the prompt-side attention span by (ar_len - 1) so the
-        # earliest token in a chunk still sees the full sliding window.
-        return min(self.max_seq_len, self.sliding_window + self.ar_len - 1)
+        # The mask includes the current AR chunk; the physical cache does not.
+        return min(self.max_seq_len, self.sliding_window) + self.ar_len - 1
 
     def get_example_inputs(self, use_kv_cache=True):
         dtype = torch.int64 if self.use_i64_token else torch.int32

@@ -210,6 +210,29 @@ void mask_oldest_visible(
 }
 } // namespace
 
+KVManager::Metadata::CacheUpdateMode KVManager::infer_cache_update_mode(
+    const TensorInfo& k_input,
+    const TensorInfo& v_input,
+    const TensorInfo& k_output,
+    const TensorInfo& v_output,
+    bool is_swa) {
+  // Qwen3.5's convolution state is 3D; attention K/V caches are 4D.
+  if (k_input.sizes().size() == 3) {
+    ET_CHECK_MSG(
+        !is_swa && k_output.sizes().size() == 3 &&
+            v_input.sizes().size() == 4 && v_output.sizes().size() == 4 &&
+            k_input.nbytes() == k_output.nbytes() &&
+            v_input.nbytes() == v_output.nbytes(),
+        "Recurrent cache requires matching input/output state sizes");
+    return Metadata::kFullOverwrite;
+  }
+  ET_CHECK_MSG(
+      k_input.sizes().size() == 4 && k_output.sizes().size() == 4 &&
+          v_input.sizes().size() == 4 && v_output.sizes().size() == 4,
+      "Attention cache requires 4D K/V tensors");
+  return is_swa ? Metadata::kCircular : Metadata::kAppend;
+}
+
 KVManager::KVManager(Metadata metadata, std::unique_ptr<MethodMeta> method_meta)
     : metadata_(metadata) {
   Result<TensorInfo> attention_mask = method_meta->input_tensor_meta(1);
@@ -1024,9 +1047,30 @@ void KVManager::fill_attention_mask_swa(
           /*use_pos_value=*/true);
     }
 
+    const int32_t rel_i = position_offset.empty() ? i : position_offset[i];
+    if (position_offset.empty()) {
+      const int32_t expired_tokens = std::max(0, i + 1 - sliding_window);
+      if (expired_tokens > 0) {
+        fill_mask(
+            attention_mask_dtype_,
+            row_ptr + static_cast<size_t>(effective_cache_len) * element_size,
+            expired_tokens,
+            /*use_pos_value=*/false);
+      }
+    } else {
+      for (int32_t j = 0; j < ar_len; ++j) {
+        if (rel_i - position_offset[j] >= sliding_window) {
+          fill_mask(
+              attention_mask_dtype_,
+              row_ptr +
+                  static_cast<size_t>(effective_cache_len + j) * element_size,
+              1,
+              /*use_pos_value=*/false);
+        }
+      }
+    }
+
     if (effective_cache_len > 0 && valid_len > 0) {
-      const int32_t rel_i =
-          position_offset.empty() ? i : position_offset[i];
       const int32_t allowed_cache_len_raw =
           sliding_window - (rel_i + 1);
       const int32_t allowed_cache_len = std::min(
@@ -1224,23 +1268,21 @@ void KVManager::update_key_swa(
   const int32_t n_iter = head_dim * metadata_.num_heads;
 
   if (selected_indices.empty()) {
-    const size_t copy_size = static_cast<size_t>(n_update) * element_size;
+    const int32_t copy_count = std::min(n_update, cache_len);
+    const int32_t source_offset = n_update - copy_count;
+    const int32_t copy_write_pos = (write_pos + source_offset) % cache_len;
     for (int i = 0; i < n_iter; ++i) {
-      if (write_pos + n_update <= cache_len) {
-        std::memcpy(
-            write_ptr + static_cast<size_t>(write_pos) * element_size,
-            read_ptr,
-            copy_size);
-      } else {
-        const int32_t first = cache_len - write_pos;
-        const int32_t second = n_update - first;
-        std::memcpy(
-            write_ptr + static_cast<size_t>(write_pos) * element_size,
-            read_ptr,
-            static_cast<size_t>(first) * element_size);
+      const int32_t first = std::min(copy_count, cache_len - copy_write_pos);
+      const int32_t second = copy_count - first;
+      std::memcpy(
+          write_ptr + static_cast<size_t>(copy_write_pos) * element_size,
+          read_ptr + static_cast<size_t>(source_offset) * element_size,
+          static_cast<size_t>(first) * element_size);
+      if (second > 0) {
         std::memcpy(
             write_ptr,
-            read_ptr + static_cast<size_t>(first) * element_size,
+            read_ptr +
+                static_cast<size_t>(source_offset + first) * element_size,
             static_cast<size_t>(second) * element_size);
       }
       write_ptr += static_cast<size_t>(cache_len) * element_size;
@@ -1280,22 +1322,27 @@ void KVManager::update_value_swa(
   const int32_t num_heads = static_cast<int32_t>(metadata_.num_heads);
 
   for (int h = 0; h < num_heads; ++h) {
-    std::byte* dst = write_ptr + static_cast<size_t>(h) * cache_len *
-        head_dim * element_size;
-    std::byte* src = read_ptr + static_cast<size_t>(h) * out_size * head_dim *
-        element_size;
+    std::byte* dst = write_ptr +
+        static_cast<size_t>(h) * cache_len * head_dim * element_size;
+    std::byte* src =
+        read_ptr + static_cast<size_t>(h) * out_size * head_dim * element_size;
 
     if (selected_indices.empty()) {
-      const int32_t first = std::min(n_update, cache_len - write_pos);
-      const int32_t second = n_update - first;
+      const int32_t copy_count = std::min(n_update, cache_len);
+      const int32_t source_offset = n_update - copy_count;
+      const int32_t copy_write_pos = (write_pos + source_offset) % cache_len;
+      const int32_t first = std::min(copy_count, cache_len - copy_write_pos);
+      const int32_t second = copy_count - first;
       std::memcpy(
-          dst + static_cast<size_t>(write_pos) * head_dim * element_size,
-          src,
+          dst + static_cast<size_t>(copy_write_pos) * head_dim * element_size,
+          src + static_cast<size_t>(source_offset) * head_dim * element_size,
           static_cast<size_t>(first) * head_dim * element_size);
       if (second > 0) {
         std::memcpy(
             dst,
-            src + static_cast<size_t>(first) * head_dim * element_size,
+            src +
+                static_cast<size_t>(source_offset + first) * head_dim *
+                    element_size,
             static_cast<size_t>(second) * head_dim * element_size);
       }
       continue;

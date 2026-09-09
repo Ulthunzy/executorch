@@ -235,6 +235,9 @@ Result<uint64_t> MultimodalPromptProcessor::prefill(
     bool dump_logits,
     AttentionSinkRopeRunner* attention_sink_rope_runner,
     const std::vector<int32_t>* position_ids) {
+  if (dump_logits) {
+    prompt_all_logits_.clear();
+  }
   int32_t num_prompt_tokens = prompt_embedding.tensor->size(1);
   if (!is_bert()) {
     ET_CHECK_MSG(
@@ -307,7 +310,9 @@ Result<uint64_t> MultimodalPromptProcessor::prefill(
       prompt_all_logits_.insert(
           prompt_all_logits_.end(),
           logits_.data,
-          logits_.data + metadata_.ar_len * metadata_.vocab_size);
+          logits_.data +
+              metadata_.ar_len * metadata_.vocab_size *
+                  logits_.getElementSize());
     }
     // In the last run, offset to the meaningful logits.
     if (i == num_iters - 1) {

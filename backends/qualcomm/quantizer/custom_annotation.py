@@ -250,7 +250,9 @@ def annotate_kv_8bit(  # noqa: C901
                 torch.ops.aten.sub.Tensor,
                 torch.ops.aten.matmul.default,
                 torch.ops.aten.conv2d.default,
+                torch.ops.qnn_custom.hadamard_transform.default,
             ]:
+                # R3 rotates keys before cache quantization; preserve its input precision.
                 break
             else:
                 print(f"The node ({node}) is not expected in the input1 of the matmul")

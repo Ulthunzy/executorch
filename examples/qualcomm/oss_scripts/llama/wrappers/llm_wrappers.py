@@ -839,9 +839,10 @@ class TextDecoder(Component):
             max_seq_len = self.meta.get(
                 "get_max_seq_len", self.meta["get_max_context_len"]
             )
-            window_context_len = min(
-                max_seq_len,
-                self.meta["get_sliding_window"] + self.meta["get_ar_len"] - 1,
+            window_context_len = (
+                min(max_seq_len, self.meta["get_sliding_window"])
+                + self.meta["get_ar_len"]
+                - 1
             )
             window_cache_len = max(0, window_context_len - self.meta["get_ar_len"])
             self.kv_cache_shape |= {
@@ -1104,6 +1105,7 @@ class TextDecoder(Component):
             atten_mask_shape.add(
                 (
                     self.meta["get_max_batch_size"],
+                    1,
                     self.meta["get_ar_len"],
                     max_seq_len,
                 )
@@ -1112,9 +1114,10 @@ class TextDecoder(Component):
         if getattr(self.control_args, "enable_true_swa", False) and (
             "get_sliding_window" in self.meta
         ):
-            window_context_len = min(
-                max_seq_len,
-                self.meta["get_sliding_window"] + self.meta["get_ar_len"] - 1,
+            window_context_len = (
+                min(max_seq_len, self.meta["get_sliding_window"])
+                + self.meta["get_ar_len"]
+                - 1
             )
             window_cache_len = max(0, window_context_len - self.meta["get_ar_len"])
             self.kv_cache_shape |= {
@@ -1126,6 +1129,7 @@ class TextDecoder(Component):
             atten_mask_shape.add(
                 (
                     self.meta["get_max_batch_size"],
+                    1,
                     self.meta["get_ar_len"],
                     window_context_len,
                 )
@@ -1251,10 +1255,9 @@ class TextDecoder(Component):
     def _auto_tune_calibration_threads(self):
         """Find the optimal thread count for calibration via quick microbenchmark.
 
-        AR1 decode calibration is SGEMV-dominated (memory-bandwidth-bound).
-        The default thread count (os.cpu_count()) is typically far too high,
-        causing massive OpenMP sync overhead. This runs a few forward passes
-        at candidate thread counts and picks the fastest.
+        The default thread count is often higher than the calibration graph can
+        use efficiently. Run a few observer-free forwards and keep the fastest
+        setting for the PTQ calibration pass.
         """
         # Use sched_getaffinity when available — it respects cgroup/taskset
         # constraints (e.g. containers), unlike os.cpu_count() which returns
@@ -1396,6 +1399,19 @@ class TextDecoder(Component):
                     event_name="export_tasks",
                 )
 
+            calibration_threads = None
+            calibration_device = self.control_args.calibration_device
+            if (
+                self.mode == Mode.CALIBRATE
+                and not use_qat
+                and calibration_device == "cpu"
+            ):
+                calibration_threads = getattr(
+                    self.control_args, "calibration_num_threads", 0
+                )
+                if calibration_threads == 0:
+                    calibration_threads = self._auto_tune_calibration_threads()
+
             if use_qat:
                 self.decoder = prepare_qat_pt2e(self.decoder, quantizer)
                 move_exported_model_to_train(self.decoder)
@@ -1444,12 +1460,24 @@ class TextDecoder(Component):
                     )
                     logging.info("QAT training complete")
                 else:
-                    PTQStrategy(
-                        inference=self._decoder_inference,
-                        module=self.decoder,
-                        tok_embedding=self.tok_embedding,
-                        seq_mse_candidates=self.config.seq_mse_candidates,
-                    ).quantize(calib_loader=calibration_dataloaders)
+                    original_threads = torch.get_num_threads()
+                    if calibration_threads is not None:
+                        torch.set_num_threads(calibration_threads)
+                        logging.info(
+                            "Calibration using %d threads (was %d)",
+                            calibration_threads,
+                            original_threads,
+                        )
+                    try:
+                        PTQStrategy(
+                            inference=self._decoder_inference,
+                            module=self.decoder,
+                            tok_embedding=self.tok_embedding,
+                            seq_mse_candidates=self.config.seq_mse_candidates,
+                            device=calibration_device,
+                        ).quantize(calib_loader=calibration_dataloaders)
+                    finally:
+                        torch.set_num_threads(original_threads)
                     logging.info("Calibration complete")
             else:
                 # one dummy inference to remove affine observer
@@ -1560,6 +1588,7 @@ class HybridTextDecoder(Component):
         quantized_model,
         unquantized_model,
         override_kv_cache,
+        allow_non_isomorphic=False,
     ):
         pbq_target = {
             torch.ops.torchao.dequantize_affine,
@@ -1595,21 +1624,29 @@ class HybridTextDecoder(Component):
             )
 
         def activation_override(quantized_node, unquantized_node):
-            for quantized_user, unquantized_user in zip(
-                list(quantized_node.users), list(unquantized_node.users)
-            ):
-                if "output" == quantized_user.name:
+            quantized_qdq_users = {}
+            for user in list(quantized_node.users):
+                if user.target in qdq_target:
+                    quantized_qdq_users.setdefault(user.target, []).append(user)
+
+            target_occurrence = {}
+            for unquantized_user in list(unquantized_node.users):
+                if unquantized_user.target not in qdq_target:
                     continue
-                assert quantized_user.target == unquantized_user.target, (
-                    "found unmatched targets: "
-                    f"{quantized_user.target} vs {unquantized_user.target}"
-                )
-                if quantized_user.target in qdq_target:
-                    unquantized_user.args = (
-                        unquantized_user.args[0],
-                        *quantized_user.args[1:],
+                occurrence = target_occurrence.get(unquantized_user.target, 0)
+                candidates = quantized_qdq_users.get(unquantized_user.target, [])
+                if occurrence >= len(candidates):
+                    raise RuntimeError(
+                        "Quantization encoding propagation found no matching Q/DQ "
+                        f"user for {unquantized_user} from {unquantized_node}."
                     )
-                    activation_override(quantized_user, unquantized_user)
+                quantized_user = candidates[occurrence]
+                target_occurrence[unquantized_user.target] = occurrence + 1
+                unquantized_user.args = (
+                    unquantized_user.args[0],
+                    *quantized_user.args[1:],
+                )
+                activation_override(quantized_user, unquantized_user)
 
         def parameter_override(quantized_node, unquantized_node):
             # Some parameters need to be iterated over to retrieve attributes such as static_llama.tok_embedding.weight
@@ -1634,8 +1671,39 @@ class HybridTextDecoder(Component):
                 _get_attr(quantized_model, quantized_node.target),
             )
             # scale / zero point are part of op's attributes
-            if list(quantized_node.users)[0].target in ptq_target:
+            if any(user.target in ptq_target for user in unquantized_node.users):
                 activation_override(quantized_node, unquantized_node)
+
+        def semantic_key(node):
+            module_stack = tuple(
+                str(value) for value in node.meta.get("nn_module_stack", {}).values()
+            )
+            return (
+                node.op,
+                str(node.target),
+                module_stack,
+                node.meta.get("stack_trace", ""),
+            )
+
+        def match_semantic_nodes(quantized_nodes, unquantized_nodes, kind):
+            candidates = {}
+            for node in quantized_nodes:
+                candidates.setdefault(semantic_key(node), []).append(node)
+
+            occurrences = {}
+            pairs = []
+            for node in unquantized_nodes:
+                key = semantic_key(node)
+                occurrence = occurrences.get(key, 0)
+                matches = candidates.get(key, [])
+                if occurrence >= len(matches):
+                    raise RuntimeError(
+                        f"Unable to propagate {kind} encoding for node {node.name}: "
+                        "the calibration graph has no matching source operation."
+                    )
+                pairs.append((matches[occurrence], node))
+                occurrences[key] = occurrence + 1
+            return pairs
 
         # copy encoding for hybrid mode
         parameters = [
@@ -1655,17 +1723,41 @@ class HybridTextDecoder(Component):
             ]
             for model in (quantized_model, unquantized_model)
         ]
-        # check topology order by node name & nn_module_stack
-        for act_quantized, act_unquantized in zip(*activations):
-            compare_nodes(act_quantized, act_unquantized)
+        if allow_non_isomorphic:
+            activation_pairs = match_semantic_nodes(
+                activations[0], activations[1], "activation"
+            )
+            quantized_parameters = {node.target: node for node in parameters[0].keys()}
+            parameter_pairs = []
+            for node in parameters[1].keys():
+                if node.target not in quantized_parameters:
+                    raise RuntimeError(
+                        f"Unable to propagate parameter encoding for {node.target}: "
+                        "the calibration graph has no matching parameter."
+                    )
+                parameter_pairs.append((quantized_parameters[node.target], node))
+        else:
+            if len(activations[0]) != len(activations[1]):
+                raise RuntimeError(
+                    "Encoding propagation requires isomorphic graphs, but activation "
+                    f"counts differ ({len(activations[0])} vs {len(activations[1])})."
+                )
+            if len(parameters[0]) != len(parameters[1]):
+                raise RuntimeError(
+                    "Encoding propagation requires isomorphic graphs, but parameter "
+                    f"counts differ ({len(parameters[0])} vs {len(parameters[1])})."
+                )
+            activation_pairs = list(zip(*activations))
+            parameter_pairs = list(zip(*[p.keys() for p in parameters]))
+            for act_quantized, act_unquantized in activation_pairs:
+                compare_nodes(act_quantized, act_unquantized)
+            for op_quantized, op_unquantized in zip(*[p.values() for p in parameters]):
+                compare_nodes(op_quantized, op_unquantized)
 
-        for op_quantized, op_unquantized in zip(*[p.values() for p in parameters]):
-            compare_nodes(op_quantized, op_unquantized)
-        # perform encoding override
-        for act_quantized, act_unquantized in zip(*activations):
+        for act_quantized, act_unquantized in activation_pairs:
             activation_override(act_quantized, act_unquantized)
 
-        for param_quantized, param_unquantized in zip(*[p.keys() for p in parameters]):
+        for param_quantized, param_unquantized in parameter_pairs:
             parameter_override(param_quantized, param_unquantized)
 
         if override_kv_cache:
@@ -1745,6 +1837,9 @@ class HybridTextDecoder(Component):
                 quantized_model=self.calibration_prefill.decoder,
                 unquantized_model=self.decode.decoder,
                 override_kv_cache=True,
+                allow_non_isomorphic=_is_qwen35_decoder_model(
+                    self.control_args.decoder_model
+                ),
             )
 
             if self.apply_embedding:
@@ -1753,16 +1848,6 @@ class HybridTextDecoder(Component):
                     unquantized_model=self.decode.tok_embedding,
                     override_kv_cache=False,
                 )
-
-            # Saving Decode QDQ Model EP for SQNR evaluation
-            qdq_ep = torch.export.export(
-                self.calibration_prefill.decoder,
-                self.calibration_prefill.export_input,
-                strict=True,
-            )
-            qdq_ep_path = f"{self.decode.control_args.artifact}/{DECODE_QDQ_FILENAME}"
-            torch.export.save(qdq_ep, qdq_ep_path)
-            logging.info(f"QDQ EP saved to {qdq_ep_path}")
 
             # For hybrid mode, override encoding of prefill model.
             if (
@@ -1774,6 +1859,7 @@ class HybridTextDecoder(Component):
                         quantized_model=self.calibration_prefill.decoder,
                         unquantized_model=self.prefill.decoder,
                         override_kv_cache=False,
+                        allow_non_isomorphic=True,
                     )
                     decode_cache_qparams = self.decode._collect_input_kv_cache_qparams()
                     expected_cache_qparams = 2 * self.decode.meta["get_n_layers"]
@@ -1805,6 +1891,20 @@ class HybridTextDecoder(Component):
                         override_kv_cache=False,
                     )
 
+            if not self.control_args.skip_qdq_save:
+                # SQNR evaluates full sequences. Keep the historical filename for compatibility.
+                qdq_ep = torch.export.export(
+                    self.calibration_prefill.decoder,
+                    self.calibration_prefill.export_input,
+                    strict=True,
+                )
+                qdq_ep_path = f"{self.decode.control_args.artifact}/{DECODE_QDQ_FILENAME}"
+                torch.export.save(qdq_ep, qdq_ep_path)
+                del qdq_ep
+                logging.info(f"QDQ EP saved to {qdq_ep_path}")
+            else:
+                logging.info("Skipping full-sequence QDQ evaluation artifact")
+
             self.decode._save_logits_quant_attrs()
             if _is_qwen35_decoder_model(self.control_args.decoder_model):
                 self.decode._save_input_kv_cache_quant_attrs()
@@ -1813,7 +1913,7 @@ class HybridTextDecoder(Component):
         # calibration_prefill is only used for encoding override
         # free it once encoding override is complete.
         del self.calibration_prefill
-        gc.collect()
+        _release_memory()
 
         # prepare lowering tok_embedding if applicable
         if self.apply_embedding:

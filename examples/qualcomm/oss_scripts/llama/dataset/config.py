@@ -27,6 +27,8 @@ class DataConfig:
     calib_samples: Optional[List[str]] = field(default_factory=list)
     calib_hf_dataset: Optional[str] = None
     calib_hf_limit: int = 1
+    calib_text_datasets: List[str] = field(default_factory=list)
+    calib_text_samples: List[int] = field(default_factory=lambda: [128])
 
     # QAT training data (explicit split: separate calib and train sources)
     train_tasks: Optional[List[str]] = None
@@ -47,12 +49,15 @@ class DataConfig:
                 else torch.int32
             ),
             batch_size=getattr(args, "batch_size", 1),
+            seed=getattr(args, "seed", 42),
             calib_tasks=getattr(args, "calib_tasks", None),
             calib_limit=getattr(args, "calib_limit", 1),
             calib_num_fewshot=getattr(args, "calib_num_fewshot", None),
             calib_samples=getattr(args, "calib_samples", None) or [],
             calib_hf_dataset=getattr(args, "calib_hf_dataset", None),
             calib_hf_limit=getattr(args, "calib_hf_limit", 1),
+            calib_text_datasets=getattr(args, "calib_text_datasets", None) or [],
+            calib_text_samples=getattr(args, "calib_text_samples", [128]),
             train_tasks=getattr(args, "train_tasks", None),
             train_limit=getattr(args, "train_limit", 180),
             train_hf_dataset=getattr(args, "train_hf_dataset", None),
