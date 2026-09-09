@@ -56,6 +56,13 @@ class KVManager {
       Metadata metadata,
       std::unique_ptr<executorch::runtime::MethodMeta> method_meta);
 
+  static Metadata::CacheUpdateMode infer_cache_update_mode(
+      const executorch::runtime::TensorInfo& k_input,
+      const executorch::runtime::TensorInfo& v_input,
+      const executorch::runtime::TensorInfo& k_output,
+      const executorch::runtime::TensorInfo& v_output,
+      bool is_swa);
+
   /**
    * @brief Allocate buffer for KV cache and set the cur_ar_len_.
    * @param buffer_manager Pointer to IMemAlloc instance; by default, it uses a

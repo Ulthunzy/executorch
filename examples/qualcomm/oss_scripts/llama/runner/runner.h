@@ -72,7 +72,8 @@ class Runner : public executorch::extension::llm::IRunner {
       const int gcap = 0,
       std::unique_ptr<tokenizers::Tokenizer> tokenizer = nullptr,
       std::unique_ptr<executorch::extension::Module>
-          attention_sink_rope_module = nullptr);
+          attention_sink_rope_module = nullptr,
+      const float repetition_penalty = 1.0f);
 
   bool is_loaded() const override;
   executorch::runtime::Error load() override;
@@ -112,6 +113,7 @@ class Runner : public executorch::extension::llm::IRunner {
   std::string performance_output_path_;
   std::string dump_logits_path_;
   float temperature_;
+  float repetition_penalty_;
   EvalMode eval_mode_;
   bool shared_buffer_;
 

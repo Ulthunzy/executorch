@@ -348,6 +348,8 @@ class DefaultEval(EvalBase):
                 f"--eval_mode {EVAL_MODE[args.model_mode]}",
                 f"--temperature {args.temperature}",
                 f"--system_prompt '{args.system_prompt}'",
+                f"--ignore_eos={str(args.ignore_eos).lower()}",
+                f"--repetition_penalty {args.repetition_penalty}",
                 lookahead_args if args.model_mode == "lookahead" else "",
             ]
         )

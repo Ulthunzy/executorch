@@ -254,19 +254,57 @@ class TestPasses(unittest.TestCase):
                     "get_max_seq_len": hidden_dim,
                     "get_head_dim": head_dim,
                 }
-                shape = (max_batch_size, ar_len, hidden_dim)
+                hidden_shape = (max_batch_size, ar_len, hidden_dim)
+                mask_shape = (max_batch_size, 1, ar_len, hidden_dim)
 
                 self.assertIsNone(
                     TextDecoder._tag_ios(
-                        decoder, FakeNode("hidden_states", shape), fixed_point_type
+                        decoder,
+                        FakeNode("hidden_states", hidden_shape),
+                        fixed_point_type,
                     )
                 )
                 self.assertEqual(
                     TextDecoder._tag_ios(
-                        decoder, FakeNode("atten_mask", shape), fixed_point_type
+                        decoder, FakeNode("atten_mask", mask_shape), fixed_point_type
                     ),
                     torch.uint16,
                 )
+
+    def test_true_swa_cache_length_is_independent_of_ar(self):
+        from executorch.examples.models.llama.model_args import ModelArgs
+        from executorch.examples.qualcomm.oss_scripts.llama.model.static_llama import (
+            Qwen35ModelWithoutEmbedding_swa,
+        )
+
+        sliding_window = 8
+        for ar_len in (1, 2, 8, 16):
+            max_seq_len = max(sliding_window, ar_len)
+            args = ModelArgs(
+                dim=8,
+                n_layers=1,
+                n_heads=2,
+                n_kv_heads=1,
+                vocab_size=16,
+                hidden_dim=16,
+                head_dim=4,
+                max_seq_len=max_seq_len,
+                max_context_len=max_seq_len,
+                use_kv_cache=True,
+                apply_embedding=False,
+                layer_types=["sliding_attention"],
+                sliding_window=sliding_window,
+                use_hf_rope=True,
+                kv_io_bit_width=8,
+                mrope_section=[1, 1, 0],
+            )
+            model = Qwen35ModelWithoutEmbedding_swa(args, ar_len=ar_len)
+            example_inputs = model.get_example_inputs()
+            window_context_len = example_inputs[1].masks[1].mask.shape[-1]
+            cache_len = example_inputs[3][0].shape[-1]
+
+            self.assertEqual(cache_len, min(max_seq_len, sliding_window) - 1)
+            self.assertEqual(window_context_len, cache_len + ar_len)
 
     def test_insert_reshape_for_argmax(self):
         class ArgmaxModule(torch.nn.Module):

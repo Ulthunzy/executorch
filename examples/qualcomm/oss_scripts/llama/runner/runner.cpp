@@ -159,7 +159,8 @@ Runner::Runner(
     const int window,
     const int gcap,
     std::unique_ptr<tokenizers::Tokenizer> tokenizer,
-    std::unique_ptr<executorch::extension::Module> attention_sink_rope_module)
+    std::unique_ptr<executorch::extension::Module> attention_sink_rope_module,
+    const float repetition_penalty)
     : module_(std::move(module)),
       attention_sink_rope_module_(std::move(attention_sink_rope_module)),
       ngram_(ngram),
@@ -169,6 +170,7 @@ Runner::Runner(
       performance_output_path_(performance_output_path),
       dump_logits_path_(dump_logits_path),
       temperature_(temperature),
+      repetition_penalty_(repetition_penalty),
       eval_mode_(static_cast<EvalMode>(eval_mode)),
       shared_buffer_(shared_buffer),
       tokenizer_(std::move(tokenizer)) {
@@ -322,8 +324,8 @@ Error Runner::load() {
   const dev_mem::RssSample decoder_ctor_stage_before = dev_mem::sample_rss();
   dev_mem::log_proc_status_mem("load stage: decoder runner ctor (before)");
 #endif
-  decoder_runner_ =
-      std::make_unique<DecoderRunner>(module_.get(), vocab_size, temperature_);
+  decoder_runner_ = std::make_unique<DecoderRunner>(
+      module_.get(), vocab_size, temperature_, repetition_penalty_);
 
 #if ET_QNN_RUNNER_DEV_MEM_LOG
   const dev_mem::RssSample decoder_ctor_stage_after = dev_mem::sample_rss();
@@ -409,6 +411,7 @@ Error Runner::load() {
   std::vector<int32_t> layer_cache_len;
   std::vector<bool> layer_is_swa;
   int32_t window_context_len = context_len_;
+  int32_t prompt_window_context_len = context_len_;
   if (cache_mode_ == CacheMode::HybridCache) {
     const auto window_mask_sizes = method_meta->input_tensor_meta(2)->sizes();
     window_context_len = window_mask_sizes[window_mask_sizes.size() - 1];
@@ -416,19 +419,54 @@ Error Runner::load() {
       enable_true_swa = true;
     }
 
-    const size_t base_inputs = 3 + (cache_mode_ == CacheMode::HybridCache ? 1 : 0);
+    const size_t base_inputs =
+        3 + (cache_mode_ == CacheMode::HybridCache ? 1 : 0);
     const size_t k_cache_start = base_inputs;
     const int32_t full_cache_len = context_len_ - token_generator_ar_len;
     layer_cache_len.resize(num_kv_layers);
     layer_is_swa.assign(num_kv_layers, false);
     for (int64_t layer = 0; layer < num_kv_layers; ++layer) {
       const int32_t cache_len =
-          method_meta->input_tensor_meta(k_cache_start + static_cast<size_t>(layer))
+          method_meta
+              ->input_tensor_meta(k_cache_start + static_cast<size_t>(layer))
               ->sizes()[3];
       layer_cache_len[layer] = cache_len;
       if (cache_len != full_cache_len) {
         layer_is_swa[layer] = true;
         enable_true_swa = true;
+      }
+    }
+
+    if (eval_mode_ == EvalMode::kHybrid ||
+        eval_mode_ == EvalMode::kLookaheadDecoding) {
+      auto prompt_method_meta =
+          module_->method_meta(prompt_processor_method_name);
+      if (!prompt_method_meta.ok()) {
+        ET_LOG(
+            Error,
+            "Failed to fetch prompt method metadata for %s",
+            prompt_processor_method_name.c_str());
+        return Error::Internal;
+      }
+      const auto prompt_window_mask_sizes =
+          prompt_method_meta->input_tensor_meta(2)->sizes();
+      prompt_window_context_len =
+          prompt_window_mask_sizes[prompt_window_mask_sizes.size() - 1];
+      if (prompt_window_context_len != context_len_) {
+        enable_true_swa = true;
+      }
+
+      const int32_t prefill_full_cache_len =
+          context_len_ - prompt_processor_ar_len;
+      for (int64_t layer = 0; layer < num_kv_layers; ++layer) {
+        const int32_t prefill_cache_len =
+            prompt_method_meta
+                ->input_tensor_meta(k_cache_start + static_cast<size_t>(layer))
+                ->sizes()[3];
+        if (prefill_cache_len != prefill_full_cache_len) {
+          layer_is_swa[layer] = true;
+          enable_true_swa = true;
+        }
       }
     }
   }
@@ -442,13 +480,15 @@ Error Runner::load() {
       }
       if (!layer_cache_len.empty()) {
         min_cache_len = std::min(min_cache_len, layer_cache_len[layer]);
-        max_cache_len_seen = std::max(max_cache_len_seen, layer_cache_len[layer]);
+        max_cache_len_seen =
+            std::max(max_cache_len_seen, layer_cache_len[layer]);
       }
     }
     ET_LOG(
         Info,
-        "True SWA enabled: window_context_len=%d, full_context_len=%d, swa_layers=%lld/%lld, cache_len_range=[%d,%d]",
+        "True SWA enabled: decode_window_context_len=%d, prompt_window_context_len=%d, full_context_len=%d, swa_layers=%lld/%lld, cache_len_range=[%d,%d]",
         window_context_len,
+        prompt_window_context_len,
         context_len_,
         static_cast<long long>(swa_layers),
         static_cast<long long>(num_kv_layers),
@@ -459,7 +499,8 @@ Error Runner::load() {
   if (enable_true_swa &&
       (eval_mode_ == EvalMode::kHybrid ||
        eval_mode_ == EvalMode::kLookaheadDecoding)) {
-    auto prompt_method_meta = module_->method_meta(prompt_processor_method_name);
+    auto prompt_method_meta =
+        module_->method_meta(prompt_processor_method_name);
     if (!prompt_method_meta.ok()) {
       ET_LOG(
           Error,
@@ -467,13 +508,14 @@ Error Runner::load() {
           prompt_processor_method_name.c_str());
       return Error::Internal;
     }
-    const size_t base_inputs = 3 + (cache_mode_ == CacheMode::HybridCache ? 1 : 0);
+    const size_t base_inputs =
+        3 + (cache_mode_ == CacheMode::HybridCache ? 1 : 0);
     const size_t k_cache_start = base_inputs;
     for (int64_t layer = 0; layer < num_kv_layers; ++layer) {
       if (!layer_is_swa.empty() && layer_is_swa[layer]) {
         const int32_t prefill_cache_len =
-            prompt_method_meta->input_tensor_meta(
-                                   k_cache_start + static_cast<size_t>(layer))
+            prompt_method_meta
+                ->input_tensor_meta(k_cache_start + static_cast<size_t>(layer))
                 ->sizes()[3];
         if (prefill_cache_len != layer_cache_len[layer]) {
           ET_LOG(
@@ -609,35 +651,30 @@ Error Runner::load() {
 #if ET_QNN_RUNNER_DEV_MEM_LOG
   const dev_mem::RssSample load_io_after = dev_mem::sample_rss();
   dev_mem::log_rss_delta(
-      "load stage: io/cache allocation",
-      load_io_before,
-      load_io_after);
+      "load stage: io/cache allocation", load_io_before, load_io_after);
   dev_mem::log_proc_status_mem("load stage: io/cache allocation (after)");
 
   const size_t prompt_io_bytes =
       prompt_processor_->total_prompt_processor_io_size_in_bytes();
   const size_t token_io_bytes =
       token_generator_->total_token_generator_io_size_in_bytes();
-  const size_t total_static_buffers =
-      kv_manager_->total_cache_size_in_bytes() + prompt_io_bytes +
-      token_io_bytes;
+  const size_t total_static_buffers = kv_manager_->total_cache_size_in_bytes() +
+      prompt_io_bytes + token_io_bytes;
   const dev_mem::RssSample load_after = dev_mem::sample_rss();
   ET_LOG(
       Info,
       "[DEV_MEM] load current RSS: before=%.2f MiB after=%.2f MiB delta=%.2f MiB",
       dev_mem::bytes_to_mib(load_before.current_bytes),
       dev_mem::bytes_to_mib(load_after.current_bytes),
-      dev_mem::bytes_to_mib(
-          dev_mem::saturating_sub(
-              load_after.current_bytes, load_before.current_bytes)));
+      dev_mem::bytes_to_mib(dev_mem::saturating_sub(
+          load_after.current_bytes, load_before.current_bytes)));
   ET_LOG(
       Info,
       "[DEV_MEM] load peak RSS: before=%.2f MiB after=%.2f MiB delta=%.2f MiB",
       dev_mem::bytes_to_mib(load_before.peak_bytes),
       dev_mem::bytes_to_mib(load_after.peak_bytes),
-      dev_mem::bytes_to_mib(
-          dev_mem::saturating_sub(
-              load_after.peak_bytes, load_before.peak_bytes)));
+      dev_mem::bytes_to_mib(dev_mem::saturating_sub(
+          load_after.peak_bytes, load_before.peak_bytes)));
   ET_LOG(
       Info,
       "[DEV_MEM] static buffers: kv_cache=%.2f MiB prompt_io=%.2f MiB token_io=%.2f MiB total=%.2f MiB",
@@ -736,10 +773,12 @@ Error Runner::generate_from_prompt_or_file(
 #if ET_QNN_RUNNER_DEV_MEM_LOG
   const dev_mem::RssSample prefill_before = dev_mem::sample_rss();
 #endif
+  decoder_runner_->begin_turn(prompt_tokens, cur_pos_ == 0);
   auto prefill_res = prompt_processor_->prefill(
       prompt_tokens, cur_pos_, dump_logits, attention_sink_rope_runner_.get());
   ET_CHECK_OK_OR_RETURN_ERROR(prefill_res.error());
   uint64_t cur_token = prefill_res.get();
+  decoder_runner_->record_token(cur_token);
   cur_pos_ += num_prompt_tokens;
   stats_.first_token_ms = time_in_ms();
   stats_.prompt_eval_end_ms = time_in_ms();
@@ -775,7 +814,8 @@ Error Runner::generate_from_prompt_or_file(
           seq_len,
           token_callback,
           dump_logits,
-          attention_sink_rope_runner_.get()));
+          attention_sink_rope_runner_.get(),
+          config.ignore_eos));
   stats_.inference_end_ms = time_in_ms();
 #if ET_QNN_RUNNER_DEV_MEM_LOG
   const dev_mem::RssSample decode_after = dev_mem::sample_rss();

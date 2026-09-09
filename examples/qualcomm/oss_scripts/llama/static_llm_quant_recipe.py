@@ -1063,7 +1063,7 @@ class Lincal_1_7BQuantRecipe(StaticLLMQuantRecipe):
                 False,
                 act_observer=MinMaxObserver,
                 granularity=QuantGranularity.PER_BLOCK,
-                extra_kwargs={"block_size": (1, 64, 1, 1)},
+                extra_kwargs={"block_size": (1, 32, 1, 1)},
             )
             .add_regex(
                 {

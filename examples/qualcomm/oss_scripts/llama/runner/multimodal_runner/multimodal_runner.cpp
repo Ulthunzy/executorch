@@ -32,6 +32,7 @@
 #include "arm_neon.h"
 #endif
 
+using executorch::extension::Module;
 using executorch::extension::llm::Audio;
 using executorch::extension::llm::get_rss_bytes;
 using executorch::extension::llm::Image;
@@ -39,7 +40,6 @@ using executorch::extension::llm::MultimodalInput;
 using executorch::extension::llm::print_report;
 using executorch::extension::llm::Stats;
 using executorch::extension::llm::time_in_ms;
-using executorch::extension::Module;
 using executorch::runtime::Error;
 using executorch::runtime::MethodMeta;
 using executorch::runtime::Result;
@@ -236,7 +236,8 @@ QNNMultimodalRunner::QNNMultimodalRunner(
     const bool shared_buffer,
     const int ngram,
     const int window,
-    const int gcap)
+    const int gcap,
+    const float repetition_penalty)
     // TODO: The arguments for the MultimodalRunner base class are currently
     // unused in this runner implementation. QNNMultimodalRunner will be
     // refactored in the future to align with MultimodalRunner's usage.
@@ -259,6 +260,7 @@ QNNMultimodalRunner::QNNMultimodalRunner(
       performance_output_path_(performance_output_path),
       dump_logits_path_(dump_logits_path),
       temperature_(temperature),
+      repetition_penalty_(repetition_penalty),
       eval_mode_(static_cast<EvalMode>(eval_mode)),
       shared_buffer_(shared_buffer) {
   stats_.reset();
@@ -273,6 +275,9 @@ QNNMultimodalRunner::QNNMultimodalRunner(
     model_version_ = VisionLanguageModel::kQwen2_5_VL;
   } else if (model_version == "lincal_vl") {
     model_version_ = VisionLanguageModel::kQwen2_5_VL;
+    cache_mode_ = CacheMode::HybridCache;
+  } else if (model_version == "lincal3_vl") {
+    model_version_ = VisionLanguageModel::kLincal3_VL;
     cache_mode_ = CacheMode::HybridCache;
   } else if (model_version == "qwen3_5") {
     model_version_ = VisionLanguageModel::kQwen3_5;
@@ -347,6 +352,7 @@ Error QNNMultimodalRunner::load() {
     } else if (
         *vlm == VisionLanguageModel::kInternvl3 ||
         *vlm == VisionLanguageModel::kQwen2_5_VL ||
+        *vlm == VisionLanguageModel::kLincal3_VL ||
         *vlm == VisionLanguageModel::kQwen3_5 ||
         *vlm == VisionLanguageModel::kLincal3_5) {
       eos_ids->insert(tokenizer_->encode("<|im_end|>", 0, 0).get()[0]);
@@ -367,14 +373,15 @@ Error QNNMultimodalRunner::load() {
   // shape to get vocab size.
   int32_t vocab_size = method_meta->output_tensor_meta(0)->sizes()[2];
   decoder_runner_ = std::make_unique<DecoderRunner>(
-      text_decoder_.get(), vocab_size, temperature_);
+      text_decoder_.get(), vocab_size, temperature_, repetition_penalty_);
 
   ET_CHECK_OK_OR_RETURN_ERROR(decoder_runner_->load(method_names));
 
   ET_LOG(Info, "Reading metadata from model");
 #if ET_QNN_RUNNER_DEV_MEM_LOG
   const dev_mem::RssSample metadata_stage_before = dev_mem::sample_rss();
-  dev_mem::log_proc_status_mem("multimodal load stage: metadata extraction (before)");
+  dev_mem::log_proc_status_mem(
+      "multimodal load stage: metadata extraction (before)");
 #endif
   // retrieve any method meta, can be either prefill or kv
   ET_ASSIGN_OR_RETURN(num_layers_evalue__, text_decoder_->get("get_n_layers"));
@@ -444,6 +451,7 @@ Error QNNMultimodalRunner::load() {
   std::vector<int32_t> layer_cache_len;
   std::vector<bool> layer_is_swa;
   int32_t window_context_len = context_len_;
+  int32_t prompt_window_context_len = context_len_;
   if (cache_mode_ == CacheMode::HybridCache) {
     const auto window_mask_sizes = method_meta->input_tensor_meta(2)->sizes();
     window_context_len = window_mask_sizes[window_mask_sizes.size() - 1];
@@ -475,6 +483,35 @@ Error QNNMultimodalRunner::load() {
         }
       }
     }
+
+    const auto prompt_window_mask_sizes =
+        prompt_method_meta->input_tensor_meta(2)->sizes();
+    prompt_window_context_len =
+        prompt_window_mask_sizes[prompt_window_mask_sizes.size() - 1];
+    if (prompt_window_context_len != context_len_) {
+      enable_true_swa = true;
+    }
+
+    const size_t prompt_input_cache_start =
+        prompt_method_meta->num_inputs() - 2 * static_cast<size_t>(num_layers);
+    const int32_t prefill_full_cache_len =
+        context_len_ - prompt_processor_ar_len;
+    for (int64_t layer = 0; layer < num_layers; ++layer) {
+      Result<TensorInfo> k_in = prompt_method_meta->input_tensor_meta(
+          prompt_input_cache_start + static_cast<size_t>(layer));
+      if (!k_in.ok()) {
+        ET_LOG(
+            Error,
+            "Failed to fetch prefill key cache metadata for layer %lld",
+            static_cast<long long>(layer));
+        return Error::Internal;
+      }
+      if (k_in->sizes().size() == 4 &&
+          k_in->sizes()[3] != prefill_full_cache_len) {
+        layer_is_swa[layer] = true;
+        enable_true_swa = true;
+      }
+    }
   }
   if (enable_true_swa) {
     int64_t swa_layers = 0;
@@ -485,8 +522,9 @@ Error QNNMultimodalRunner::load() {
     }
     ET_LOG(
         Info,
-        "True SWA enabled for multimodal runner: window_context_len=%d, full_context_len=%d, swa_layers=%lld/%lld",
+        "True SWA enabled for multimodal runner: decode_window_context_len=%d, prompt_window_context_len=%d, full_context_len=%d, swa_layers=%lld/%lld",
         window_context_len,
+        prompt_window_context_len,
         context_len_,
         static_cast<long long>(swa_layers),
         static_cast<long long>(num_layers));
@@ -496,8 +534,7 @@ Error QNNMultimodalRunner::load() {
   if (is_qwen35_family_vlm(model_version_)) {
     using CacheSpec = KVManager::Metadata::CacheSpec;
     cache_specs.resize(
-        num_layers,
-        CacheSpec{0, 0, 0, 0, KVManager::Metadata::kAppend});
+        num_layers, CacheSpec{0, 0, 0, 0, KVManager::Metadata::kAppend});
 
     for (const std::string& method_name : method_names) {
       Result<MethodMeta> cache_method_meta =
@@ -536,21 +573,25 @@ Error QNNMultimodalRunner::load() {
         spec.k_output_bytes = std::max(spec.k_output_bytes, k_out->nbytes());
         spec.v_output_bytes = std::max(spec.v_output_bytes, v_out->nbytes());
 
-        const bool same_size_cache =
-            k_in->nbytes() == k_out->nbytes() &&
-            v_in->nbytes() == v_out->nbytes();
-        if (!layer_is_swa.empty() && layer_is_swa[layer]) {
-          spec.update_mode = KVManager::Metadata::kCircular;
-        } else if (same_size_cache) {
-          spec.update_mode = KVManager::Metadata::kFullOverwrite;
-        }
-        spec.k_zero_point = read_required_int_metadata(
-            text_decoder_.get(),
-            "get_kv_input_" + std::to_string(layer) + "_zero_point");
-        spec.v_zero_point = read_required_int_metadata(
-            text_decoder_.get(),
-            "get_kv_input_" + std::to_string(num_layers + layer) +
-                "_zero_point");
+        spec.update_mode = KVManager::infer_cache_update_mode(
+            k_in.get(),
+            v_in.get(),
+            k_out.get(),
+            v_out.get(),
+            !layer_is_swa.empty() && layer_is_swa[layer]);
+        spec.k_zero_point =
+            executorch::runtime::isFloatingType(k_in->scalar_type())
+            ? 0
+            : read_required_int_metadata(
+                  text_decoder_.get(),
+                  "get_kv_input_" + std::to_string(layer) + "_zero_point");
+        spec.v_zero_point =
+            executorch::runtime::isFloatingType(v_in->scalar_type())
+            ? 0
+            : read_required_int_metadata(
+                  text_decoder_.get(),
+                  "get_kv_input_" + std::to_string(num_layers + layer) +
+                      "_zero_point");
       }
     }
   }
@@ -621,9 +662,11 @@ Error QNNMultimodalRunner::load() {
       "multimodal load stage: metadata extraction",
       metadata_stage_before,
       metadata_stage_after);
-  dev_mem::log_proc_status_mem("multimodal load stage: metadata extraction (after)");
+  dev_mem::log_proc_status_mem(
+      "multimodal load stage: metadata extraction (after)");
   const dev_mem::RssSample load_io_before = dev_mem::sample_rss();
-  dev_mem::log_proc_status_mem("multimodal load stage: io/cache allocation (before)");
+  dev_mem::log_proc_status_mem(
+      "multimodal load stage: io/cache allocation (before)");
 #endif
   kv_manager_ = std::make_unique<KVManager>(
       KVManager::Metadata{
@@ -689,7 +732,7 @@ Error QNNMultimodalRunner::load() {
             position_id_dim_},
         &stats_,
         std::make_unique<MethodMeta>(std::move(
-          text_decoder_->method_meta(token_generator_method_name).get())));
+            text_decoder_->method_meta(token_generator_method_name).get())));
   } else {
     token_generator_ = std::make_unique<MultimodalTokenGenerator>(
         tokenizer_.get(),
@@ -711,7 +754,7 @@ Error QNNMultimodalRunner::load() {
             position_id_dim_},
         &stats_,
         std::make_unique<MethodMeta>(std::move(
-          text_decoder_->method_meta(token_generator_method_name).get())));
+            text_decoder_->method_meta(token_generator_method_name).get())));
   }
   if (enable_true_swa) {
     kv_manager_->configure_cache_size_swa(layer_cache_len, layer_is_swa);
@@ -762,7 +805,9 @@ Error QNNMultimodalRunner::load() {
           Info,
           "Image placeholder token ID for vision modality loaded: %zu",
           image_token_id_);
-    } else if (*vlm == VisionLanguageModel::kQwen2_5_VL) {
+    } else if (
+        *vlm == VisionLanguageModel::kQwen2_5_VL ||
+        *vlm == VisionLanguageModel::kLincal3_VL) {
       ET_CHECK_MSG(
           false,
           "Qwen2.5-VL compatible models require image_token_id metadata.");
@@ -779,7 +824,8 @@ Error QNNMultimodalRunner::load() {
       "multimodal load stage: io/cache allocation",
       load_io_before,
       load_io_after);
-  dev_mem::log_proc_status_mem("multimodal load stage: io/cache allocation (after)");
+  dev_mem::log_proc_status_mem(
+      "multimodal load stage: io/cache allocation (after)");
 
   const size_t prompt_io_bytes =
       prompt_processor_->total_prompt_processor_io_size_in_bytes();
@@ -789,26 +835,24 @@ Error QNNMultimodalRunner::load() {
       tok_embedding_processor_->total_embedding_processor_io_size_in_bytes();
   const size_t embedding_decode_io_bytes =
       tok_embedding_generator_->total_embedding_processor_io_size_in_bytes();
-  const size_t total_static_buffers =
-      kv_manager_->total_cache_size_in_bytes() + prompt_io_bytes +
-      token_io_bytes + embedding_prefill_io_bytes + embedding_decode_io_bytes;
+  const size_t total_static_buffers = kv_manager_->total_cache_size_in_bytes() +
+      prompt_io_bytes + token_io_bytes + embedding_prefill_io_bytes +
+      embedding_decode_io_bytes;
   const dev_mem::RssSample load_after = dev_mem::sample_rss();
   ET_LOG(
       Info,
       "[DEV_MEM] multimodal load current RSS: before=%.2f MiB after=%.2f MiB delta=%.2f MiB",
       dev_mem::bytes_to_mib(load_before.current_bytes),
       dev_mem::bytes_to_mib(load_after.current_bytes),
-      dev_mem::bytes_to_mib(
-          dev_mem::saturating_sub(
-              load_after.current_bytes, load_before.current_bytes)));
+      dev_mem::bytes_to_mib(dev_mem::saturating_sub(
+          load_after.current_bytes, load_before.current_bytes)));
   ET_LOG(
       Info,
       "[DEV_MEM] multimodal load peak RSS: before=%.2f MiB after=%.2f MiB delta=%.2f MiB",
       dev_mem::bytes_to_mib(load_before.peak_bytes),
       dev_mem::bytes_to_mib(load_after.peak_bytes),
-      dev_mem::bytes_to_mib(
-          dev_mem::saturating_sub(
-              load_after.peak_bytes, load_before.peak_bytes)));
+      dev_mem::bytes_to_mib(dev_mem::saturating_sub(
+          load_after.peak_bytes, load_before.peak_bytes)));
   ET_LOG(
       Info,
       "[DEV_MEM] multimodal static buffers: kv_cache=%.2f MiB prompt_io=%.2f MiB token_io=%.2f MiB embedding_prefill_io=%.2f MiB embedding_decode_io=%.2f MiB total=%.2f MiB",
@@ -861,11 +905,11 @@ executorch::runtime::Error QNNMultimodalRunner::generate(
 
   // Reset merger for new generation
   embedding_merger_->reset();
-  const bool use_qwen35_mrope = is_qwen35_family_vlm(model_version_) &&
-      position_id_dim_ == 3;
+  const bool use_qwen35_mrope =
+      is_qwen35_family_vlm(model_version_) && position_id_dim_ == 3;
   const bool placeholder_merge =
-      modality_of(model_version_) == Modality::kVision && image_token_id_ != 0 &&
-      !is_qwen35_family_vlm(model_version_);
+      modality_of(model_version_) == Modality::kVision &&
+      image_token_id_ != 0 && !is_qwen35_family_vlm(model_version_);
   std::vector<int32_t> prompt_position_ids;
   int32_t mrope_pos = 0;
 
@@ -963,6 +1007,7 @@ executorch::runtime::Error QNNMultimodalRunner::generate(
 #if ET_QNN_RUNNER_DEV_MEM_LOG
   const dev_mem::RssSample prefill_before = dev_mem::sample_rss();
 #endif
+  decoder_runner_->begin_turn(prompt_tokens, cur_pos_ == 0);
   auto prefill_res = prompt_processor_->prefill(
       merged_embeddings,
       cur_pos_,
@@ -971,15 +1016,13 @@ executorch::runtime::Error QNNMultimodalRunner::generate(
       use_qwen35_mrope ? &prompt_position_ids : nullptr);
   ET_CHECK_OK_OR_RETURN_ERROR(prefill_res.error());
   uint64_t cur_token = prefill_res.get();
+  decoder_runner_->record_token(cur_token);
   cur_pos_ += num_prompt_tokens;
   stats_.first_token_ms = time_in_ms();
   stats_.prompt_eval_end_ms = time_in_ms();
 #if ET_QNN_RUNNER_DEV_MEM_LOG
   const dev_mem::RssSample prefill_after = dev_mem::sample_rss();
-  dev_mem::log_rss_delta(
-      "multimodal prefill",
-      prefill_before,
-      prefill_after);
+  dev_mem::log_rss_delta("multimodal prefill", prefill_before, prefill_after);
   dev_mem::log_proc_status_mem("multimodal prefill (after)");
 #endif
 
@@ -1009,14 +1052,12 @@ executorch::runtime::Error QNNMultimodalRunner::generate(
           seq_len,
           token_callback,
           dump_logits,
-          nullptr));
+          nullptr,
+          config.ignore_eos));
   stats_.inference_end_ms = time_in_ms();
 #if ET_QNN_RUNNER_DEV_MEM_LOG
   const dev_mem::RssSample decode_after = dev_mem::sample_rss();
-  dev_mem::log_rss_delta(
-      "multimodal decode",
-      decode_before,
-      decode_after);
+  dev_mem::log_rss_delta("multimodal decode", decode_before, decode_after);
   dev_mem::log_proc_status_mem("multimodal decode (after)");
 #endif
   ET_LOG(

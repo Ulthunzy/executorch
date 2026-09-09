@@ -63,10 +63,22 @@ Required for compilation. Provide at least one source; multiple sources are conc
 | `--calib_samples` | Custom conversation JSON files (see format below). Required for VLM/ALM. |
 | `--calib_hf_dataset` | A HuggingFace chat dataset name as additional calibration data. |
 | `--calib_hf_limit` | Number of samples to load from `--calib_hf_dataset` (default 1). |
+| `--calib_text_datasets` | Raw-text sources: `cci3-hq`, `wikitext-2`, or local JSON/JSONL files containing a `text` field. Hub sources stream the training split. |
+| `--calib_text_samples` | Packed token sequences per raw-text source (default 128 each). One count for all sources, or one count per source. |
+
+For bilingual calibration, use `--calib_text_datasets cci3-hq wikitext-2
+--calib_text_samples 128 128`. These are raw-text sources, unlike the chat-only
+`--calib_hf_dataset` loader. CCI3-HQ requires dataset access authorization on
+Hugging Face; alternatively supply a local JSON/JSONL path. Raw-text calibration
+can be combined with the other calibration sources for PTQ or QAT. See the
+[raw-text calibration options](README.md#mixed-chineseenglish-raw-text-calibration)
+for sampling and packing details. Recalibration changes the PTE, whereas the
+runtime `--repetition_penalty` option can be adjusted without re-exporting it.
 
 For LLMs, provide at least one calibration source. **VLM and ALM models can only be
 calibrated through `--calib_samples`** (a JSON file with the media inputs); the
-lm_eval-based (`--calib_tasks`) and HuggingFace-dataset (`--calib_hf_dataset`) sources are
+lm_eval-based (`--calib_tasks`), HuggingFace chat (`--calib_hf_dataset`), and raw-text
+(`--calib_text_datasets`) sources are
 LLM-only.
 
 ### Training data

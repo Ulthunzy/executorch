@@ -206,9 +206,14 @@ Result<int64_t> MultimodalLhdTokenGenerator::generate(
     int32_t seq_len,
     std::function<void(const std::string&)> token_callback,
     bool dump_logits,
-    AttentionSinkRopeRunner* attention_sink_rope_runner) {
+    AttentionSinkRopeRunner* attention_sink_rope_runner,
+    bool ignore_eos) {
   ET_CHECK_MSG(
       !tokens.empty(), "Token generation loop shouldn't take empty tokens");
+  if (!ignore_eos && this->eos_ids_->count(tokens.back()) > 0) {
+    ET_LOG(Info, "Reached EOS after prefill; stopping generation");
+    return 0;
+  }
   // position in the sequence
   int64_t pos = start_pos;
   int64_t prev_pos;
@@ -331,6 +336,7 @@ Result<int64_t> MultimodalLhdTokenGenerator::generate(
           this->decoder_runner_->logits_to_token(logits_tensor, sample_idx);
       this->stats_->on_sampling_end();
       result_tokens.push_back(cur_token);
+      this->decoder_runner_->record_token(cur_token);
       pos++;
 
       // print the token as string, decode it with the Tokenizer object
@@ -339,7 +345,7 @@ Result<int64_t> MultimodalLhdTokenGenerator::generate(
       token_callback(decoded_token__);
 
       // data-dependent terminating condition: we have n_eos_ number of EOS
-      if (this->eos_ids_->count(cur_token) > 0) {
+      if (!ignore_eos && this->eos_ids_->count(cur_token) > 0) {
         printf("\n");
         ET_LOG(Info, "\nReached to the end of generation");
         break;
@@ -392,7 +398,7 @@ Result<int64_t> MultimodalLhdTokenGenerator::generate(
     }
 
     // data-dependent terminating condition: we have n_eos_ number of EOS
-    if (this->eos_ids_->count(cur_token) > 0) {
+    if (!ignore_eos && this->eos_ids_->count(cur_token) > 0) {
       printf("\n");
       ET_LOG(Info, "\nReached to the end of generation");
       break;

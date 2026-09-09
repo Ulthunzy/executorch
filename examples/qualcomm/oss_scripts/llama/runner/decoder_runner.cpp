@@ -10,6 +10,7 @@
 
 #include <executorch/examples/qualcomm/oss_scripts/llama/runner/decoder_runner.h>
 
+#include <cmath>
 #include <ctime>
 using executorch::aten::Tensor;
 using executorch::extension::Module;
@@ -24,13 +25,19 @@ namespace example {
 DecoderRunner::DecoderRunner(
     Module* module,
     int32_t vocab_size,
-    float temperature)
+    float temperature,
+    float repetition_penalty)
     : module_(module),
       sampler_(std::make_unique<Sampler>(
           vocab_size,
           temperature,
           kTopp,
-          static_cast<unsigned long long>(std::time(nullptr)))) {}
+          static_cast<unsigned long long>(std::time(nullptr)))),
+      repetition_penalty_(repetition_penalty) {
+  ET_CHECK_MSG(
+      std::isfinite(repetition_penalty) && repetition_penalty >= 1.0f,
+      "repetition_penalty must be finite and >= 1.0");
+}
 
 Error DecoderRunner::set_outputs(
     const std::string& method_name,
@@ -43,11 +50,35 @@ Error DecoderRunner::set_outputs(
 }
 
 Error DecoderRunner::load(const std::vector<std::string>& method_names) {
-  if (is_method_loaded(method_names)) {
-    return Error::Ok;
-  }
   for (const std::string& method_name : method_names) {
     ET_CHECK_OK_OR_RETURN_ERROR(module_->load_method(method_name));
+  }
+  if (repetition_penalty_.enabled()) {
+    for (const std::string& method_name : method_names) {
+      ET_ASSIGN_OR_RETURN(meta, module_->method_meta(method_name));
+      ET_ASSIGN_OR_RETURN(output_meta, meta.output_tensor_meta(0));
+      if (output_meta.scalar_type() == executorch::aten::ScalarType::Float) {
+        continue;
+      }
+      ET_ASSIGN_OR_RETURN(scale, module_->get("get_logits_scale"));
+      ET_ASSIGN_OR_RETURN(zero_point, module_->get("get_logits_zero_point"));
+      ET_CHECK_OR_RETURN_ERROR(
+          scale.isDouble() && zero_point.isInt(),
+          InvalidArgument,
+          "Repetition penalty requires valid logits quantization metadata");
+      logits_scale_ = static_cast<float>(scale.toDouble());
+      logits_zero_point_ = zero_point.toInt();
+      ET_CHECK_OR_RETURN_ERROR(
+          std::isfinite(logits_scale_) && logits_scale_ > 0,
+          InvalidArgument,
+          "Invalid logits scale for repetition penalty");
+      ET_LOG(
+          Info,
+          "Repetition penalty: dequantizing logits (scale=%g, zero_point=%lld)",
+          logits_scale_,
+          static_cast<long long>(logits_zero_point_));
+      break;
+    }
   }
   return Error::Ok;
 }

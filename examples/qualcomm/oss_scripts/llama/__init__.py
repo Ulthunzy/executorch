@@ -718,7 +718,7 @@ class Lincal_0_6B(LLMModelConfig):
 @register_llm_model("lincal-1_7b")
 @dataclass(init=False, frozen=True)
 class Lincal_1_7B(LLMModelConfig):
-    repo_id: str = "/hunter/model/Lincal/Lincal-1.7B-1.0.05.1"
+    repo_id: str = "/hunter/model/Luxi/luxi-1.7B-1.0.05.2"
     params_path: str = os.path.join(
         BASE_DIR, "../../../models/lincal/config/1_7b_config.json"
     )

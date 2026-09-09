@@ -24,6 +24,7 @@ from executorch.examples.qualcomm.oss_scripts.llama.dataset.loaders import (
     load_audio_file,
     load_conversation_samples,
     load_hf_chat_dataset,
+    load_text_calibration_datasets,
 )
 from executorch.examples.qualcomm.oss_scripts.llama.dataset.preprocessors import (
     ModalityPreprocessor,
@@ -136,6 +137,17 @@ class DecoderDatasetBuilder:
         """Wrap a single pre-tokenized sequence in an LLMDataset."""
         return LLMDataset([token_ids])
 
+    def from_text_sources(self, cfg: DataConfig) -> LLMDataset:
+        return LLMDataset(
+            load_text_calibration_datasets(
+                cfg.calib_text_datasets,
+                cfg.calib_text_samples,
+                self._tokenizer_wrapper.tokenizer,
+                self._max_context_len,
+                cfg.seed,
+            )
+        )
+
 
 class EncoderDatasetBuilder:
     """Builds modality-encoder Datasets."""
@@ -212,6 +224,10 @@ class DatasetBuilder:
         self._is_multimodal = any(
             hasattr(llm_config, m) for m in [AUDIO_ENCODER, VISION_ENCODER]
         )
+        if self._is_multimodal and data_config.calib_text_datasets:
+            raise ValueError(
+                "--calib_text_datasets currently supports text-only models."
+            )
         self._text_decoder_dataset_builder = DecoderDatasetBuilder(
             tokenizer_wrapper=tokenizer_wrapper,
             max_context_len=data_config.max_context_len,
@@ -290,10 +306,14 @@ class DatasetBuilder:
                 ],
             )
         )
+        if cfg.calib_text_datasets:
+            decoder_datasets.append(
+                self._text_decoder_dataset_builder.from_text_sources(cfg)
+            )
         if not decoder_datasets:
             raise ValueError(
                 "No calibration data specified. Provide at least one of: "
-                "--calib_tasks, --calib_samples, --calib_hf_dataset."
+                "--calib_tasks, --calib_samples, --calib_hf_dataset, --calib_text_datasets."
             )
 
         datasets[TEXT_DECODER] = (
@@ -373,6 +393,10 @@ class DatasetBuilder:
                 ],
             )
         )
+        if cfg.calib_text_datasets:
+            calib_datasets.append(
+                self._text_decoder_dataset_builder.from_text_sources(cfg)
+            )
         train_datasets: List[Dataset] = list(
             filter(
                 None,

@@ -42,6 +42,8 @@ class PerBlockParamObserver(AffineQuantizedMinMaxObserver):
         self.bitwidth_of_scale = 4
         self.num_steps = 2**self.bitwidth_of_scale
         self.calibrated = False
+        self.register_buffer("min_val", None)
+        self.register_buffer("max_val", None)
 
     def forward(self, input: torch.Tensor):
         if input.numel() == 0 or self.calibrated:
@@ -55,7 +57,7 @@ class PerBlockParamObserver(AffineQuantizedMinMaxObserver):
         input_detached = input_detached.view(shape_for_reduction)
         min_val = torch.amin(input_detached, dim=reduction_dims)
         max_val = torch.amax(input_detached, dim=reduction_dims)
-        if not hasattr(self, "min_val") or not hasattr(self, "max_val"):
+        if self.min_val is None or self.max_val is None:
             self.min_val = min_val
             self.max_val = max_val
         else:
@@ -74,8 +76,8 @@ class PerBlockParamObserver(AffineQuantizedMinMaxObserver):
         return input
 
     def calculate_qparams(self) -> Tuple[torch.Tensor, torch.Tensor]:
-        assert hasattr(self, "min_val") and hasattr(
-            self, "max_val"
+        assert (
+            self.min_val is not None and self.max_val is not None
         ), "Expecting the observer has min_val and max_val, please run the observer before calling calculate_qparams"
         return choose_qparams_affine_with_min_max(
             self.min_val,

@@ -8,6 +8,7 @@
 
 #pragma once
 
+#include <executorch/examples/qualcomm/oss_scripts/llama/runner/repetition_penalty.h>
 #include <executorch/examples/qualcomm/oss_scripts/llama/runner/utils.h>
 #include <executorch/extension/llm/sampler/sampler.h>
 #include <executorch/extension/module/module.h>
@@ -19,7 +20,16 @@ class DecoderRunner {
   DecoderRunner(
       executorch::extension::Module* module,
       int32_t vocab_size,
-      float temperature);
+      float temperature,
+      float repetition_penalty = 1.0f);
+
+  void begin_turn(const std::vector<uint64_t>& prompt, bool reset) {
+    repetition_penalty_.begin_turn(prompt, reset);
+  }
+
+  void record_token(uint64_t token) {
+    repetition_penalty_.record_token(token);
+  }
   /**
    * Run LLM text decoder with inputs to generate next token.
    * @param inputs The inputs to the LLM Module.
@@ -60,7 +70,7 @@ class DecoderRunner {
     std::byte* logits = logits_tensor.mutable_data_ptr<std::byte>();
     auto num_tokens = logits_tensor.size(1);
     auto vocab_size = logits_tensor.size(2);
-    static std::vector<float> logits_f(vocab_size);
+    logits_f_.resize(vocab_size);
     std::byte* logits_last = logits;
     // offset to the meaningful logit we want for prefill model.
     executorch::aten::ScalarType logits_dtype = logits_tensor.scalar_type();
@@ -68,18 +78,17 @@ class DecoderRunner {
     if (num_tokens > 1) {
       logits_last += pos * vocab_size * logits_nbytes;
     }
-    // Discard dequantization (converting std::byte to float) because the
-    // relative order of elements remains the same without conversion
+    // Preserve legacy sampling when the repetition penalty is disabled.
     for (int i = 0; i < vocab_size; i++) {
       switch (logits_dtype) {
         case executorch::aten::ScalarType::UInt16:
-          logits_f[i] = reinterpret_cast<uint16_t*>(logits_last)[i];
+          logits_f_[i] = reinterpret_cast<uint16_t*>(logits_last)[i];
           break;
         case executorch::aten::ScalarType::Byte:
-          logits_f[i] = reinterpret_cast<uint8_t*>(logits_last)[i];
+          logits_f_[i] = reinterpret_cast<uint8_t*>(logits_last)[i];
           break;
         case executorch::aten::ScalarType::Float:
-          logits_f[i] = reinterpret_cast<float*>(logits_last)[i];
+          logits_f_[i] = reinterpret_cast<float*>(logits_last)[i];
           break;
         default:
           ET_CHECK_MSG(
@@ -88,11 +97,20 @@ class DecoderRunner {
               executorch::runtime::toString(logits_dtype));
       }
     }
-    return sampler_->sample(logits_f.data());
+    const bool quantized = logits_dtype != executorch::aten::ScalarType::Float;
+    repetition_penalty_.apply(
+        logits_f_,
+        quantized ? logits_scale_ : 1.0f,
+        quantized ? logits_zero_point_ : 0);
+    return sampler_->sample(logits_f_.data());
   }
 
  protected:
   executorch::extension::Module* module_;
   std::unique_ptr<executorch::extension::llm::Sampler> sampler_;
+  RepetitionPenalty repetition_penalty_;
+  std::vector<float> logits_f_;
+  float logits_scale_{1.0f};
+  int64_t logits_zero_point_{0};
 };
 } // namespace example

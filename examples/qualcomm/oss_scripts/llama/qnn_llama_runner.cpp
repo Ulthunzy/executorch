@@ -74,6 +74,14 @@ DEFINE_bool(
     false,
     "Specifies to use shared buffers for zero-copy use case between the application and device/co-processor associated with the backend.");
 DEFINE_int32(num_iters, 1, "total num of iterations to run.");
+DEFINE_bool(
+    ignore_eos,
+    false,
+    "Ignore EOS and continue to seq_len for fixed-length benchmarking.");
+DEFINE_double(
+    repetition_penalty,
+    1.0,
+    "Penalty for previously seen tokens; >= 1.0, 1.0 disables it. Runtime only.");
 DEFINE_int32(
     ngram,
     0,
@@ -245,7 +253,8 @@ void start_runner(
       FLAGS_window,
       FLAGS_gcap,
       nullptr,
-      std::move(attention_sink_rope_module));
+      std::move(attention_sink_rope_module),
+      static_cast<float>(FLAGS_repetition_penalty));
   auto decoder_model_version = runner.get_decoder_model_version();
   std::vector<char> buf;
   buf.reserve(5 * FLAGS_seq_len); // assume each token is around 5 char
@@ -259,7 +268,7 @@ void start_runner(
       true,
       "",
       "",
-      false,
+      FLAGS_ignore_eos,
       -1,
       false,
       FLAGS_seq_len,

@@ -107,7 +107,8 @@ class MultimodalLhdTokenGenerator : public example::MultimodalTokenGenerator {
       int32_t seq_len,
       std::function<void(const std::string&)> token_callback,
       bool dump_logits,
-      AttentionSinkRopeRunner* attention_sink_rope_runner) override;
+      AttentionSinkRopeRunner* attention_sink_rope_runner,
+      bool ignore_eos = false) override;
 
  private:
   // Bring base class's virtual prepare_io into scope so the overload below
