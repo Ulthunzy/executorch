@@ -16,8 +16,7 @@ namespace example {
  * @class MultimodalTokenGenerator
  * @brief Extended TokenGenerator with multimodal embedding support
  */
-template <typename T>
-class MultimodalTokenGenerator : public example::TokenGenerator<T> {
+class MultimodalTokenGenerator : public example::TokenGenerator {
  public:
   struct Metadata {
     int32_t context_len;
@@ -37,11 +36,12 @@ class MultimodalTokenGenerator : public example::TokenGenerator<T> {
       tokenizers::Tokenizer* tokenizer,
       TokenEmbeddingProcessor* tok_embedding_runner,
       DecoderRunner* decoder_runner,
-      KVManager<T>* kv_manager,
+      KVManager* kv_manager,
       const std::string& method_name,
       std::unique_ptr<std::unordered_set<uint64_t>>&& eos_ids,
       Metadata metadata,
-      executorch::llm::Stats* stats);
+      executorch::llm::Stats* stats,
+      std::unique_ptr<executorch::extension::MethodMeta> method_meta);
 
   virtual ~MultimodalTokenGenerator() = default;
 
@@ -55,21 +55,10 @@ class MultimodalTokenGenerator : public example::TokenGenerator<T> {
       override;
 
   inline const size_t total_token_generator_io_size_in_bytes() const {
-    const size_t window_attention_mask_size =
-        metadata_.cache_mode == CacheMode::HybridCache
-        ? align_shared_buffer_allocation_size(window_attention_mask_.size)
-        : 0;
-    if (metadata_.cache_mode == CacheMode::HybridCache) {
-      return align_shared_buffer_allocation_size(input_toks_.size) +
-          align_shared_buffer_allocation_size(input_pos_.size) +
-          align_shared_buffer_allocation_size(attention_mask_.size) +
-          window_attention_mask_size +
-          align_shared_buffer_allocation_size(logits_.size) +
-          align_shared_buffer_allocation_size(input_embedding_.size);
-    }
     return align_shared_buffer_allocation_size(input_toks_.size) +
         align_shared_buffer_allocation_size(input_pos_.size) +
         align_shared_buffer_allocation_size(attention_mask_.size) +
+        align_shared_buffer_allocation_size(window_attention_mask_.size) +
         align_shared_buffer_allocation_size(logits_.size) +
         align_shared_buffer_allocation_size(input_embedding_.size);
   }
@@ -80,15 +69,15 @@ class MultimodalTokenGenerator : public example::TokenGenerator<T> {
 
  protected:
   // Reuse members from token_generator
-  using TokenGenerator<T>::kv_manager_;
-  using TokenGenerator<T>::input_pos_;
-  using TokenGenerator<T>::attention_mask_;
-  using TokenGenerator<T>::window_attention_mask_;
-  using TokenGenerator<T>::true_swa_enabled_swa_;
-  using TokenGenerator<T>::window_context_len_swa_;
-  using TokenGenerator<T>::inputs_;
-  using TokenGenerator<T>::input_tensors_;
-  using TokenGenerator<T>::output_tensors_;
+  using TokenGenerator::attention_mask_;
+  using TokenGenerator::input_pos_;
+  using TokenGenerator::input_tensors_;
+  using TokenGenerator::inputs_;
+  using TokenGenerator::kv_manager_;
+  using TokenGenerator::output_tensors_;
+  using TokenGenerator::window_attention_mask_;
+  using TokenGenerator::true_swa_enabled_swa_;
+  using TokenGenerator::window_context_len_swa_;
 
   // Additional members specific to multimodal
   TensorStruct<float> input_embedding_;
@@ -96,12 +85,12 @@ class MultimodalTokenGenerator : public example::TokenGenerator<T> {
 
  private:
   // Reuse members from token_generator
-  using TokenGenerator<T>::input_toks_;
-  using TokenGenerator<T>::logits_;
-  using TokenGenerator<T>::k_cache_in_;
-  using TokenGenerator<T>::v_cache_in_;
-  using TokenGenerator<T>::k_cache_out_;
-  using TokenGenerator<T>::v_cache_out_;
+  using TokenGenerator::input_toks_;
+  using TokenGenerator::k_cache_in_;
+  using TokenGenerator::k_cache_out_;
+  using TokenGenerator::logits_;
+  using TokenGenerator::v_cache_in_;
+  using TokenGenerator::v_cache_out_;
 
   // Additional members specific to multimodal
   TokenEmbeddingProcessor* tok_embedding_runner_;

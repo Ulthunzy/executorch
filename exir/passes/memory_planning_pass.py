@@ -1,5 +1,6 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 # All rights reserved.
+# Copyright 2026 Arm Limited and/or its affiliates.
 #
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
@@ -136,6 +137,51 @@ def _check_default_mem_ids(gm: torch.fx.GraphModule):
                 )
 
 
+def _move_memory_meta_to_spec(node: Node) -> None:
+    """Move storage sharing metadata from node.meta to node.meta["spec"].
+
+    Only applies if _share_alloc_with_arg_idx is set.
+    """
+    share_idx = node.meta.get("_share_alloc_with_arg_idx")
+    shared_alloc_offset = node.meta.get("_shared_alloc_offset")
+
+    if share_idx is None:
+        if shared_alloc_offset is not None:
+            raise ValueError(
+                "_shared_alloc_offset meta was set but not _share_alloc_with_arg_idx."
+            )
+        return
+    if shared_alloc_offset is None:
+        shared_alloc_offset = 0
+
+    if not isinstance(share_idx, int):
+        raise TypeError("_share_alloc_with_arg_idx must be an int")
+    if not isinstance(shared_alloc_offset, int):
+        raise TypeError("_shared_alloc_offset must be an int")
+
+    output_spec = node.meta.get("spec")
+    if not isinstance(output_spec, TensorSpec):
+        raise TypeError(
+            "_share_alloc_with_arg_idx requires node.meta['spec'] to be a TensorSpec"
+        )
+
+    if share_idx < 0 or share_idx >= len(node.args):
+        raise IndexError("_share_alloc_with_arg_idx must index node.args")
+
+    input_node = node.args[share_idx]
+    if not isinstance(input_node, Node):
+        raise TypeError("_share_alloc_with_arg_idx must reference a Node argument")
+
+    base_spec = input_node.meta.get("spec")
+    if not isinstance(base_spec, TensorSpec):
+        raise TypeError(
+            "_share_alloc_with_arg_idx must reference an argument with a TensorSpec"
+        )
+
+    output_spec.storage_base = base_spec
+    output_spec.storage_base_offset = shared_alloc_offset
+
+
 @dataclass
 class _MemoryPlanningState:
     mutable_buffers: Dict[str, Set[TensorSpec]] = field(default_factory=dict)
@@ -153,7 +199,6 @@ class MemoryPlanningPass(PassBase):
         alloc_mutable_buffers: bool = True,
         share_mutable_buffers: bool = False,
         alignment: int = ALIGNMENT,
-        enable_non_cpu_memory_planning: bool = False,
     ) -> None:
         r"""
         alloc_graph_input/alloc_graph_output will have 4 different combinations
@@ -174,8 +219,11 @@ class MemoryPlanningPass(PassBase):
         self.alloc_mutable_buffers = alloc_mutable_buffers
         self.share_mutable_buffers = share_mutable_buffers
         self.alignment = alignment
-        self.enable_non_cpu_memory_planning = enable_non_cpu_memory_planning
         self.state = _MemoryPlanningState()
+        # Set by EdgeProgramManager.to_executorch() from the top-level
+        # ExecutorchBackendConfig. When True, apply_algo partitions specs by
+        # device so non-CPU buffers get their own memory arenas.
+        self.enable_non_cpu_memory_planning: bool = False
 
     def _set_alloc_node_spec(self, graph_module: torch.fx.GraphModule) -> None:
         """
@@ -194,6 +242,8 @@ class MemoryPlanningPass(PassBase):
                     if len(out_arg_names) == 1:
                         out_alloc_node = node.kwargs[out_arg_names[0]]
                         out_alloc_node.meta["spec"] = node.meta["spec"]
+
+                        _move_memory_meta_to_spec(node)
                         continue
                     specs = get_node_tensor_specs(node)
                     i = 0

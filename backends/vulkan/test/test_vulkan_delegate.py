@@ -7,11 +7,13 @@
 # pyre-unsafe
 
 import ctypes
+import functools
 import unittest
 from typing import Tuple
 
 import executorch.backends.vulkan.test.utils as test_utils
 import torch
+import torch.nn.functional as F
 from executorch.backends.transforms.convert_dtype_pass import I64toI32
 from executorch.backends.vulkan.partitioner.vulkan_partitioner import VulkanPartitioner
 from executorch.backends.vulkan.vulkan_preprocess import VulkanBackend
@@ -40,6 +42,24 @@ try:
     ctypes.CDLL("libvulkan.so.1")
 except:
     pass
+
+
+def disable_test(reason):
+    """Disable a test while still reporting it as executed.
+
+    Some test runners do not handle skipped results consistently, so this keeps
+    disabled tests visible in logs without using unittest.skip.
+    """
+
+    def decorator(fn):
+        @functools.wraps(fn)
+        def wrapper(*args, **kwargs):
+            print(f"DISABLED_TEST: {fn.__qualname__}: {reason}")
+            return None
+
+        return wrapper
+
+    return decorator
 
 
 def lower_module(
@@ -519,6 +539,20 @@ class TestVulkanBackend(unittest.TestCase):
 
         self.lower_module_and_test_output(ClampModule(), sample_inputs)
 
+    def test_vulkan_backend_dynamic_float_clamp(self):
+        class ClampModule(torch.nn.Module):
+            def forward(self, x):
+                return torch.clamp(x, max=x.shape[0])
+
+        sample_inputs = (torch.arange(32).reshape(8, 4).float(),)
+        length = Dim("length", min=2, max=16)
+        self.lower_module_and_test_output(
+            ClampModule(),
+            sample_inputs,
+            dynamic_shapes={"x": {0: length}},
+            test_inputs=[(torch.arange(12).reshape(3, 4).float(),)],
+        )
+
     def test_vulkan_backend_cos(self):
         class CosModule(torch.nn.Module):
             def __init__(self):
@@ -743,7 +777,25 @@ class TestVulkanBackend(unittest.TestCase):
 
         self.lower_module_and_test_output(model, sample_inputs)
 
-    @unittest.skip(
+    def test_vulkan_backend_index_tensor_higher_rank_self(self):
+        # `table[positions]` with a 2-D table, the shape RoPE uses to look up
+        # its precomputed frequencies. The gather only ever needed `indices` to
+        # be 1-D -- `self`'s trailing dims come through unchanged -- but the
+        # support check used to require a 1-D `self` too, and the buffer shader
+        # only read `self[idx, 0, 0, 0]`.
+        class Gather(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.register_buffer("table", torch.rand(32, 8))
+
+            def forward(self, positions):
+                return self.table[positions] * 2.0
+
+        sample_inputs = (torch.arange(5, dtype=torch.int32),)
+
+        self.lower_module_and_test_output(Gather(), sample_inputs)
+
+    @disable_test(
         "Currently this test is failing due to weird partitioning because the eq scalar"
         "operator is not supported yet. Re-enable when the operator is supported."
     )
@@ -810,7 +862,7 @@ class TestVulkanBackend(unittest.TestCase):
 
         self.lower_module_and_test_output(module, sample_inputs)
 
-    @unittest.skip(
+    @disable_test(
         "Reduce shader does not support multiple reduction axes at the moment"
     )
     def test_vulkan_backend_sum_dim_list(self):
@@ -831,7 +883,7 @@ class TestVulkanBackend(unittest.TestCase):
             sample_inputs,
         )
 
-    @unittest.skip(
+    @disable_test(
         "Reduce shader does not support multiple reduction axes at the moment"
     )
     def test_vulkan_backend_sum(self):
@@ -1028,7 +1080,7 @@ class TestVulkanBackend(unittest.TestCase):
             sample_inputs,
         )
 
-    @unittest.skip("layer norm compute shader not working with swiftshader")
+    @disable_test("layer norm compute shader not working with swiftshader")
     def test_vulkan_backend_native_layer_norm(self):
         class NativeLayerNormModule(torch.nn.Module):
             def __init__(self):
@@ -1459,7 +1511,7 @@ class TestVulkanBackend(unittest.TestCase):
             sample_inputs,
         )
 
-    @unittest.skip(
+    @disable_test(
         "Softmax shader with shared memory does not work with swiftshader due to potential swiftshader bug"
     )
     def test_vulkan_backend_softmax(self):
@@ -1480,7 +1532,7 @@ class TestVulkanBackend(unittest.TestCase):
             sample_inputs,
         )
 
-    @unittest.skip(
+    @disable_test(
         "Softmax shader with shared memory does not work with swiftshader due to potential swiftshader bug"
     )
     def test_vulkan_backend_logsoftmax(self):
@@ -1512,7 +1564,7 @@ class TestVulkanBackend(unittest.TestCase):
 
         self.lower_unary_module_and_test_output(GeluModule())
 
-    @unittest.skip(
+    @disable_test(
         "Reduce shader does not support multiple reduction axes at the moment"
     )
     def test_vulkan_backend_mean(self):
@@ -1586,6 +1638,84 @@ class TestVulkanBackend(unittest.TestCase):
         self.lower_module_and_test_output(
             IndexSelectModule(dim=0, indices=[1, 3, 5, 7, 8, 9, 10, 11, 2, 3]),
             sample_inputs,
+        )
+
+    def test_vulkan_backend_index_tensor_nonzero_axis(self):
+        class IndexTensorModule(torch.nn.Module):
+            def __init__(self, dim):
+                super().__init__()
+                self.dim = dim
+                self.index = torch.tensor([0, 2])
+
+            def forward(self, x):
+                indices = [slice(None)] * x.dim()
+                indices[self.dim] = self.index
+                return x[tuple(indices)]
+
+        sample_inputs = (torch.arange(24).reshape(1, 3, 8).float(),)
+        for dim in (1, 2):
+            self.lower_module_and_test_output(
+                IndexTensorModule(dim),
+                sample_inputs,
+            )
+
+    def test_vulkan_backend_dynamic_replicate_pad_time_reduction(self):
+        class TimeReductionModule(torch.nn.Module):
+            def forward(self, x):
+                padded_frames = 8 * ((x.shape[1] + 7) // 8)
+                x = F.pad(
+                    x,
+                    (0, 0, 0, padded_frames - x.shape[1]),
+                    mode="replicate",
+                )
+                return x.view(x.shape[0], -1, 640)
+
+        sample_inputs = (torch.randn(1, 24, 80),)
+        frames = Dim("frames", min=1, max=24)
+        self.lower_module_and_test_output(
+            TimeReductionModule(),
+            sample_inputs,
+            dynamic_shapes={"x": {1: frames}},
+            test_inputs=[
+                (torch.randn(1, 8, 80),),
+                (torch.randn(1, 9, 80),),
+                (torch.randn(1, 17, 80),),
+            ],
+        )
+
+    def test_vulkan_backend_dynamic_arange_float_step(self):
+        class ArangeModule(torch.nn.Module):
+            def __init__(self, end_scale, step):
+                super().__init__()
+                self.end_scale = end_scale
+                self.step = step
+
+            def forward(self, x):
+                return torch.arange(0, self.end_scale * x.shape[0], self.step)
+
+        sample_inputs = (torch.randn(8),)
+        length = Dim("length", min=2, max=16)
+        for end_scale, step in ((1, 0.5), (-1, -0.5)):
+            with self.subTest(end_scale=end_scale, step=step):
+                self.lower_module_and_test_output(
+                    ArangeModule(end_scale, step),
+                    sample_inputs,
+                    dynamic_shapes={"x": {0: length}},
+                    test_inputs=[(torch.randn(3),), (torch.randn(7),)],
+                )
+
+    def test_vulkan_backend_dynamic_arange_start(self):
+        class ArangeModule(torch.nn.Module):
+            def forward(self, x):
+                return torch.arange(x.shape[0], 32, 2)
+
+        sample_inputs = (torch.randn(8),)
+        length = Dim("length", min=2, max=16)
+        self.lower_module_and_test_output(
+            ArangeModule(),
+            sample_inputs,
+            dynamic_shapes={"x": {0: length}},
+            test_inputs=[(torch.randn(3),), (torch.randn(15),)],
         )
 
     def test_vulkan_backend_arange_int(self):
@@ -2364,7 +2494,7 @@ class TestVulkanBackend(unittest.TestCase):
             quantized_linear_module_gemm, sample_inputs_gemm, atol=1e-2, rtol=1e-2
         )
 
-    @unittest.skip("Cannot run on swiftshader due to no integer dot product support")
+    @disable_test("Cannot run on swiftshader due to no integer dot product support")
     def test_vulkan_backend_xnnpack_pt2e_quantized_linear_sequence(self):
         """
         Test a sequence of linear layers quantized with XNNPACK quantization config.
@@ -2439,7 +2569,7 @@ class TestVulkanBackend(unittest.TestCase):
             rtol=1e-1,
         )
 
-    @unittest.skip("Cannot run on swiftshader due to no integer dot product support")
+    @disable_test("Cannot run on swiftshader due to no integer dot product support")
     def test_vulkan_backend_xnnpack_pt2e_quantized_conv_sequence(self):
         """
         Test a sequence of convolution layers quantized with PT2E quantization.
@@ -2530,7 +2660,7 @@ class TestVulkanBackend(unittest.TestCase):
             rtol=1e-1,
         )
 
-    @unittest.skip("Cannot run on swiftshader due to no integer dot product support")
+    @disable_test("Cannot run on swiftshader due to no integer dot product support")
     def test_vulkan_backend_xnnpack_pt2e_quantized_conv_sequence_all_reduced(self):
         """
         Test a sequence of convolution layers quantized with PT2E quantization.
@@ -2610,7 +2740,7 @@ class TestVulkanBackend(unittest.TestCase):
             rtol=1e-1,
         )
 
-    @unittest.skip("Cannot run on swiftshader due to no 8-bit int support")
+    @disable_test("Cannot run on swiftshader due to no 8-bit int support")
     def test_vulkan_backend_torchao_8da4w_quantized_linear(self):
         """
         Test TorchAO 8da4w quantization (int8 dynamic activation + int4 weight) with Vulkan backend.

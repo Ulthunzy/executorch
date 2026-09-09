@@ -8,8 +8,12 @@
 Gemma 4 31B-IT — export-friendly reference implementation for ExecuTorch.
 
 Model definition designed for torch.export(strict=True) with the CUDA backend.
-All stateful buffers (KV cache, RoPE inv_freq) are registered buffers so they
-are captured by share_mutable_buffers across prefill/decode. The numerically
+All stateful buffers (KV cache, RoPE inv_freq) are registered buffers with
+in-place updates. On the CUDA/AOTI backend they are lifted into the delegate as
+constants and shared across prefill/decode at runtime via the backend's per-FQN
+buffer cache (so the CUDA export leaves share_mutable_buffers off); backends that
+keep these buffers at the graph level (e.g. MLX) instead share them via
+share_mutable_buffers. The numerically
 sensitive primitives — RMSNorm, GELU-tanh MLP, proportional/full RoPE, and
 the BHSD KV cache — are imported from ``examples.models.gemma4.text_decoder``
 so the 31B and E2B/E4B paths share them.
@@ -49,8 +53,6 @@ from executorch.examples.models.gemma4.text_decoder import (
     apply_rotary_emb,
     Gemma4KVCache,
     Gemma4MLP,
-    RMSNorm,
-    RMSNormNoWeight,
 )
 from executorch.examples.models.gemma4_31b.sampler import sample
 from torch.nn import functional as F
@@ -247,29 +249,13 @@ class Gemma4Attention(nn.Module):
         )
 
         # Q/K norm have learnable weight; V norm is weightless.
-        self.q_norm = RMSNorm(self.head_dim, eps=config.rms_norm_eps)
-        self.k_norm = RMSNorm(self.head_dim, eps=config.rms_norm_eps)
-        self.v_norm = RMSNormNoWeight(self.head_dim, eps=config.rms_norm_eps)
-
-        # Precomputed RoPE table for this layer (per-layer because head_dim
-        # and theta differ between sliding and full attention). For full
-        # attention layers we pass freq_base_dim=head_dim so the zero-padded
-        # On-the-fly RoPE: store only inv_freq, compute cos/sin per forward.
-        # Saves memory vs precomputed [max_seq_len, head_dim] tables.
-        if self.is_sliding:
-            rotary_dim = self.head_dim
-        else:
-            rotary_dim = int(self.head_dim * self.partial_rotary)
-        rope_angles = rotary_dim // 2
-        inv_freq_rotated = 1.0 / (
-            self.rope_theta ** (torch.arange(0, rotary_dim, 2).float() / self.head_dim)
+        self.q_norm = nn.RMSNorm(self.head_dim, eps=config.rms_norm_eps)
+        self.k_norm = nn.RMSNorm(self.head_dim, eps=config.rms_norm_eps)
+        self.v_norm = nn.RMSNorm(
+            self.head_dim, eps=config.rms_norm_eps, elementwise_affine=False
         )
-        nope_angles = self.head_dim // 2 - rope_angles
-        if nope_angles > 0:
-            inv_freq = torch.cat([inv_freq_rotated, torch.zeros(nope_angles)])
-        else:
-            inv_freq = inv_freq_rotated
-        self.register_buffer("inv_freq", inv_freq, persistent=False)
+
+        self.register_buffer("inv_freq", self._compute_inv_freq(), persistent=False)
 
         # KV cache. Sliding layers use a ring buffer (2x window) to save
         # memory; full layers use a flat buffer (max_seq_len).
@@ -288,6 +274,30 @@ class Gemma4Attention(nn.Module):
                 head_dim=self.head_dim,
                 use_index_copy=True,
             )
+
+    def _compute_inv_freq(self, device: Optional[torch.device] = None) -> torch.Tensor:
+        """Compute RoPE inverse-frequency table for this layer."""
+        if self.is_sliding:
+            rotary_dim = self.head_dim
+        else:
+            rotary_dim = int(self.head_dim * self.partial_rotary)
+        rope_angles = rotary_dim // 2
+        inv_freq_rotated = 1.0 / (
+            self.rope_theta
+            ** (
+                torch.arange(0, rotary_dim, 2, device=device, dtype=torch.float32)
+                / self.head_dim
+            )
+        )
+        nope_angles = self.head_dim // 2 - rope_angles
+        if nope_angles > 0:
+            return torch.cat(
+                [
+                    inv_freq_rotated,
+                    torch.zeros(nope_angles, device=device, dtype=torch.float32),
+                ]
+            )
+        return inv_freq_rotated
 
     def forward(
         self,
@@ -358,14 +368,14 @@ class Gemma4DecoderLayer(nn.Module):
         self.self_attn = Gemma4Attention(config, layer_idx)
         self.mlp = Gemma4MLP(config.hidden_size, config.intermediate_size)
 
-        self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_attention_layernorm = RMSNorm(
+        self.input_layernorm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.post_attention_layernorm = nn.RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
-        self.pre_feedforward_layernorm = RMSNorm(
+        self.pre_feedforward_layernorm = nn.RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
-        self.post_feedforward_layernorm = RMSNorm(
+        self.post_feedforward_layernorm = nn.RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
 
@@ -410,7 +420,7 @@ class Gemma4_31B(nn.Module):
         self.layers = nn.ModuleList(
             [Gemma4DecoderLayer(config, i) for i in range(config.num_hidden_layers)]
         )
-        self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.norm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         # Held separately so it can be untied + quantized at export time.
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
 
@@ -464,20 +474,17 @@ class Gemma4_31B(nn.Module):
         self,
         tokens: torch.LongTensor,
         input_pos: torch.LongTensor,
-        temperature: Optional[torch.Tensor] = None,
+        temperature: torch.Tensor,
     ) -> torch.Tensor:
         """Run the model.
 
         Args:
             tokens: (B, T) token IDs.
             input_pos: (T,) absolute positions for RoPE / KV cache.
-            temperature: optional 1-D float tensor controlling on-device sampling.
-                When provided, returns sampled tokens (B, 1) via Gumbel-max;
-                when None (e.g. eager eval), returns full logits (B, T, V) with
-                soft-capping applied so callers see post-cap values.
+            temperature: 1-D float tensor for Gumbel-max sampling.
 
         Returns:
-            (B, 1) token IDs when sampling, else (B, T, V) float32 logits.
+            (B, 1) sampled token IDs as int64.
         """
         x = self.embed_tokens(tokens) * self.embed_normalizer
 
@@ -486,13 +493,6 @@ class Gemma4_31B(nn.Module):
             x = layer(x, input_pos, sliding_mask, full_mask)
 
         x = self.norm(x)
-
-        if temperature is None:
-            logits = self.lm_head(x).float()
-            cap = self.logit_softcap.float()
-            return torch.tanh(logits / cap) * cap
-
-        # Decode-time fast path: only materialize logits for the last token.
         last = self.lm_head(x[:, -1, :]).float()
         cap = self.logit_softcap.float()
         last = torch.tanh(last / cap) * cap
@@ -506,9 +506,14 @@ class Gemma4_31B(nn.Module):
     ) -> tuple["Gemma4_31B", Gemma4_31BConfig]:
         """Build the model on `meta` and load weights from the HF safetensors checkpoint.
 
-        Uses lazy shard-by-shard loading + assign=True so peak memory stays at
-        roughly one shard's worth of weights.
+        Streams the shards through the shared ``load_checkpoint`` loader, remapping
+        HF tensor names via ``_hf_to_model_key`` (which also skips multimodal keys)
+        and filling the tied ``lm_head`` from ``embed_tokens`` via ``tie_map``.
+        Runtime buffers (KV caches, RoPE tables) stay on meta -- callers fill them
+        with ``materialize_runtime_buffers``.
         """
+        from executorch.extension.llm.export.load import load_checkpoint
+
         config = Gemma4_31BConfig.from_hf_config(os.path.join(model_dir, "config.json"))
         config.max_seq_len = max_seq_len
 
@@ -520,35 +525,11 @@ class Gemma4_31B(nn.Module):
             model = Gemma4_31B(config)
 
         print(f"Loading weights from {model_dir}...")
-        state_dict = _load_and_remap_checkpoint(model_dir, config)
-
-        # Tied embeddings: copy embedding weight into lm_head when missing.
-        if "lm_head.weight" not in state_dict and "embed_tokens.weight" in state_dict:
-            state_dict["lm_head.weight"] = state_dict["embed_tokens.weight"]
-
-        missing, unexpected = model.load_state_dict(
-            state_dict, strict=False, assign=True
-        )
-
-        # Runtime buffers (KV caches, RoPE tables, masks) are zero-initialized
-        # and not in the checkpoint — those are the "expected" missing keys.
-        runtime_prefixes = (
-            ".kv_cache.",
-            ".inv_freq",
-            "embed_normalizer",
-            "logit_softcap",
-            "cache_positions",
-        )
-        actual_missing = set(missing)
-        expected = {k for k in actual_missing if any(p in k for p in runtime_prefixes)}
-        extra = actual_missing - expected
-        if extra:
-            print(f"  WARNING: missing weight keys: {sorted(extra)[:10]}")
-        if unexpected:
-            print(f"  WARNING: unexpected keys: {sorted(unexpected)[:10]}")
-        print(
-            f"  Loaded {len(state_dict)} tensors "
-            f"({len(expected)} runtime buffers OK)"
+        load_checkpoint(
+            model_dir,
+            model,
+            key_map=_hf_to_model_key,
+            tie_map={"embed_tokens.weight": ("lm_head.weight", False)},
         )
         return model, config
 
@@ -609,38 +590,6 @@ def _hf_to_model_key(hf_key: str) -> Optional[str]:
     return None
 
 
-def _load_and_remap_checkpoint(model_dir: str, config: Gemma4_31BConfig) -> dict:
-    """Stream-load safetensors shards and remap keys to model state_dict keys."""
-    from safetensors import safe_open
-
-    index_path = os.path.join(model_dir, "model.safetensors.index.json")
-    if os.path.exists(index_path):
-        with open(index_path, "r") as f:
-            index = json.load(f)
-        shard_files = sorted(set(index["weight_map"].values()))
-    elif os.path.exists(os.path.join(model_dir, "model.safetensors")):
-        shard_files = ["model.safetensors"]
-    else:
-        raise FileNotFoundError(f"No safetensors checkpoint in {model_dir}")
-
-    state_dict: dict[str, torch.Tensor] = {}
-    skipped = 0
-    for shard_file in shard_files:
-        shard_path = os.path.join(model_dir, shard_file)
-        with safe_open(shard_path, framework="pt", device="cpu") as f:
-            for ckpt_key in f.keys():
-                model_key = _hf_to_model_key(ckpt_key)
-                if model_key is None:
-                    skipped += 1
-                    continue
-                tensor = f.get_tensor(ckpt_key)
-                # layer_scalar in checkpoint is shape (1,) bf16 — keep as-is.
-                state_dict[model_key] = tensor
-    if skipped > 0:
-        print(f"  Skipped {skipped} non-text keys (vision tower, etc.)")
-    return state_dict
-
-
 # ---------------------------------------------------------------------------
 # Runtime buffer materialization
 
@@ -675,7 +624,9 @@ def materialize_runtime_buffers(
 
     for layer in model.layers:
         attn = layer.self_attn
-        attn.inv_freq = attn.inv_freq.to(device)
+        attn.register_buffer(
+            "inv_freq", attn._compute_inv_freq(device=device), persistent=False
+        )
 
     model.register_buffer(
         "embed_normalizer",

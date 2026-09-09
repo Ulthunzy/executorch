@@ -8,6 +8,7 @@
 
 #pragma once
 #include <executorch/examples/qualcomm/oss_scripts/llama/runner/imem_alloc.h>
+#include <executorch/examples/qualcomm/oss_scripts/llama/runner/utils.h>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -16,17 +17,15 @@
 namespace example {
 
 // Structure to hold key-value cache buffers
-template <typename T>
 struct KVCache {
-  T* buffer;
-  T* output_buffer;
+  std::byte* buffer;
+  std::byte* output_buffer;
 };
 
 /**
  * @class KVManager
  * @brief Class for kv cache update, rearrangement, and buffer allocatation.
  */
-template <typename T>
 class KVManager {
  public:
   struct Metadata {
@@ -47,14 +46,15 @@ class KVManager {
     };
 
     int32_t context_len;
-    int64_t head_dim;
     int32_t max_ar_len;
     int32_t max_cache_len;
     int64_t num_heads;
     int64_t num_layers;
     std::vector<CacheSpec> cache_specs;
   };
-  KVManager(Metadata metadata);
+  KVManager(
+      Metadata metadata,
+      std::unique_ptr<executorch::runtime::MethodMeta> method_meta);
 
   /**
    * @brief Allocate buffer for KV cache and set the cur_ar_len_.
@@ -96,7 +96,7 @@ class KVManager {
    * @param n_past Number of past elements in the cache.
    */
   void init_attention_mask(
-      uint16_t* attention_mask,
+      std::byte* attention_mask,
       const std::vector<int32_t>& attention_map,
       int32_t ar_len,
       int32_t n_past);
@@ -123,7 +123,7 @@ class KVManager {
    * @param position_offset (optional) attention mask position offset of
    */
   void init_attention_mask(
-      uint16_t* attention_mask,
+      std::byte* attention_mask,
       const std::vector<int32_t>& attention_map,
       int32_t ar_len,
       int32_t n_past,
@@ -139,7 +139,7 @@ class KVManager {
    * @param n_update Number of elements to be updated.
    */
   void update_attention_mask(
-      uint16_t* attention_mask,
+      std::byte* attention_mask,
       int32_t ar_len,
       int32_t n_past,
       int32_t n_update);
@@ -157,7 +157,7 @@ class KVManager {
    * lookahead decoder
    */
   void update_attention_mask(
-      uint16_t* attention_mask,
+      std::byte* attention_mask,
       int32_t ar_len,
       int32_t n_past,
       int32_t n_update,
@@ -223,7 +223,7 @@ class KVManager {
    * length can differ from metadata_.context_len when true SWA is enabled.
    */
   void init_attention_mask_swa(
-      uint16_t* attention_mask,
+      std::byte* attention_mask,
       const std::vector<int32_t>& attention_map,
       int32_t ar_len,
       int32_t n_past,
@@ -235,7 +235,7 @@ class KVManager {
    * @brief Update (recompute) SWA window attention mask after cache update.
    */
   void update_attention_mask_swa(
-      uint16_t* attention_mask,
+      std::byte* attention_mask,
       const std::vector<int32_t>& attention_map,
       int32_t ar_len,
       int32_t n_past,
@@ -252,10 +252,10 @@ class KVManager {
     return swa_cache_len_swa_;
   }
 
-  const std::vector<KVCache<T>>& get_k_cache_() const {
+  const std::vector<KVCache>& get_k_cache_() const {
     return k_cache_;
   }
-  const std::vector<KVCache<T>>& get_v_cache_() const {
+  const std::vector<KVCache>& get_v_cache_() const {
     return v_cache_;
   }
 
@@ -263,43 +263,46 @@ class KVManager {
     return total_cache_size_;
   }
 
-  int64_t get_head_dim() const {
-    return metadata_.head_dim;
-  }
-
  private:
   // Helper functions to rearrange and update key and value caches
-  void rearrange_key(KVCache<T>& k_cache, int32_t ar_len_dst);
-  void rearrange_value(KVCache<T>& v_cache, int32_t ar_len_dst);
+
+  void rearrange_key(KVCache& k_cache, int32_t ar_len_dst, int64_t head_dim);
+
+  void rearrange_value(KVCache& v_cache, int32_t ar_len_dst, int64_t head_dim);
+
   void update_key(
-      KVCache<T>& k_cache,
+      KVCache& k_cache,
       int32_t n_past,
       int32_t n_update,
-      const std::vector<int32_t>& selected_indices);
+      const std::vector<int32_t>& selected_indices,
+      int64_t head_dim);
   void update_value(
-      KVCache<T>& v_cache,
+      KVCache& v_cache,
       int32_t n_past,
       int32_t n_update,
-      const std::vector<int32_t>& selected_indices);
+      const std::vector<int32_t>& selected_indices,
+      int64_t head_dim);
 
   void update_full_overwrite_cache(
-      const KVCache<T>& k_cache,
-      const KVCache<T>& v_cache,
+      const KVCache& k_cache,
+      const KVCache& v_cache,
       int32_t layer);
 
   void update_key_swa(
-      KVCache<T>& k_cache,
+      KVCache& k_cache,
       int32_t cache_len,
       int32_t n_update,
-      const std::vector<int32_t>& selected_indices);
+      const std::vector<int32_t>& selected_indices,
+      int64_t head_dim);
   void update_value_swa(
-      KVCache<T>& v_cache,
+      KVCache& v_cache,
       int32_t cache_len,
       int32_t n_update,
-      const std::vector<int32_t>& selected_indices);
+      const std::vector<int32_t>& selected_indices,
+      int64_t head_dim);
 
   void fill_attention_mask_swa(
-      uint16_t* attention_mask,
+      std::byte* attention_mask,
       const std::vector<int32_t>& attention_map,
       int32_t ar_len,
       int32_t context_len,
@@ -308,11 +311,7 @@ class KVManager {
 
   void maybe_sync_swa_state_from_n_past_swa(int32_t n_past, int32_t cache_len);
 
-  void compact_prefill_to_swa(int32_t n_past, int32_t cache_len);
-
-  void recompute_total_cache_size(
-      const std::vector<int32_t>* layer_cache_len = nullptr,
-      const std::vector<bool>* layer_is_swa = nullptr);
+  void recompute_total_cache_size();
 
   // metadata
   Metadata metadata_;
@@ -327,10 +326,22 @@ class KVManager {
   std::vector<bool> layer_is_swa_;
   std::vector<int32_t> layer_cache_len_swa_;
 
+  executorch::aten::ScalarType attention_mask_dtype_ =
+      executorch::aten::ScalarType::Undefined;
+  executorch::aten::ScalarType kv_cache_dtype_ =
+      executorch::aten::ScalarType::Undefined;
   // Store start pointer of k and v cache for input and output
   // input: layer -> head * head_dim * cache_len_in(layer)
   // output: layer -> head * head_dim * max_ar_len
-  std::vector<KVCache<T>> k_cache_;
-  std::vector<KVCache<T>> v_cache_;
+  std::vector<KVCache> k_cache_;
+  std::vector<KVCache> v_cache_;
+  // Per-layer buffer sizes and head_dim (may differ when head_dim varies across
+  // layers)
+  std::vector<size_t> k_cache_in_nbytes_;
+  std::vector<size_t> k_cache_out_nbytes_;
+  std::vector<size_t> v_cache_in_nbytes_;
+  std::vector<size_t> v_cache_out_nbytes_;
+  std::vector<int64_t> k_head_dim_;
+  std::vector<int64_t> v_head_dim_;
 };
 } // namespace example

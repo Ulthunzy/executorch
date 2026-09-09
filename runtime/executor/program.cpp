@@ -29,6 +29,14 @@
 #define ET_ENABLE_PROGRAM_VERIFICATION 1
 #endif
 
+/*
+ * The constant_buffer path is deprecated from ExecuTorch 0.7. Disable it by
+ * passing -DET_ENABLE_DEPRECATED_CONSTANT_BUFFER=0.
+ */
+#ifndef ET_ENABLE_DEPRECATED_CONSTANT_BUFFER
+#define ET_ENABLE_DEPRECATED_CONSTANT_BUFFER 1
+#endif
+
 namespace executorch {
 namespace ET_RUNTIME_NAMESPACE {
 namespace {
@@ -218,6 +226,21 @@ Result<executorch_flatbuffer::ExecutionPlan*> get_execution_plan(
   const executorch_flatbuffer::Program* flatbuffer_program =
       executorch_flatbuffer::GetProgram(program_data->data());
 
+  // The file identifier above ("ET12") is bumped by convention only on a
+  // backward-incompatible schema change, so it selects a schema family. The
+  // version is the finer gate within that family: a file written by a newer
+  // exporter is refused here instead of being misread field by field. Older
+  // files stay loadable because the schema only grows by appending optional
+  // fields.
+  ET_CHECK_OR_RETURN_ERROR(
+      flatbuffer_program->version() <= kMaxSupportedSchemaVersion,
+      InvalidProgram,
+      "Program schema version %u is newer than the highest this runtime "
+      "supports (%u). Export the model with an older ExecuTorch, or update "
+      "the runtime.",
+      flatbuffer_program->version(),
+      kMaxSupportedSchemaVersion);
+
   // Instantiate PteDataMap if named_data is present.
   const auto named_data = flatbuffer_program->named_data();
   std::optional<internal::PteDataMap> pte_data_map = std::nullopt;
@@ -306,6 +329,7 @@ Result<executorch_flatbuffer::ExecutionPlan*> get_execution_plan(
     // https://docs.pytorch.org/executorch/stable/api-life-cycle.html#deprecation-policy.
     // For support, contact the PyTorch Edge team or make an issue in:
     // https://github.com/pytorch/executorch/issues.
+#if ET_ENABLE_DEPRECATED_CONSTANT_BUFFER
     ET_LOG(
         Error,
         "!!DEPRECATED!! This branch is deprecated from ExecuTorch 0.7; re-export this PTE file to ensure support on newer runtimes.");
@@ -316,6 +340,13 @@ Result<executorch_flatbuffer::ExecutionPlan*> get_execution_plan(
         flatbuffer_program,
         /*constant_segment_data=*/FreeableBuffer{},
         std::move(pte_data_map));
+#else
+    ET_LOG(
+        Error,
+        "PTE file relies on the constant_buffer path, which is disabled in this"
+        " build (ET_ENABLE_DEPRECATED_CONSTANT_BUFFER=0). Please re-export the PTE file.");
+    return Error::InvalidProgram;
+#endif
   }
 }
 
@@ -355,7 +386,8 @@ Result<Method> Program::load_method(
     MemoryManager* memory_manager,
     EventTracer* event_tracer,
     const NamedDataMap* named_data_map,
-    const LoadBackendOptionsMap* backend_options) const {
+    const LoadBackendOptionsMap* backend_options,
+    Span<const Kernel> kernel_registry) const {
   EXECUTORCH_SCOPE_PROF("Program::load_method");
   internal::event_tracer_create_event_block(event_tracer, "Default");
   internal::EventTracerProfileMethodScope event_tracer_scope =
@@ -378,7 +410,8 @@ Result<Method> Program::load_method(
       memory_manager,
       event_tracer,
       named_data_map,
-      backend_options);
+      backend_options,
+      kernel_registry);
 }
 
 Result<MethodMeta> Program::method_meta(const char* method_name) const {
@@ -449,6 +482,7 @@ Result<const void*> Program::get_constant_buffer_data(
         static_cast<const unsigned char*>(constant_segment_data_.data()) +
         offset);
   } else {
+#if ET_ENABLE_DEPRECATED_CONSTANT_BUFFER
     // Otherwise, the constant data is stored inside Program.constant_buffer.
     const auto* constant_buffer_ptr = internal_program->constant_buffer();
     size_t num_elems =
@@ -475,6 +509,14 @@ Result<const void*> Program::get_constant_buffer_data(
         static_cast<size_t>(storage_size));
 
     return storage->data();
+#else
+    (void)buffer_index;
+    (void)nbytes;
+    ET_LOG(
+        Error,
+        "constant_buffer path is disabled (ET_ENABLE_DEPRECATED_CONSTANT_BUFFER=0). Please re-export the PTE file.");
+    return Error::InvalidProgram;
+#endif
   }
 }
 
@@ -550,6 +592,11 @@ Result<FreeableBuffer> Program::LoadSegment(
     ET_LOG(Error, "No segments in program: requested index %zu", index);
     return Error::NotFound;
   }
+  ET_CHECK_OR_RETURN_ERROR(
+      internal_program_->segments() != nullptr,
+      InvalidProgram,
+      "No segments in program: requested index %zu",
+      index);
   size_t num_segments = internal_program_->segments()->size();
   if (index >= num_segments) {
     ET_LOG(
@@ -625,6 +672,10 @@ Error Program::load_mutable_subsegment_into(
   size_t offset = segment_offsets->offsets()->Get(offset_index);
 
   // Grab the segment index
+  ET_CHECK_OR_RETURN_ERROR(
+      internal_program_->segments() != nullptr,
+      InvalidProgram,
+      "No segments in program");
   size_t num_segments = internal_program_->segments()->size();
   if (segment_offsets->segment_index() >= num_segments) {
     ET_LOG(

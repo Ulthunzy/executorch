@@ -28,7 +28,6 @@
 #include <climits>
 #include <fstream>
 
-using executorch::extension::Module;
 using executorch::extension::llm::get_rss_bytes;
 using executorch::extension::llm::print_report;
 using executorch::extension::llm::Stats;
@@ -68,17 +67,17 @@ void print_performance_report(
 
 void save_logits(
     const std::string& dump_logits_path,
-    const std::vector<uint16_t>& prefill_logits,
-    const std::vector<uint16_t>& decode_logits) {
+    const std::vector<std::byte>& prefill_logits,
+    const std::vector<std::byte>& decode_logits) {
   std::ofstream outFile(dump_logits_path.c_str(), std::ios::binary);
   if (outFile.is_open()) {
     outFile.write(
         reinterpret_cast<const char*>(prefill_logits.data()),
-        prefill_logits.size() * sizeof(uint16_t));
+        prefill_logits.size());
 
     outFile.write(
         reinterpret_cast<const char*>(decode_logits.data()),
-        decode_logits.size() * sizeof(uint16_t));
+        decode_logits.size());
     outFile.close();
   } else {
     ET_CHECK_MSG(false, "Error saving the dump logits file");
@@ -146,8 +145,7 @@ size_t token_generator_io_size_from_meta(
 
 } // namespace
 
-template <typename T>
-Runner<T>::Runner(
+Runner::Runner(
     std::unique_ptr<executorch::extension::Module> module,
     const std::string& decoder_model_version,
     const std::string& model_path,
@@ -188,6 +186,9 @@ Runner<T>::Runner(
   } else if (decoder_model_version == "gemma3") {
     decoder_model_version_ = DecoderModelVersion::kGemma3;
     cache_mode_ = CacheMode::HybridCache;
+  } else if (decoder_model_version == "gemma4") {
+    decoder_model_version_ = DecoderModelVersion::kGemma4;
+    cache_mode_ = CacheMode::HybridCache;
   } else if (decoder_model_version == "granite") {
     decoder_model_version_ = DecoderModelVersion::kGranite;
   } else if (decoder_model_version == "phi_4_mini") {
@@ -216,14 +217,12 @@ Runner<T>::Runner(
   ET_LOG(Info, "eval mode=%d", eval_mode_);
 }
 
-template <typename T>
-bool Runner<T>::is_loaded() const {
+bool Runner::is_loaded() const {
   return module_->is_loaded() && tokenizer_ && decoder_runner_ &&
       prompt_processor_ && token_generator_ && kv_manager_ && buffer_manager_;
 }
 
-template <typename T>
-Error Runner<T>::load() {
+Error Runner::load() {
   if (is_loaded()) {
     return Error::Ok;
   }
@@ -285,6 +284,8 @@ Error Runner<T>::load() {
       decoder_model_version_ == DecoderModelVersion::kGemma2 ||
       decoder_model_version_ == DecoderModelVersion::kGemma3) {
     eos_ids->insert(tokenizer_->encode("<end_of_turn>", 0, 0).get()[0]);
+  } else if (decoder_model_version_ == DecoderModelVersion::kGemma4) {
+    eos_ids->insert(tokenizer_->encode("<turn|>", 0, 0).get()[0]);
   } else if (decoder_model_version_ == DecoderModelVersion::kCodegen) {
     eos_ids->insert(tokenizer_->encode("<|endoftext|>", 0, 0).get()[0]);
   } else if (decoder_model_version_ == DecoderModelVersion::kGlm) {
@@ -350,14 +351,13 @@ Error Runner<T>::load() {
 
   ET_LOG(Info, "Reading metadata from model");
   // retrieve any method meta, can be either prefill or kv
-  int64_t num_layers =
-      ET_UNWRAP(module_->get("get_n_layers")).toScalar().to<int64_t>();
+  ET_ASSIGN_OR_RETURN(num_layers_evalue__, module_->get("get_n_layers"));
+  int64_t num_layers = num_layers_evalue__.toScalar().to<int64_t>();
 
   ET_CHECK_MSG(num_layers != -1, "Could not retrieve num layers");
   // k_cache: [1, n_heads, head_dim, seq_len]
   auto k_cache_shape = method_meta->output_tensor_meta(1)->sizes();
   int64_t num_heads = k_cache_shape[1];
-  int64_t head_dim = k_cache_shape[2];
   bool use_int64_token = method_meta->input_tensor_meta(0)->scalar_type() ==
       executorch::aten::ScalarType::Long;
 
@@ -367,10 +367,10 @@ Error Runner<T>::load() {
   int32_t token_generator_ar_len = 0;
   int32_t max_cache_len = 0;
   int32_t max_ar_len = 0;
-  // atten mask: [1, AR-N, CL]
+  // atten mask: [1, 1, AR-N, CL]
   auto atten_mask_meta_token = method_meta->input_tensor_meta(1);
-  token_generator_ar_len = atten_mask_meta_token->sizes()[1];
-  context_len_ = atten_mask_meta_token->sizes()[2];
+  token_generator_ar_len = atten_mask_meta_token->sizes()[2];
+  context_len_ = atten_mask_meta_token->sizes()[3];
   if (eval_mode_ == EvalMode::kKVCached) {
     prompt_processor_ar_len = token_generator_ar_len;
   } else if (
@@ -379,7 +379,7 @@ Error Runner<T>::load() {
     auto atten_mask_meta_prompt =
         module_->method_meta(prompt_processor_method_name)
             ->input_tensor_meta(1);
-    prompt_processor_ar_len = atten_mask_meta_prompt->sizes()[1];
+    prompt_processor_ar_len = atten_mask_meta_prompt->sizes()[2];
   }
   if (prompt_processor_ar_len == context_len_)
     max_cache_len = context_len_;
@@ -393,15 +393,25 @@ Error Runner<T>::load() {
   // attention
   int32_t sliding_window = context_len_;
   if (module_->method_names()->count("get_sliding_window") > 0) {
-    sliding_window = ET_UNWRAP(module_->get("get_sliding_window")).toInt();
+    ET_ASSIGN_OR_RETURN(
+        sliding_window_evalue__, module_->get("get_sliding_window"));
+    sliding_window = sliding_window_evalue__.toInt();
   }
-
+  // Gemma4 uses YOCO: only self-decoder layers have KV I/O; use
+  // get_n_self_layers when available so KVManager allocates the correct number
+  // of caches.
+  int64_t num_kv_layers = num_layers;
+  if (module_->method_names()->count("get_n_self_layers") > 0) {
+    ET_ASSIGN_OR_RETURN(num_layers_evalue__, module_->get("get_n_self_layers"));
+    num_kv_layers = num_layers_evalue__.toScalar().to<int64_t>();
+  }
   bool enable_true_swa = false;
   std::vector<int32_t> layer_cache_len;
   std::vector<bool> layer_is_swa;
   int32_t window_context_len = context_len_;
   if (cache_mode_ == CacheMode::HybridCache) {
-    window_context_len = method_meta->input_tensor_meta(2)->sizes()[2];
+    const auto window_mask_sizes = method_meta->input_tensor_meta(2)->sizes();
+    window_context_len = window_mask_sizes[window_mask_sizes.size() - 1];
     if (window_context_len != context_len_) {
       enable_true_swa = true;
     }
@@ -409,9 +419,9 @@ Error Runner<T>::load() {
     const size_t base_inputs = 3 + (cache_mode_ == CacheMode::HybridCache ? 1 : 0);
     const size_t k_cache_start = base_inputs;
     const int32_t full_cache_len = context_len_ - token_generator_ar_len;
-    layer_cache_len.resize(num_layers);
-    layer_is_swa.assign(num_layers, false);
-    for (int64_t layer = 0; layer < num_layers; ++layer) {
+    layer_cache_len.resize(num_kv_layers);
+    layer_is_swa.assign(num_kv_layers, false);
+    for (int64_t layer = 0; layer < num_kv_layers; ++layer) {
       const int32_t cache_len =
           method_meta->input_tensor_meta(k_cache_start + static_cast<size_t>(layer))
               ->sizes()[3];
@@ -426,7 +436,7 @@ Error Runner<T>::load() {
     int64_t swa_layers = 0;
     int32_t min_cache_len = INT32_MAX;
     int32_t max_cache_len_seen = 0;
-    for (int64_t layer = 0; layer < num_layers; ++layer) {
+    for (int64_t layer = 0; layer < num_kv_layers; ++layer) {
       if (!layer_is_swa.empty() && layer_is_swa[layer]) {
         swa_layers++;
       }
@@ -441,7 +451,7 @@ Error Runner<T>::load() {
         window_context_len,
         context_len_,
         static_cast<long long>(swa_layers),
-        static_cast<long long>(num_layers),
+        static_cast<long long>(num_kv_layers),
         (min_cache_len == INT32_MAX ? 0 : min_cache_len),
         max_cache_len_seen);
   }
@@ -459,7 +469,7 @@ Error Runner<T>::load() {
     }
     const size_t base_inputs = 3 + (cache_mode_ == CacheMode::HybridCache ? 1 : 0);
     const size_t k_cache_start = base_inputs;
-    for (int64_t layer = 0; layer < num_layers; ++layer) {
+    for (int64_t layer = 0; layer < num_kv_layers; ++layer) {
       if (!layer_is_swa.empty() && layer_is_swa[layer]) {
         const int32_t prefill_cache_len =
             prompt_method_meta->input_tensor_meta(
@@ -489,13 +499,11 @@ Error Runner<T>::load() {
   const dev_mem::RssSample load_io_before = dev_mem::sample_rss();
   dev_mem::log_proc_status_mem("load stage: io/cache allocation (before)");
 #endif
-  kv_manager_ = std::make_unique<KVManager<T>>(typename KVManager<T>::Metadata{
-      context_len_,
-      head_dim,
-      max_ar_len,
-      max_cache_len,
-      num_heads,
-      num_layers});
+  kv_manager_ = std::make_unique<KVManager>(
+      KVManager::Metadata{
+          context_len_, max_ar_len, max_cache_len, num_heads, num_kv_layers},
+      std::make_unique<MethodMeta>(
+          std::move(module_->method_meta(token_generator_method_name).get())));
   if (enable_true_swa) {
     kv_manager_->configure_cache_size_swa(layer_cache_len, layer_is_swa);
   }
@@ -507,30 +515,32 @@ Error Runner<T>::load() {
         attention_sink_rope_runner_->load(method_names));
   }
 
-  prompt_processor_ = std::make_unique<PromptProcessor<T>>(
+  prompt_processor_ = std::make_unique<PromptProcessor>(
       decoder_runner_.get(),
       kv_manager_.get(),
       prompt_processor_method_name,
-      typename PromptProcessor<T>::Metadata{
+      PromptProcessor::Metadata{
           context_len_,
           num_heads,
-          num_layers,
+          num_kv_layers,
           prompt_processor_ar_len,
           vocab_size,
           use_int64_token,
           sliding_window,
-          cache_mode_});
+          cache_mode_},
+      std::make_unique<MethodMeta>(
+          std::move(module_->method_meta(prompt_processor_method_name).get())));
   if (eval_mode_ == EvalMode::kLookaheadDecoding) {
-    token_generator_ = std::make_unique<LhdTokenGenerator<T>>(
+    token_generator_ = std::make_unique<LhdTokenGenerator>(
         tokenizer_.get(),
         decoder_runner_.get(),
         kv_manager_.get(),
         token_generator_method_name,
         std::move(eos_ids),
-        typename LhdTokenGenerator<T>::Metadata{
+        LhdTokenGenerator::Metadata{
             context_len_,
             num_heads,
-            num_layers,
+            num_kv_layers,
             token_generator_ar_len,
             vocab_size,
             use_int64_token,
@@ -539,24 +549,28 @@ Error Runner<T>::load() {
             gcap_,
             sliding_window,
             cache_mode_},
-        &stats_);
+        &stats_,
+        std::make_unique<MethodMeta>(std::move(
+            module_->method_meta(token_generator_method_name).get())));
   } else {
-    token_generator_ = std::make_unique<TokenGenerator<T>>(
+    token_generator_ = std::make_unique<TokenGenerator>(
         tokenizer_.get(),
         decoder_runner_.get(),
         kv_manager_.get(),
         token_generator_method_name,
         std::move(eos_ids),
-        typename TokenGenerator<T>::Metadata{
+        TokenGenerator::Metadata{
             context_len_,
             num_heads,
-            num_layers,
+            num_kv_layers,
             token_generator_ar_len,
             vocab_size,
             use_int64_token,
             sliding_window,
             cache_mode_},
-        &stats_);
+        &stats_,
+        std::make_unique<MethodMeta>(std::move(
+            module_->method_meta(token_generator_method_name).get())));
   }
 
   auto prompt_processor_method_meta =
@@ -635,8 +649,7 @@ Error Runner<T>::load() {
   return Error::Ok;
 }
 
-template <typename T>
-Error Runner<T>::generate(
+Error Runner::generate(
     const std::string& prompt,
     const llm::GenerationConfig& config,
     std::function<void(const std::string&)> token_callback,
@@ -645,8 +658,7 @@ Error Runner<T>::generate(
       prompt, false, config, token_callback, stats_callback);
 }
 
-template <typename T>
-Error Runner<T>::generate_from_prompt_or_file(
+Error Runner::generate_from_prompt_or_file(
     const std::string& prompt,
     bool tokenized_prompt,
     const llm::GenerationConfig& config,
@@ -741,8 +753,9 @@ Error Runner<T>::generate_from_prompt_or_file(
   // print the first token from prefill. No prev_token so use cur_token for
   // it.
   if (token_callback) {
-    token_callback(
-        ET_UNWRAP_TOKENIZER(tokenizer_->decode(cur_token, cur_token)));
+    ET_ASSIGN_OR_RETURN_TOKENIZER(
+        decoded_token__, tokenizer_->decode(cur_token, cur_token));
+    token_callback(decoded_token__);
   }
   ET_LOG(
       Info,
@@ -754,13 +767,15 @@ Error Runner<T>::generate_from_prompt_or_file(
 #if ET_QNN_RUNNER_DEV_MEM_LOG
   const dev_mem::RssSample decode_before = dev_mem::sample_rss();
 #endif
-  int64_t num_generated_tokens = ET_UNWRAP(token_generator_->generate(
-      prompt_tokens,
-      cur_pos_,
-      seq_len,
-      token_callback,
-      dump_logits,
-      attention_sink_rope_runner_.get()));
+  ET_ASSIGN_OR_RETURN(
+      num_generated_tokens,
+      token_generator_->generate(
+          prompt_tokens,
+          cur_pos_,
+          seq_len,
+          token_callback,
+          dump_logits,
+          attention_sink_rope_runner_.get()));
   stats_.inference_end_ms = time_in_ms();
 #if ET_QNN_RUNNER_DEV_MEM_LOG
   const dev_mem::RssSample decode_after = dev_mem::sample_rss();
@@ -792,8 +807,7 @@ Error Runner<T>::generate_from_prompt_or_file(
   return Error::Ok;
 }
 
-template <typename T>
-Result<DecoderModelVersion> Runner<T>::get_decoder_model_version() {
+Result<DecoderModelVersion> Runner::get_decoder_model_version() {
   if (!is_loaded()) {
     stats_.model_load_start_ms = time_in_ms();
     ET_CHECK_OK_OR_RETURN_ERROR(load());
@@ -801,9 +815,5 @@ Result<DecoderModelVersion> Runner<T>::get_decoder_model_version() {
   }
   return decoder_model_version_;
 }
-
-// Explicit instantiations
-template class Runner<uint16_t>;
-template class Runner<uint8_t>;
 
 } // namespace example

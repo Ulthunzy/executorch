@@ -815,13 +815,13 @@ class FeedForward(nn.Module):
         self.w3 = nn.Linear(self.dim, self.hidden_dim, bias=False)
         self.act_fn = args.act_fn.get_function()
 
-    def prepare_feedfoward_conv(self):
+    def prepare_feedforward_conv(self):
         self.w1_conv = nn.Conv2d(self.dim, self.hidden_dim, 1, bias=False)
         self.w2_conv = nn.Conv2d(self.hidden_dim, self.dim, 1, bias=False)
         self.w3_conv = nn.Conv2d(self.dim, self.hidden_dim, 1, bias=False)
 
         self.forward_no_conv = self.forward
-        self.forward = self.forward_feedfoward_conv
+        self.forward = self.forward_feedforward_conv
         self.w1_conv.weight.data.copy_(self.w1.weight[:, :, None, None])
         self.w2_conv.weight.data.copy_(self.w2.weight[:, :, None, None])
         self.w3_conv.weight.data.copy_(self.w3.weight[:, :, None, None])
@@ -830,7 +830,7 @@ class FeedForward(nn.Module):
         del self.w2
         del self.w3
 
-    def forward_feedfoward_conv(self, x):
+    def forward_feedforward_conv(self, x):
         bsz, _, _ = x.size()
         x = torch.reshape(x, (bsz, -1, 1, self.dim))
         x = x.transpose(1, 3)  # Transpose right before and after Conv
@@ -1106,7 +1106,7 @@ class LlamaModel(nn.Module):
             self.freqs_sin[input_pos][0] if self.use_kv_cache else self.freqs_sin
         )
 
-        hidden_states = self.embedding_scale_factor * self.tok_embeddings(tokens)
+        hidden_states = self.tok_embeddings(tokens)
 
         for ind, decoder_layer in enumerate(self.layers):
             k_caches = None
@@ -1710,7 +1710,11 @@ class LlamaModelWithoutEmbedding(LlamaModel):
             self.freqs_sin[input_pos][0] if self.use_kv_cache else self.freqs_sin
         )
 
-        hidden_states = self.embedding_scale_factor * hidden_states
+        hidden_states = (
+            self.embedding_scale_factor * hidden_states
+            if self.embedding_scale_factor != 1.0
+            else hidden_states
+        )
 
         for ind, decoder_layer in enumerate(self.layers):
             k_caches = None
@@ -2083,7 +2087,8 @@ class MultiScopeAwareLlamaModel(LlamaModel):
             else self.local_freqs_sin
         )
 
-        hidden_states = self.embedding_scale_factor * self.tok_embeddings(tokens)
+        hidden_states = self.tok_embeddings(tokens)
+
         for ind, decoder_layer in enumerate(self.layers):
             k_caches = None
             v_caches = None

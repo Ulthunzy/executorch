@@ -16,13 +16,13 @@ using executorch::runtime::TensorInfo;
 
 namespace example {
 
-template <typename T>
-MultimodalPromptProcessor<T>::MultimodalPromptProcessor(
+MultimodalPromptProcessor::MultimodalPromptProcessor(
     DecoderRunner* decoder_runner,
-    KVManager<T>* kv_manager,
+    KVManager* kv_manager,
     const std::string& method_name,
-    Metadata metadata)
-    : PromptProcessor<T>(
+    Metadata metadata,
+    std::unique_ptr<MethodMeta> method_meta)
+    : PromptProcessor(
           decoder_runner,
           kv_manager,
           method_name,
@@ -33,7 +33,8 @@ MultimodalPromptProcessor<T>::MultimodalPromptProcessor(
            metadata.vocab_size,
            metadata.use_int64_token,
            metadata.sliding_window,
-           metadata.cache_mode}),
+           metadata.cache_mode},
+          std::move(method_meta)),
       metadata_(metadata) {
   // Set input_toks_.size to 0 since we use embeddings instead
   input_toks_.size = 0;
@@ -43,8 +44,7 @@ MultimodalPromptProcessor<T>::MultimodalPromptProcessor(
       metadata_.ar_len * metadata_.embedding_dim * sizeof(float);
 };
 
-template <typename T>
-void MultimodalPromptProcessor<T>::init_io(
+void MultimodalPromptProcessor::init_io(
     IMemAlloc* buffer_manager,
     Result<MethodMeta> method_meta) {
   size_t idx = 0;
@@ -68,8 +68,7 @@ void MultimodalPromptProcessor<T>::init_io(
 
   // [I]: attention_mask
   Result<TensorInfo> attention_mask = method_meta->input_tensor_meta(idx++);
-  attention_mask_.data = reinterpret_cast<uint16_t*>(
-      buffer_manager->allocate(attention_mask_.size));
+  attention_mask_.data = buffer_manager->allocate(attention_mask_.size);
   attention_mask_.tensor = std::make_unique<TensorImpl>(
       attention_mask->scalar_type(),
       attention_mask->sizes().size(),
@@ -86,7 +85,8 @@ void MultimodalPromptProcessor<T>::init_io(
     Result<TensorInfo> window_attention_mask =
         method_meta->input_tensor_meta(idx++);
     window_attention_mask_.size = window_attention_mask->nbytes();
-    window_context_len_swa_ = window_attention_mask->sizes()[2];
+    const auto window_mask_sizes = window_attention_mask->sizes();
+    window_context_len_swa_ = window_mask_sizes[window_mask_sizes.size() - 1];
     true_swa_enabled_swa_ = window_context_len_swa_ != metadata_.context_len;
     ET_LOG(
         Info,
@@ -94,8 +94,8 @@ void MultimodalPromptProcessor<T>::init_io(
         window_context_len_swa_,
         metadata_.context_len,
         true_swa_enabled_swa_);
-    window_attention_mask_.data = reinterpret_cast<uint16_t*>(
-        buffer_manager->allocate(window_attention_mask_.size));
+    window_attention_mask_.data =
+        buffer_manager->allocate(window_attention_mask_.size);
     window_attention_mask_.tensor = std::make_unique<TensorImpl>(
         window_attention_mask->scalar_type(),
         window_attention_mask->sizes().size(),
@@ -131,32 +131,29 @@ void MultimodalPromptProcessor<T>::init_io(
     for (int cache_group = 0; cache_group < 2; ++cache_group) {
       std::vector<std::unique_ptr<TensorImpl>>& cache =
           (cache_group == 0 ? k_cache_in_ : v_cache_in_);
-      std::vector<KVCache<T>> cache_ptrs = (cache_group == 0)
+      std::vector<KVCache> cache_ptrs = (cache_group == 0)
           ? kv_manager_->get_k_cache_()
           : kv_manager_->get_v_cache_();
       for (int layer = 0; layer < metadata_.num_layers; ++layer, ++index) {
         Result<TensorInfo> kv_cache = method_meta->input_tensor_meta(index);
 
-        T* cache_ptr = cache_ptrs[layer].buffer;
-
         cache[layer] = std::make_unique<TensorImpl>(
             kv_cache->scalar_type(),
             kv_cache->sizes().size(),
             const_cast<TensorImpl::SizesType*>(kv_cache->sizes().data()),
-            cache_ptr,
+            cache_ptrs[layer].buffer,
             const_cast<TensorImpl::DimOrderType*>(
                 kv_cache->dim_order().data()));
         input_tensors_.emplace_back(cache[layer].get());
         buffer_manager->add_memory_info(
-            cache_ptr, cache[layer]->nbytes(), kv_cache.get());
+            cache_ptrs[layer].buffer, cache[layer]->nbytes(), kv_cache.get());
       }
     }
   }
 
   // [O]: logits
   Result<TensorInfo> logits = method_meta->output_tensor_meta(0);
-  logits_.data =
-      reinterpret_cast<uint16_t*>(buffer_manager->allocate(logits_.size));
+  logits_.data = buffer_manager->allocate(logits_.size);
   logits_.tensor = std::make_unique<TensorImpl>(
       logits->scalar_type(),
       logits->sizes().size(),
@@ -171,21 +168,22 @@ void MultimodalPromptProcessor<T>::init_io(
   for (int cache_group = 0; cache_group < 2; ++cache_group) {
     std::vector<std::unique_ptr<TensorImpl>>& cache =
         (cache_group == 0 ? k_cache_out_ : v_cache_out_);
-    std::vector<KVCache<T>> cache_ptrs = (cache_group == 0)
+    std::vector<KVCache> cache_ptrs = (cache_group == 0)
         ? kv_manager_->get_k_cache_()
         : kv_manager_->get_v_cache_();
     for (int layer = 0; layer < metadata_.num_layers; ++layer, ++index) {
       Result<TensorInfo> kv_cache = method_meta->output_tensor_meta(index);
-      T* cache_ptr = cache_ptrs[layer].output_buffer;
       cache[layer] = std::make_unique<TensorImpl>(
           kv_cache->scalar_type(),
           kv_cache->sizes().size(),
           const_cast<TensorImpl::SizesType*>(kv_cache->sizes().data()),
-          cache_ptr,
+          cache_ptrs[layer].output_buffer,
           const_cast<TensorImpl::DimOrderType*>(kv_cache->dim_order().data()));
       output_tensors_.emplace_back(cache[layer].get());
       buffer_manager->add_memory_info(
-          cache_ptr, cache[layer]->nbytes(), kv_cache.get());
+          cache_ptrs[layer].output_buffer,
+          cache[layer]->nbytes(),
+          kv_cache.get());
     }
   }
 
@@ -197,8 +195,7 @@ void MultimodalPromptProcessor<T>::init_io(
 }
 
 // prepare embedding
-template <typename T>
-void MultimodalPromptProcessor<T>::prepare_io(
+void MultimodalPromptProcessor::prepare_io(
     const TensorStruct<float>& prompt_embedding,
     int32_t num_prompt_tokens,
     int64_t prompt_pos,
@@ -232,8 +229,7 @@ void MultimodalPromptProcessor<T>::prepare_io(
   }
 }
 
-template <typename T>
-Result<uint64_t> MultimodalPromptProcessor<T>::prefill(
+Result<uint64_t> MultimodalPromptProcessor::prefill(
     const TensorStruct<float>& prompt_embedding,
     int64_t start_pos,
     bool dump_logits,
@@ -355,9 +351,5 @@ Result<uint64_t> MultimodalPromptProcessor<T>::prefill(
       (num_prompt_tokens + metadata_.ar_len - 1) % metadata_.ar_len);
   return cur_token;
 }
-
-// Explicit instantiations
-template class MultimodalPromptProcessor<uint16_t>;
-template class MultimodalPromptProcessor<uint8_t>;
 
 } // namespace example

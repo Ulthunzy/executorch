@@ -29,7 +29,7 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-LITECORE_VERSION="v1.0"
+LITECORE_VERSION="v1.2.0"
 LITECORE_FILE_NAME="ai-litecore-ubuntu2204-${LITECORE_VERSION}.tar.gz"
 DEVICEFARM_CLI_VERSION="beta-v1.1.0"
 DEVICEFARM_FILE_NAME="devicefarmcli-${DEVICEFARM_CLI_VERSION}.zip"
@@ -43,7 +43,7 @@ download_and_extract() {
   local out_file="$3"
 
   echo "Downloading from ${download_url}..."
-  curl -fsSL --retry 3 \
+  curl -fsSL --retry 3 --retry-all-errors \
     -H "apikey: ${API_KEY}" \
     -o "${out_file}" \
     "${download_url}"
