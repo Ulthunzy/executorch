@@ -297,7 +297,55 @@ python -m pytest -q "$VALIDATION/tests" "$VALIDATION/ppl" \
   "$VALIDATION/benchmarks" "$VALIDATION/calibration"
 ```
 
+生产 masked-softmax 的因果性回归另见：
+
+```bash
+python -m pytest -q backends/qualcomm/tests/test_llama_masked_softmax.py
+python -m pytest -q backends/qualcomm/tests/test_mha_to_sha_hadamard.py
+```
+
+它覆盖浮点/QDQ、CPU/CUDA、SWA、校准图到部署图的 encoding 传播，以及
+AR4096 新导出 PT2 的原图因果检查。CUDA 不可用时跳过 GPU 项。
+Hadamard 转换回归覆盖 AR1/4/8/128、1/2/4 个 KV 头及旋转结果直接作为图输出，
+检查旋转保留批处理、attention 按头拆分且输出数值一致。
+重新导出注意事项见 [masked-softmax 修复说明](../README.md#re-exporting-after-the-masked-softmax-causality-fix)；
+旧 PT2 不会因更新测试脚本而自动修复。
+
 设备集成测试必须显式按其文档配置运行，不应把历史长实验当成日常单元测试。不要在整理代码时自动重跑全量 PPL/100 条对话或上传新模型。
+
+masked-softmax 的 QNN 真机回归（默认 Android 构建目录为 `build-android`）：
+
+```bash
+ET_MASK_QNN_DEVICE="$SERIAL" ET_MASK_QNN_SOC=SM8750 \
+EXECUTORCH_ANDROID_BUILD="$PWD/build-android" \
+python -m pytest -q backends/qualcomm/tests/test_llama_masked_softmax.py
+```
+
+此项会编译并推送隔离的小型 Lincal W4A16/SWA 模型，核对 AR1/AR128 的
+因果性、PT2/PTE 输出、QNN MaskedSoftmax 融合及原生 Hadamard 保留，不覆盖已有模型。
+需要主机 QNN SDK、已构建的 `qnn_executor_runner` 和 SDK 的 optrace 工具；
+如果主机加载 QNN 时缺少 `libc++.so.1`，可把 NDK 的
+`toolchains/llvm/prebuilt/linux-x86_64/lib/x86_64-unknown-linux-gnu`
+加入当前进程的 `LD_LIBRARY_PATH`。
+
+本机 SM8750 / QNN 2.49.40 曾在 R3 与 MHA→SHA 同时开启时出现
+`q::ConvLayer_s1.opt` 编译失败。转换现在保留批处理的原生 Hadamard，
+只拆分其输出，避免逐头复制旋转及上游投影；AR1/AR128 小模型已通过默认路径的
+编译、真机数值与算子检查。`ET_MASK_QNN_MHA2SHA` 默认值为 `1`，
+设置为 `0` 仅供关闭转换时的对照测试，不改变 `llama.py` 默认设置。
+此回归不代表完整 1.7B 模型的 PPL 或生成质量已经验证。
+
+内存紧张时，可先仅测试 AR1 decode 与 AR4 prefill：
+
+```bash
+ET_MASK_QNN_DEVICE="$SERIAL" ET_MASK_QNN_PREFILL_AR=4 \
+python -m pytest -q backends/qualcomm/tests/test_llama_masked_softmax.py \
+  -k 'deployment or exported_qdq'
+```
+
+`ET_MASK_QNN_PREFILL_AR` 仅修改此回归的部署 prefill AR 和对应 QDQ 检查，
+默认是 `128`；测试用的两层小模型仍以 AR256 校准并传播 encoding 到 AR1/prefill。
+上述筛选不会运行 AR4096 测试，也不会修改正式导出参数或重新量化已有模型。
 
 已构建上述两个 driver 后，可运行小型真机回归（会上传隔离的小模型和 tokenizer，不替换手机已有模型）：
 
