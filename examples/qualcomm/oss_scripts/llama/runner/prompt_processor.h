@@ -14,6 +14,7 @@
 #include <executorch/examples/qualcomm/oss_scripts/llama/runner/kv_manager.h>
 #include <executorch/examples/qualcomm/oss_scripts/llama/runner/utils.h>
 #include <memory>
+#include <optional>
 #include <string>
 
 namespace example {
@@ -24,6 +25,11 @@ namespace example {
 
 class PromptProcessor {
  public:
+  struct PrefillResult {
+    int64_t num_committed_tokens;
+    std::optional<uint64_t> next_token;
+  };
+
   struct Metadata {
     int32_t context_len;
     int64_t num_heads;
@@ -68,13 +74,15 @@ class PromptProcessor {
    * Module.
    * @param dump_logits Used to save all logits. Only enable when analyzing
    * accuracy.
-   * @return The next token of the LLM Module after prefill.
+   * @return Committed token count and the next token, or no next token when
+   * cancelled. Previously committed AR blocks remain in the cache.
    */
-  executorch::runtime::Result<uint64_t> prefill(
-      std::vector<uint64_t> prompt_tokens,
+  executorch::runtime::Result<PrefillResult> prefill(
+      const std::vector<uint64_t>& prompt_tokens,
       int64_t start_pos,
       bool dump_logits,
-      AttentionSinkRopeRunner* attention_sink_rope_runner);
+      AttentionSinkRopeRunner* attention_sink_rope_runner,
+      bool first_token_already_recorded = false);
   /**
    * @brief Get total I/O size in bytes (excluding the KV cache size)
    * @return Total I/O size in bytes.

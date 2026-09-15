@@ -879,6 +879,10 @@ executorch::runtime::Error QNNMultimodalRunner::generate(
     stats_.model_load_end_ms = time_in_ms();
   }
   stats_.inference_start_ms = time_in_ms();
+  ET_CHECK_OR_RETURN_ERROR(
+      !config.repair_think_eos && !config.enable_think_budget,
+      NotSupported,
+      "Thinking controls currently support the text KV/hybrid runner only");
   int32_t seq_len = config.seq_len;
   if (seq_len > context_len_) {
     ET_LOG(

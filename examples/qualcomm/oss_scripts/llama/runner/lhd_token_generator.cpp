@@ -204,6 +204,7 @@ Result<int64_t> LhdTokenGenerator::generate(
     bool ignore_eos) {
   ET_CHECK_MSG(
       !tokens.empty(), "Token generation loop shouldn't take empty tokens");
+  last_token_ = tokens.back();
   if (!ignore_eos && this->eos_ids_->count(tokens.back()) > 0) {
     ET_LOG(Info, "Reached EOS after prefill; stopping generation");
     return 0;
@@ -263,7 +264,7 @@ Result<int64_t> LhdTokenGenerator::generate(
       this->method_name_.c_str());
 
   // Generate tokens
-  while (pos < seq_len - 1) {
+  while (pos < seq_len - 1 && !this->decoder_runner_->is_stop_requested()) {
     std::vector<bool> selected(metadata_.ar_len, false);
 
     input_tokens.clear();
@@ -327,6 +328,11 @@ Result<int64_t> LhdTokenGenerator::generate(
 
     // Lookahead decoding and verification
     for (int v = 0; v < metadata_.ngram; ++v) {
+      if (pos >= seq_len - 1 || this->decoder_runner_->is_stop_requested() ||
+          (!enable_attention_sink &&
+           shifted_pos >= metadata_.context_len - metadata_.ar_len)) {
+        break;
+      }
       // Verification
       int i_batch = 0;
       if (v > 0) {
@@ -361,6 +367,7 @@ Result<int64_t> LhdTokenGenerator::generate(
       this->stats_->on_sampling_begin();
       cur_token =
           this->decoder_runner_->logits_to_token(logits_tensor, sample_idx);
+      last_token_ = cur_token;
       this->stats_->on_sampling_end();
       result_tokens.push_back(cur_token);
       this->decoder_runner_->record_token(cur_token);
@@ -370,7 +377,9 @@ Result<int64_t> LhdTokenGenerator::generate(
       // print the token as string, decode it with the Tokenizer object
       ET_ASSIGN_OR_RETURN_TOKENIZER(
           decoded_token__, this->tokenizer_->decode(prev_token, cur_token));
-      token_callback(decoded_token__);
+      if (token_callback) {
+        token_callback(decoded_token__);
+      }
 
       // data-dependent terminating condition: we have n_eos_ number of EOS
       if (!ignore_eos && this->eos_ids_->count(cur_token) > 0) {
@@ -402,12 +411,6 @@ Result<int64_t> LhdTokenGenerator::generate(
       }
     } // end of verify loop
 
-    if (!enable_attention_sink &&
-        pos > metadata_.context_len - metadata_.ar_len) {
-      printf("\n");
-      ET_LOG(Info, "\nReached to the maximum sequence length");
-      break;
-    }
     // Update KV Cache with the output results
     int32_t n_update = shifted_pos - prev_pos;
     if (this->true_swa_enabled_swa_) {
@@ -416,6 +419,11 @@ Result<int64_t> LhdTokenGenerator::generate(
     } else {
       this->kv_manager_->update_cache(
           metadata_.ar_len, prev_pos, n_update, selected);
+    }
+    if (!enable_attention_sink &&
+        shifted_pos >= metadata_.context_len - metadata_.ar_len) {
+      ET_LOG(Info, "Reached the maximum lookahead cache capacity");
+      break;
     }
 
     // Update attention mask with current position

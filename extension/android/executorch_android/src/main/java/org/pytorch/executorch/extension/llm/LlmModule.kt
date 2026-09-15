@@ -25,27 +25,41 @@ import org.pytorch.executorch.annotations.Experimental
  * Warning: These APIs are experimental and subject to change without notice
  */
 @Experimental
-class LlmModule
+open class LlmModule
 private constructor(
-    modelType: Int,
-    modulePath: String,
-    tokenizerPath: String,
-    temperature: Float,
+    private val modelType: Int,
+    private val modulePath: String,
+    private val tokenizerPath: String,
+    private val temperature: Float,
     dataFiles: List<String>,
-    numBos: Int,
-    numEos: Int,
-    loadMode: Int,
+    private val numBos: Int,
+    private val numEos: Int,
+    private val loadMode: Int,
+    private val qnnDecoderModel: String = "llama3",
+    private val qnnEvalMode: Int = -1,
+    private val qnnSharedBuffer: Boolean = false,
+    private val qnnRepetitionPenalty: Float = 1.05f,
+    private val systemPrompt: String = "",
+    private val qnnModelKeyHex: String = "",
+    private val qnnRepeatLastN: Int = 128,
 ) : Closeable {
 
-  private val mHybridData: HybridData
+  private var mHybridData: HybridData
+  private val dataFiles = dataFiles.toList()
   private val mLock = ReentrantLock()
+  private val mLifecycleLock = Any()
+  private var mUnloaded = false
   @Volatile private var mDestroyed = false
 
   init {
     ExecuTorchRuntime.getRuntime()
     ExecuTorchRuntime.validateFilePath(modulePath, "model path")
     ExecuTorchRuntime.validateFilePath(tokenizerPath, "tokenizer path")
-    mHybridData =
+    mHybridData = createHybrid()
+  }
+
+  private fun createHybrid(): HybridData =
+      if (qnnRepeatLastN == 128) {
         initHybrid(
             modelType,
             modulePath,
@@ -55,8 +69,77 @@ private constructor(
             numBos,
             numEos,
             loadMode,
+            qnnDecoderModel,
+            qnnEvalMode,
+            qnnSharedBuffer,
+            qnnRepetitionPenalty,
+            qnnModelKeyHex,
         )
-  }
+      } else {
+        initHybridWithOptions(
+            modelType,
+            modulePath,
+            tokenizerPath,
+            temperature,
+            dataFiles,
+            numBos,
+            numEos,
+            loadMode,
+            qnnDecoderModel,
+            qnnEvalMode,
+            qnnSharedBuffer,
+            qnnRepetitionPenalty,
+            qnnModelKeyHex,
+            qnnRepeatLastN,
+        )
+      }
+
+  /** Legacy App constructor. The QNN KV/hybrid mode is detected from the PTE methods. */
+  constructor(
+      modelType: Int,
+      modulePath: String,
+      tokenizerPath: String,
+      systemPrompt: String?,
+      decoderModel: String?,
+      temperature: Float,
+      dataFiles: List<String>?,
+      numBos: Int,
+      numEos: Int,
+  ) : this(
+      modelType,
+      modulePath,
+      tokenizerPath,
+      temperature,
+      dataFiles.orEmpty().toList(),
+      numBos,
+      numEos,
+      DEFAULT_LOAD_MODE,
+      decoderModel?.takeIf { it.isNotEmpty() } ?: "llama3",
+      -1,
+      false,
+      1.05f,
+      systemPrompt.orEmpty(),
+  )
+
+  constructor(
+      modelType: Int,
+      modulePath: String,
+      tokenizerPath: String,
+      systemPrompt: String?,
+      decoderModel: String?,
+      temperature: Float,
+      dataFiles: List<String>?,
+  ) : this(
+      modelType,
+      modulePath,
+      tokenizerPath,
+      systemPrompt,
+      decoderModel,
+      temperature,
+      dataFiles,
+      0,
+      0,
+  )
 
   /**
    * Constructs a LLM Module for a model with given type, model path, tokenizer, temperature, and
@@ -202,14 +285,26 @@ private constructor(
       config.modulePath,
       config.tokenizerPath,
       config.temperature,
-      listOfNotNull(config.dataPath),
+      listOfNotNull(config.dataPath?.takeIf { it.isNotEmpty() }),
       config.numBos,
       config.numEos,
       config.loadMode,
+      config.qnnDecoderModel,
+      config.qnnEvalMode,
+      config.qnnSharedBuffer,
+      config.qnnRepetitionPenalty,
+      qnnModelKeyHex = config.qnnModelKeyHex,
+      qnnRepeatLastN = config.qnnRepeatLastN,
   )
 
   private fun checkNotDestroyed() {
     if (mDestroyed) throw IllegalStateException("LlmModule has been destroyed")
+    synchronized(mLifecycleLock) {
+      if (mUnloaded) {
+        mHybridData = createHybrid()
+        mUnloaded = false
+      }
+    }
   }
 
   private fun checkNotReentrant() {
@@ -228,9 +323,11 @@ private constructor(
         if (mLock.holdCount > 1) {
           throw IllegalStateException("Cannot close module from within a callback during execution")
         }
-        if (!mDestroyed) {
-          mDestroyed = true
-          mHybridData.resetNative()
+        synchronized(mLifecycleLock) {
+          if (!mDestroyed) {
+            mDestroyed = true
+            mHybridData.resetNative()
+          }
         }
       } finally {
         mLock.unlock()
@@ -242,7 +339,7 @@ private constructor(
 
   /** @deprecated Use [close] instead. */
   @Deprecated("Use close() instead", replaceWith = ReplaceWith("close()"))
-  fun resetNative() {
+  open fun resetNative() {
     close()
   }
 
@@ -254,8 +351,8 @@ private constructor(
    * @param prompt Input prompt
    * @param llmCallback callback object to receive results.
    */
-  fun generate(prompt: String, llmCallback: LlmCallback) {
-    generate(
+  open fun generate(prompt: String, llmCallback: LlmCallback): Int {
+    return generate(
         prompt,
         DEFAULT_SEQ_LEN,
         llmCallback,
@@ -273,8 +370,8 @@ private constructor(
    * @param seqLen sequence length
    * @param llmCallback callback object to receive results.
    */
-  fun generate(prompt: String, seqLen: Int, llmCallback: LlmCallback) {
-    generate(
+  open fun generate(prompt: String, seqLen: Int, llmCallback: LlmCallback): Int {
+    return generate(
         null,
         0,
         0,
@@ -296,8 +393,8 @@ private constructor(
    * @param llmCallback callback object to receive results
    * @param echo indicate whether to echo the input prompt or not (text completion vs chat)
    */
-  fun generate(prompt: String, llmCallback: LlmCallback, echo: Boolean) {
-    generate(
+  open fun generate(prompt: String, llmCallback: LlmCallback, echo: Boolean): Int {
+    return generate(
         null,
         0,
         0,
@@ -320,8 +417,16 @@ private constructor(
    * @param llmCallback callback object to receive results
    * @param echo indicate whether to echo the input prompt or not (text completion vs chat)
    */
-  fun generate(prompt: String, seqLen: Int, llmCallback: LlmCallback, echo: Boolean) {
-    generate(prompt, seqLen, llmCallback, echo, DEFAULT_TEMPERATURE, DEFAULT_BOS, DEFAULT_EOS)
+  open fun generate(prompt: String, seqLen: Int, llmCallback: LlmCallback, echo: Boolean): Int {
+    return generate(
+        prompt,
+        seqLen,
+        llmCallback,
+        echo,
+        DEFAULT_TEMPERATURE,
+        DEFAULT_BOS,
+        DEFAULT_EOS,
+    )
   }
 
   /**
@@ -335,7 +440,7 @@ private constructor(
    * @param numBos number of BOS tokens to prepend
    * @param numEos number of EOS tokens to append
    */
-  fun generate(
+  open fun generate(
       prompt: String,
       seqLen: Int,
       llmCallback: LlmCallback,
@@ -343,15 +448,12 @@ private constructor(
       temperature: Float,
       numBos: Int,
       numEos: Int,
-  ) {
+  ): Int {
     mLock.lock()
     try {
       checkNotReentrant()
       checkNotDestroyed()
-      val err = generateNative(prompt, seqLen, llmCallback, echo, temperature, numBos, numEos)
-      if (err != 0) {
-        throw ExecutorchRuntimeException.makeExecutorchException(err, "Failed to generate")
-      }
+      return generateNative(prompt, seqLen, llmCallback, echo, temperature, numBos, numEos)
     } finally {
       mLock.unlock()
     }
@@ -366,6 +468,26 @@ private constructor(
       temperature: Float,
       numBos: Int,
       numEos: Int,
+      maxNewTokens: Int = -1,
+      warming: Boolean = false,
+      ignoreEos: Boolean = false,
+  ): Int
+
+  @DoNotStrip
+  private external fun generateWithThinkingNative(
+      prompt: String,
+      seqLen: Int,
+      llmCallback: LlmCallback,
+      echo: Boolean,
+      temperature: Float,
+      numBos: Int,
+      numEos: Int,
+      maxNewTokens: Int,
+      warming: Boolean,
+      ignoreEos: Boolean,
+      repairThinkEos: Boolean,
+      enableThinkBudget: Boolean,
+      thinkBudget: Int,
   ): Int
 
   /**
@@ -375,20 +497,29 @@ private constructor(
    * @param config the config for generation
    * @param llmCallback callback object to receive results
    */
-  fun generate(prompt: String, config: LlmGenerationConfig, llmCallback: LlmCallback) {
-    generate(
-        null,
-        0,
-        0,
-        0,
-        prompt,
-        config.seqLen,
-        llmCallback,
-        config.echo,
-        config.temperature,
-        config.numBos,
-        config.numEos,
-    )
+  open fun generate(prompt: String, config: LlmGenerationConfig, llmCallback: LlmCallback): Int {
+    mLock.lock()
+    try {
+      checkNotReentrant()
+      checkNotDestroyed()
+      return generateWithThinkingNative(
+          prompt,
+          config.seqLen,
+          llmCallback,
+          config.echo,
+          config.temperature,
+          config.numBos,
+          config.numEos,
+          config.maxNewTokens,
+          config.warming,
+          config.ignoreEos,
+          config.repairThinkEos && (config.repairThinkEosExplicit || defaultThinkingProtection),
+          config.enableThinkBudget && (config.enableThinkBudgetExplicit || defaultThinkingProtection),
+          config.thinkBudget,
+      )
+    } finally {
+      mLock.unlock()
+    }
   }
 
   /**
@@ -403,7 +534,7 @@ private constructor(
    * @param llmCallback callback object to receive results.
    * @param echo indicate whether to echo the input prompt or not (text completion vs chat)
    */
-  fun generate(
+  open fun generate(
       image: IntArray?,
       width: Int,
       height: Int,
@@ -412,8 +543,8 @@ private constructor(
       seqLen: Int,
       llmCallback: LlmCallback,
       echo: Boolean,
-  ) {
-    generate(
+  ): Int {
+    return generate(
         image,
         width,
         height,
@@ -441,7 +572,7 @@ private constructor(
    * @param echo indicate whether to echo the input prompt or not (text completion vs chat)
    * @param temperature temperature for sampling (use negative value to use module default)
    */
-  fun generate(
+  open fun generate(
       image: IntArray?,
       width: Int,
       height: Int,
@@ -451,8 +582,8 @@ private constructor(
       llmCallback: LlmCallback,
       echo: Boolean,
       temperature: Float,
-  ) {
-    generate(
+  ): Int {
+    return generate(
         image,
         width,
         height,
@@ -482,7 +613,7 @@ private constructor(
    * @param numBos number of BOS tokens to prepend
    * @param numEos number of EOS tokens to append
    */
-  fun generate(
+  open fun generate(
       image: IntArray?,
       width: Int,
       height: Int,
@@ -494,7 +625,7 @@ private constructor(
       temperature: Float,
       numBos: Int,
       numEos: Int,
-  ) {
+  ): Int {
     mLock.lock()
     try {
       checkNotReentrant()
@@ -502,13 +633,10 @@ private constructor(
       if (image != null) {
         val nativeResult = prefillImagesInput(image, width, height, channels)
         if (nativeResult != 0) {
-          throw ExecutorchRuntimeException.makeExecutorchException(nativeResult, "Prefill failed")
+          return nativeResult
         }
       }
-      val err = generateNative(prompt, seqLen, llmCallback, echo, temperature, numBos, numEos)
-      if (err != 0) {
-        throw ExecutorchRuntimeException.makeExecutorchException(err, "Failed to generate")
-      }
+      return generateNative(prompt, seqLen, llmCallback, echo, temperature, numBos, numEos)
     } finally {
       mLock.unlock()
     }
@@ -526,7 +654,7 @@ private constructor(
    * @throws ExecutorchRuntimeException if the prefill failed
    */
   @Experimental
-  fun prefillImages(image: IntArray, width: Int, height: Int, channels: Int) {
+  open fun prefillImages(image: IntArray, width: Int, height: Int, channels: Int): Long {
     mLock.lock()
     try {
       checkNotReentrant()
@@ -535,6 +663,7 @@ private constructor(
       if (nativeResult != 0) {
         throw ExecutorchRuntimeException.makeExecutorchException(nativeResult, "Prefill failed")
       }
+      return 0L
     } finally {
       mLock.unlock()
     }
@@ -556,7 +685,7 @@ private constructor(
    * @throws ExecutorchRuntimeException if the prefill failed
    */
   @Experimental
-  fun prefillImages(image: ByteBuffer, width: Int, height: Int, channels: Int) {
+  open fun prefillImages(image: ByteBuffer, width: Int, height: Int, channels: Int) {
     mLock.lock()
     try {
       checkNotReentrant()
@@ -610,7 +739,7 @@ private constructor(
    * @throws ExecutorchRuntimeException if the prefill failed
    */
   @Experimental
-  fun prefillNormalizedImage(image: ByteBuffer, width: Int, height: Int, channels: Int) {
+  open fun prefillNormalizedImage(image: ByteBuffer, width: Int, height: Int, channels: Int) {
     mLock.lock()
     try {
       checkNotReentrant()
@@ -689,7 +818,7 @@ private constructor(
    * @throws ExecutorchRuntimeException if the prefill failed
    */
   @Experimental
-  fun prefillImages(image: FloatArray, width: Int, height: Int, channels: Int) {
+  open fun prefillImages(image: FloatArray, width: Int, height: Int, channels: Int): Long {
     mLock.lock()
     try {
       checkNotReentrant()
@@ -698,6 +827,7 @@ private constructor(
       if (nativeResult != 0) {
         throw ExecutorchRuntimeException.makeExecutorchException(nativeResult, "Prefill failed")
       }
+      return 0L
     } finally {
       mLock.unlock()
     }
@@ -720,7 +850,7 @@ private constructor(
    * @throws ExecutorchRuntimeException if the prefill failed
    */
   @Experimental
-  fun prefillAudio(audio: ByteArray, batchSize: Int, nBins: Int, nFrames: Int) {
+  open fun prefillAudio(audio: ByteArray, batchSize: Int, nBins: Int, nFrames: Int): Long {
     mLock.lock()
     try {
       checkNotReentrant()
@@ -729,6 +859,7 @@ private constructor(
       if (nativeResult != 0) {
         throw ExecutorchRuntimeException.makeExecutorchException(nativeResult, "Prefill failed")
       }
+      return 0L
     } finally {
       mLock.unlock()
     }
@@ -751,7 +882,7 @@ private constructor(
    * @throws ExecutorchRuntimeException if the prefill failed
    */
   @Experimental
-  fun prefillAudio(audio: FloatArray, batchSize: Int, nBins: Int, nFrames: Int) {
+  open fun prefillAudio(audio: FloatArray, batchSize: Int, nBins: Int, nFrames: Int): Long {
     mLock.lock()
     try {
       checkNotReentrant()
@@ -760,6 +891,7 @@ private constructor(
       if (nativeResult != 0) {
         throw ExecutorchRuntimeException.makeExecutorchException(nativeResult, "Prefill failed")
       }
+      return 0L
     } finally {
       mLock.unlock()
     }
@@ -782,7 +914,7 @@ private constructor(
    * @throws ExecutorchRuntimeException if the prefill failed
    */
   @Experimental
-  fun prefillRawAudio(audio: ByteArray, batchSize: Int, nChannels: Int, nSamples: Int) {
+  open fun prefillRawAudio(audio: ByteArray, batchSize: Int, nChannels: Int, nSamples: Int): Long {
     mLock.lock()
     try {
       checkNotReentrant()
@@ -791,6 +923,7 @@ private constructor(
       if (nativeResult != 0) {
         throw ExecutorchRuntimeException.makeExecutorchException(nativeResult, "Prefill failed")
       }
+      return 0L
     } finally {
       mLock.unlock()
     }
@@ -810,7 +943,7 @@ private constructor(
    * @throws ExecutorchRuntimeException if the prefill failed
    */
   @Experimental
-  fun prefillPrompt(prompt: String) {
+  open fun prefillPrompt(prompt: String): Long {
     mLock.lock()
     try {
       checkNotReentrant()
@@ -819,6 +952,7 @@ private constructor(
       if (nativeResult != 0) {
         throw ExecutorchRuntimeException.makeExecutorchException(nativeResult, "Prefill failed")
       }
+      return 0L
     } finally {
       mLock.unlock()
     }
@@ -832,7 +966,7 @@ private constructor(
    *
    * The startPos will be reset to 0.
    */
-  fun resetContext() {
+  open fun resetContext() {
     mLock.lock()
     try {
       checkNotReentrant()
@@ -846,15 +980,17 @@ private constructor(
   @DoNotStrip private external fun resetContextNative()
 
   /** Stop current generate() before it finishes. */
-  fun stop() {
-    if (mDestroyed) return
-    stopNative()
+  open fun stop() {
+    synchronized(mLifecycleLock) {
+      if (mDestroyed || mUnloaded) return
+      stopNative()
+    }
   }
 
   @DoNotStrip private external fun stopNative()
 
   /** Force loading the module. Otherwise the model is loaded during first generate(). */
-  fun load() {
+  open fun load(): Int {
     mLock.lock()
     try {
       checkNotReentrant()
@@ -863,6 +999,7 @@ private constructor(
       if (err != 0) {
         throw ExecutorchRuntimeException.makeExecutorchException(err, "Failed to load model")
       }
+      return err
     } finally {
       mLock.unlock()
     }
@@ -870,16 +1007,76 @@ private constructor(
 
   @DoNotStrip private external fun loadNative(): Int
 
+  /**
+   * Unloads model resources without destroying this wrapper. A later load/generate recreates the
+   * runner with the same configuration and an empty context. Stop and await generation first.
+   */
+  open fun unload() {
+    mLock.lock()
+    try {
+      checkNotReentrant()
+      if (mDestroyed) throw IllegalStateException("LlmModule has been destroyed")
+      synchronized(mLifecycleLock) {
+        if (!mUnloaded) {
+          mHybridData.resetNative()
+          mUnloaded = true
+        }
+      }
+    } finally {
+      mLock.unlock()
+    }
+  }
+
+  open fun generateWithChat(prompt: String, llmCallback: LlmCallback): Int =
+      generateWithChat(prompt, DEFAULT_SEQ_LEN, llmCallback, DEFAULT_ECHO)
+
+  /**
+   * Formats a raw chat message. For QNN, seqLen is the new-token budget; total context comes from
+   * the PTE. No system prompt is inserted unless supplied to the constructor. echo only controls
+   * prompt echo, never thinking. Returns the native status code.
+   */
+  open fun generateWithChat(
+      prompt: String,
+      seqLen: Int,
+      llmCallback: LlmCallback,
+      echo: Boolean,
+  ): Int {
+    mLock.lock()
+    try {
+      checkNotReentrant()
+      checkNotDestroyed()
+      return generateWithChatNative(prompt, seqLen, llmCallback, echo, systemPrompt)
+    } finally {
+      mLock.unlock()
+    }
+  }
+
+  @DoNotStrip
+  private external fun generateWithChatNative(
+      prompt: String,
+      seqLen: Int,
+      llmCallback: LlmCallback,
+      echo: Boolean,
+      systemPrompt: String,
+  ): Int
+
+  private val defaultThinkingProtection: Boolean
+    get() =
+        modelType == MODEL_TYPE_QNN_LLAMA &&
+            (qnnDecoderModel == "lincal" || qnnDecoderModel == "qwen3")
+
   companion object {
     const val MODEL_TYPE_TEXT = 1
     const val MODEL_TYPE_TEXT_VISION = 2
     const val MODEL_TYPE_MULTIMODAL = 2
+    const val MODEL_TYPE_MEDIATEK_LLAMA = LlmModuleConfig.MODEL_TYPE_MEDIATEK_LLAMA
+    const val MODEL_TYPE_QNN_LLAMA = LlmModuleConfig.MODEL_TYPE_QNN_LLAMA
 
     private const val DEFAULT_SEQ_LEN = 128
     private const val DEFAULT_ECHO = true
     private const val DEFAULT_TEMPERATURE = -1.0f
-    private const val DEFAULT_BOS = 0
-    private const val DEFAULT_EOS = 0
+    private const val DEFAULT_BOS = -1
+    private const val DEFAULT_EOS = -1
     private const val DEFAULT_LOAD_MODE = LlmModuleConfig.LOAD_MODE_MMAP
 
     @DoNotStrip
@@ -893,6 +1090,30 @@ private constructor(
         numBos: Int,
         numEos: Int,
         loadMode: Int,
+        qnnDecoderModel: String,
+        qnnEvalMode: Int,
+        qnnSharedBuffer: Boolean,
+        qnnRepetitionPenalty: Float,
+        qnnModelKeyHex: String,
+    ): HybridData
+
+    @DoNotStrip
+    @JvmStatic
+    private external fun initHybridWithOptions(
+        modelType: Int,
+        modulePath: String,
+        tokenizerPath: String,
+        temperature: Float,
+        dataFiles: List<String>,
+        numBos: Int,
+        numEos: Int,
+        loadMode: Int,
+        qnnDecoderModel: String,
+        qnnEvalMode: Int,
+        qnnSharedBuffer: Boolean,
+        qnnRepetitionPenalty: Float,
+        qnnModelKeyHex: String,
+        qnnRepeatLastN: Int,
     ): HybridData
   }
 }

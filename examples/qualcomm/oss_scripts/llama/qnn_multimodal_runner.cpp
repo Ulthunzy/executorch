@@ -96,7 +96,7 @@ DEFINE_bool(
 DEFINE_double(
     repetition_penalty,
     1.0,
-    "Penalty for previously seen tokens; >= 1.0, 1.0 disables it. Runtime only.");
+    "Penalty for tokens in the most recent 256 prompt/generated tokens; >= 1.0, 1.0 disables it. Runtime only.");
 DEFINE_double(
     temperature,
     0.0f,

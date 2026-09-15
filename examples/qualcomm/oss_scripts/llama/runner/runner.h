@@ -11,9 +11,11 @@
 
 #pragma once
 
+#include <atomic>
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <string>
 
 #include <executorch/examples/qualcomm/oss_scripts/llama/runner/attention_sink_rope_runner.h>
@@ -73,11 +75,11 @@ class Runner : public executorch::extension::llm::IRunner {
       std::unique_ptr<tokenizers::Tokenizer> tokenizer = nullptr,
       std::unique_ptr<executorch::extension::Module>
           attention_sink_rope_module = nullptr,
-      const float repetition_penalty = 1.0f);
+      const float repetition_penalty = 1.0f,
+      const size_t repeat_last_n = RepetitionPenalty::kDefaultWindowSize);
 
   bool is_loaded() const override;
   executorch::runtime::Error load() override;
-  // TODO: Support echo and warming
   executorch::runtime::Error generate(
       const std::string& prompt,
       const executorch::extension::llm::GenerationConfig& config,
@@ -91,14 +93,20 @@ class Runner : public executorch::extension::llm::IRunner {
       const executorch::extension::llm::GenerationConfig& config,
       std::function<void(const std::string&)> token_callback = {},
       std::function<void(const executorch::llm::Stats&)> stats_callback = {});
-  void stop() override {};
-  void reset() override {};
-  executorch::runtime::Result<DecoderModelVersion> get_decoder_model_version();
+  void stop() override;
+  void reset() override;
+  bool has_history() const {
+    return cur_pos_ > 0 || pending_token_.has_value();
+  }
+  executorch::runtime::Result<DecoderModelVersion> get_decoder_model_version()
+      const;
 
  private:
   std::unique_ptr<executorch::extension::Module> module_;
   std::unique_ptr<executorch::extension::Module> attention_sink_rope_module_;
   int32_t context_len_{0};
+  int32_t prompt_ar_len_{1};
+  std::atomic<bool> stop_requested_{false};
 
   int ngram_{0};
   int window_{0};
@@ -108,12 +116,17 @@ class Runner : public executorch::extension::llm::IRunner {
   // global/local architecture.
   CacheMode cache_mode_{CacheMode::StaticCahce};
   int64_t cur_pos_{0};
+  std::optional<uint64_t> pending_token_;
+  bool context_valid_{true};
+  std::optional<uint64_t> bos_token_;
+  uint64_t eos_token_{0};
 
   std::string tokenizer_path_;
   std::string performance_output_path_;
   std::string dump_logits_path_;
   float temperature_;
   float repetition_penalty_;
+  size_t repeat_last_n_;
   EvalMode eval_mode_;
   bool shared_buffer_;
 

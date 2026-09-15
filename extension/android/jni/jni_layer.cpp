@@ -698,9 +698,11 @@ class ExecuTorchJni : public facebook::jni::HybridClass<ExecuTorchJni> {
 
 #ifdef EXECUTORCH_BUILD_LLAMA_JNI
 extern void register_natives_for_llm();
+extern void register_natives_for_textencoder();
 #else
 // No op if we don't build LLM
 void register_natives_for_llm() {}
+void register_natives_for_textencoder() {}
 #endif
 extern void register_natives_for_runtime();
 
@@ -715,6 +717,7 @@ JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM* vm, void*) {
   return facebook::jni::initialize(vm, [] {
     executorch::extension::ExecuTorchJni::registerNatives();
     register_natives_for_llm();
+    register_natives_for_textencoder();
     register_natives_for_runtime();
     register_natives_for_training();
   });

@@ -739,7 +739,7 @@ def _build_parser():
         "--repetition_penalty",
         type=_repetition_penalty,
         default=1.0,
-        help="Runtime repetition penalty over prompt and generated tokens; 1.0 disables it. Does not affect calibration or compilation.",
+        help="Runtime repetition penalty over the most recent 256 prompt/generated tokens, including thinking and earlier turns; 1.0 disables it. Does not affect calibration or compilation.",
     )
 
     parser.add_argument(
@@ -747,6 +747,24 @@ def _build_parser():
         action=argparse.BooleanOptionalAction,
         default=False,
         help="Ignore EOS during prompt evaluation and generate to max_seq_len for fixed-length benchmarking. Does not affect compilation or calibration.",
+    )
+    parser.add_argument(
+        "--repair_think_eos",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="QNN text KV/hybrid only: replace premature EOS inside think with </think>.",
+    )
+    parser.add_argument(
+        "--enable_think_budget",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="QNN text KV/hybrid only: close think at its token budget and continue answering.",
+    )
+    parser.add_argument(
+        "--think_budget",
+        type=int,
+        default=512,
+        help="Positive runtime thinking-token budget; no re-export required.",
     )
 
     parser.add_argument(
@@ -960,7 +978,14 @@ def _build_parser():
         nargs="+",
         type=int,
         default=[128],
-        help="Number of packed calibration sequences per text source (default: 128 each). Supply one count for all sources or one per source.",
+        help="Number of calibration sequences per text source (default: 128 each). Supply one count for all sources or one per source. Preserved sources use one complete row per sequence.",
+    )
+
+    parser.add_argument(
+        "--calib_text_preserve_sources",
+        nargs="+",
+        default=None,
+        help="Local JSON/JSONL paths also listed in --calib_text_datasets whose rows must remain intact. No template, packing, truncation or automatic EOS insertion is applied. Oversized rows fail explicitly; other sources retain their existing packing behavior.",
     )
 
     parser.add_argument(
@@ -1093,6 +1118,10 @@ def _build_parser():
 
 
 def export_llama(args) -> None:
+    if not set(args.calib_text_preserve_sources or []).issubset(
+        args.calib_text_datasets or []
+    ):
+        raise ValueError("Preserved sources must also appear in --calib_text_datasets.")
     if args.skip_qdq_save and SQNR_EVAL in args.eval_methods:
         raise ValueError("--skip_qdq_save cannot be combined with sqnr_eval")
     if args.calib_text_datasets:

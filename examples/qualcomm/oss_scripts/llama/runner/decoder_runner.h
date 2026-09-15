@@ -8,6 +8,8 @@
 
 #pragma once
 
+#include <atomic>
+
 #include <executorch/examples/qualcomm/oss_scripts/llama/runner/repetition_penalty.h>
 #include <executorch/examples/qualcomm/oss_scripts/llama/runner/utils.h>
 #include <executorch/extension/llm/sampler/sampler.h>
@@ -21,7 +23,8 @@ class DecoderRunner {
       executorch::extension::Module* module,
       int32_t vocab_size,
       float temperature,
-      float repetition_penalty = 1.0f);
+      float repetition_penalty = 1.0f,
+      size_t repeat_last_n = RepetitionPenalty::kDefaultWindowSize);
 
   void begin_turn(const std::vector<uint64_t>& prompt, bool reset) {
     repetition_penalty_.begin_turn(prompt, reset);
@@ -30,6 +33,16 @@ class DecoderRunner {
   void record_token(uint64_t token) {
     repetition_penalty_.record_token(token);
   }
+
+  void set_stop_flag(const std::atomic<bool>* flag) {
+    stop_requested_ = flag;
+  }
+
+  bool is_stop_requested() const {
+    return stop_requested_ && stop_requested_->load(std::memory_order_relaxed);
+  }
+
+  executorch::runtime::Error set_temperature(float temperature);
   /**
    * Run LLM text decoder with inputs to generate next token.
    * @param inputs The inputs to the LLM Module.
@@ -102,6 +115,11 @@ class DecoderRunner {
         logits_f_,
         quantized ? logits_scale_ : 1.0f,
         quantized ? logits_zero_point_ : 0);
+    if (quantized && temperature_ > 0 && !repetition_penalty_.enabled()) {
+      for (float& logit : logits_f_) {
+        logit = (logit - logits_zero_point_) * logits_scale_;
+      }
+    }
     return sampler_->sample(logits_f_.data());
   }
 
@@ -112,5 +130,9 @@ class DecoderRunner {
   std::vector<float> logits_f_;
   float logits_scale_{1.0f};
   int64_t logits_zero_point_{0};
+  float temperature_{0};
+  bool quantized_logits_{false};
+  bool has_logits_quantization_{false};
+  const std::atomic<bool>* stop_requested_{nullptr};
 };
 } // namespace example

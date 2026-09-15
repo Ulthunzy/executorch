@@ -602,6 +602,16 @@ void KVManager::update_attention_mask(
   }
 }
 
+bool KVManager::has_inplace_cache_updates() const {
+  for (size_t layer = 0; layer < k_cache_.size(); ++layer) {
+    if (k_cache_[layer].buffer == k_cache_[layer].output_buffer ||
+        v_cache_[layer].buffer == v_cache_[layer].output_buffer) {
+      return true;
+    }
+  }
+  return false;
+}
+
 void KVManager::init_cache(IMemAlloc* buffer_manager, int32_t ar_len) {
   cur_ar_len_ = ar_len;
   swa_write_pos_swa_ = 0;

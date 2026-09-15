@@ -243,11 +243,12 @@ void PromptProcessor::prepare_io(
   }
 }
 
-Result<uint64_t> PromptProcessor::prefill(
-    std::vector<uint64_t> prompt_tokens,
+Result<PromptProcessor::PrefillResult> PromptProcessor::prefill(
+    const std::vector<uint64_t>& prompt_tokens,
     int64_t start_pos,
     bool dump_logits,
-    AttentionSinkRopeRunner* attention_sink_rope_runner) {
+    AttentionSinkRopeRunner* attention_sink_rope_runner,
+    bool first_token_already_recorded) {
   ET_CHECK_MSG(!prompt_tokens.empty(), "Prompt cannot be null");
   if (dump_logits) {
     prompt_all_logits_.clear();
@@ -271,8 +272,6 @@ Result<uint64_t> PromptProcessor::prefill(
         "The sequence length exceeds the maximum limit that the prompt processor can handle.");
   }
 
-  // store the token
-  int64_t cur_token;
   int64_t prompt_pos = 0;
   int32_t n_update = metadata_.ar_len;
   int num_iters = 1 + ((num_prompt_tokens - 1) / metadata_.ar_len);
@@ -341,14 +340,21 @@ Result<uint64_t> PromptProcessor::prefill(
       "Failed to set output tensor for module %s",
       method_name_.c_str());
 
+  const bool inplace_cache = kv_manager_->has_inplace_cache_updates();
   for (int i = 0; i < num_iters; ++i) {
+    if (decoder_runner_->is_stop_requested()) {
+      return PrefillResult{prompt_pos, std::nullopt};
+    }
+    bool evicted = false;
     // The current position plus the future generated cache exceeds the cache
     // size, which means we need to remove eviction_batch_size key-value cache
     // entries to make room for new tokens.
     if (enable_attention_sink &&
         shifted_pos + metadata_.ar_len >
             metadata_.context_len - metadata_.ar_len) {
-      attention_sink_rope_runner->evict_token(method_name_, cache_inputs_);
+      ET_CHECK_OK_OR_RETURN_ERROR(
+          attention_sink_rope_runner->evict_token(method_name_, cache_inputs_));
+      evicted = true;
       shifted_pos =
           shifted_pos - attention_sink_rope_runner->get_eviction_batch_size();
       // Initialize attention mask with current position
@@ -379,7 +385,13 @@ Result<uint64_t> PromptProcessor::prefill(
     prepare_io(prompt_tokens, prompt_pos, shifted_pos);
 
     // Run inference
-    decoder_runner_->step(method_name_, inputs_);
+    auto logits_result = decoder_runner_->step(method_name_, inputs_);
+    ET_CHECK_OK_OR_RETURN_ERROR(logits_result.error());
+    // In-place recurrent state and sink eviction cannot discard a completed
+    // step. Finish its commit before observing cancellation in those cases.
+    if (!inplace_cache && !evicted && decoder_runner_->is_stop_requested()) {
+      return PrefillResult{prompt_pos, std::nullopt};
+    }
     if (dump_logits) {
       prompt_all_logits_.insert(
           prompt_all_logits_.end(),
@@ -394,7 +406,8 @@ Result<uint64_t> PromptProcessor::prefill(
     }
     // Update KV Cache with the output results
     if (true_swa_enabled_swa_) {
-      kv_manager_->update_cache_swa(metadata_.ar_len, shifted_pos, n_update, {});
+      kv_manager_->update_cache_swa(
+          metadata_.ar_len, shifted_pos, n_update, {});
     } else {
       kv_manager_->update_cache(metadata_.ar_len, shifted_pos, n_update, {});
     }
@@ -421,14 +434,22 @@ Result<uint64_t> PromptProcessor::prefill(
             metadata_.sliding_window);
       }
     }
-    prompt_pos += metadata_.ar_len;
-    shifted_pos += metadata_.ar_len;
+    const int32_t penalty_begin =
+        first_token_already_recorded && prompt_pos == 0 ? 1 : 0;
+    for (int32_t t = penalty_begin; t < n_update; ++t) {
+      decoder_runner_->record_token(prompt_tokens[prompt_pos + t]);
+    }
+    prompt_pos += n_update;
+    shifted_pos += n_update;
   }
 
-  cur_token = decoder_runner_->logits_to_token(
+  if (decoder_runner_->is_stop_requested()) {
+    return PrefillResult{prompt_pos, std::nullopt};
+  }
+  auto cur_token = decoder_runner_->logits_to_token(
       output_tensors_[0],
       (num_prompt_tokens + metadata_.ar_len - 1) % metadata_.ar_len);
-  return cur_token;
+  return PrefillResult{prompt_pos, static_cast<uint64_t>(cur_token)};
 }
 
 } // namespace example

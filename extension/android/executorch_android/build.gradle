@@ -25,6 +25,16 @@ def qnnVersion = System.properties['qnnVersion']
 def execuTorchVersion = System.properties['execuTorchVersion']
 def flavor = System.properties['flavor']
 
+def cryptoNotices = tasks.register('copyCryptoNotices', Copy) {
+    from('../../../third-party/boringssl/LICENSE') {
+        rename { 'BoringSSL-LICENSE.txt' }
+    }
+    from('../../../third-party/boringssl/third_party/fiat/LICENSE') {
+        rename { 'Fiat-LICENSE.txt' }
+    }
+    into(layout.buildDirectory.dir('generated/cryptoNotices/META-INF/executorch'))
+}
+
 android {
     namespace = "org.pytorch.executorch"
     compileSdk = 34
@@ -43,7 +53,8 @@ android {
 
     sourceSets {
         main {
-            jniLibs.srcDirs = ['../../../cmake-out-android-so/']
+            jniLibs.srcDirs = [project.findProperty('executorchJniLibsDir') ?: '../../../cmake-out-android-so/']
+            resources.srcDir(layout.buildDirectory.dir('generated/cryptoNotices'))
         }
         androidTest {
             resources.srcDirs += ['src/androidTest/resources']
@@ -54,6 +65,8 @@ android {
         freeCompilerArgs += ["-Xjvm-default=all"]
     }
 }
+
+tasks.named('preBuild').configure { dependsOn(cryptoNotices) }
 
 task copyTestRes(type: Exec) {
     commandLine 'bash', 'android_test_setup.sh'

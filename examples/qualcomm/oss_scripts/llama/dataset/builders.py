@@ -145,6 +145,7 @@ class DecoderDatasetBuilder:
                 self._tokenizer_wrapper.tokenizer,
                 self._max_context_len,
                 cfg.seed,
+                preserve_sources=cfg.calib_text_preserve_sources,
             )
         )
 

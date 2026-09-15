@@ -81,7 +81,7 @@ DEFINE_bool(
 DEFINE_double(
     repetition_penalty,
     1.0,
-    "Penalty for previously seen tokens; >= 1.0, 1.0 disables it. Runtime only.");
+    "Penalty for tokens in the most recent 256 prompt/generated tokens; >= 1.0, 1.0 disables it. Runtime only.");
 DEFINE_int32(
     ngram,
     0,
@@ -183,15 +183,15 @@ std::string get_formatted_prompt(
       break;
     case example::DecoderModelVersion::kQwen3:
     case example::DecoderModelVersion::kLincal:
-      formatted_prompt.append("<|im_start|>user\n");
-      formatted_prompt.append(prompt);
-      formatted_prompt.append("<|im_end|>\n");
       if (!system_prompt.empty()) {
         formatted_prompt.append("<|im_start|>system\n");
         formatted_prompt.append(system_prompt);
         formatted_prompt.append("<|im_end|>\n");
       }
-      formatted_prompt.append("<|im_start|>assistant");
+      formatted_prompt.append("<|im_start|>user\n");
+      formatted_prompt.append(prompt);
+      formatted_prompt.append("<|im_end|>\n");
+      formatted_prompt.append("<|im_start|>assistant\n");
       break;
     case example::DecoderModelVersion::kSmollm2_135m:
       if (!system_prompt.empty()) {
@@ -231,6 +231,19 @@ std::string get_formatted_prompt(
   return formatted_prompt;
 }
 
+DEFINE_bool(
+    repair_think_eos,
+    false,
+    "Replace premature EOS inside think with </think>");
+DEFINE_bool(
+    enable_think_budget,
+    false,
+    "Limit thinking tokens and continue with the answer");
+DEFINE_int32(
+    think_budget,
+    512,
+    "Maximum generated thinking tokens when enabled");
+
 void start_runner(
     std::unique_ptr<executorch::extension::Module> module,
     std::vector<std::string>& prompts,
@@ -256,6 +269,7 @@ void start_runner(
       std::move(attention_sink_rope_module),
       static_cast<float>(FLAGS_repetition_penalty));
   auto decoder_model_version = runner.get_decoder_model_version();
+  ET_CHECK_MSG(decoder_model_version.ok(), "Failed to load decoder model");
   std::vector<char> buf;
   buf.reserve(5 * FLAGS_seq_len); // assume each token is around 5 char
   std::ofstream fout(FLAGS_output_path.c_str());
@@ -265,19 +279,33 @@ void start_runner(
     }
   };
   executorch::extension::llm::GenerationConfig config{
-      true,
-      "",
-      "",
-      FLAGS_ignore_eos,
-      -1,
-      false,
-      FLAGS_seq_len,
-      static_cast<float>(FLAGS_temperature),
-      0,
-      0};
+      .echo = true,
+      .ignore_eos = FLAGS_ignore_eos,
+      .seq_len = FLAGS_seq_len,
+      .temperature = static_cast<float>(FLAGS_temperature)};
+  config.repair_think_eos = FLAGS_repair_think_eos;
+  config.enable_think_budget = FLAGS_enable_think_budget;
+  config.think_budget = FLAGS_think_budget;
+  switch (decoder_model_version.get()) {
+    case example::DecoderModelVersion::kLlama2:
+    case example::DecoderModelVersion::kLlama3:
+    case example::DecoderModelVersion::kGemma:
+    case example::DecoderModelVersion::kGemma2:
+    case example::DecoderModelVersion::kGemma3:
+      config.num_bos = 1;
+      break;
+    default:
+      // ChatML has no BOS; Gemma4 already includes it in its chat template.
+      break;
+  }
   if (use_tokenized_prompt) {
-    runner.generate_from_prompt_or_file(
-        FLAGS_tokenized_prompt.c_str(), use_tokenized_prompt, config, callback);
+    ET_CHECK_MSG(
+        runner.generate_from_prompt_or_file(
+            FLAGS_tokenized_prompt.c_str(),
+            use_tokenized_prompt,
+            config,
+            callback) == executorch::runtime::Error::Ok,
+        "Generation failed");
   } else {
     // generate tokens & store inference output
     for (int i = 0; i < FLAGS_num_iters; i++) {
@@ -285,8 +313,13 @@ void start_runner(
         std::string formatted_prompt;
         formatted_prompt = get_formatted_prompt(
             prompt, FLAGS_system_prompt, decoder_model_version.get());
-        runner.generate_from_prompt_or_file(
-            formatted_prompt.c_str(), use_tokenized_prompt, config, callback);
+        ET_CHECK_MSG(
+            runner.generate_from_prompt_or_file(
+                formatted_prompt.c_str(),
+                use_tokenized_prompt,
+                config,
+                callback) == executorch::runtime::Error::Ok,
+            "Generation failed");
       }
     }
   }
