@@ -81,6 +81,20 @@ Support on other hardware depends on the **HTP architecture (HtpArch)** and the 
 - **Weight sharing** between prefill and decode requires **V73 or newer**
 - **16-bit activations + 16-bit weights for matmul** (e.g., 16-bit KV cache) requires **V73 or newer**
 
+### Prefill/Decode Weight Sharing
+
+`LLMModelConfig.use_weight_sharing` defaults to `True`, including for `lincal-1_7b`.
+`llama.py` reads this model setting when building the HTP decoder and token
+embedding compile specs. In hybrid mode, QNN can share eligible identical weights
+between prefill and decode graphs; KV-only mode has no prefill graph to share with.
+Actual savings depend on the compiled graphs and QNN SDK.
+
+To disable sharing for a model, set `use_weight_sharing = False` in its registered
+configuration class in `__init__.py`, then re-export the PTE. This is useful for
+hardware compatibility or model-specific decode performance regressions, such as
+the previously observed Qwen3.5 regression. This setting does not change QNN GPU
+compile options or runtime generation parameters.
+
 ### Quantization Guidance for Older Devices
 
 For older HTP versions, you may need to adjust the quantization strategy. Recommended starting points:

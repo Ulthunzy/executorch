@@ -353,9 +353,7 @@ def compile(
         TOK_EMBEDDING: None,
         TEXT_DECODER: None,
     }
-    # Keep QNN weight sharing disabled while hybrid prefill/decode sharing
-    # regresses qwen3.5 decode performance.
-    use_weight_sharing = False
+    use_weight_sharing = decoder_model_config.use_weight_sharing
     for modality in compile_specs:
         if is_multimodal and modality in {AUDIO_ENCODER, TEXT_ENCODER, VISION_ENCODER}:
             to_skip = False
