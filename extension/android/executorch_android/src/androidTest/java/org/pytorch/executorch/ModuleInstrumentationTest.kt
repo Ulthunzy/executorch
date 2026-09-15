@@ -88,13 +88,9 @@ class ModuleInstrumentationTest {
   fun testModuleLoadMethodNonExistantMethod() {
     val module = Module.load(getTestFilePath(TEST_FILE_NAME))
     try {
-      val exception =
-          Assert.assertThrows(ExecutorchRuntimeException::class.java) {
-            module.loadMethod(NONE_METHOD)
-          }
       Assert.assertEquals(
           ExecutorchRuntimeException.INVALID_ARGUMENT,
-          exception.errorCode,
+          module.loadMethod(NONE_METHOD),
       )
     } finally {
       module.destroy()

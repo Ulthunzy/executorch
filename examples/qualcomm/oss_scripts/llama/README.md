@@ -63,6 +63,13 @@ sampled immediately after prefill. It only changes runtime behavior: the same
 PTE can be reused without recalibration or recompilation. Text generated after
 EOS in benchmark mode should not be used to assess response quality.
 
+### Reusable self-identity evaluation
+
+For a fixed 50-question, two-turn device benchmark with retained KV history,
+raw outputs, reviewable accuracy reports, and cross-model summaries, see
+[model_validation](model_validation/README.md). It supports ChatML QNN
+Lincal/Qwen models and preserves the model's default thinking behavior.
+
 ## Hardware Support
 
 We’ve validated this flow on the **Samsung Galaxy S23**, **Samsung Galaxy S24**, **Samsung Galaxy S25**, and **OnePlus 12**.
@@ -661,24 +668,73 @@ containing `{"text": "..."}` records instead of `cci3-hq`.
 Changing calibration data requires exporting a new PTE; use a new artifact directory
 to retain the previous model for comparison. It does not change deployment AR.
 
+##### Preserve complete thinking conversations
+
+For preformatted conversations, add the local source path to both
+`--calib_text_datasets` and `--calib_text_preserve_sources`. Each nonempty `text`
+row then becomes one sequence, with no chat-template rendering, concatenation,
+truncation or automatic EOS insertion. Rows outside 2..`max_context_len` tokens
+raise an error. Include the model's role/EOS markers in the source text yourself.
+Unlisted sources, including CCI3-HQ and WikiText, keep their existing behavior.
+`--calib_text_samples` limits rows for preserved sources and packed sequences for
+other sources. Use the full row count to include the whole curated file.
+
+See [thinking calibration preparation](model_validation/calibration/README.md)
+for the reusable curator, GPU candidate generation and token-exact loader
+validation. The local Luxi v1 bundle at
+`assets/samples/luxi_think_calibration_v1/` contains 256 Chinese R1 samples and
+30 reviewed Luxi two-turn conversations. This bundle is not tracked in Git;
+copy it separately or prepare a new bundle using the linked instructions.
+Use its ChatML JSONL through this preserved-source path; `messages.json` is for
+inspection, not the recommended calibration input. Calibration is not supervised
+fine-tuning and does not establish an accuracy improvement until a new PTE is evaluated.
+
 ##### Runtime repetition penalty
 
 Both `llama.py` and the QNN text/multimodal runners accept
 `--repetition_penalty 1.1`. The default `1.0` disables the penalty and preserves
 existing sampling. Values must be finite and at least `1.0`.
-The penalty is applied once per distinct token in the prompt and accepted output
-history, including earlier turns in the same runner conversation. Lookahead
-candidates do not enter history until accepted. History is not evicted with SWA.
+The penalty is applied once per distinct token in the most recent 256 token
+positions of the prompt and accepted output, including thinking and earlier turns
+in the same runner conversation. Repeated occurrences occupy separate positions
+but are penalized only once; a token stops being penalized when its last occurrence
+leaves the window. Lookahead candidates do not enter history until accepted.
+The window slides independently of SWA and is cleared when the runner is reset.
+The text runner also accepts a constructor-level `repeat_last_n` (default 256).
+The identity-test driver's JSON exposes it as `"repeat_last_n": 64`; use a positive
+32-bit integer. This changes the actual history window, not just the log label.
+With `repetition_penalty=1.0`, the penalty is disabled regardless of window size.
 For seen tokens, positive logits are divided by the penalty and negative logits
 are multiplied by it, before temperature/top-p sampling. Quantized logits are
 dequantized using the PTE's `get_logits_scale` and `get_logits_zero_point` metadata
 when the penalty is enabled. Older quantized PTEs missing these metadata methods
 must be re-exported to use the penalty.
 
-Rebuild and update the runner once to add this option; subsequent changes to the
-penalty require neither runner rebuilding nor PTE export. EOS stopping remains
+Rebuild and update the runner (or Android AAR) once to use the 256-token window;
+existing binaries keep their old behavior. Subsequent changes to the penalty
+strength require neither runner rebuilding nor PTE export. EOS stopping remains
 independent (`--ignore_eos=false` on the native runner). Repetition penalty can
 reduce loops, but is not a substitute for validating model/quantization accuracy.
+
+##### Runtime input logs
+
+The QNN text runner (including JNI and the identity-test driver) logs each call's
+effective `temperature`, `repetition_penalty`, `repeat_last_n`, and `ignore_eos`
+as `[QNN_GENERATION]`. It also logs the effective sequence limit and prefill size.
+`[QNN_INPUT]` identifies the cached token count, pending output token (`-1` means
+none), and explicit input BOS/EOS counts. Later turns reuse KV history; they do
+not resend that history as text.
+
+`[QNN_PROMPT]` contains the complete string passed to the tokenizer, including
+ChatML and thinking markers, independent of `echo`. Chunks have UTF-8 byte offsets
+and JSON-escaped `text` strings (`\n` means a newline); concatenate the decoded
+strings to recover the exact input. Chunking avoids the native log's 256-byte
+buffer limit. For tokenized-file input this string is the **file path**, not text
+sent to the tokenizer. `max_new_tokens=0` skips input logging and inference.
+
+These Info logs contain user/system prompt content; treat them as sensitive and
+disable Info logging in production builds that must not retain prompts. Rebuild
+and deploy the runner/driver or AAR to enable these logs; no PTE export is needed.
 
 ##### Custom calibration samples (`--calib_samples`)
 
