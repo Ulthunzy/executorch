@@ -14,6 +14,7 @@
 #include <executorch/examples/models/llama/tokenizer/llama_tiktoken.h>
 #include <executorch/examples/qualcomm/oss_scripts/llama/runner/client_mem.h>
 #include <executorch/examples/qualcomm/oss_scripts/llama/runner/lhd_token_generator.h>
+#include <executorch/examples/qualcomm/oss_scripts/llama/runner/prompt_logging.h>
 #include <executorch/examples/qualcomm/oss_scripts/llama/runner/rpc_mem.h>
 #include <executorch/examples/qualcomm/oss_scripts/llama/runner/runner.h>
 #include <executorch/examples/qualcomm/oss_scripts/llama/runner/utils.h>
@@ -27,6 +28,7 @@
 #include <algorithm>
 #include <climits>
 #include <fstream>
+#include <string_view>
 
 using executorch::extension::llm::get_rss_bytes;
 using executorch::extension::llm::print_report;
@@ -42,6 +44,9 @@ namespace {
 void print_performance_report(
     const Stats& stats,
     const std::string& performance_output_path) {
+  if (performance_output_path.empty()) {
+    return;
+  }
   // For now, we just print the total inference time for CI, can save more info
   // in future if needed.
   std::ofstream outfile(performance_output_path.c_str());
@@ -160,7 +165,8 @@ Runner::Runner(
     const int gcap,
     std::unique_ptr<tokenizers::Tokenizer> tokenizer,
     std::unique_ptr<executorch::extension::Module> attention_sink_rope_module,
-    const float repetition_penalty)
+    const float repetition_penalty,
+    const size_t repeat_last_n)
     : module_(std::move(module)),
       attention_sink_rope_module_(std::move(attention_sink_rope_module)),
       ngram_(ngram),
@@ -171,6 +177,7 @@ Runner::Runner(
       dump_logits_path_(dump_logits_path),
       temperature_(temperature),
       repetition_penalty_(repetition_penalty),
+      repeat_last_n_(repeat_last_n),
       eval_mode_(static_cast<EvalMode>(eval_mode)),
       shared_buffer_(shared_buffer),
       tokenizer_(std::move(tokenizer)) {
@@ -258,29 +265,55 @@ Error Runner::load() {
   dev_mem::log_proc_status_mem("load stage: tokenizer/eos setup (before)");
 #endif
   auto eos_ids = std::make_unique<std::unordered_set<uint64_t>>();
-  if (tokenizer_ != nullptr) {
+  const bool uses_chatml =
+      decoder_model_version_ == DecoderModelVersion::kQwen2_5 ||
+      decoder_model_version_ == DecoderModelVersion::kQwen3 ||
+      decoder_model_version_ == DecoderModelVersion::kLincal ||
+      decoder_model_version_ == DecoderModelVersion::kSmollm2_135m ||
+      decoder_model_version_ == DecoderModelVersion::kSmollm3;
+  if (tokenizer_ != nullptr && !uses_chatml) {
     eos_ids->insert(tokenizer_->encode("<|eot_id|>", 0, 0).get()[0]);
     eos_ids->insert(tokenizer_->encode("<|eot|>", 0, 0).get()[0]);
     eos_ids->insert(tokenizer_->encode("<|end_of_text|>", 0, 0).get()[0]);
-  } else {
+  } else if (tokenizer_ == nullptr) {
     tokenizer_ = llm::load_tokenizer(tokenizer_path_);
     if (tokenizer_ == nullptr) {
       ET_LOG(
           Error, "Failed to load tokenizer with %s", tokenizer_path_.c_str());
       return Error::Internal;
     }
-    eos_ids->insert(tokenizer_->eos_tok());
+    if (!uses_chatml) {
+      eos_ids->insert(tokenizer_->eos_tok());
+    }
   }
+  bos_token_ = tokenizer_->bos_tok();
+  eos_token_ = tokenizer_->eos_tok();
   if (decoder_model_version_ == DecoderModelVersion::kLlama3) {
+    auto bos = tokenizer_->piece_to_id("<|begin_of_text|>");
+    ET_CHECK_TK_OK_OR_RETURN_ERROR(bos.error(), "Missing Llama3 BOS token");
+    bos_token_ = bos.get();
+    auto eos = tokenizer_->piece_to_id("<|eot_id|>");
+    ET_CHECK_TK_OK_OR_RETURN_ERROR(eos.error(), "Missing Llama3 EOS token");
+    eos_token_ = eos.get();
     eos_ids->insert(tokenizer_->encode("<|eot_id|>", 0, 0).get()[0]);
   } else if (decoder_model_version_ == DecoderModelVersion::kPhi4) {
     eos_ids->insert(tokenizer_->encode("<|end|>", 0, 0).get()[0]);
-  } else if (
-      decoder_model_version_ == DecoderModelVersion::kQwen3 ||
-      decoder_model_version_ == DecoderModelVersion::kLincal ||
-      decoder_model_version_ == DecoderModelVersion::kSmollm2_135m ||
-      decoder_model_version_ == DecoderModelVersion::kSmollm3) {
-    eos_ids->insert(tokenizer_->encode("<|im_end|>", 0, 0).get()[0]);
+  } else if (uses_chatml) {
+    // ChatML prompts have no separate BOS; the role delimiters are in the text.
+    bos_token_.reset();
+    // A standalone tokenizer.json may leave eos_tok() at 0 (ordinary "!").
+    for (const auto* marker : {"<|im_end|>", "<|endoftext|>"}) {
+      auto ids = tokenizer_->encode(marker, 0, 0);
+      ET_CHECK_OR_RETURN_ERROR(
+          ids.ok() && ids.get().size() == 1,
+          InvalidArgument,
+          "ChatML tokenizer must encode %s as one token",
+          marker);
+      eos_ids->insert(ids.get()[0]);
+      if (std::string_view(marker) == "<|im_end|>") {
+        eos_token_ = ids.get()[0];
+      }
+    }
   } else if (
       decoder_model_version_ == DecoderModelVersion::kGemma ||
       decoder_model_version_ == DecoderModelVersion::kGemma2 ||
@@ -325,7 +358,8 @@ Error Runner::load() {
   dev_mem::log_proc_status_mem("load stage: decoder runner ctor (before)");
 #endif
   decoder_runner_ = std::make_unique<DecoderRunner>(
-      module_.get(), vocab_size, temperature_, repetition_penalty_);
+      module_.get(), vocab_size, temperature_, repetition_penalty_, repeat_last_n_);
+  decoder_runner_->set_stop_flag(&stop_requested_);
 
 #if ET_QNN_RUNNER_DEV_MEM_LOG
   const dev_mem::RssSample decoder_ctor_stage_after = dev_mem::sample_rss();
@@ -389,6 +423,7 @@ Error Runner::load() {
     max_cache_len = context_len_ -
         std::min(token_generator_ar_len, prompt_processor_ar_len);
   max_ar_len = std::max(token_generator_ar_len, prompt_processor_ar_len);
+  prompt_ar_len_ = prompt_processor_ar_len;
 
   // Load the sliding window size if the model supports it.
   // This is used to configure the attention mask for models with window
@@ -701,13 +736,64 @@ Error Runner::generate_from_prompt_or_file(
     const llm::GenerationConfig& config,
     std::function<void(const std::string&)> token_callback,
     std::function<void(const Stats&)> stats_callback) {
-  ET_CHECK_MSG(!prompt.empty(), "prompt cannot be null");
+  stop_requested_.store(false, std::memory_order_relaxed);
+  ET_CHECK_OR_RETURN_ERROR(
+      context_valid_,
+      InvalidState,
+      "QNN context is incomplete; call resetContext()/reset() before generating again");
+  ET_CHECK_OR_RETURN_ERROR(
+      !prompt.empty(), InvalidArgument, "prompt cannot be empty");
+  ET_CHECK_OR_RETURN_ERROR(
+      config.max_new_tokens >= -1 && config.num_bos >= 0 &&
+          config.num_bos <= 127 && config.num_eos >= 0 && config.num_eos <= 127,
+      InvalidArgument,
+      "Invalid generation configuration");
+  const bool thinking_controls =
+      config.repair_think_eos || config.enable_think_budget;
+  ET_CHECK_OR_RETURN_ERROR(
+      config.think_budget > 0 && !(thinking_controls && config.ignore_eos),
+      InvalidArgument,
+      "think_budget must be positive; thinking controls cannot be combined with ignore_eos");
+  ET_CHECK_OR_RETURN_ERROR(
+      !thinking_controls || eval_mode_ != EvalMode::kLookaheadDecoding,
+      NotSupported,
+      "Thinking controls support KV/hybrid decoding, not lookahead");
   if (!is_loaded()) {
     stats_.model_load_start_ms = time_in_ms();
     ET_CHECK_OK_OR_RETURN_ERROR(load());
     stats_.model_load_end_ms = time_in_ms();
   }
+  const auto load_start = stats_.model_load_start_ms;
+  const auto load_end = stats_.model_load_end_ms;
+  stats_.reset();
+  stats_.model_load_start_ms = load_start;
+  stats_.model_load_end_ms = load_end;
   stats_.inference_start_ms = time_in_ms();
+  ET_CHECK_OK_OR_RETURN_ERROR(
+      decoder_runner_->set_temperature(config.temperature));
+  ET_LOG(
+      Info,
+      "[QNN_GENERATION] temperature=%g, repetition_penalty=%g, repeat_last_n=%zu, ignore_eos=%d",
+      static_cast<double>(config.temperature),
+      static_cast<double>(repetition_penalty_),
+      repeat_last_n_,
+      static_cast<int>(config.ignore_eos));
+  ET_LOG(
+      Info,
+      "[QNN_GENERATION] repair_think_eos=%d, enable_think_budget=%d, think_budget=%d",
+      static_cast<int>(config.repair_think_eos),
+      static_cast<int>(config.enable_think_budget),
+      config.think_budget);
+  if (config.max_new_tokens == 0) {
+    ET_LOG(
+        Info,
+        "[QNN_GENERATION] max_new_tokens=0; skipping input and generation");
+    stats_.inference_end_ms = time_in_ms();
+    if (stats_callback) {
+      stats_callback(stats_);
+    }
+    return Error::Ok;
+  }
 
   int32_t seq_len = config.seq_len;
   if (attention_sink_rope_runner_ == nullptr && seq_len > context_len_) {
@@ -719,14 +805,26 @@ Error Runner::generate_from_prompt_or_file(
         context_len_);
     seq_len = context_len_;
   } else if (seq_len <= 0) {
-    ET_LOG(
-        Info,
-        "Warning: Invalid seq_len (%d). Using compiled max_context_len (%d).",
-        seq_len,
-        context_len_);
+    if (seq_len != -1) {
+      ET_LOG(
+          Info,
+          "Warning: Invalid seq_len (%d). Using compiled max_context_len (%d).",
+          seq_len,
+          context_len_);
+    }
     seq_len = context_len_;
   }
-  int32_t n_bos = (cur_pos_ == 0) ? 1 : 0;
+  int32_t n_bos = (cur_pos_ == 0) ? config.num_bos : 0;
+
+  ET_LOG(
+      Info,
+      "[QNN_INPUT] source=%s, cached_tokens=%lld, pending_token=%lld, num_bos=%d, num_eos=%d",
+      tokenized_prompt ? "token_file" : "text",
+      static_cast<long long>(cur_pos_),
+      pending_token_ ? static_cast<long long>(*pending_token_) : -1LL,
+      tokenized_prompt ? 0 : n_bos,
+      tokenized_prompt ? 0 : config.num_eos);
+  log_prompt(prompt);
 
   // encode the (string) prompt into tokens sequence
   std::vector<uint64_t> prompt_tokens;
@@ -750,36 +848,125 @@ Error Runner::generate_from_prompt_or_file(
           prompt.c_str());
     }
   } else {
+    // HFTokenizer treats bos/eos as a postprocessor switch, not token counts.
+    // Encode without automatic special tokens and insert the requested IDs.
     tokenizers::Result<std::vector<uint64_t>> encode_res =
-        tokenizer_->encode(prompt, n_bos, 0);
+        tokenizer_->encode(prompt, 0, 0);
     ET_CHECK_TK_OK_OR_RETURN_ERROR(
         encode_res.error(), "failed to encode prompt %s", prompt.c_str());
     prompt_tokens = encode_res.get();
+    ET_CHECK_OR_RETURN_ERROR(
+        n_bos == 0 || bos_token_.has_value(),
+        InvalidArgument,
+        "This ChatML model has no BOS token; use numBos=0 and its chat template");
+    if (n_bos > 0) {
+      prompt_tokens.insert(prompt_tokens.begin(), n_bos, *bos_token_);
+    }
+    prompt_tokens.insert(prompt_tokens.end(), config.num_eos, eos_token_);
   }
   int num_prompt_tokens = prompt_tokens.size();
-  ET_CHECK_MSG(num_prompt_tokens >= 1, "Expected at least 1 prompt token");
+  ET_CHECK_OK_OR_RETURN_ERROR(token_generator_->configure_thinking(
+      config.repair_think_eos,
+      config.enable_think_budget,
+      config.think_budget,
+      prompt_tokens));
+  ET_CHECK_OR_RETURN_ERROR(
+      num_prompt_tokens >= 1,
+      InvalidArgument,
+      "Expected at least 1 prompt token");
+  // The last sampled token has not run through the model yet. Commit it with
+  // the next prompt, including EOS, without re-encoding or emitting it twice.
+  if (pending_token_) {
+    prompt_tokens.insert(prompt_tokens.begin(), *pending_token_);
+  }
   int64_t end_pos = 0;
-  ET_CHECK_MSG(
+  ET_CHECK_OR_RETURN_ERROR(
       !c10::add_overflows(
-          cur_pos_, static_cast<int64_t>(num_prompt_tokens), &end_pos) &&
+          cur_pos_, static_cast<int64_t>(prompt_tokens.size()), &end_pos) &&
           end_pos < static_cast<int64_t>(seq_len),
+      InvalidArgument,
       "sequence length exceeded - please increase the seq_len value");
+  if (prompt_ar_len_ == context_len_) {
+    ET_CHECK_OR_RETURN_ERROR(
+        cur_pos_ == 0,
+        InvalidArgument,
+        "Full-context prefill requires resetContext()/reset() between conversations");
+  } else if (!attention_sink_rope_runner_) {
+    ET_CHECK_OR_RETURN_ERROR(
+        end_pos <= context_len_ - prompt_ar_len_,
+        InvalidArgument,
+        "Prompt exceeds the compiled prefill capacity");
+  }
+  if (config.max_new_tokens > 0) {
+    seq_len = static_cast<int32_t>(
+        std::min<int64_t>(seq_len, end_pos + config.max_new_tokens));
+  }
+  ET_LOG(
+      Info,
+      "[QNN_GENERATION] seq_len=%d, max_new_tokens=%d, prefill_ar_len=%d, input_tokens=%d, prefill_tokens=%zu, echo=%d, warming=%d",
+      seq_len,
+      config.max_new_tokens,
+      prompt_ar_len_,
+      num_prompt_tokens,
+      prompt_tokens.size(),
+      static_cast<int>(config.echo),
+      static_cast<int>(config.warming));
 
   // Prompt Processor first
   if (token_callback && config.echo) {
     token_callback(prompt);
   }
+  if (stop_requested_.load(std::memory_order_relaxed)) {
+    stats_.inference_end_ms = time_in_ms();
+    if (stats_callback) {
+      stats_callback(stats_);
+    }
+    return Error::Ok;
+  }
   bool dump_logits = dump_logits_path_.empty() ? false : true;
 #if ET_QNN_RUNNER_DEV_MEM_LOG
   const dev_mem::RssSample prefill_before = dev_mem::sample_rss();
 #endif
-  decoder_runner_->begin_turn(prompt_tokens, cur_pos_ == 0);
-  auto prefill_res = prompt_processor_->prefill(
-      prompt_tokens, cur_pos_, dump_logits, attention_sink_rope_runner_.get());
-  ET_CHECK_OK_OR_RETURN_ERROR(prefill_res.error());
-  uint64_t cur_token = prefill_res.get();
+  // Execution errors may leave partial writes; ordinary cancellation returns
+  // the last committed AR boundary and keeps the context usable.
+  context_valid_ = false;
+  decoder_runner_->begin_turn({}, cur_pos_ == 0);
+  ET_ASSIGN_OR_RETURN(
+      prefill_result,
+      prompt_processor_->prefill(
+          prompt_tokens,
+          cur_pos_,
+          dump_logits,
+          attention_sink_rope_runner_.get(),
+          pending_token_.has_value()));
+  cur_pos_ += prefill_result.num_committed_tokens;
+  const int64_t committed_pending =
+      pending_token_ && prefill_result.num_committed_tokens > 0 ? 1 : 0;
+  if (committed_pending) {
+    pending_token_.reset();
+  }
+  if (!prefill_result.next_token ||
+      stop_requested_.load(std::memory_order_relaxed)) {
+    context_valid_ = true;
+    stats_.num_prompt_tokens =
+        prefill_result.num_committed_tokens - committed_pending;
+    stats_.prompt_eval_end_ms = time_in_ms();
+    stats_.inference_end_ms = time_in_ms();
+    ET_LOG(
+        Info,
+        "Prefill cancelled: committed %lld/%zu input tokens; context position=%lld",
+        static_cast<long long>(prefill_result.num_committed_tokens),
+        prompt_tokens.size(),
+        static_cast<long long>(cur_pos_));
+    if (stats_callback) {
+      stats_callback(stats_);
+    }
+    return Error::Ok;
+  }
+  uint64_t cur_token = *prefill_result.next_token;
+  cur_token =
+      token_generator_->select_thinking_token(cur_token, seq_len - cur_pos_);
   decoder_runner_->record_token(cur_token);
-  cur_pos_ += num_prompt_tokens;
   stats_.first_token_ms = time_in_ms();
   stats_.prompt_eval_end_ms = time_in_ms();
 
@@ -827,14 +1014,18 @@ Error Runner::generate_from_prompt_or_file(
       "RSS after finishing text generation: %f MiB (0 if unsupported)",
       get_rss_bytes() / 1024.0 / 1024.0);
   cur_pos_ += num_generated_tokens;
+  pending_token_ = token_generator_->last_token();
+  context_valid_ = true;
   if (cur_pos_ == seq_len) {
     ET_LOG(Info, "Sequence length (%i tokens) reached!", seq_len);
   }
 
   stats_.num_prompt_tokens = num_prompt_tokens;
-  stats_.num_generated_tokens = num_generated_tokens;
-  print_report(stats_);
-  print_performance_report(stats_, performance_output_path_);
+  stats_.num_generated_tokens = num_generated_tokens + 1;
+  if (!config.warming) {
+    print_report(stats_);
+    print_performance_report(stats_, performance_output_path_);
+  }
   if (dump_logits) {
     save_logits(
         dump_logits_path_,
@@ -847,12 +1038,30 @@ Error Runner::generate_from_prompt_or_file(
   return Error::Ok;
 }
 
-Result<DecoderModelVersion> Runner::get_decoder_model_version() {
-  if (!is_loaded()) {
-    stats_.model_load_start_ms = time_in_ms();
-    ET_CHECK_OK_OR_RETURN_ERROR(load());
-    stats_.model_load_end_ms = time_in_ms();
+void Runner::stop() {
+  stop_requested_.store(true, std::memory_order_relaxed);
+}
+
+void Runner::reset() {
+  cur_pos_ = 0;
+  pending_token_.reset();
+  context_valid_ = true;
+  stats_.reset();
+  if (kv_manager_) {
+    kv_manager_->reset_state(prompt_ar_len_, true);
   }
+  if (decoder_runner_) {
+    decoder_runner_->begin_turn({}, true);
+  }
+  if (token_generator_) {
+    token_generator_->reset();
+  }
+  if (attention_sink_rope_runner_) {
+    attention_sink_rope_runner_->reset();
+  }
+}
+
+Result<DecoderModelVersion> Runner::get_decoder_model_version() const {
   return decoder_model_version_;
 }
 

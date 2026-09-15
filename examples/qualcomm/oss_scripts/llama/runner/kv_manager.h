@@ -78,6 +78,8 @@ class KVManager {
    */
   void reset_state(int32_t ar_len, bool clear_buffers = false);
 
+  bool has_inplace_cache_updates() const;
+
   /**
    * @brief Switch key and value cache from AR-cur to AR-dst.
    * @param ar_len_dst Target length of input tokens.

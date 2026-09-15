@@ -7,10 +7,12 @@
  */
 
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <cstring>
 #include <memory>
 #include <sstream>
+#include <stdexcept>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -37,6 +39,7 @@
 
 #if defined(EXECUTORCH_BUILD_QNN)
 #include <executorch/examples/qualcomm/oss_scripts/llama/runner/runner.h>
+#include <executorch/extension/android/jni/encrypted_model_loader.h>
 #endif
 
 #if defined(EXECUTORCH_BUILD_MEDIATEK)
@@ -91,6 +94,7 @@ class ExecuTorchLlmJni : public facebook::jni::HybridClass<ExecuTorchLlmJni> {
   int model_type_category_;
   std::unique_ptr<llm::IRunner> runner_;
   bool needs_bos_ = true;
+  bool default_thinking_protection_ = false;
 
  public:
   constexpr static auto kJavaDescriptor =
@@ -102,6 +106,40 @@ class ExecuTorchLlmJni : public facebook::jni::HybridClass<ExecuTorchLlmJni> {
   constexpr static int MODEL_TYPE_QNN_LLAMA = 4;
 
   static facebook::jni::local_ref<jhybriddata> initHybrid(
+      facebook::jni::alias_ref<jclass> cls,
+      jint model_type_category,
+      facebook::jni::alias_ref<jstring> model_path,
+      facebook::jni::alias_ref<jstring> tokenizer_path,
+      jfloat temperature,
+      facebook::jni::alias_ref<facebook::jni::JList<jstring>::javaobject>
+          data_files,
+      jint num_bos,
+      jint num_eos,
+      jint load_mode,
+      facebook::jni::alias_ref<jstring> qnn_decoder_model,
+      jint qnn_eval_mode,
+      jboolean qnn_shared_buffer,
+      jfloat qnn_repetition_penalty,
+      facebook::jni::alias_ref<jstring> qnn_model_key_hex) {
+    return initHybridWithOptions(
+        cls,
+        model_type_category,
+        model_path,
+        tokenizer_path,
+        temperature,
+        data_files,
+        num_bos,
+        num_eos,
+        load_mode,
+        qnn_decoder_model,
+        qnn_eval_mode,
+        qnn_shared_buffer,
+        qnn_repetition_penalty,
+        qnn_model_key_hex,
+        128);
+  }
+
+  static facebook::jni::local_ref<jhybriddata> initHybridWithOptions(
       facebook::jni::alias_ref<jclass>,
       jint model_type_category,
       facebook::jni::alias_ref<jstring> model_path,
@@ -111,7 +149,13 @@ class ExecuTorchLlmJni : public facebook::jni::HybridClass<ExecuTorchLlmJni> {
           data_files,
       jint num_bos,
       jint num_eos,
-      jint load_mode) {
+      jint load_mode,
+      facebook::jni::alias_ref<jstring> qnn_decoder_model,
+      jint qnn_eval_mode,
+      jboolean qnn_shared_buffer,
+      jfloat qnn_repetition_penalty,
+      facebook::jni::alias_ref<jstring> qnn_model_key_hex,
+      jint qnn_repeat_last_n) {
     return makeCxxInstance(
         model_type_category,
         model_path,
@@ -120,7 +164,13 @@ class ExecuTorchLlmJni : public facebook::jni::HybridClass<ExecuTorchLlmJni> {
         data_files,
         num_bos,
         num_eos,
-        load_mode);
+        load_mode,
+        qnn_decoder_model,
+        qnn_eval_mode,
+        qnn_shared_buffer,
+        qnn_repetition_penalty,
+        qnn_model_key_hex,
+        qnn_repeat_last_n);
   }
 
   static executorch::extension::Module::LoadMode load_mode_from_int(
@@ -145,14 +195,28 @@ class ExecuTorchLlmJni : public facebook::jni::HybridClass<ExecuTorchLlmJni> {
       facebook::jni::alias_ref<jstring> model_path,
       facebook::jni::alias_ref<jstring> tokenizer_path,
       jfloat temperature,
-      facebook::jni::alias_ref<jobject> data_files = nullptr,
-      jint num_bos = 0,
-      jint num_eos = 0,
-      jint load_mode = 1) {
+      facebook::jni::alias_ref<jobject> data_files,
+      jint num_bos,
+      jint num_eos,
+      jint load_mode,
+      facebook::jni::alias_ref<jstring> qnn_decoder_model,
+      jint qnn_eval_mode,
+      jboolean qnn_shared_buffer,
+      jfloat qnn_repetition_penalty,
+      facebook::jni::alias_ref<jstring> qnn_model_key_hex,
+      jint qnn_repeat_last_n) {
+    if (!model_path || !tokenizer_path || !std::isfinite(temperature) ||
+        temperature < 0 || num_bos < -1 || num_bos > 127 || num_eos < -1 ||
+        num_eos > 127) {
+      executorch::jni_helper::throwExecutorchException(
+          static_cast<uint32_t>(Error::InvalidArgument),
+          "Invalid LlmModule paths, temperature, or BOS/EOS counts");
+      return;
+    }
     try {
       temperature_ = temperature;
-      num_bos_ = num_bos;
-      num_eos_ = num_eos;
+      num_bos_ = std::max(0, num_bos);
+      num_eos_ = std::max(0, num_eos);
 #if defined(ET_USE_THREADPOOL)
       // Reserve 1 thread for the main thread.
       int32_t num_performant_cores =
@@ -168,6 +232,21 @@ class ExecuTorchLlmJni : public facebook::jni::HybridClass<ExecuTorchLlmJni> {
       model_type_category_ = model_type_category;
       auto cpp_load_mode = load_mode_from_int(load_mode);
       std::vector<std::string> data_files_vector;
+      if (data_files != nullptr) {
+        // Convert Java List<String> to C++ std::vector<string>
+        auto list_class = facebook::jni::findClassStatic("java/util/List");
+        auto size_method = list_class->getMethod<jint()>("size");
+        auto get_method =
+            list_class->getMethod<facebook::jni::local_ref<jobject>(jint)>(
+                "get");
+
+        jint size = size_method(data_files);
+        for (jint i = 0; i < size; ++i) {
+          auto str_obj = get_method(data_files, i);
+          auto jstr = facebook::jni::static_ref_cast<jstring>(str_obj);
+          data_files_vector.push_back(jstr->toStdString());
+        }
+      }
       if (model_type_category == MODEL_TYPE_CATEGORY_MULTIMODAL) {
         runner_ = llm::create_multimodal_runner(
             model_path->toStdString().c_str(),
@@ -175,21 +254,6 @@ class ExecuTorchLlmJni : public facebook::jni::HybridClass<ExecuTorchLlmJni> {
             std::nullopt,
             cpp_load_mode);
       } else if (model_type_category == MODEL_TYPE_CATEGORY_LLM) {
-        if (data_files != nullptr) {
-          // Convert Java List<String> to C++ std::vector<string>
-          auto list_class = facebook::jni::findClassStatic("java/util/List");
-          auto size_method = list_class->getMethod<jint()>("size");
-          auto get_method =
-              list_class->getMethod<facebook::jni::local_ref<jobject>(jint)>(
-                  "get");
-
-          jint size = size_method(data_files);
-          for (jint i = 0; i < size; ++i) {
-            auto str_obj = get_method(data_files, i);
-            auto jstr = facebook::jni::static_ref_cast<jstring>(str_obj);
-            data_files_vector.push_back(jstr->toStdString());
-          }
-        }
         runner_ = executorch::extension::llm::create_text_llm_runner(
             model_path->toStdString(),
             llm::load_tokenizer(tokenizer_path->toStdString()),
@@ -200,12 +264,86 @@ class ExecuTorchLlmJni : public facebook::jni::HybridClass<ExecuTorchLlmJni> {
             cpp_load_mode);
 #if defined(EXECUTORCH_BUILD_QNN)
       } else if (model_type_category == MODEL_TYPE_QNN_LLAMA) {
-        std::unique_ptr<executorch::extension::Module> module =
-            std::make_unique<executorch::extension::Module>(
-                model_path->toStdString().c_str(),
-                data_files_vector,
-                cpp_load_mode);
-        std::string decoder_model = "llama3"; // use llama3 for now
+        if (!qnn_decoder_model ||
+            (qnn_eval_mode != -1 &&
+             qnn_eval_mode != example::Runner::kKVCached &&
+             qnn_eval_mode != example::Runner::kHybrid) ||
+            !std::isfinite(qnn_repetition_penalty) ||
+            qnn_repetition_penalty < 1.0f || qnn_repeat_last_n <= 0) {
+          throw std::invalid_argument("Invalid QNN runner configuration");
+        }
+        const auto decoder_model = qnn_decoder_model->toStdString();
+        default_thinking_protection_ =
+            decoder_model == "lincal" || decoder_model == "qwen3";
+        const std::vector<std::string> supported_models = {
+            "llama2",
+            "llama3",
+            "gemma",
+            "gemma2",
+            "gemma3",
+            "gemma4",
+            "granite",
+            "phi_4_mini",
+            "qwen2_5",
+            "qwen3",
+            "lincal",
+            "smollm2_135m",
+            "smollm3",
+            "codegen",
+            "glm"};
+        if (std::find(
+                supported_models.begin(),
+                supported_models.end(),
+                decoder_model) == supported_models.end()) {
+          throw std::invalid_argument(
+              "Unsupported QNN decoder: " + decoder_model);
+        }
+        auto encrypted = load_encrypted_model(
+            model_path->toStdString(),
+            qnn_model_key_hex ? qnn_model_key_hex->toStdString() : "");
+        if (!encrypted.ok()) {
+          executorch::jni_helper::throwExecutorchException(
+              static_cast<uint32_t>(encrypted.error()),
+              "Cannot open or authenticate QNN model");
+          return;
+        }
+        std::unique_ptr<executorch::extension::Module> module;
+        if (*encrypted) {
+          if (!data_files_vector.empty()) {
+            executorch::jni_helper::throwExecutorchException(
+                static_cast<uint32_t>(Error::NotSupported),
+                "Encrypted QNN containers do not support external data files");
+            return;
+          }
+          module = std::make_unique<executorch::extension::Module>(
+              std::move(*encrypted));
+        } else {
+          module = std::make_unique<executorch::extension::Module>(
+              model_path->toStdString(), data_files_vector, cpp_load_mode);
+        }
+        if (qnn_eval_mode == -1) {
+          const auto methods = module->method_names();
+          if (!methods.ok()) {
+            executorch::jni_helper::throwExecutorchException(
+                static_cast<uint32_t>(methods.error()),
+                "Cannot inspect QNN model methods");
+            return;
+          }
+          if (!methods->count("kv_forward")) {
+            throw std::invalid_argument("QNN model has no kv_forward method");
+          }
+          qnn_eval_mode = methods->count("prefill_forward")
+              ? example::Runner::kHybrid
+              : example::Runner::kKVCached;
+        }
+        ET_LOG(
+            Info,
+            "Creating QNN runner: decoder=%s, eval_mode=%d, temperature=%g, repetition_penalty=%g, repeat_last_n=%zu",
+            decoder_model.c_str(),
+            static_cast<int>(qnn_eval_mode),
+            static_cast<double>(temperature_),
+            static_cast<double>(qnn_repetition_penalty),
+            static_cast<size_t>(qnn_repeat_last_n));
         runner_ = std::make_unique<example::Runner>(
             std::move(module),
             decoder_model.c_str(),
@@ -213,8 +351,16 @@ class ExecuTorchLlmJni : public facebook::jni::HybridClass<ExecuTorchLlmJni> {
             tokenizer_path->toStdString().c_str(),
             "",
             "",
-            temperature_);
-        model_type_category_ = MODEL_TYPE_CATEGORY_LLM;
+            temperature_,
+            qnn_eval_mode,
+            static_cast<bool>(qnn_shared_buffer),
+            0,
+            0,
+            0,
+            nullptr,
+            nullptr,
+            qnn_repetition_penalty,
+            static_cast<size_t>(qnn_repeat_last_n));
 #endif
 #if defined(EXECUTORCH_BUILD_MEDIATEK)
       } else if (model_type_category == MODEL_TYPE_MEDIATEK_LLAMA) {
@@ -225,6 +371,16 @@ class ExecuTorchLlmJni : public facebook::jni::HybridClass<ExecuTorchLlmJni> {
         model_type_category_ = MODEL_TYPE_CATEGORY_LLM;
 #endif
       }
+      if (!runner_) {
+        throw std::invalid_argument(
+            "Unsupported model type or backend not compiled: " +
+            std::to_string(model_type_category));
+      }
+    } catch (const facebook::jni::JniException&) {
+      throw;
+    } catch (const std::invalid_argument& e) {
+      executorch::jni_helper::throwExecutorchException(
+          static_cast<uint32_t>(Error::InvalidArgument), e.what());
     } catch (const std::exception& e) {
       executorch::jni_helper::throwExecutorchException(
           static_cast<uint32_t>(Error::Internal),
@@ -243,16 +399,61 @@ class ExecuTorchLlmJni : public facebook::jni::HybridClass<ExecuTorchLlmJni> {
       jboolean echo,
       jfloat temperature,
       jint num_bos,
-      jint num_eos) {
+      jint num_eos,
+      jint max_new_tokens,
+      jboolean warming,
+      jboolean ignore_eos) {
+    return generate_with_thinking(
+        prompt,
+        seq_len,
+        callback,
+        echo,
+        temperature,
+        num_bos,
+        num_eos,
+        max_new_tokens,
+        warming,
+        ignore_eos,
+        default_thinking_protection_ && !ignore_eos,
+        default_thinking_protection_ && !ignore_eos,
+        512);
+  }
+
+  jint generate_with_thinking(
+      facebook::jni::alias_ref<jstring> prompt,
+      jint seq_len,
+      facebook::jni::alias_ref<ExecuTorchLlmCallbackJni> callback,
+      jboolean echo,
+      jfloat temperature,
+      jint num_bos,
+      jint num_eos,
+      jint max_new_tokens,
+      jboolean warming,
+      jboolean ignore_eos,
+      jboolean repair_think_eos,
+      jboolean enable_think_budget,
+      jint think_budget) {
     Error err = Error::Ok;
-    if (!prompt) {
+    if (!prompt || (seq_len != -1 && seq_len <= 0) || max_new_tokens < -1 ||
+        !std::isfinite(temperature) || num_bos < -1 || num_bos > 127 ||
+        num_eos < -1 || num_eos > 127 || think_budget <= 0 ||
+        ((repair_think_eos || enable_think_budget) && ignore_eos)) {
       err = Error::InvalidArgument;
       if (callback) {
         callback->onError(
             static_cast<int>(err),
-            "generate() failed: prompt must not be null");
+            "generate() failed: invalid prompt or generation configuration");
       }
       return static_cast<jint>(err);
+    }
+    if ((repair_think_eos || enable_think_budget) &&
+        model_type_category_ != MODEL_TYPE_QNN_LLAMA) {
+      if (callback) {
+        callback->onError(
+            static_cast<int>(Error::NotSupported),
+            "Thinking controls currently require a QNN text KV/hybrid runner");
+      }
+      return static_cast<jint>(Error::NotSupported);
     }
 
     float effective_temperature = temperature >= 0 ? temperature : temperature_;
@@ -283,10 +484,19 @@ class ExecuTorchLlmJni : public facebook::jni::HybridClass<ExecuTorchLlmJni> {
     try {
       executorch::extension::llm::GenerationConfig config{
           .echo = static_cast<bool>(echo),
+          .ignore_eos = static_cast<bool>(ignore_eos),
+          .max_new_tokens = max_new_tokens,
+          .warming = static_cast<bool>(warming),
           .seq_len = seq_len,
           .temperature = effective_temperature,
-          .num_bos = needs_bos_ ? num_bos_ : 0,
-          .num_eos = num_eos,
+          .num_bos =
+              (needs_bos_ || model_type_category_ == MODEL_TYPE_QNN_LLAMA)
+              ? (num_bos >= 0 ? num_bos : num_bos_)
+              : 0,
+          .num_eos = num_eos >= 0 ? num_eos : num_eos_,
+          .repair_think_eos = static_cast<bool>(repair_think_eos),
+          .enable_think_budget = static_cast<bool>(enable_think_budget),
+          .think_budget = think_budget,
       };
       err = runner_->generate(
           prompt->toStdString(),
@@ -297,14 +507,20 @@ class ExecuTorchLlmJni : public facebook::jni::HybridClass<ExecuTorchLlmJni> {
               callback->onStats(result);
             }
           });
-      if (err == Error::Ok) {
+      if (err == Error::Ok && max_new_tokens != 0) {
         needs_bos_ = false;
       }
       if (err != Error::Ok && callback) {
+        const bool invalid_qnn_context =
+            model_type_category_ == MODEL_TYPE_QNN_LLAMA &&
+            err == Error::InvalidState;
         callback->onError(
             static_cast<int>(err),
-            "generate() failed with error code " +
-                std::to_string(static_cast<int>(err)));
+            invalid_qnn_context
+                ? "QNN context is incomplete after an execution error; "
+                  "call resetContext() and resend the conversation history"
+                : "generate() failed with error code " +
+                    std::to_string(static_cast<int>(err)));
       }
     } catch (const std::exception& e) {
       if (callback) {
@@ -317,11 +533,94 @@ class ExecuTorchLlmJni : public facebook::jni::HybridClass<ExecuTorchLlmJni> {
     return static_cast<jint>(err);
   }
 
+  jint generate_with_chat(
+      facebook::jni::alias_ref<jstring> prompt,
+      jint seq_len,
+      facebook::jni::alias_ref<ExecuTorchLlmCallbackJni> callback,
+      jboolean echo,
+      facebook::jni::alias_ref<jstring> system_prompt) {
+    if (!prompt || seq_len < -1) {
+      if (callback) {
+        callback->onError(
+            static_cast<int>(Error::InvalidArgument), "Invalid chat input");
+      }
+      return static_cast<jint>(Error::InvalidArgument);
+    }
+    const auto input = prompt->toStdString();
+    if (input.empty()) {
+      return 0;
+    }
+#if defined(EXECUTORCH_BUILD_QNN)
+    if (model_type_category_ == MODEL_TYPE_QNN_LLAMA && runner_) {
+      auto* qnn = static_cast<example::Runner*>(runner_.get());
+      const auto version = qnn->get_decoder_model_version();
+      if (!version.ok()) {
+        if (callback) {
+          callback->onError(
+              static_cast<int>(version.error()), "Cannot load QNN chat model");
+        }
+        return static_cast<jint>(version.error());
+      }
+      const auto system = system_prompt ? system_prompt->toStdString() : "";
+      const bool has_history = qnn->has_history();
+      std::string formatted;
+      switch (*version) {
+        case example::kQwen3:
+        case example::kQwen2_5:
+        case example::kLincal:
+          if (has_history) {
+            formatted = "\n";
+          } else if (!system.empty()) {
+            formatted = "<|im_start|>system\n" + system + "<|im_end|>\n";
+          }
+          formatted += "<|im_start|>user\n" + input +
+              "<|im_end|>\n<|im_start|>assistant\n";
+          break;
+        case example::kGemma3:
+          formatted = "<start_of_turn>user\n";
+          if (!has_history && !system.empty()) {
+            formatted += system + "\n";
+          }
+          formatted += input + "<end_of_turn>\n<start_of_turn>model\n";
+          break;
+        default:
+          formatted = input;
+          break;
+      }
+      return generate(
+          facebook::jni::make_jstring(formatted),
+          -1,
+          callback,
+          echo,
+          temperature_,
+          num_bos_,
+          num_eos_,
+          seq_len,
+          false,
+          false);
+    }
+#endif
+    return generate(
+        prompt,
+        seq_len,
+        callback,
+        echo,
+        temperature_,
+        num_bos_,
+        num_eos_,
+        -1,
+        false,
+        false);
+  }
+
   // Returns status_code
   // Contract is valid within an AAR (JNI + corresponding Java code)
   jint prefill_text_input(facebook::jni::alias_ref<jstring> prompt) {
     if (!runner_) {
       return static_cast<jint>(Error::InvalidState);
+    }
+    if (!prompt) {
+      return static_cast<jint>(Error::InvalidArgument);
     }
     std::vector<llm::MultimodalInput> inputs;
     inputs.emplace_back(llm::MultimodalInput{prompt->toStdString()});
@@ -602,7 +901,14 @@ class ExecuTorchLlmJni : public facebook::jni::HybridClass<ExecuTorchLlmJni> {
   static void registerNatives() {
     registerHybrid({
         makeNativeMethod("initHybrid", ExecuTorchLlmJni::initHybrid),
+        makeNativeMethod(
+            "initHybridWithOptions", ExecuTorchLlmJni::initHybridWithOptions),
         makeNativeMethod("generateNative", ExecuTorchLlmJni::generate),
+        makeNativeMethod(
+            "generateWithThinkingNative",
+            ExecuTorchLlmJni::generate_with_thinking),
+        makeNativeMethod(
+            "generateWithChatNative", ExecuTorchLlmJni::generate_with_chat),
         makeNativeMethod("stopNative", ExecuTorchLlmJni::stop),
         makeNativeMethod("loadNative", ExecuTorchLlmJni::load),
         makeNativeMethod(

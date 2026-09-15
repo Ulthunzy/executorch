@@ -26,14 +26,16 @@ DecoderRunner::DecoderRunner(
     Module* module,
     int32_t vocab_size,
     float temperature,
-    float repetition_penalty)
+    float repetition_penalty,
+    size_t repeat_last_n)
     : module_(module),
       sampler_(std::make_unique<Sampler>(
           vocab_size,
           temperature,
           kTopp,
           static_cast<unsigned long long>(std::time(nullptr)))),
-      repetition_penalty_(repetition_penalty) {
+      repetition_penalty_(repetition_penalty, repeat_last_n),
+      temperature_(temperature) {
   ET_CHECK_MSG(
       std::isfinite(repetition_penalty) && repetition_penalty >= 1.0f,
       "repetition_penalty must be finite and >= 1.0");
@@ -53,33 +55,53 @@ Error DecoderRunner::load(const std::vector<std::string>& method_names) {
   for (const std::string& method_name : method_names) {
     ET_CHECK_OK_OR_RETURN_ERROR(module_->load_method(method_name));
   }
-  if (repetition_penalty_.enabled()) {
+  {
     for (const std::string& method_name : method_names) {
       ET_ASSIGN_OR_RETURN(meta, module_->method_meta(method_name));
       ET_ASSIGN_OR_RETURN(output_meta, meta.output_tensor_meta(0));
       if (output_meta.scalar_type() == executorch::aten::ScalarType::Float) {
         continue;
       }
+      quantized_logits_ = true;
+      ET_ASSIGN_OR_RETURN(available_methods, module_->method_names());
+      if (!available_methods.count("get_logits_scale") ||
+          !available_methods.count("get_logits_zero_point")) {
+        ET_CHECK_OR_RETURN_ERROR(
+            !repetition_penalty_.enabled() && temperature_ == 0,
+            InvalidArgument,
+            "Sampling requires logits quantization metadata");
+        break;
+      }
       ET_ASSIGN_OR_RETURN(scale, module_->get("get_logits_scale"));
       ET_ASSIGN_OR_RETURN(zero_point, module_->get("get_logits_zero_point"));
       ET_CHECK_OR_RETURN_ERROR(
           scale.isDouble() && zero_point.isInt(),
           InvalidArgument,
-          "Repetition penalty requires valid logits quantization metadata");
+          "Sampling requires valid logits quantization metadata");
       logits_scale_ = static_cast<float>(scale.toDouble());
       logits_zero_point_ = zero_point.toInt();
       ET_CHECK_OR_RETURN_ERROR(
           std::isfinite(logits_scale_) && logits_scale_ > 0,
           InvalidArgument,
-          "Invalid logits scale for repetition penalty");
-      ET_LOG(
-          Info,
-          "Repetition penalty: dequantizing logits (scale=%g, zero_point=%lld)",
-          logits_scale_,
-          static_cast<long long>(logits_zero_point_));
+          "Invalid logits scale for sampling");
+      has_logits_quantization_ = true;
       break;
     }
   }
+  return Error::Ok;
+}
+
+Error DecoderRunner::set_temperature(float temperature) {
+  ET_CHECK_OR_RETURN_ERROR(
+      std::isfinite(temperature) && temperature >= 0,
+      InvalidArgument,
+      "Temperature must be finite and non-negative");
+  ET_CHECK_OR_RETURN_ERROR(
+      temperature == 0 || !quantized_logits_ || has_logits_quantization_,
+      InvalidArgument,
+      "Non-greedy sampling requires logits quantization metadata");
+  temperature_ = temperature;
+  sampler_->set_temperature(temperature);
   return Error::Ok;
 }
 

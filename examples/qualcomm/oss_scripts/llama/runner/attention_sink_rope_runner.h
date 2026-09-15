@@ -50,6 +50,9 @@ class AttentionSinkRopeRunner {
   int get_position_shift() {
     return position_shift_;
   }
+  void reset() {
+    position_shift_ = 0;
+  }
   int get_eviction_batch_size() {
     return eviction_batch_size_;
   }

@@ -12,6 +12,7 @@
 #include <executorch/examples/qualcomm/oss_scripts/llama/runner/decoder_runner.h>
 #include <executorch/examples/qualcomm/oss_scripts/llama/runner/imem_alloc.h>
 #include <executorch/examples/qualcomm/oss_scripts/llama/runner/kv_manager.h>
+#include <executorch/examples/qualcomm/oss_scripts/llama/runner/thinking_controller.h>
 #include <executorch/examples/qualcomm/oss_scripts/llama/runner/utils.h>
 #include <executorch/extension/llm/runner/stats.h>
 #include <pytorch/tokenizers/tokenizer.h>
@@ -46,6 +47,16 @@ class TokenGenerator {
       std::unique_ptr<executorch::extension::MethodMeta> method_meta);
 
   virtual ~TokenGenerator() = default;
+  virtual void reset() {}
+  uint64_t last_token() const {
+    return last_token_;
+  }
+  executorch::runtime::Error configure_thinking(
+      bool repair_eos,
+      bool enable_budget,
+      int32_t budget,
+      const std::vector<uint64_t>& prompt);
+  uint64_t select_thinking_token(uint64_t sampled, int64_t remaining_slots);
   /**
    * @brief Initialize I/O tensor and allocate I/O data buffer.
    * @param buffer_manager Pointer to IMemAlloc instance; by default, it uses a
@@ -88,6 +99,7 @@ class TokenGenerator {
   }
 
  protected:
+  uint64_t last_token_{0};
   tokenizers::Tokenizer* tokenizer_;
   DecoderRunner* decoder_runner_;
   KVManager* kv_manager_;
@@ -129,6 +141,7 @@ class TokenGenerator {
  private:
   // metadata
   Metadata metadata_;
+  ThinkingController thinking_;
 
   // Unused by default, only used when dump_logits_path is provided.
   std::vector<std::byte> token_all_logits_;

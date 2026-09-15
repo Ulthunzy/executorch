@@ -87,6 +87,12 @@ class LhdTokenGenerator : public TokenGenerator {
 
   ~LhdTokenGenerator() = default;
 
+  void reset() override {
+    is_lhd_branch_initialized_ = false;
+    ngrams_pool_ =
+        NgramContainer(metadata_.vocab_size, metadata_.ngram, metadata_.gcap);
+  }
+
   /**
      * @brief Generate tokens with lookahead decoding.
      * @param tokens Vector of input tokens.

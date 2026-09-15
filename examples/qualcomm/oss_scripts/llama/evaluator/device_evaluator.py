@@ -353,6 +353,16 @@ class DefaultEval(EvalBase):
                 lookahead_args if args.model_mode == "lookahead" else "",
             ]
         )
+        if args.repair_think_eos or args.enable_think_budget:
+            if is_multimodal or args.model_mode == "lookahead":
+                raise ValueError("Thinking controls require a text KV/hybrid runner")
+            if args.think_budget <= 0 or args.ignore_eos:
+                raise ValueError("think_budget must be positive; disable ignore_eos")
+            runner_args += (
+                f" --repair_think_eos={str(args.repair_think_eos).lower()}"
+                f" --enable_think_budget={str(args.enable_think_budget).lower()}"
+                f" --think_budget={args.think_budget}"
+            )
         self.runner_cmd = " ".join(
             [
                 self.runner_base_cmd,

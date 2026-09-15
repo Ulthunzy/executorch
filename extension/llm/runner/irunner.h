@@ -69,6 +69,11 @@ struct GenerationConfig {
   int32_t num_bos = 0;
   int32_t num_eos = 0;
 
+  // QNN text KV/hybrid: independently opt in to reasoning-block repairs.
+  bool repair_think_eos = false;
+  bool enable_think_budget = false;
+  int32_t think_budget = 512;
+
   /**
    * Resolve the maximum number of new tokens to generate based on constraints.
    *

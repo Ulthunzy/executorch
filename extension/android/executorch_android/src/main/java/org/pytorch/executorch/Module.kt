@@ -101,17 +101,11 @@ private constructor(
    * this on a background thread. However, users need to make sure that they don't execute before
    * this function returns.
    */
-  open fun loadMethod(methodName: String) {
+  open fun loadMethod(methodName: String): Int {
     mLock.lock()
     try {
       check(mHybridData.isValid) { "Module has been destroyed" }
-      val errorCode = loadMethodNative(methodName)
-      if (errorCode != 0) {
-        throw ExecutorchRuntimeException.makeExecutorchException(
-            errorCode,
-            "Failed to load method: $methodName",
-        )
-      }
+      return loadMethodNative(methodName)
     } finally {
       mLock.unlock()
     }

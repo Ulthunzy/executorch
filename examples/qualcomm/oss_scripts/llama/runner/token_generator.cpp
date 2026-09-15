@@ -213,6 +213,77 @@ const std::vector<std::byte>& TokenGenerator::get_all_logits() {
 }
 
 // This function only considers the case where token_generator_ar_len equals 1.
+executorch::runtime::Error TokenGenerator::configure_thinking(
+    bool repair_eos,
+    bool enable_budget,
+    int32_t budget,
+    const std::vector<uint64_t>& prompt) {
+  thinking_ = ThinkingController();
+  if (!repair_eos && !enable_budget) {
+    return executorch::runtime::Error::Ok;
+  }
+  std::vector<uint64_t> ids;
+  for (const auto* text :
+       {"<think>", "</think>", "<|im_start|>", "<|im_end|>"}) {
+    auto encoded = tokenizer_->encode(text, 0, 0);
+    ET_CHECK_OR_RETURN_ERROR(
+        encoded.ok() && encoded.get().size() == 1 &&
+            encoded.get()[0] < static_cast<uint64_t>(metadata_.vocab_size),
+        InvalidArgument,
+        "Thinking controls require single-token ChatML/think markers: %s",
+        text);
+    ids.push_back(encoded.get()[0]);
+  }
+  ET_CHECK_OR_RETURN_ERROR(
+      std::unordered_set<uint64_t>(ids.begin(), ids.end()).size() ==
+              ids.size() &&
+          eos_ids_->count(ids[0]) == 0 && eos_ids_->count(ids[1]) == 0,
+      InvalidArgument,
+      "Think markers must be distinct tokens and must not be EOS");
+  auto header = tokenizer_->encode("<|im_start|>assistant\n", 0, 0);
+  ET_CHECK_OR_RETURN_ERROR(
+      header.ok() && !header.get().empty() && header.get()[0] == ids[2],
+      InvalidArgument,
+      "Cannot encode assistant header");
+  thinking_.begin_turn(
+      repair_eos,
+      enable_budget,
+      budget,
+      ids[0],
+      ids[1],
+      ids[2],
+      ids[3],
+      header.get(),
+      prompt);
+  return executorch::runtime::Error::Ok;
+}
+
+uint64_t TokenGenerator::select_thinking_token(
+    uint64_t sampled,
+    int64_t remaining_slots) {
+  if (!thinking_.enabled()) {
+    return sampled;
+  }
+  const auto token =
+      thinking_.select(sampled, eos_ids_->count(sampled) > 0, remaining_slots);
+  if (thinking_.reason() != ThinkingController::Reason::None) {
+    const char* reason = thinking_.reason() == ThinkingController::Reason::Eos
+        ? "early_eos"
+        : (thinking_.reason() == ThinkingController::Reason::Budget
+               ? "think_budget"
+               : "context_limit");
+    ET_LOG(
+        Info,
+        "[QNN_THINK] forced_close reason=%s, sampled=%llu, emitted=%llu, thinking_tokens=%lld, remaining_slots=%lld",
+        reason,
+        static_cast<unsigned long long>(sampled),
+        static_cast<unsigned long long>(token),
+        static_cast<long long>(thinking_.generated_think_tokens()),
+        static_cast<long long>(remaining_slots));
+  }
+  return token;
+}
+
 void TokenGenerator::prepare_io(uint64_t cur_token, int64_t start_pos) {
   // update input_tok
   *input_toks_.data =
@@ -231,6 +302,7 @@ Result<int64_t> TokenGenerator::generate(
     bool ignore_eos) {
   ET_CHECK_MSG(
       !tokens.empty(), "Token generation loop shouldn't take empty tokens");
+  last_token_ = tokens.back();
   if (dump_logits) {
     token_all_logits_.clear();
   }
@@ -305,7 +377,7 @@ Result<int64_t> TokenGenerator::generate(
       method_name_.c_str());
 
   // Generate our tokens
-  while (pos < seq_len - 1) {
+  while (pos < seq_len - 1 && !decoder_runner_->is_stop_requested()) {
     // The current position plus the future generated cache exceeds the cache
     // size, which means we need to remove eviction_batch_size key-value cache
     // entries to make room for new tokens.
@@ -360,6 +432,8 @@ Result<int64_t> TokenGenerator::generate(
     stats_->on_sampling_begin();
     cur_token =
         decoder_runner_->logits_to_token(logits_tensor, metadata_.ar_len);
+    cur_token = select_thinking_token(cur_token, seq_len - (pos + 1));
+    last_token_ = cur_token;
     stats_->on_sampling_end();
     decoder_runner_->record_token(cur_token);
 
@@ -399,7 +473,9 @@ Result<int64_t> TokenGenerator::generate(
     // print the token as string, decode it with the Tokenizer object
     ET_ASSIGN_OR_RETURN_TOKENIZER(
         decoded_token__, tokenizer_->decode(prev_token, cur_token));
-    token_callback(decoded_token__);
+    if (token_callback) {
+      token_callback(decoded_token__);
+    }
 
     if (!ignore_eos && eos_ids_->count(cur_token) > 0) {
       ET_LOG(Info, "Reached EOS; stopping generation");

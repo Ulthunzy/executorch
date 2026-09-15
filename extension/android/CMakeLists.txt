@@ -184,14 +184,30 @@ endif()
 if(EXECUTORCH_BUILD_LLAMA_JNI)
   target_sources(
     executorch_jni PRIVATE jni/jni_layer_llama.cpp jni/jni_layer_asr.cpp
+                          jni/jni_layer_textencoder.cpp
   )
   list(APPEND link_libraries extension_llm_runner extension_asr_runner)
   target_compile_definitions(executorch_jni PUBLIC EXECUTORCH_BUILD_LLAMA_JNI=1)
 
   if(QNN_SDK_ROOT)
+    if(NOT TARGET crypto)
+      set(_et_jni_build_testing "${BUILD_TESTING}")
+      set(_et_jni_build_shared_libs "${BUILD_SHARED_LIBS}")
+      set(BUILD_TESTING OFF)
+      set(BUILD_SHARED_LIBS OFF)
+      add_subdirectory(
+        ${EXECUTORCH_ROOT}/third-party/boringssl
+        ${CMAKE_CURRENT_BINARY_DIR}/third-party/boringssl
+        EXCLUDE_FROM_ALL
+      )
+      set(BUILD_TESTING "${_et_jni_build_testing}")
+      set(BUILD_SHARED_LIBS "${_et_jni_build_shared_libs}")
+    endif()
+    list(APPEND link_libraries crypto)
     target_sources(
       executorch_jni
       PRIVATE
+        jni/encrypted_model_loader.cpp
         ${EXECUTORCH_ROOT}/examples/qualcomm/oss_scripts/llama/runner/runner.cpp
         ${EXECUTORCH_ROOT}/examples/qualcomm/oss_scripts/llama/runner/decoder_runner.cpp
         ${EXECUTORCH_ROOT}/examples/qualcomm/oss_scripts/llama/runner/prompt_processor.cpp

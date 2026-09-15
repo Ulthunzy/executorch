@@ -29,6 +29,7 @@ def load_text_calibration_datasets(
     tokenizer,
     max_context_len: int,
     seed: int = 42,
+    preserve_sources: Optional[List[str]] = None,
 ) -> List[List[int]]:
     """Stream and pack raw text into bounded calibration sequences, then mix sources."""
     if not sample_counts or any(n <= 0 for n in sample_counts):
@@ -39,6 +40,14 @@ def load_text_calibration_datasets(
         raise ValueError("Provide one --calib_text_samples count, or one per dataset.")
     if max_context_len < 2:
         raise ValueError("Raw-text calibration requires max_context_len >= 2.")
+    preserve_sources = set(preserve_sources or [])
+    if not preserve_sources.issubset(sources):
+        raise ValueError("Preserved sources must also appear in --calib_text_datasets.")
+    if any(
+        not Path(source).is_file() or Path(source).suffix not in (".json", ".jsonl")
+        for source in preserve_sources
+    ):
+        raise ValueError("Preserved sources must be local JSON/JSONL files.")
 
     presets = {
         "cci3-hq": ("BAAI/CCI3-HQ", None),
@@ -67,8 +76,24 @@ def load_text_calibration_datasets(
         for sample in islice(ds, max(1000, count * 1000)):
             raw_text = sample.get("text")
             if not isinstance(raw_text, str) or not raw_text.strip():
+                if source in preserve_sources:
+                    raise ValueError(
+                        f"{source}: preserved row requires nonempty 'text'."
+                    )
                 continue
             tokens = tokenizer.encode(raw_text, bos=False, eos=False)
+            if source in preserve_sources:
+                if not 2 <= len(tokens) <= max_context_len:
+                    raise ValueError(
+                        f"{source}: preserved row {sample.get('id', '?')} has "
+                        f"{len(tokens)} tokens; expected 2..{max_context_len}. "
+                        "Refusing to truncate a complete conversation."
+                    )
+                # Keep preformatted conversations token-exact, including their EOS.
+                packed.append(tokens)
+                if len(packed) == count:
+                    break
+                continue
             if not tokens:
                 continue
             if len(tokens) > max_context_len:
@@ -97,11 +122,12 @@ def load_text_calibration_datasets(
                 count,
             )
         logging.info(
-            "%s: %d calibration sequences, %d tokens (train split, seed=%d)",
+            "%s: %d calibration sequences, %d tokens (train split, seed=%d, preserve_boundaries=%s)",
             source,
             len(packed),
             sum(map(len, packed)),
             seed,
+            source in preserve_sources,
         )
         sequences.extend(packed)
     rng.shuffle(sequences)
