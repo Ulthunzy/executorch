@@ -638,6 +638,31 @@ host memory even with `--model_mode kv`. This option does not skip calibration o
 change the deployed PTE; it cannot be combined with `--eval_methods sqnr_eval`.
 The default still saves the QDQ artifact for later accuracy analysis.
 
+##### Re-exporting after the masked-softmax causality fix
+
+Models configured with `masked_softmax=True`, including `lincal-1_7b`, now
+exclude masked scores before the row minimum and explicitly zero masked
+probabilities after softmax. This removes the dependency on future keys and
+masked values in the saved QDQ graph. The same implementation is used for
+calibration, prefill and decode, without changing the KV layout or prefill AR.
+The finite fill avoids introducing infinity into the QNN graph.
+
+For R3 models, MHA-to-SHA conversion keeps native Hadamard rotations batched
+and splits their outputs into attention heads. This avoids the QNN 2.49
+`q::ConvLayer_s1.opt` preparation failure observed when splitting the rotations
+themselves. R3, per-head attention and the KV interface remain enabled/unchanged.
+
+Existing PT2/PTE files do not pick up Python source changes. Re-run the normal
+`llama.py` calibration and export with the original SafeTensors checkpoint and
+a **new artifact directory**. No weight retraining is needed; recalibration
+collects activation encodings for the changed graph. Omit `--skip_qdq_save` when
+both `decode_qdq.pt2` and PTE are needed. Do not copy old graph encodings onto the
+new topology or use the historical PT2-only diagnostic patches as a release.
+
+Validate the new artifacts through [model_validation](model_validation/README.md).
+The PT2 future-token causality guard remains enabled; passing small regression
+models does not establish full-model PPL or answer quality.
+
 ##### Mixed Chinese/English raw-text calibration
 
 For text-only models, add these options to the export command to calibrate on
