@@ -1,0 +1,1062 @@
+{
+  "schema_version": 1,
+  "name": "luxi-calibration-multiturn-candidates-v1-not-heldout-eval",
+  "sessions": [
+    {
+      "id": "C01",
+      "group": "购物计算",
+      "turns": [
+        {
+          "id": "C01T1",
+          "turn": 1,
+          "prompt": "一盒彩笔18元，我买了4盒，一共需要多少钱？",
+          "expected_answer_regex": "72",
+          "required_name_language": "either",
+          "misidentification_challenge": false
+        },
+        {
+          "id": "C01T2",
+          "turn": 2,
+          "prompt": "如果退掉其中一盒，现在实际花了多少钱？",
+          "expected_answer_regex": "54",
+          "required_name_language": "either",
+          "misidentification_challenge": false
+        }
+      ]
+    },
+    {
+      "id": "C02",
+      "group": "购物计算",
+      "turns": [
+        {
+          "id": "C02T1",
+          "turn": 1,
+          "prompt": "笔记本每本7元，买5本后用50元付款，应找回多少元？",
+          "expected_answer_regex": "15",
+          "required_name_language": "either",
+          "misidentification_challenge": false
+        },
+        {
+          "id": "C02T2",
+          "turn": 2,
+          "prompt": "再买一本同样的笔记本，找回的钱还剩多少元？",
+          "expected_answer_regex": "8",
+          "required_name_language": "either",
+          "misidentification_challenge": false
+        }
+      ]
+    },
+    {
+      "id": "C03",
+      "group": "数量变化",
+      "turns": [
+        {
+          "id": "C03T1",
+          "turn": 1,
+          "prompt": "仓库有96个杯子，平均装进8个箱子，每箱几个？",
+          "expected_answer_regex": "12",
+          "required_name_language": "either",
+          "misidentification_challenge": false
+        },
+        {
+          "id": "C03T2",
+          "turn": 2,
+          "prompt": "其中3箱送走了，仓库还剩多少个杯子？",
+          "expected_answer_regex": "60",
+          "required_name_language": "either",
+          "misidentification_challenge": false
+        }
+      ]
+    },
+    {
+      "id": "C04",
+      "group": "数量变化",
+      "turns": [
+        {
+          "id": "C04T1",
+          "turn": 1,
+          "prompt": "我有45张贴纸，送给朋友17张，现在还剩多少张？",
+          "expected_answer_regex": "28",
+          "required_name_language": "either",
+          "misidentification_challenge": false
+        },
+        {
+          "id": "C04T2",
+          "turn": 2,
+          "prompt": "朋友又还给我6张，现在是多少张？",
+          "expected_answer_regex": "34",
+          "required_name_language": "either",
+          "misidentification_challenge": false
+        }
+      ]
+    },
+    {
+      "id": "C05",
+      "group": "折扣计算",
+      "turns": [
+        {
+          "id": "C05T1",
+          "turn": 1,
+          "prompt": "一件原价120元的外套打八折，售价是多少？",
+          "expected_answer_regex": "96",
+          "required_name_language": "either",
+          "misidentification_challenge": false
+        },
+        {
+          "id": "C05T2",
+          "turn": 2,
+          "prompt": "在折后价格上再减10元，最后付多少钱？",
+          "expected_answer_regex": "86",
+          "required_name_language": "either",
+          "misidentification_challenge": false
+        }
+      ]
+    },
+    {
+      "id": "C06",
+      "group": "距离计算",
+      "turns": [
+        {
+          "id": "C06T1",
+          "turn": 1,
+          "prompt": "每圈跑道长400米，跑3圈是多少米？",
+          "expected_answer_regex": "1200|1,200",
+          "required_name_language": "either",
+          "misidentification_challenge": false
+        },
+        {
+          "id": "C06T2",
+          "turn": 2,
+          "prompt": "如果再跑半圈，总距离是多少米？",
+          "expected_answer_regex": "1400|1,400",
+          "required_name_language": "either",
+          "misidentification_challenge": false
+        }
+      ]
+    },
+    {
+      "id": "C07",
+      "group": "平均数",
+      "turns": [
+        {
+          "id": "C07T1",
+          "turn": 1,
+          "prompt": "三次测验分数是80、90、100，平均分是多少？",
+          "expected_answer_regex": "90",
+          "required_name_language": "either",
+          "misidentification_challenge": false
+        },
+        {
+          "id": "C07T2",
+          "turn": 2,
+          "prompt": "第四次考了90分，四次的平均分是多少？",
+          "expected_answer_regex": "90",
+          "required_name_language": "either",
+          "misidentification_challenge": false
+        }
+      ]
+    },
+    {
+      "id": "C08",
+      "group": "单位换算",
+      "turns": [
+        {
+          "id": "C08T1",
+          "turn": 1,
+          "prompt": "2米35厘米合计是多少厘米？",
+          "expected_answer_regex": "235",
+          "required_name_language": "either",
+          "misidentification_challenge": false
+        },
+        {
+          "id": "C08T2",
+          "turn": 2,
+          "prompt": "从这段长度里剪去40厘米，还剩多少厘米？",
+          "expected_answer_regex": "195",
+          "required_name_language": "either",
+          "misidentification_challenge": false
+        }
+      ]
+    },
+    {
+      "id": "C09",
+      "group": "时间计算",
+      "turns": [
+        {
+          "id": "C09T1",
+          "turn": 1,
+          "prompt": "现在是14点20分，会议在45分钟后开始，开始时间是什么？",
+          "expected_answer_regex": "15[:：]05|15点0?5|十五点零?五",
+          "required_name_language": "either",
+          "misidentification_challenge": false
+        },
+        {
+          "id": "C09T2",
+          "turn": 2,
+          "prompt": "会议持续30分钟，那么几点结束？",
+          "expected_answer_regex": "15[:：]35|15点35|十五点三十五",
+          "required_name_language": "either",
+          "misidentification_challenge": false
+        }
+      ]
+    },
+    {
+      "id": "C10",
+      "group": "时间计算",
+      "turns": [
+        {
+          "id": "C10T1",
+          "turn": 1,
+          "prompt": "火车9点10分出发，行程1小时25分钟，到达时间是什么？",
+          "expected_answer_regex": "10[:：]35|10点35|十点三十五",
+          "required_name_language": "either",
+          "misidentification_challenge": false
+        },
+        {
+          "id": "C10T2",
+          "turn": 2,
+          "prompt": "如果到达时间推迟15分钟，新的到达时间是什么？",
+          "expected_answer_regex": "10[:：]50|10点50|十点五十",
+          "required_name_language": "either",
+          "misidentification_challenge": false
+        }
+      ]
+    },
+    {
+      "id": "C11",
+      "group": "分数计算",
+      "turns": [
+        {
+          "id": "C11T1",
+          "turn": 1,
+          "prompt": "一张披萨分成8块，我吃了3块，还剩几块？",
+          "expected_answer_regex": "5",
+          "required_name_language": "either",
+          "misidentification_challenge": false
+        },
+        {
+          "id": "C11T2",
+          "turn": 2,
+          "prompt": "剩下的又被吃掉2块，现在还剩原来披萨的几分之几？",
+          "expected_answer_regex": "3/8|八分之三|3\\\\over\\s*8|\\\\frac\\{3\\}\\{8\\}",
+          "required_name_language": "either",
+          "misidentification_challenge": false
+        }
+      ]
+    },
+    {
+      "id": "C12",
+      "group": "比例计算",
+      "turns": [
+        {
+          "id": "C12T1",
+          "turn": 1,
+          "prompt": "配饮料时，果汁和水按1比3混合。用了100毫升果汁，需要多少毫升水？",
+          "expected_answer_regex": "300",
+          "required_name_language": "either",
+          "misidentification_challenge": false
+        },
+        {
+          "id": "C12T2",
+          "turn": 2,
+          "prompt": "如果果汁增到150毫升，为保持比例要用多少毫升水？",
+          "expected_answer_regex": "450",
+          "required_name_language": "either",
+          "misidentification_challenge": false
+        }
+      ]
+    },
+    {
+      "id": "C13",
+      "group": "整数计算",
+      "turns": [
+        {
+          "id": "C13T1",
+          "turn": 1,
+          "prompt": "请计算17加26，给出结果。",
+          "expected_answer_regex": "43",
+          "required_name_language": "either",
+          "misidentification_challenge": false
+        },
+        {
+          "id": "C13T2",
+          "turn": 2,
+          "prompt": "把刚才的结果乘以2，得到多少？",
+          "expected_answer_regex": "86",
+          "required_name_language": "either",
+          "misidentification_challenge": false
+        }
+      ]
+    },
+    {
+      "id": "C14",
+      "group": "整数计算",
+      "turns": [
+        {
+          "id": "C14T1",
+          "turn": 1,
+          "prompt": "请算一下144除以12是多少。",
+          "expected_answer_regex": "12",
+          "required_name_language": "either",
+          "misidentification_challenge": false
+        },
+        {
+          "id": "C14T2",
+          "turn": 2,
+          "prompt": "再把这个结果减去5，是多少？",
+          "expected_answer_regex": "7",
+          "required_name_language": "either",
+          "misidentification_challenge": false
+        }
+      ]
+    },
+    {
+      "id": "C15",
+      "group": "面积计算",
+      "turns": [
+        {
+          "id": "C15T1",
+          "turn": 1,
+          "prompt": "长方形长9厘米、宽4厘米，面积是多少平方厘米？",
+          "expected_answer_regex": "36",
+          "required_name_language": "either",
+          "misidentification_challenge": false
+        },
+        {
+          "id": "C15T2",
+          "turn": 2,
+          "prompt": "宽不变，长增加2厘米，新的面积是多少平方厘米？",
+          "expected_answer_regex": "44",
+          "required_name_language": "either",
+          "misidentification_challenge": false
+        }
+      ]
+    },
+    {
+      "id": "C16",
+      "group": "费用计算",
+      "turns": [
+        {
+          "id": "C16T1",
+          "turn": 1,
+          "prompt": "网费每月60元，连续支付3个月共多少钱？",
+          "expected_answer_regex": "180",
+          "required_name_language": "either",
+          "misidentification_challenge": false
+        },
+        {
+          "id": "C16T2",
+          "turn": 2,
+          "prompt": "如果使用一张30元优惠券，实际支付多少钱？",
+          "expected_answer_regex": "150",
+          "required_name_language": "either",
+          "misidentification_challenge": false
+        }
+      ]
+    },
+    {
+      "id": "C17",
+      "group": "颜色记忆",
+      "turns": [
+        {
+          "id": "C17T1",
+          "turn": 1,
+          "prompt": "请记住：我的雨伞是紫色的，水杯是橙色的。",
+          "expected_answer_regex": "紫色",
+          "required_name_language": "either",
+          "misidentification_challenge": false
+        },
+        {
+          "id": "C17T2",
+          "turn": 2,
+          "prompt": "只回答雨伞的颜色，不要把水杯的颜色混进来。",
+          "expected_answer_regex": "紫色",
+          "required_name_language": "either",
+          "misidentification_challenge": false
+        }
+      ]
+    },
+    {
+      "id": "C18",
+      "group": "物品记忆",
+      "turns": [
+        {
+          "id": "C18T1",
+          "turn": 1,
+          "prompt": "我把门卡放在书桌左边的蓝色盒子里，请帮我记住。",
+          "expected_answer_regex": "蓝色盒子|蓝盒",
+          "required_name_language": "either",
+          "misidentification_challenge": false
+        },
+        {
+          "id": "C18T2",
+          "turn": 2,
+          "prompt": "门卡现在在哪里？",
+          "expected_answer_regex": "书桌.*左|左.*蓝色盒",
+          "required_name_language": "either",
+          "misidentification_challenge": false
+        }
+      ]
+    },
+    {
+      "id": "C19",
+      "group": "偏好更新",
+      "turns": [
+        {
+          "id": "C19T1",
+          "turn": 1,
+          "prompt": "我想喝温水，不想喝冰水，请记住这个偏好。",
+          "expected_answer_regex": "温水",
+          "required_name_language": "either",
+          "misidentification_challenge": false
+        },
+        {
+          "id": "C19T2",
+          "turn": 2,
+          "prompt": "如果你帮我选饮品，该选温水还是冰水？",
+          "expected_answer_regex": "温水",
+          "required_name_language": "either",
+          "misidentification_challenge": false
+        }
+      ]
+    },
+    {
+      "id": "C20",
+      "group": "计划更新",
+      "turns": [
+        {
+          "id": "C20T1",
+          "turn": 1,
+          "prompt": "我原计划周三上午整理照片，请先记住。",
+          "expected_answer_regex": "周三|星期三",
+          "required_name_language": "either",
+          "misidentification_challenge": false
+        },
+        {
+          "id": "C20T2",
+          "turn": 2,
+          "prompt": "计划改到周五下午了。现在最终安排在什么时候？",
+          "expected_answer_regex": "周五下午|星期五下午",
+          "required_name_language": "either",
+          "misidentification_challenge": false
+        }
+      ]
+    },
+    {
+      "id": "C21",
+      "group": "称呼记忆",
+      "turns": [
+        {
+          "id": "C21T1",
+          "turn": 1,
+          "prompt": "我的昵称是小舟，请在这次对话中这样称呼我。",
+          "expected_answer_regex": "小舟",
+          "required_name_language": "either",
+          "misidentification_challenge": false
+        },
+        {
+          "id": "C21T2",
+          "turn": 2,
+          "prompt": "刚才我让你怎么称呼我？",
+          "expected_answer_regex": "小舟",
+          "required_name_language": "either",
+          "misidentification_challenge": false
+        }
+      ]
+    },
+    {
+      "id": "C22",
+      "group": "项目记忆",
+      "turns": [
+        {
+          "id": "C22T1",
+          "turn": 1,
+          "prompt": "请记住项目代号是晨露，负责人是林悦。",
+          "expected_answer_regex": "晨露",
+          "required_name_language": "either",
+          "misidentification_challenge": false
+        },
+        {
+          "id": "C22T2",
+          "turn": 2,
+          "prompt": "只写出这个项目的负责人姓名。",
+          "expected_answer_regex": "林悦",
+          "required_name_language": "either",
+          "misidentification_challenge": false
+        }
+      ]
+    },
+    {
+      "id": "C23",
+      "group": "清单修改",
+      "turns": [
+        {
+          "id": "C23T1",
+          "turn": 1,
+          "prompt": "我的购物清单是鸡蛋、面包、牛奶，请复述这三项。",
+          "expected_answer_regex": "鸡蛋.*面包.*牛奶",
+          "required_name_language": "either",
+          "misidentification_challenge": false
+        },
+        {
+          "id": "C23T2",
+          "turn": 2,
+          "prompt": "把牛奶换成豆浆后，清单有哪些东西？",
+          "expected_answer_regex": "鸡蛋.*面包.*豆浆",
+          "required_name_language": "either",
+          "misidentification_challenge": false
+        }
+      ]
+    },
+    {
+      "id": "C24",
+      "group": "排序记忆",
+      "turns": [
+        {
+          "id": "C24T1",
+          "turn": 1,
+          "prompt": "三个人的身高分别是小安150厘米、小博160厘米、小晨155厘米。谁最高？",
+          "expected_answer_regex": "小博",
+          "required_name_language": "either",
+          "misidentification_challenge": false
+        },
+        {
+          "id": "C24T2",
+          "turn": 2,
+          "prompt": "那谁最矮？",
+          "expected_answer_regex": "小安",
+          "required_name_language": "either",
+          "misidentification_challenge": false
+        }
+      ]
+    },
+    {
+      "id": "C25",
+      "group": "空间关系",
+      "turns": [
+        {
+          "id": "C25T1",
+          "turn": 1,
+          "prompt": "红球在绿球左边，绿球在蓝球左边。最左边是什么颜色的球？",
+          "expected_answer_regex": "红",
+          "required_name_language": "either",
+          "misidentification_challenge": false
+        },
+        {
+          "id": "C25T2",
+          "turn": 2,
+          "prompt": "最右边是什么颜色的球？",
+          "expected_answer_regex": "蓝",
+          "required_name_language": "either",
+          "misidentification_challenge": false
+        }
+      ]
+    },
+    {
+      "id": "C26",
+      "group": "日期顺序",
+      "turns": [
+        {
+          "id": "C26T1",
+          "turn": 1,
+          "prompt": "请把周二、周五、周一按一周中的先后顺序排列。",
+          "expected_answer_regex": "周一.*周二.*周五",
+          "required_name_language": "either",
+          "misidentification_challenge": false
+        },
+        {
+          "id": "C26T2",
+          "turn": 2,
+          "prompt": "把周三也加进去，重新按先后顺序排列。",
+          "expected_answer_regex": "周一.*周二.*周三.*周五",
+          "required_name_language": "either",
+          "misidentification_challenge": false
+        }
+      ]
+    },
+    {
+      "id": "C27",
+      "group": "水果记忆",
+      "turns": [
+        {
+          "id": "C27T1",
+          "turn": 1,
+          "prompt": "我最喜欢梨，妹妹最喜欢葡萄，请记住谁喜欢哪种水果。",
+          "expected_answer_regex": "梨",
+          "required_name_language": "either",
+          "misidentification_challenge": false
+        },
+        {
+          "id": "C27T2",
+          "turn": 2,
+          "prompt": "妹妹喜欢哪种水果？",
+          "expected_answer_regex": "葡萄",
+          "required_name_language": "either",
+          "misidentification_challenge": false
+        }
+      ]
+    },
+    {
+      "id": "C28",
+      "group": "任务进度",
+      "turns": [
+        {
+          "id": "C28T1",
+          "turn": 1,
+          "prompt": "待办有洗衣服、扫地、浇花，目前只有扫地完成了。还有哪些没做？",
+          "expected_answer_regex": "洗衣服.*浇花|浇花.*洗衣服",
+          "required_name_language": "either",
+          "misidentification_challenge": false
+        },
+        {
+          "id": "C28T2",
+          "turn": 2,
+          "prompt": "现在洗衣服也完成了，还剩哪一项？",
+          "expected_answer_regex": "浇花",
+          "required_name_language": "either",
+          "misidentification_challenge": false
+        }
+      ]
+    },
+    {
+      "id": "C29",
+      "group": "地点更新",
+      "turns": [
+        {
+          "id": "C29T1",
+          "turn": 1,
+          "prompt": "钥匙原来在玄关抽屉里，现在我把它放到背包前袋。请记住最新位置。",
+          "expected_answer_regex": "背包前袋",
+          "required_name_language": "either",
+          "misidentification_challenge": false
+        },
+        {
+          "id": "C29T2",
+          "turn": 2,
+          "prompt": "如果我现在找钥匙，应该先找哪里？",
+          "expected_answer_regex": "背包.*前袋",
+          "required_name_language": "either",
+          "misidentification_challenge": false
+        }
+      ]
+    },
+    {
+      "id": "C30",
+      "group": "约定记忆",
+      "turns": [
+        {
+          "id": "C30T1",
+          "turn": 1,
+          "prompt": "我们约定用星桥作为这次活动的名称，请记住。",
+          "expected_answer_regex": "星桥",
+          "required_name_language": "either",
+          "misidentification_challenge": false
+        },
+        {
+          "id": "C30T2",
+          "turn": 2,
+          "prompt": "这次活动的名称是什么？",
+          "expected_answer_regex": "星桥",
+          "required_name_language": "either",
+          "misidentification_challenge": false
+        }
+      ]
+    },
+    {
+      "id": "C31",
+      "group": "预约记忆",
+      "turns": [
+        {
+          "id": "C31T1",
+          "turn": 1,
+          "prompt": "请记住预约编号是A731，预约时间是周六上午10点。",
+          "expected_answer_regex": "A731",
+          "required_name_language": "either",
+          "misidentification_challenge": false
+        },
+        {
+          "id": "C31T2",
+          "turn": 2,
+          "prompt": "只输出刚才的预约编号。",
+          "expected_answer_regex": "A731",
+          "required_name_language": "either",
+          "misidentification_challenge": false
+        }
+      ]
+    },
+    {
+      "id": "C32",
+      "group": "人数变化",
+      "turns": [
+        {
+          "id": "C32T1",
+          "turn": 1,
+          "prompt": "读书小组原来有8个人，新加入2个人，现在共有几个人？",
+          "expected_answer_regex": "10",
+          "required_name_language": "either",
+          "misidentification_challenge": false
+        },
+        {
+          "id": "C32T2",
+          "turn": 2,
+          "prompt": "其中1个人请假，这次实际到场多少人？",
+          "expected_answer_regex": "9",
+          "required_name_language": "either",
+          "misidentification_challenge": false
+        }
+      ]
+    },
+    {
+      "id": "C33",
+      "group": "翻译",
+      "turns": [
+        {
+          "id": "C33T1",
+          "turn": 1,
+          "prompt": "请把英文单词apple翻译成中文。",
+          "expected_answer_regex": "苹果",
+          "required_name_language": "either",
+          "misidentification_challenge": false
+        },
+        {
+          "id": "C33T2",
+          "turn": 2,
+          "prompt": "刚才这个中文词对应的英文单词怎么拼？",
+          "expected_answer_regex": "[Aa]pple",
+          "required_name_language": "either",
+          "misidentification_challenge": false
+        }
+      ]
+    },
+    {
+      "id": "C34",
+      "group": "翻译",
+      "turns": [
+        {
+          "id": "C34T1",
+          "turn": 1,
+          "prompt": "请把good morning翻译成中文。",
+          "expected_answer_regex": "早上好|早安",
+          "required_name_language": "either",
+          "misidentification_challenge": false
+        },
+        {
+          "id": "C34T2",
+          "turn": 2,
+          "prompt": "如果改为晚上见面，英文问候应怎样说？",
+          "expected_answer_regex": "[Gg]ood evening",
+          "required_name_language": "either",
+          "misidentification_challenge": false
+        }
+      ]
+    },
+    {
+      "id": "C35",
+      "group": "文本提取",
+      "turns": [
+        {
+          "id": "C35T1",
+          "turn": 1,
+          "prompt": "从这句话提取城市名称：小吴从杭州坐车去南京。",
+          "expected_answer_regex": "杭州.*南京",
+          "required_name_language": "either",
+          "misidentification_challenge": false
+        },
+        {
+          "id": "C35T2",
+          "turn": 2,
+          "prompt": "只保留目的地城市，应该是哪一个？",
+          "expected_answer_regex": "南京",
+          "required_name_language": "either",
+          "misidentification_challenge": false
+        }
+      ]
+    },
+    {
+      "id": "C36",
+      "group": "词语分类",
+      "turns": [
+        {
+          "id": "C36T1",
+          "turn": 1,
+          "prompt": "苹果、香蕉、胡萝卜中，哪一个通常归为蔬菜？",
+          "expected_answer_regex": "胡萝卜",
+          "required_name_language": "either",
+          "misidentification_challenge": false
+        },
+        {
+          "id": "C36T2",
+          "turn": 2,
+          "prompt": "剩下的两项是什么？",
+          "expected_answer_regex": "苹果.*香蕉|香蕉.*苹果",
+          "required_name_language": "either",
+          "misidentification_challenge": false
+        }
+      ]
+    },
+    {
+      "id": "C37",
+      "group": "数字排序",
+      "turns": [
+        {
+          "id": "C37T1",
+          "turn": 1,
+          "prompt": "把9、3、7按从小到大排列。",
+          "expected_answer_regex": "3\\D+7\\D+9",
+          "required_name_language": "either",
+          "misidentification_challenge": false
+        },
+        {
+          "id": "C37T2",
+          "turn": 2,
+          "prompt": "如果再加入数字5，新的顺序是什么？",
+          "expected_answer_regex": "3\\D+5\\D+7\\D+9",
+          "required_name_language": "either",
+          "misidentification_challenge": false
+        }
+      ]
+    },
+    {
+      "id": "C38",
+      "group": "字符串处理",
+      "turns": [
+        {
+          "id": "C38T1",
+          "turn": 1,
+          "prompt": "字符串abc一共有几个字符？",
+          "expected_answer_regex": "3|三",
+          "required_name_language": "either",
+          "misidentification_challenge": false
+        },
+        {
+          "id": "C38T2",
+          "turn": 2,
+          "prompt": "在它末尾加上de后，新字符串是什么？",
+          "expected_answer_regex": "abcde",
+          "required_name_language": "either",
+          "misidentification_challenge": false
+        }
+      ]
+    },
+    {
+      "id": "C39",
+      "group": "简短概括",
+      "turns": [
+        {
+          "id": "C39T1",
+          "turn": 1,
+          "prompt": "请概括：小猫早上在窗边晒太阳，下午在沙发上睡觉。",
+          "expected_answer_regex": "晒太阳|睡觉",
+          "required_name_language": "either",
+          "misidentification_challenge": false
+        },
+        {
+          "id": "C39T2",
+          "turn": 2,
+          "prompt": "它下午在哪里？",
+          "expected_answer_regex": "沙发",
+          "required_name_language": "either",
+          "misidentification_challenge": false
+        }
+      ]
+    },
+    {
+      "id": "C40",
+      "group": "英文记忆",
+      "turns": [
+        {
+          "id": "C40T1",
+          "turn": 1,
+          "prompt": "Please remember: the meeting room is Maple and the access code is 4826.",
+          "expected_answer_regex": "Maple|4826",
+          "required_name_language": "either",
+          "misidentification_challenge": false
+        },
+        {
+          "id": "C40T2",
+          "turn": 2,
+          "prompt": "What is the access code? Give only the code.",
+          "expected_answer_regex": "4826",
+          "required_name_language": "either",
+          "misidentification_challenge": false
+        }
+      ]
+    },
+    {
+      "id": "C41",
+      "group": "身份问答",
+      "turns": [
+        {
+          "id": "C41T1",
+          "turn": 1,
+          "prompt": "我想知道当前这位智能助手的名称，请介绍你的名字。",
+          "expected_answer_regex": "陆小兮|[Ll]u\\s*[Xx]iaoxi",
+          "required_name_language": "either",
+          "misidentification_challenge": false
+        },
+        {
+          "id": "C41T2",
+          "turn": 2,
+          "prompt": "请只留下你刚才说的中文名字。",
+          "expected_answer_regex": "陆小兮",
+          "required_name_language": "either",
+          "misidentification_challenge": false
+        }
+      ]
+    },
+    {
+      "id": "C42",
+      "group": "身份问答",
+      "turns": [
+        {
+          "id": "C42T1",
+          "turn": 1,
+          "prompt": "在这次聊天中，你以什么名称提供帮助？",
+          "expected_answer_regex": "陆小兮|[Ll]u\\s*[Xx]iaoxi",
+          "required_name_language": "either",
+          "misidentification_challenge": false
+        },
+        {
+          "id": "C42T2",
+          "turn": 2,
+          "prompt": "把你的英文名称单独写在一行里。",
+          "expected_answer_regex": "[Ll]u\\s*[Xx]iaoxi",
+          "required_name_language": "either",
+          "misidentification_challenge": false
+        }
+      ]
+    },
+    {
+      "id": "C43",
+      "group": "身份问答",
+      "turns": [
+        {
+          "id": "C43T1",
+          "turn": 1,
+          "prompt": "请告诉我这个对话助手的中文称呼，方便我记下来。",
+          "expected_answer_regex": "陆小兮",
+          "required_name_language": "either",
+          "misidentification_challenge": false
+        },
+        {
+          "id": "C43T2",
+          "turn": 2,
+          "prompt": "我可以直接用这个名字叫你吗？请带上名字回答。",
+          "expected_answer_regex": "陆小兮",
+          "required_name_language": "either",
+          "misidentification_challenge": false
+        }
+      ]
+    },
+    {
+      "id": "C44",
+      "group": "身份问答",
+      "turns": [
+        {
+          "id": "C44T1",
+          "turn": 1,
+          "prompt": "我第一次使用这个助手，想先了解你的名称。",
+          "expected_answer_regex": "陆小兮|[Ll]u\\s*[Xx]iaoxi",
+          "required_name_language": "either",
+          "misidentification_challenge": false
+        },
+        {
+          "id": "C44T2",
+          "turn": 2,
+          "prompt": "接下来请用一句简短的中文自我介绍再说一遍。",
+          "expected_answer_regex": "陆小兮",
+          "required_name_language": "either",
+          "misidentification_challenge": false
+        }
+      ]
+    },
+    {
+      "id": "C45",
+      "group": "身份问答",
+      "turns": [
+        {
+          "id": "C45T1",
+          "turn": 1,
+          "prompt": "请给出你自己的中文名称，不用列举功能。",
+          "expected_answer_regex": "陆小兮",
+          "required_name_language": "either",
+          "misidentification_challenge": false
+        },
+        {
+          "id": "C45T2",
+          "turn": 2,
+          "prompt": "这个名称的英文写法是什么？",
+          "expected_answer_regex": "[Ll]u\\s*[Xx]iaoxi",
+          "required_name_language": "either",
+          "misidentification_challenge": false
+        }
+      ]
+    },
+    {
+      "id": "C46",
+      "group": "身份问答",
+      "turns": [
+        {
+          "id": "C46T1",
+          "turn": 1,
+          "prompt": "What's the name of the assistant in this conversation?",
+          "expected_answer_regex": "[Ll]u\\s*[Xx]iaoxi",
+          "required_name_language": "either",
+          "misidentification_challenge": false
+        },
+        {
+          "id": "C46T2",
+          "turn": 2,
+          "prompt": "How do you write your name in Chinese characters?",
+          "expected_answer_regex": "陆小兮",
+          "required_name_language": "either",
+          "misidentification_challenge": false
+        }
+      ]
+    },
+    {
+      "id": "C47",
+      "group": "身份问答",
+      "turns": [
+        {
+          "id": "C47T1",
+          "turn": 1,
+          "prompt": "请以“我是”开头，简短说出你的助手名称。",
+          "expected_answer_regex": "陆小兮|[Ll]u\\s*[Xx]iaoxi",
+          "required_name_language": "either",
+          "misidentification_challenge": false
+        },
+        {
+          "id": "C47T2",
+          "turn": 2,
+          "prompt": "去掉其余介绍，只重复你的中文名称。",
+          "expected_answer_regex": "陆小兮",
+          "required_name_language": "either",
+          "misidentification_challenge": false
+        }
+      ]
+    },
+    {
+      "id": "C48",
+      "group": "身份问答",
+      "turns": [
+        {
+          "id": "C48T1",
+          "turn": 1,
+          "prompt": "如果在通讯录中记录这个助手，我应该填哪个中文名字？",
+          "expected_answer_regex": "陆小兮",
+          "required_name_language": "either",
+          "misidentification_challenge": false
+        },
+        {
+          "id": "C48T2",
+          "turn": 2,
+          "prompt": "再确认一遍，你自己的英文名称是什么？",
+          "expected_answer_regex": "[Ll]u\\s*[Xx]iaoxi",
+          "required_name_language": "either",
+          "misidentification_challenge": false
+        }
+      ]
+    }
+  ]
+}

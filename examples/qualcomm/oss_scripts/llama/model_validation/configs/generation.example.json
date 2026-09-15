@@ -1,0 +1,53 @@
+{
+  "schema_version": 1,
+  "description": "Qwen3/Lincal 两轮对话：think 开关 × RP1.0/1.1；温度0、窗口128、无系统提示、保护关闭。修改路径后使用。",
+  "variables": {
+    "hf_model": "/path/to/safetensors-model",
+    "pte_model": "/path/to/hybrid_llama_qnn.pte",
+    "tokenizer": "/path/to/safetensors-model",
+    "pte_tokenizer": "/path/to/tokenizer.json",
+    "cases": "${validation}/benchmarks/cases.json",
+    "driver": "${repo}/build-android/model_validation/generation/identity_eval_driver",
+    "serial": "YOUR_ADB_SERIAL",
+    "device_lib_dir": "/data/local/tmp/qnn-libs",
+    "gpu": "cuda:0",
+    "seq_len": 4096,
+    "repeat_last_n": 128,
+    "expected_english": "Lu Xiaoxi",
+    "expected_chinese": "陆小兮"
+  },
+  "output_root": "${repo}/llama-output/model-validation/new-model-generation",
+  "steps": [
+    {
+      "id": "inputs",
+      "tool": "check-inputs",
+      "args": ["--tokenizer", "${tokenizer}", "--cases", "${cases}", "--output", "${output}/inputs"],
+      "inputs": ["${tokenizer}/tokenizer.json", "${tokenizer}/tokenizer_config.json", "${cases}"],
+      "outputs": ["${output}/inputs/canonical.json", "${output}/inputs/validation.json"]
+    },
+    {
+      "id": "hf-ablation",
+      "tool": "hf",
+      "depends_on": ["inputs"],
+      "resource": "gpu:${gpu}",
+      "matrix": {"think": ["on", "off"], "rp": [1.0, 1.1]},
+      "args": ["--model", "${hf_model}", "--tokenizer", "${tokenizer}", "--device", "${gpu}", "--dtype", "bfloat16", "--attention", "sdpa", "--seq-len", "${seq_len}", "--cases", "${cases}", "--repetition-penalty", "${rp}", "--repeat-last-n", "${repeat_last_n}", "--expected-english", "${expected_english}", "--expected-chinese", "${expected_chinese}", "--output", "${output}/generation/${job}"],
+      "append_when": [{"parameter": "think", "equals": "off", "args": ["--disable-thinking"]}],
+      "inputs": ["${hf_model}", "${tokenizer}", "${cases}"],
+      "outputs": ["${output}/generation/${job}/summary.json"],
+      "resume_args": ["--resume"]
+    },
+    {
+      "id": "pte-ablation",
+      "tool": "pte",
+      "depends_on": ["inputs"],
+      "resource": "adb:${serial}",
+      "matrix": {"think": ["on", "off"], "rp": [1.0, 1.1]},
+      "args": ["run", "--model", "${pte_model}", "--tokenizer", "${pte_tokenizer}", "--device", "${serial}", "--device-lib-dir", "${device_lib_dir}", "--driver", "${driver}", "--mode", "hybrid", "--decoder", "lincal", "--seq-len", "${seq_len}", "--cases", "${cases}", "--canonical-inputs", "${output}/inputs/canonical.json", "--repetition-penalty", "${rp}", "--repeat-last-n", "${repeat_last_n}", "--no-repair-think-eos", "--no-enable-think-budget", "--expected-english", "${expected_english}", "--expected-chinese", "${expected_chinese}", "--output", "${output}/generation/${job}"],
+      "append_when": [{"parameter": "think", "equals": "off", "args": ["--disable-thinking"]}],
+      "inputs": ["${pte_model}", "${pte_tokenizer}", "${cases}", "${driver}", "${output}/inputs/canonical.json"],
+      "outputs": ["${output}/generation/${job}/summary.json"],
+      "resume_args": ["--resume"]
+    }
+  ]
+}
