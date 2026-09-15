@@ -170,6 +170,7 @@ class LLMModelConfig(ABC):
     r1: Enable SpinQuant R1 quantization optimization.
     r2: Enable SpinQuant R2 quantization optimization.
     r3: Enable SpinQuant R3 quantization optimization.
+    use_weight_sharing: Share eligible weights across HTP prefill/decode graphs. Defaults to True.
     quant_recipe: Quantization recipe to use when setting quant configs for the model.
     qat_recipe: Optional QAT-specific quantization recipe. Used only when --qat is set;
                 if None, falls back to quant_recipe.
@@ -189,6 +190,7 @@ class LLMModelConfig(ABC):
     r2: bool
     r3: bool
     quant_recipe: StaticLLMQuantRecipe
+    use_weight_sharing: bool = True
     qat_recipe: Optional[Type[StaticLLMQuantRecipe]] = None
 
     def __str__(self):  # noqa: C901
@@ -732,6 +734,7 @@ class Lincal_1_7B(LLMModelConfig):
     r1 = False
     r2 = False
     r3 = True
+    use_weight_sharing = True
     quant_recipe = Lincal_1_7BQuantRecipe
 
 
