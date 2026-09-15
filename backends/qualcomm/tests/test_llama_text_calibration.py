@@ -40,8 +40,11 @@ class TextTokenizer:
 @pytest.fixture
 def hub_sources(monkeypatch):
     calls = []
+    real_load = loaders.hf_load_dataset
 
     def load(repo, **kwargs):
+        if repo == "json":
+            return real_load(repo, **kwargs)
         calls.append((repo, kwargs))
         text = "中文校准" if repo == "BAAI/CCI3-HQ" else "English calibration"
         return IterableDataset.from_generator(
@@ -205,3 +208,110 @@ def test_raw_text_rejects_multimodal():
             SimpleNamespace(tokenizer=TextTokenizer()),
             AttentionMask([CausalAttentionMask(1, 8, 8)]),
         )
+
+
+def test_preserved_conversations_are_token_exact(tmp_path):
+    path = tmp_path / "chat.jsonl"
+    texts = ["<think>one</think>answer<eos>", "<think>two</think>final<eos>"]
+    path.write_text(
+        "\n".join(json.dumps({"id": i, "text": s}) for i, s in enumerate(texts))
+    )
+    result = loaders.load_text_calibration_datasets(
+        [str(path)], [10], TextTokenizer(), 128, preserve_sources=[str(path)]
+    )
+    assert sorted(result) == sorted([list(map(ord, s)) for s in texts])
+    assert all(0 not in seq for seq in result)  # No extra EOS injected.
+
+
+def test_preserved_source_does_not_change_other_sources(tmp_path, hub_sources):
+    path = tmp_path / "chat.jsonl"
+    path.write_text(json.dumps({"text": "abcdef"}))
+    result = loaders.load_text_calibration_datasets(
+        [str(path), "wikitext-2"],
+        [1, 2],
+        TextTokenizer(),
+        8,
+        preserve_sources=[str(path)],
+    )
+    assert sorted(map(len, result)) == [6, 8, 8]
+    assert list(map(ord, "abcdef")) in result
+
+
+def test_preserved_source_rejects_truncation(tmp_path):
+    path = tmp_path / "chat.jsonl"
+    path.write_text(json.dumps({"id": "long", "text": "abcdefghi"}))
+    with pytest.raises(ValueError, match="Refusing to truncate"):
+        loaders.load_text_calibration_datasets(
+            [str(path)], [1], TextTokenizer(), 8, preserve_sources=[str(path)]
+        )
+
+
+@pytest.mark.parametrize("text", [None, "", "a"])
+def test_preserved_source_rejects_invalid_rows(tmp_path, text):
+    path = tmp_path / "chat.jsonl"
+    path.write_text(json.dumps({"text": text}))
+    with pytest.raises(ValueError):
+        loaders.load_text_calibration_datasets(
+            [str(path)], [1], TextTokenizer(), 8, preserve_sources=[str(path)]
+        )
+
+
+def test_preserved_source_must_be_listed_and_local(hub_sources):
+    with pytest.raises(ValueError, match="must also appear"):
+        loaders.load_text_calibration_datasets(
+            ["wikitext-2"], [1], TextTokenizer(), 8, preserve_sources=["missing.jsonl"]
+        )
+    with pytest.raises(ValueError, match="must be local"):
+        loaders.load_text_calibration_datasets(
+            ["wikitext-2"], [1], TextTokenizer(), 8, preserve_sources=["wikitext-2"]
+        )
+    assert hub_sources == []
+
+
+def test_preserved_source_cli_and_dataloader(tmp_path):
+    path = tmp_path / "chat.jsonl"
+    path.write_text(json.dumps({"text": "abcdef"}))
+    args = _build_parser().parse_args(
+        [
+            "--decoder_model",
+            "lincal-1_7b",
+            "--prompt",
+            "hello",
+            "--max_context_len",
+            "8",
+            "--calib_text_datasets",
+            str(path),
+            "--calib_text_preserve_sources",
+            str(path),
+            "--calib_text_samples",
+            "1",
+        ]
+    )
+    cfg = DataConfig.from_args(args)
+    assert cfg.calib_text_preserve_sources == [str(path)]
+    assert cfg.seed == 42
+    builder = DatasetBuilder(
+        cfg,
+        SimpleNamespace(),
+        SimpleNamespace(tokenizer=TextTokenizer()),
+        AttentionMask([CausalAttentionMask(1, 8, 8)]),
+    )
+    batches = list(builder.build_calib_dataloaders()[TEXT_DECODER])
+    assert len(batches) == 1
+    assert batches[0]["token_ids"] == [list(map(ord, "abcdef"))]
+    assert batches[0]["input_ids"].shape == (1, 8)
+
+
+def test_cli_rejects_unlisted_preserved_source():
+    args = _build_parser().parse_args(
+        [
+            "--decoder_model",
+            "lincal-1_7b",
+            "--prompt",
+            "hello",
+            "--calib_text_preserve_sources",
+            "missing.jsonl",
+        ]
+    )
+    with pytest.raises(ValueError, match="must also appear"):
+        export_llama(args)

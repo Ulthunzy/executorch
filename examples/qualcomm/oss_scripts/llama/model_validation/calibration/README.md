@@ -4,7 +4,9 @@
 
 ## 已完成的 v1
 
-[数据及统计](../../assets/samples/luxi_think_calibration_v1/README.md)：286 组对话，316 个 assistant 回复，286,547 token。中文 R1 256 组，Luxi 自身 GPU 双轮对话 30 组；实际导出 tokenizer 与 HF tokenizer 的 token ID 已逐条核对一致。
+本地数据包位于 `examples/qualcomm/oss_scripts/llama/assets/samples/luxi_think_calibration_v1/`，数据及统计见包内 `README.md`：286 组对话，316 个 assistant 回复，286,547 token。中文 R1 256 组，Luxi 自身 GPU 双轮对话 30 组；实际导出 tokenizer 与 HF tokenizer 的 token ID 已逐条核对一致。
+
+完整数据包和历史生成结果不提交 Git，克隆仓库不会包含它们。复用时需单独复制数据包；也可以按下文流程生成新数据，并将示例中的本地模型、数据及输出路径替换为实际路径。生成器、校验工具和小型候选题集仍随源码提交。
 
 公开部分来自 [Congliu/Chinese-DeepSeek-R1-Distill-data-110k](https://huggingface.co/datasets/Congliu/Chinese-DeepSeek-R1-Distill-data-110k)，固定版本 `8520b649430617c2be4490f424d251d09d835ed3`。该数据将 `input`、`reasoning_content`、`content` 分开，数据卡标注 Apache-2.0，并保留上游来源及模型评分。评分不是独立事实保证；使用和再分发前还需核对原始来源的许可与限制。
 
