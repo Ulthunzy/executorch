@@ -386,6 +386,19 @@ class ConvertMhaToSha(ExportPass):
                 new_nodes = _no_split(node, sha)
             return new_nodes
 
+        def _visit_hadamard(node, sha):
+            """Keep Hadamard batched and split only its output into SHA heads."""
+            out_shape = _shape(node)
+            assert (
+                out_shape[sha.axis] % sha.heads == 0
+            ), f"mismatching num_heads, {out_shape[sha.axis]} % {sha.heads} != 0"
+            return _split_placeholder(
+                node,
+                axis=sha.axis,
+                size=out_shape[sha.axis] // sha.heads,
+                count=sha.heads,
+            )
+
         def _get_slicers(count, axis, size):
             return [
                 tuple(
@@ -627,12 +640,17 @@ class ConvertMhaToSha(ExportPass):
                 exir_ops.edge.aten.mul.Tensor: _visit_binary,
                 exir_ops.edge.aten.eq.Tensor: _no_split,
                 operator.getitem: _visit_getitem,
+                exir_ops.edge.qnn_custom.hadamard_transform.default: _visit_hadamard,
             }
 
             target = node.target if _is_call(node) else node.op
             visited[node] = visitors.get(target, _visit_default)(node, sha)
 
-            if [user for user in node.users.keys() if _is_output(user)]:
+            # Hadamard slices depend on the original batched node; replacing it
+            # with their concat would create a cycle when it is also an output.
+            if target != exir_ops.edge.qnn_custom.hadamard_transform.default and any(
+                _is_output(user) for user in node.users
+            ):
                 _concat_sha_nodes(node, sha)
             return visited[node]
 
