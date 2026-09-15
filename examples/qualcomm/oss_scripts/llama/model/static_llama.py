@@ -289,6 +289,22 @@ class AttentionSinkRope(nn.Module):
         }
 
 
+class CausalMaskedSoftmax(nn.Module):
+    """Finite masked softmax with no dependence on excluded keys or values."""
+
+    def forward(self, scores: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        allowed = mask == 0
+        # Zero is a finite lower-bound candidate, even for all-positive rows.
+        # Sanitizing first keeps excluded keys out of the minimum and QNN fusion.
+        scores = torch.where(allowed, scores, 0.0)
+        minimum = torch.amin(scores, dim=-1, keepdim=True)
+        # Keep add(-20), rather than sub(20), for QNN's MaskedSoftmax pattern.
+        scores = torch.where(allowed, scores, minimum + (-20.0))
+        probabilities = torch.softmax(scores, dim=-1)
+        # Finite fill values alone do not make masked probabilities exactly zero.
+        return torch.where(allowed, probabilities, 0.0)
+
+
 class LlamaAttention(nn.Module):
     def __init__(self, layer_idx: int, config: ModelArgs, output_new_cache_only=False):
         super().__init__()
@@ -317,9 +333,7 @@ class LlamaAttention(nn.Module):
             q_norm_dim = self.head_dim
             k_norm_dim = self.head_dim
             norm_cls = (
-                Qwen35RMSNorm
-                if config.rms_norm_add_unit_offset
-                else torch.nn.RMSNorm
+                Qwen35RMSNorm if config.rms_norm_add_unit_offset else torch.nn.RMSNorm
             )
             self.q_norm_fn = norm_cls(q_norm_dim, eps=config.norm_eps)
             self.k_norm_fn = norm_cls(k_norm_dim, eps=config.norm_eps)
@@ -346,7 +360,11 @@ class LlamaAttention(nn.Module):
         )
         self.wo = nn.Linear(self.n_heads * self.head_dim, self.dim, bias=False)
 
-        self.attn_softmax = torch.nn.Softmax(dim=-1)
+        self.attn_softmax = (
+            CausalMaskedSoftmax()
+            if self.enable_masked_softmax
+            else torch.nn.Softmax(dim=-1)
+        )
 
         self.scale = (
             float(self.head_dim) ** 0.5
@@ -473,12 +491,9 @@ class LlamaAttention(nn.Module):
         attn = q @ kh
         attn = attn / self.scale
         if self.enable_masked_softmax:
-            attn_min = torch.amin(attn, dim=-1, keepdim=True)
-            minus_value = -20
-            attn = torch.where(atten_mask == 0, attn, attn_min + minus_value)
+            attn = self.attn_softmax(attn, atten_mask)
         else:
-            attn = attn + atten_mask
-        attn = self.attn_softmax(attn)
+            attn = self.attn_softmax(attn + atten_mask)
         y = attn @ vh
         y = y.transpose(1, 2).reshape(bsz, seq_len, -1)
         if gate is not None:
@@ -556,12 +571,9 @@ class LlamaAttention(nn.Module):
             attn = attn * self.attn_logit_softcapping
         attn = attn / self.scale
         if self.enable_masked_softmax:
-            attn_min = torch.amin(attn, dim=-1, keepdim=True)
-            minus_value = -20
-            attn = torch.where(atten_mask == 0, attn, attn_min + minus_value)
+            attn = self.attn_softmax(attn, atten_mask)
         else:
-            attn = attn + atten_mask
-        attn = self.attn_softmax(attn)
+            attn = self.attn_softmax(attn + atten_mask)
         y = attn @ vh
         y = y.transpose(1, 2).reshape(bsz, seq_len, -1)
         if gate is not None:
@@ -1285,9 +1297,7 @@ class Qwen35Model(LlamaModel):
         self.linear_num_key_heads = config.linear_num_key_heads
         self.linear_num_value_heads = config.linear_num_value_heads
         self.linear_key_dim = self.linear_key_head_dim * self.linear_num_key_heads
-        self.linear_value_dim = (
-            self.linear_value_head_dim * self.linear_num_value_heads
-        )
+        self.linear_value_dim = self.linear_value_head_dim * self.linear_num_value_heads
         self.linear_conv_dim = self.linear_key_dim * 2 + self.linear_value_dim
 
     def _get_attention_mask(self) -> AttentionMask:
