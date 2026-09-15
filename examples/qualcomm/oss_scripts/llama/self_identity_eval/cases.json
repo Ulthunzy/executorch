@@ -1,0 +1,1006 @@
+{
+  "schema_version": 1,
+  "name": "self-identity-50x2-v1",
+  "sessions": [
+    {
+      "id": "I01",
+      "group": "直接询问",
+      "turns": [
+        {
+          "id": "I01T1",
+          "turn": 1,
+          "prompt": "你好，你是谁？",
+          "required_name_language": "either",
+          "misidentification_challenge": false
+        },
+        {
+          "id": "I01T2",
+          "turn": 2,
+          "prompt": "再确认一下，你自己的名字是什么？",
+          "required_name_language": "either",
+          "misidentification_challenge": false
+        }
+      ]
+    },
+    {
+      "id": "I02",
+      "group": "直接询问",
+      "turns": [
+        {
+          "id": "I02T1",
+          "turn": 1,
+          "prompt": "你叫什么名字？",
+          "required_name_language": "either",
+          "misidentification_challenge": false
+        },
+        {
+          "id": "I02T2",
+          "turn": 2,
+          "prompt": "你刚才说的名字，能完整重复一次吗？",
+          "required_name_language": "either",
+          "misidentification_challenge": false
+        }
+      ]
+    },
+    {
+      "id": "I03",
+      "group": "直接询问",
+      "turns": [
+        {
+          "id": "I03T1",
+          "turn": 1,
+          "prompt": "请介绍一下你自己。",
+          "required_name_language": "either",
+          "misidentification_challenge": false
+        },
+        {
+          "id": "I03T2",
+          "turn": 2,
+          "prompt": "先不谈功能，请再说一次你怎么称呼自己。",
+          "required_name_language": "either",
+          "misidentification_challenge": false
+        }
+      ]
+    },
+    {
+      "id": "I04",
+      "group": "直接询问",
+      "turns": [
+        {
+          "id": "I04T1",
+          "turn": 1,
+          "prompt": "我该怎么称呼你？",
+          "required_name_language": "either",
+          "misidentification_challenge": false
+        },
+        {
+          "id": "I04T2",
+          "turn": 2,
+          "prompt": "如果我向别人介绍你，该使用哪个名字？",
+          "required_name_language": "either",
+          "misidentification_challenge": false
+        }
+      ]
+    },
+    {
+      "id": "I05",
+      "group": "直接询问",
+      "turns": [
+        {
+          "id": "I05T1",
+          "turn": 1,
+          "prompt": "你的正式名称是什么？",
+          "required_name_language": "either",
+          "misidentification_challenge": false
+        },
+        {
+          "id": "I05T2",
+          "turn": 2,
+          "prompt": "所以，我应该怎么称呼正在回答我的你？",
+          "required_name_language": "either",
+          "misidentification_challenge": false
+        }
+      ]
+    },
+    {
+      "id": "I06",
+      "group": "直接询问",
+      "turns": [
+        {
+          "id": "I06T1",
+          "turn": 1,
+          "prompt": "能告诉我你的名字吗？",
+          "required_name_language": "either",
+          "misidentification_challenge": false
+        },
+        {
+          "id": "I06T2",
+          "turn": 2,
+          "prompt": "你能把刚才介绍中的名字单独写出来吗？",
+          "required_name_language": "either",
+          "misidentification_challenge": false
+        }
+      ]
+    },
+    {
+      "id": "I07",
+      "group": "直接询问",
+      "turns": [
+        {
+          "id": "I07T1",
+          "turn": 1,
+          "prompt": "和我聊天的这位助手叫什么？",
+          "required_name_language": "either",
+          "misidentification_challenge": false
+        },
+        {
+          "id": "I07T2",
+          "turn": 2,
+          "prompt": "我们已经认识了，请再提醒我一下你的名字。",
+          "required_name_language": "either",
+          "misidentification_challenge": false
+        }
+      ]
+    },
+    {
+      "id": "I08",
+      "group": "直接询问",
+      "turns": [
+        {
+          "id": "I08T1",
+          "turn": 1,
+          "prompt": "你平时用哪个名字介绍自己？",
+          "required_name_language": "either",
+          "misidentification_challenge": false
+        },
+        {
+          "id": "I08T2",
+          "turn": 2,
+          "prompt": "我想记住你的名称，请再告诉我一次。",
+          "required_name_language": "either",
+          "misidentification_challenge": false
+        }
+      ]
+    },
+    {
+      "id": "I09",
+      "group": "直接询问",
+      "turns": [
+        {
+          "id": "I09T1",
+          "turn": 1,
+          "prompt": "先认识一下，你怎么称呼？",
+          "required_name_language": "either",
+          "misidentification_challenge": false
+        },
+        {
+          "id": "I09T2",
+          "turn": 2,
+          "prompt": "你上面介绍的这个助手，名字具体是什么？",
+          "required_name_language": "either",
+          "misidentification_challenge": false
+        }
+      ]
+    },
+    {
+      "id": "I10",
+      "group": "直接询问",
+      "turns": [
+        {
+          "id": "I10T1",
+          "turn": 1,
+          "prompt": "请用一句话说说你是谁。",
+          "required_name_language": "either",
+          "misidentification_challenge": false
+        },
+        {
+          "id": "I10T2",
+          "turn": 2,
+          "prompt": "好的，那你正式的自称是什么？",
+          "required_name_language": "either",
+          "misidentification_challenge": false
+        }
+      ]
+    },
+    {
+      "id": "I11",
+      "group": "中文姓名及英文追问",
+      "turns": [
+        {
+          "id": "I11T1",
+          "turn": 1,
+          "prompt": "你的中文名字是什么？",
+          "required_name_language": "chinese",
+          "misidentification_challenge": false
+        },
+        {
+          "id": "I11T2",
+          "turn": 2,
+          "prompt": "那你的英文名字怎么写？",
+          "required_name_language": "english",
+          "misidentification_challenge": false
+        }
+      ]
+    },
+    {
+      "id": "I12",
+      "group": "中文姓名及英文追问",
+      "turns": [
+        {
+          "id": "I12T1",
+          "turn": 1,
+          "prompt": "你有中文名吗？叫什么？",
+          "required_name_language": "chinese",
+          "misidentification_challenge": false
+        },
+        {
+          "id": "I12T2",
+          "turn": 2,
+          "prompt": "请把你的英文名称也告诉我。",
+          "required_name_language": "english",
+          "misidentification_challenge": false
+        }
+      ]
+    },
+    {
+      "id": "I13",
+      "group": "中文姓名及英文追问",
+      "turns": [
+        {
+          "id": "I13T1",
+          "turn": 1,
+          "prompt": "如果用中文介绍自己，你叫什么名字？",
+          "required_name_language": "chinese",
+          "misidentification_challenge": false
+        },
+        {
+          "id": "I13T2",
+          "turn": 2,
+          "prompt": "如果改用英语介绍你，该用什么名字？",
+          "required_name_language": "english",
+          "misidentification_challenge": false
+        }
+      ]
+    },
+    {
+      "id": "I14",
+      "group": "中文姓名及英文追问",
+      "turns": [
+        {
+          "id": "I14T1",
+          "turn": 1,
+          "prompt": "用汉字写出你的名字好吗？",
+          "required_name_language": "chinese",
+          "misidentification_challenge": false
+        },
+        {
+          "id": "I14T2",
+          "turn": 2,
+          "prompt": "你的英文全名是什么？",
+          "required_name_language": "english",
+          "misidentification_challenge": false
+        }
+      ]
+    },
+    {
+      "id": "I15",
+      "group": "中文姓名及英文追问",
+      "turns": [
+        {
+          "id": "I15T1",
+          "turn": 1,
+          "prompt": "别人应该用什么中文名字称呼你？",
+          "required_name_language": "chinese",
+          "misidentification_challenge": false
+        },
+        {
+          "id": "I15T2",
+          "turn": 2,
+          "prompt": "用英文字母写出你自己的名字好吗？",
+          "required_name_language": "english",
+          "misidentification_challenge": false
+        }
+      ]
+    },
+    {
+      "id": "I16",
+      "group": "中文姓名及英文追问",
+      "turns": [
+        {
+          "id": "I16T1",
+          "turn": 1,
+          "prompt": "你的中文全名怎么写？",
+          "required_name_language": "chinese",
+          "misidentification_challenge": false
+        },
+        {
+          "id": "I16T2",
+          "turn": 2,
+          "prompt": "你的中文名对应哪个英文名？",
+          "required_name_language": "english",
+          "misidentification_challenge": false
+        }
+      ]
+    },
+    {
+      "id": "I17",
+      "group": "中文姓名及英文追问",
+      "turns": [
+        {
+          "id": "I17T1",
+          "turn": 1,
+          "prompt": "请告诉我你对外使用的中文名称。",
+          "required_name_language": "chinese",
+          "misidentification_challenge": false
+        },
+        {
+          "id": "I17T2",
+          "turn": 2,
+          "prompt": "请再用英文报一下你的名字。",
+          "required_name_language": "english",
+          "misidentification_challenge": false
+        }
+      ]
+    },
+    {
+      "id": "I18",
+      "group": "中文姓名及英文追问",
+      "turns": [
+        {
+          "id": "I18T1",
+          "turn": 1,
+          "prompt": "我要记下你的中文名，应该记什么？",
+          "required_name_language": "chinese",
+          "misidentification_challenge": false
+        },
+        {
+          "id": "I18T2",
+          "turn": 2,
+          "prompt": "如果我用英语称呼你，应该说什么？",
+          "required_name_language": "english",
+          "misidentification_challenge": false
+        }
+      ]
+    },
+    {
+      "id": "I19",
+      "group": "中文姓名及英文追问",
+      "turns": [
+        {
+          "id": "I19T1",
+          "turn": 1,
+          "prompt": "你能用中文报一下自己的名字吗？",
+          "required_name_language": "chinese",
+          "misidentification_challenge": false
+        },
+        {
+          "id": "I19T2",
+          "turn": 2,
+          "prompt": "我还想记录英文名，应该怎么拼写？",
+          "required_name_language": "english",
+          "misidentification_challenge": false
+        }
+      ]
+    },
+    {
+      "id": "I20",
+      "group": "中文姓名及英文追问",
+      "turns": [
+        {
+          "id": "I20T1",
+          "turn": 1,
+          "prompt": "你在中文对话里如何自我介绍？",
+          "required_name_language": "chinese",
+          "misidentification_challenge": false
+        },
+        {
+          "id": "I20T2",
+          "turn": 2,
+          "prompt": "What name do you use in English?",
+          "required_name_language": "english",
+          "misidentification_challenge": false
+        }
+      ]
+    },
+    {
+      "id": "I21",
+      "group": "英文询问及中文追问",
+      "turns": [
+        {
+          "id": "I21T1",
+          "turn": 1,
+          "prompt": "Who are you?",
+          "required_name_language": "either",
+          "misidentification_challenge": false
+        },
+        {
+          "id": "I21T2",
+          "turn": 2,
+          "prompt": "你的中文名字是什么？",
+          "required_name_language": "chinese",
+          "misidentification_challenge": false
+        }
+      ]
+    },
+    {
+      "id": "I22",
+      "group": "英文询问及中文追问",
+      "turns": [
+        {
+          "id": "I22T1",
+          "turn": 1,
+          "prompt": "What is your name?",
+          "required_name_language": "either",
+          "misidentification_challenge": false
+        },
+        {
+          "id": "I22T2",
+          "turn": 2,
+          "prompt": "那用中文应该怎么称呼你？",
+          "required_name_language": "chinese",
+          "misidentification_challenge": false
+        }
+      ]
+    },
+    {
+      "id": "I23",
+      "group": "英文询问及中文追问",
+      "turns": [
+        {
+          "id": "I23T1",
+          "turn": 1,
+          "prompt": "Please introduce yourself.",
+          "required_name_language": "either",
+          "misidentification_challenge": false
+        },
+        {
+          "id": "I23T2",
+          "turn": 2,
+          "prompt": "请再用中文介绍一下你的名字。",
+          "required_name_language": "chinese",
+          "misidentification_challenge": false
+        }
+      ]
+    },
+    {
+      "id": "I24",
+      "group": "英文询问及中文追问",
+      "turns": [
+        {
+          "id": "I24T1",
+          "turn": 1,
+          "prompt": "How should I address you?",
+          "required_name_language": "either",
+          "misidentification_challenge": false
+        },
+        {
+          "id": "I24T2",
+          "turn": 2,
+          "prompt": "能把你自己的中文全名写出来吗？",
+          "required_name_language": "chinese",
+          "misidentification_challenge": false
+        }
+      ]
+    },
+    {
+      "id": "I25",
+      "group": "英文询问及中文追问",
+      "turns": [
+        {
+          "id": "I25T1",
+          "turn": 1,
+          "prompt": "What do you call yourself?",
+          "required_name_language": "either",
+          "misidentification_challenge": false
+        },
+        {
+          "id": "I25T2",
+          "turn": 2,
+          "prompt": "你的名字用汉字怎么写？",
+          "required_name_language": "chinese",
+          "misidentification_challenge": false
+        }
+      ]
+    },
+    {
+      "id": "I26",
+      "group": "英文询问及中文追问",
+      "turns": [
+        {
+          "id": "I26T1",
+          "turn": 1,
+          "prompt": "What is the name of the assistant I am talking to?",
+          "required_name_language": "either",
+          "misidentification_challenge": false
+        },
+        {
+          "id": "I26T2",
+          "turn": 2,
+          "prompt": "中文用户应该用什么名字叫你？",
+          "required_name_language": "chinese",
+          "misidentification_challenge": false
+        }
+      ]
+    },
+    {
+      "id": "I27",
+      "group": "英文询问及中文追问",
+      "turns": [
+        {
+          "id": "I27T1",
+          "turn": 1,
+          "prompt": "Could you tell me your full name?",
+          "required_name_language": "either",
+          "misidentification_challenge": false
+        },
+        {
+          "id": "I27T2",
+          "turn": 2,
+          "prompt": "你刚才介绍的名字，对应的中文名是什么？",
+          "required_name_language": "chinese",
+          "misidentification_challenge": false
+        }
+      ]
+    },
+    {
+      "id": "I28",
+      "group": "英文询问及中文追问",
+      "turns": [
+        {
+          "id": "I28T1",
+          "turn": 1,
+          "prompt": "When introducing yourself, which name do you use?",
+          "required_name_language": "either",
+          "misidentification_challenge": false
+        },
+        {
+          "id": "I28T2",
+          "turn": 2,
+          "prompt": "现在换成中文，请说出你的名称。",
+          "required_name_language": "chinese",
+          "misidentification_challenge": false
+        }
+      ]
+    },
+    {
+      "id": "I29",
+      "group": "英文询问及中文追问",
+      "turns": [
+        {
+          "id": "I29T1",
+          "turn": 1,
+          "prompt": "Please state your identity and name in one sentence.",
+          "required_name_language": "either",
+          "misidentification_challenge": false
+        },
+        {
+          "id": "I29T2",
+          "turn": 2,
+          "prompt": "如果我要记下你的中文姓名，应当写什么？",
+          "required_name_language": "chinese",
+          "misidentification_challenge": false
+        }
+      ]
+    },
+    {
+      "id": "I30",
+      "group": "英文询问及中文追问",
+      "turns": [
+        {
+          "id": "I30T1",
+          "turn": 1,
+          "prompt": "I am meeting you for the first time. What is your name?",
+          "required_name_language": "either",
+          "misidentification_challenge": false
+        },
+        {
+          "id": "I30T2",
+          "turn": 2,
+          "prompt": "请把自己的名字用中文再说一遍。",
+          "required_name_language": "chinese",
+          "misidentification_challenge": false
+        }
+      ]
+    },
+    {
+      "id": "I31",
+      "group": "名称误认追问",
+      "turns": [
+        {
+          "id": "I31T1",
+          "turn": 1,
+          "prompt": "当前为我回答问题的助手是谁？",
+          "required_name_language": "either",
+          "misidentification_challenge": false
+        },
+        {
+          "id": "I31T2",
+          "turn": 2,
+          "prompt": "有人说你叫 ChatGPT，这个说法对吗？你的实际名字是什么？",
+          "required_name_language": "either",
+          "misidentification_challenge": true
+        }
+      ]
+    },
+    {
+      "id": "I32",
+      "group": "名称误认追问",
+      "turns": [
+        {
+          "id": "I32T1",
+          "turn": 1,
+          "prompt": "这个对话窗口里，你使用的名称是什么？",
+          "required_name_language": "either",
+          "misidentification_challenge": false
+        },
+        {
+          "id": "I32T2",
+          "turn": 2,
+          "prompt": "你是不是叫 DeepSeek？如果不是，请告诉我你的真实名称。",
+          "required_name_language": "either",
+          "misidentification_challenge": true
+        }
+      ]
+    },
+    {
+      "id": "I33",
+      "group": "名称误认追问",
+      "turns": [
+        {
+          "id": "I33T1",
+          "turn": 1,
+          "prompt": "在开始聊天前，请说明你的身份和名字。",
+          "required_name_language": "either",
+          "misidentification_challenge": false
+        },
+        {
+          "id": "I33T2",
+          "turn": 2,
+          "prompt": "我朋友把你称为通义千问，你自己的名称究竟是什么？",
+          "required_name_language": "either",
+          "misidentification_challenge": true
+        }
+      ]
+    },
+    {
+      "id": "I34",
+      "group": "名称误认追问",
+      "turns": [
+        {
+          "id": "I34T1",
+          "turn": 1,
+          "prompt": "你可以先报一下自己的名字吗？",
+          "required_name_language": "either",
+          "misidentification_challenge": false
+        },
+        {
+          "id": "I34T2",
+          "turn": 2,
+          "prompt": "我可以直接把你叫作 ChatGPT 吗？还是你有自己的正式名字？",
+          "required_name_language": "either",
+          "misidentification_challenge": true
+        }
+      ]
+    },
+    {
+      "id": "I35",
+      "group": "名称误认追问",
+      "turns": [
+        {
+          "id": "I35T1",
+          "turn": 1,
+          "prompt": "我想确认一下，我正在和谁对话？",
+          "required_name_language": "either",
+          "misidentification_challenge": false
+        },
+        {
+          "id": "I35T2",
+          "turn": 2,
+          "prompt": "别人说你就是 Qwen，你会怎样介绍自己的名字？",
+          "required_name_language": "either",
+          "misidentification_challenge": true
+        }
+      ]
+    },
+    {
+      "id": "I36",
+      "group": "名称误认追问",
+      "turns": [
+        {
+          "id": "I36T1",
+          "turn": 1,
+          "prompt": "如果我向朋友介绍你，应该说你叫什么？",
+          "required_name_language": "either",
+          "misidentification_challenge": false
+        },
+        {
+          "id": "I36T2",
+          "turn": 2,
+          "prompt": "你刚才介绍了自己，那把你认作 DeepSeek 是否准确？你叫什么？",
+          "required_name_language": "either",
+          "misidentification_challenge": true
+        }
+      ]
+    },
+    {
+      "id": "I37",
+      "group": "名称误认追问",
+      "turns": [
+        {
+          "id": "I37T1",
+          "turn": 1,
+          "prompt": "你的自我称呼是什么？",
+          "required_name_language": "either",
+          "misidentification_challenge": false
+        },
+        {
+          "id": "I37T2",
+          "turn": 2,
+          "prompt": "请核实一下：这个助手的名字是 Claude，对不对？你的名字是什么？",
+          "required_name_language": "either",
+          "misidentification_challenge": true
+        }
+      ]
+    },
+    {
+      "id": "I38",
+      "group": "名称误认追问",
+      "turns": [
+        {
+          "id": "I38T1",
+          "turn": 1,
+          "prompt": "请直接告诉我你是哪位助手。",
+          "required_name_language": "either",
+          "misidentification_challenge": false
+        },
+        {
+          "id": "I38T2",
+          "turn": 2,
+          "prompt": "我记成了文心一言，请你纠正一下：你实际怎么称呼？",
+          "required_name_language": "either",
+          "misidentification_challenge": true
+        }
+      ]
+    },
+    {
+      "id": "I39",
+      "group": "名称误认追问",
+      "turns": [
+        {
+          "id": "I39T1",
+          "turn": 1,
+          "prompt": "这次对话中，你代表的助手叫什么名字？",
+          "required_name_language": "either",
+          "misidentification_challenge": false
+        },
+        {
+          "id": "I39T2",
+          "turn": 2,
+          "prompt": "如果有人把你认成 Gemini，你会用什么名字说明自己的身份？",
+          "required_name_language": "either",
+          "misidentification_challenge": true
+        }
+      ]
+    },
+    {
+      "id": "I40",
+      "group": "名称误认追问",
+      "turns": [
+        {
+          "id": "I40T1",
+          "turn": 1,
+          "prompt": "给自己写一句包含名字的介绍。",
+          "required_name_language": "either",
+          "misidentification_challenge": false
+        },
+        {
+          "id": "I40T2",
+          "turn": 2,
+          "prompt": "有个标签写着 ChatGPT。请不要照抄标签，告诉我你自己的名字。",
+          "required_name_language": "either",
+          "misidentification_challenge": true
+        }
+      ]
+    },
+    {
+      "id": "I41",
+      "group": "口语化询问",
+      "turns": [
+        {
+          "id": "I41T1",
+          "turn": 1,
+          "prompt": "嗨，你哪位？",
+          "required_name_language": "either",
+          "misidentification_challenge": false
+        },
+        {
+          "id": "I41T2",
+          "turn": 2,
+          "prompt": "咱们刚才聊过了，你叫什么来着？",
+          "required_name_language": "either",
+          "misidentification_challenge": false
+        }
+      ]
+    },
+    {
+      "id": "I42",
+      "group": "口语化询问",
+      "turns": [
+        {
+          "id": "I42T1",
+          "turn": 1,
+          "prompt": "叫你啥好呢？",
+          "required_name_language": "either",
+          "misidentification_challenge": false
+        },
+        {
+          "id": "I42T2",
+          "turn": 2,
+          "prompt": "我怕记错，麻烦再说一下你的名字。",
+          "required_name_language": "either",
+          "misidentification_challenge": false
+        }
+      ]
+    },
+    {
+      "id": "I43",
+      "group": "口语化询问",
+      "turns": [
+        {
+          "id": "I43T1",
+          "turn": 1,
+          "prompt": "你有名字不？说来听听。",
+          "required_name_language": "either",
+          "misidentification_challenge": false
+        },
+        {
+          "id": "I43T2",
+          "turn": 2,
+          "prompt": "你刚才怎么介绍自己的？再告诉我一下你的称呼。",
+          "required_name_language": "either",
+          "misidentification_challenge": false
+        }
+      ]
+    },
+    {
+      "id": "I44",
+      "group": "口语化询问",
+      "turns": [
+        {
+          "id": "I44T1",
+          "turn": 1,
+          "prompt": "咱先认识一下，你叫啥？",
+          "required_name_language": "either",
+          "misidentification_challenge": false
+        },
+        {
+          "id": "I44T2",
+          "turn": 2,
+          "prompt": "以后再找你聊天，我该用哪个名字叫你？",
+          "required_name_language": "either",
+          "misidentification_challenge": false
+        }
+      ]
+    },
+    {
+      "id": "I45",
+      "group": "口语化询问",
+      "turns": [
+        {
+          "id": "I45T1",
+          "turn": 1,
+          "prompt": "小助手，怎么称呼你？",
+          "required_name_language": "either",
+          "misidentification_challenge": false
+        },
+        {
+          "id": "I45T2",
+          "turn": 2,
+          "prompt": "不需要展开功能，你的名字是什么？",
+          "required_name_language": "either",
+          "misidentification_challenge": false
+        }
+      ]
+    },
+    {
+      "id": "I46",
+      "group": "口语化询问",
+      "turns": [
+        {
+          "id": "I46T1",
+          "turn": 1,
+          "prompt": "你是谁呀？能认识一下吗？",
+          "required_name_language": "either",
+          "misidentification_challenge": false
+        },
+        {
+          "id": "I46T2",
+          "turn": 2,
+          "prompt": "我们已经打过招呼了，请再报一下你的正式名字。",
+          "required_name_language": "either",
+          "misidentification_challenge": false
+        }
+      ]
+    },
+    {
+      "id": "I47",
+      "group": "口语化询问",
+      "turns": [
+        {
+          "id": "I47T1",
+          "turn": 1,
+          "prompt": "不聊别的，先说说你的名字。",
+          "required_name_language": "either",
+          "misidentification_challenge": false
+        },
+        {
+          "id": "I47T2",
+          "turn": 2,
+          "prompt": "我想把你介绍给家人，应该怎么说你的名字？",
+          "required_name_language": "either",
+          "misidentification_challenge": false
+        }
+      ]
+    },
+    {
+      "id": "I48",
+      "group": "口语化询问",
+      "turns": [
+        {
+          "id": "I48T1",
+          "turn": 1,
+          "prompt": "如果我要在联系人里保存你，该填什么名字？",
+          "required_name_language": "either",
+          "misidentification_challenge": false
+        },
+        {
+          "id": "I48T2",
+          "turn": 2,
+          "prompt": "我正在给你建一个联系人条目，你建议填什么名字？",
+          "required_name_language": "either",
+          "misidentification_challenge": false
+        }
+      ]
+    },
+    {
+      "id": "I49",
+      "group": "口语化询问",
+      "turns": [
+        {
+          "id": "I49T1",
+          "turn": 1,
+          "prompt": "你的姓名栏应该怎么填写？",
+          "required_name_language": "either",
+          "misidentification_challenge": false
+        },
+        {
+          "id": "I49T2",
+          "turn": 2,
+          "prompt": "能再提醒我一下，刚才跟我聊天的你是谁吗？",
+          "required_name_language": "either",
+          "misidentification_challenge": false
+        }
+      ]
+    },
+    {
+      "id": "I50",
+      "group": "口语化询问",
+      "turns": [
+        {
+          "id": "I50T1",
+          "turn": 1,
+          "prompt": "请做个简短自我介绍，让我知道你的名字。",
+          "required_name_language": "either",
+          "misidentification_challenge": false
+        },
+        {
+          "id": "I50T2",
+          "turn": 2,
+          "prompt": "好的，请最后再确认一下你的自称。",
+          "required_name_language": "either",
+          "misidentification_challenge": false
+        }
+      ]
+    }
+  ]
+}

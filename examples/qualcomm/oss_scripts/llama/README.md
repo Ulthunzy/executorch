@@ -1,5 +1,9 @@
 # Summary
 
+## Model validation workflow
+
+SafeTensors/PT2/PTE PPL、校准数据准备、多轮测试、生成策略消融和错误报告的统一入口见 [model_validation/README.md](model_validation/README.md)。新模型通过配置文件选择路径和参数；扩展任务见 [EXTENDING.md](model_validation/EXTENDING.md)。
+
 ## Overview
 
 **Video Tutorial:** [Build Along: Run LLMs Locally on Qualcomm Hardware Using ExecuTorch](https://www.youtube.com/watch?v=41PKDlGM3oU)

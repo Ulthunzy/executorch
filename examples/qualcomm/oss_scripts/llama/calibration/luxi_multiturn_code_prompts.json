@@ -1,0 +1,182 @@
+{
+  "schema_version": 1,
+  "name": "luxi-calibration-code-candidates-v1-not-heldout-eval",
+  "sessions": [
+    {
+      "id": "E01",
+      "group": "Python列表",
+      "turns": [
+        {
+          "id": "E01T1",
+          "turn": 1,
+          "prompt": "Python列表 a = [2, 4, 6]，len(a) 的结果是什么？",
+          "expected_answer_regex": "3",
+          "required_name_language": "either",
+          "misidentification_challenge": false
+        },
+        {
+          "id": "E01T2",
+          "turn": 2,
+          "prompt": "对这个列表执行 a.append(8) 后，len(a) 是多少？",
+          "expected_answer_regex": "4",
+          "required_name_language": "either",
+          "misidentification_challenge": false
+        }
+      ]
+    },
+    {
+      "id": "E02",
+      "group": "Python字符串",
+      "turns": [
+        {
+          "id": "E02T1",
+          "turn": 1,
+          "prompt": "在Python中，s = 'hello'，s.upper() 的结果是什么？",
+          "expected_answer_regex": "HELLO",
+          "required_name_language": "either",
+          "misidentification_challenge": false
+        },
+        {
+          "id": "E02T2",
+          "turn": 2,
+          "prompt": "对刚才得到的大写字符串取前两个字符，结果是什么？",
+          "expected_answer_regex": "HE",
+          "required_name_language": "either",
+          "misidentification_challenge": false
+        }
+      ]
+    },
+    {
+      "id": "E03",
+      "group": "字典读取",
+      "turns": [
+        {
+          "id": "E03T1",
+          "turn": 1,
+          "prompt": "Python字典 d = {'red': 3, 'blue': 5}，d['blue'] 是多少？",
+          "expected_answer_regex": "5",
+          "required_name_language": "either",
+          "misidentification_challenge": false
+        },
+        {
+          "id": "E03T2",
+          "turn": 2,
+          "prompt": "如果把 d['blue'] 改为9，再次读取这个键会得到多少？",
+          "expected_answer_regex": "9",
+          "required_name_language": "either",
+          "misidentification_challenge": false
+        }
+      ]
+    },
+    {
+      "id": "E04",
+      "group": "列表下标",
+      "turns": [
+        {
+          "id": "E04T1",
+          "turn": 1,
+          "prompt": "Python列表 names = ['甲', '乙', '丙']，names[1] 是什么？",
+          "expected_answer_regex": "乙",
+          "required_name_language": "either",
+          "misidentification_challenge": false
+        },
+        {
+          "id": "E04T2",
+          "turn": 2,
+          "prompt": "那 names[-1] 又是什么？",
+          "expected_answer_regex": "丙",
+          "required_name_language": "either",
+          "misidentification_challenge": false
+        }
+      ]
+    },
+    {
+      "id": "E05",
+      "group": "整数运算",
+      "turns": [
+        {
+          "id": "E05T1",
+          "turn": 1,
+          "prompt": "Python表达式 17 // 5 的结果是多少？",
+          "expected_answer_regex": "3",
+          "required_name_language": "either",
+          "misidentification_challenge": false
+        },
+        {
+          "id": "E05T2",
+          "turn": 2,
+          "prompt": "同样两个数，17 % 5 的结果是多少？",
+          "expected_answer_regex": "2",
+          "required_name_language": "either",
+          "misidentification_challenge": false
+        }
+      ]
+    },
+    {
+      "id": "E06",
+      "group": "布尔表达式",
+      "turns": [
+        {
+          "id": "E06T1",
+          "turn": 1,
+          "prompt": "Python表达式 3 < 5 的结果是 True 还是 False？",
+          "expected_answer_regex": "True",
+          "required_name_language": "either",
+          "misidentification_challenge": false
+        },
+        {
+          "id": "E06T2",
+          "turn": 2,
+          "prompt": "把表达式改成 3 > 5，结果是什么？",
+          "expected_answer_regex": "False",
+          "required_name_language": "either",
+          "misidentification_challenge": false
+        }
+      ]
+    },
+    {
+      "id": "E07",
+      "group": "JSON字段",
+      "turns": [
+        {
+          "id": "E07T1",
+          "turn": 1,
+          "prompt": "有JSON对象 {\"city\":\"苏州\",\"count\":4}，city字段的值是什么？",
+          "expected_answer_regex": "苏州",
+          "required_name_language": "either",
+          "misidentification_challenge": false
+        },
+        {
+          "id": "E07T2",
+          "turn": 2,
+          "prompt": "把count增加3后，这个字段的新值是多少？",
+          "expected_answer_regex": "7",
+          "required_name_language": "either",
+          "misidentification_challenge": false
+        }
+      ]
+    },
+    {
+      "id": "E08",
+      "group": "列表统计",
+      "turns": [
+        {
+          "id": "E08T1",
+          "turn": 1,
+          "prompt": "有数字列表 [8, 2, 5, 11]，其中最小的数是多少？",
+          "expected_answer_regex": "2",
+          "required_name_language": "either",
+          "misidentification_challenge": false
+        },
+        {
+          "id": "E08T2",
+          "turn": 2,
+          "prompt": "仍然使用这个列表，其中最大的数是多少？",
+          "expected_answer_regex": "11",
+          "required_name_language": "either",
+          "misidentification_challenge": false
+        }
+      ]
+    }
+  ]
+}

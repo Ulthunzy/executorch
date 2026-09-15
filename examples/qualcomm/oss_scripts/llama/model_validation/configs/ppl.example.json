@@ -1,0 +1,65 @@
+{
+  "schema_version": 1,
+  "description": "固定本地参考文本、相同token与计分窗口；标准PPL不使用think/RP/保护策略。",
+  "variables": {
+    "hf_model": "/path/to/safetensors-model",
+    "pt2_model": "/path/to/decode_qdq.pt2",
+    "pte_model": "/path/to/hybrid_llama_qnn.pte",
+    "tokenizer": "/path/to/safetensors-model",
+    "pte_tokenizer": "/path/to/tokenizer.json",
+    "text": "/path/to/wikitext-2-raw-v1-test.txt",
+    "driver": "${repo}/build-android/model_validation/ppl/identity_eval_driver",
+    "serial": "YOUR_ADB_SERIAL",
+    "device_lib_dir": "/data/local/tmp/qnn-libs",
+    "context_len": 4096,
+    "stride": 2048
+  },
+  "output_root": "${repo}/llama-output/model-validation/new-model-ppl",
+  "steps": [
+    {
+      "id": "corpus",
+      "tool": "ppl",
+      "args": ["prepare", "--tokenizer", "${tokenizer}", "--text", "${text}", "--context-len", "${context_len}", "--stride", "${stride}", "--output", "${output}/corpus"],
+      "inputs": ["${tokenizer}", "${text}"],
+      "outputs": ["${output}/corpus/manifest.json", "${output}/corpus/tokens.u64", "${output}/corpus/windows.json"]
+    },
+    {
+      "id": "hf-ppl",
+      "tool": "ppl",
+      "depends_on": ["corpus"],
+      "resource": "gpu:cuda:0",
+      "args": ["run", "--engine", "hf", "--corpus", "${output}/corpus", "--model", "${hf_model}", "--tokenizer", "${tokenizer}", "--device", "cuda:0", "--dtype", "float32", "--output", "${output}/ppl/hf"],
+      "inputs": ["${hf_model}", "${tokenizer}", "${output}/corpus/manifest.json"],
+      "outputs": ["${output}/ppl/hf/summary.json"],
+      "resume_args": ["--resume"]
+    },
+    {
+      "id": "pt2-ppl",
+      "tool": "ppl",
+      "depends_on": ["corpus"],
+      "resource": "gpu:cuda:0",
+      "args": ["run", "--engine", "pt2", "--pt2-layout", "lincal-full-sequence", "--corpus", "${output}/corpus", "--model", "${pt2_model}", "--tokenizer", "${tokenizer}", "--device", "cuda:0", "--output", "${output}/ppl/pt2"],
+      "inputs": ["${pt2_model}", "${tokenizer}", "${output}/corpus/manifest.json"],
+      "outputs": ["${output}/ppl/pt2/summary.json"],
+      "resume_args": ["--resume"]
+    },
+    {
+      "id": "pte-ppl",
+      "tool": "ppl",
+      "depends_on": ["corpus"],
+      "resource": "adb:${serial}",
+      "args": ["run", "--engine", "pte", "--corpus", "${output}/corpus", "--model", "${pte_model}", "--tokenizer", "${pte_tokenizer}", "--serial", "${serial}", "--device-lib-dir", "${device_lib_dir}", "--driver", "${driver}", "--mode", "hybrid", "--decoder", "lincal", "--output", "${output}/ppl/pte"],
+      "inputs": ["${pte_model}", "${pte_tokenizer}", "${driver}", "${output}/corpus/manifest.json"],
+      "outputs": ["${output}/ppl/pte/summary.json"],
+      "resume_args": ["--resume"]
+    },
+    {
+      "id": "report",
+      "tool": "report",
+      "depends_on": ["hf-ppl", "pt2-ppl", "pte-ppl"],
+      "args": ["${output}/ppl/hf", "${output}/ppl/pt2", "${output}/ppl/pte", "--output", "${output}/report"],
+      "inputs": ["${output}/ppl/hf/summary.json", "${output}/ppl/pt2/summary.json", "${output}/ppl/pte/summary.json"],
+      "outputs": ["${output}/report/comparison.json", "${output}/report/REPORT.md"]
+    }
+  ]
+}
