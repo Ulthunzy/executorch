@@ -6,6 +6,8 @@
 .mypy_cache/
 .venv/
 __pycache__/
+*.pyc
+*.pyo
 
 # Build and tool-generated files
 arm_test/
@@ -148,3 +150,19 @@ charts/
 qwen_mha2sha_attention_test_record.txt
 draw_lincal_qwen_vl_speed.py
 .Package.swift/backend_mlx_resources/*.metallib
+
+# Local calibration data and historical experiments (kept outside source control)
+/.mv
+/backends/arm/third-party/
+/bench_0625_0625_test/
+/examples/qualcomm/oss_scripts/llama/artifacts/BAAI/
+/examples/qualcomm/oss_scripts/llama/assets/samples/luxi_identity_clean.json
+/examples/qualcomm/oss_scripts/llama/assets/samples/luxi_identity_clean.md
+/examples/qualcomm/oss_scripts/llama/assets/samples/luxi_mixed_think_20.chatml.jsonl
+/examples/qualcomm/oss_scripts/llama/assets/samples/luxi_mixed_think_20.json
+/examples/qualcomm/oss_scripts/llama/assets/samples/luxi_mixed_think_20.md
+/examples/qualcomm/oss_scripts/llama/assets/samples/luxi_mixed_think_20.messages.json
+/examples/qualcomm/oss_scripts/llama/assets/samples/luxi_think_20.chatml.jsonl
+/examples/qualcomm/oss_scripts/llama/assets/samples/luxi_think_20.json
+/examples/qualcomm/oss_scripts/llama/assets/samples/luxi_think_20.md
+/examples/qualcomm/oss_scripts/llama/assets/samples/luxi_think_calibration_v1/
