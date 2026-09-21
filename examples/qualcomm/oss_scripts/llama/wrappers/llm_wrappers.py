@@ -9,13 +9,14 @@ import gc
 import inspect
 import json
 import logging
+import math
 import os
 import re
 import time
 import types
 
 from functools import partial
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 
@@ -166,6 +167,113 @@ def _load_local_model_config(
         return None
     with open(params_path) as f:
         return json.load(f)
+
+
+def _hf_config_path(*candidates: Optional[str]) -> Optional[str]:
+    """Return the HF config.json that ships with the weights, if any."""
+    for candidate in candidates:
+        if not candidate:
+            continue
+        path = os.path.join(os.path.expanduser(candidate), "config.json")
+        if os.path.isfile(path):
+            return path
+    return None
+
+
+def _full_attention_layers(layer_types: Optional[List[str]]) -> Optional[List[int]]:
+    if not layer_types:
+        return None
+    return [index for index, kind in enumerate(layer_types) if kind != "sliding_attention"]
+
+
+# HF config 字段 -> params/ModelArgs 字段。只映射语义完全一致的键。
+_HF_MODEL_ARG_FIELDS: Dict[str, str] = {
+    "num_hidden_layers": "n_layers",
+    "hidden_size": "dim",
+    "intermediate_size": "hidden_dim",
+    "num_attention_heads": "n_heads",
+    "num_key_value_heads": "n_kv_heads",
+    "head_dim": "head_dim",
+    "vocab_size": "vocab_size",
+    "rms_norm_eps": "norm_eps",
+    "rope_theta": "rope_theta",
+    "sliding_window": "sliding_window",
+    "layer_types": "layer_types",
+}
+
+
+def _same_value(current: Any, expected: Any) -> bool:
+    if isinstance(current, (int, float)) and isinstance(expected, (int, float)):
+        return math.isclose(float(current), float(expected), rel_tol=1e-9, abs_tol=1e-12)
+    return current == expected
+
+
+def _sync_model_args_from_hf_config(
+    model_args: Dict[str, Any],
+    *,
+    sources: Tuple[Optional[str], ...],
+) -> Dict[str, Any]:
+    """Reconcile params with the weights' own HF config, HF wins on mismatch.
+
+    The params JSON (--params or the registry template) is a snapshot of one
+    weight version and can lag behind the checkpoint -- e.g. layer_types of a
+    new release still carrying the previous sliding/full layout. Architecture
+    keys that the HF config defines follow the weights, so mismatch is reported
+    and the HF value wins. Params stay authoritative for keys HF does not carry.
+    """
+    path = _hf_config_path(*sources)
+    if path is None:
+        logging.warning(
+            "No HF config.json found next to the weights (%s); model args stay as "
+            "declared by the params file. Pass --source_safetensors <weights dir> "
+            "to sync them with the checkpoint.",
+            ", ".join(str(source) for source in sources if source) or "<none>",
+        )
+        return model_args
+
+    with open(path) as f:
+        hf_config = json.load(f)
+    mismatched, synced = [], []
+    for hf_key, arg_key in _HF_MODEL_ARG_FIELDS.items():
+        expected = hf_config.get(hf_key)
+        if expected is None or arg_key not in model_args:
+            continue
+        expected = list(expected) if isinstance(expected, list) else expected
+        current = model_args[arg_key]
+        if _same_value(current, expected):
+            continue
+        mismatched.append((hf_key, current, expected))
+        model_args[arg_key] = expected
+        synced.append(arg_key)
+
+    layer_types = model_args.get("layer_types")
+    if layer_types is not None and model_args.get("n_layers") not in (None, len(layer_types)):
+        raise ValueError(
+            f"layer_types in {path} has {len(layer_types)} entries but "
+            f"n_layers is {model_args['n_layers']}"
+        )
+
+    if mismatched:
+        for hf_key, current, expected in mismatched:
+            if hf_key == "layer_types":
+                current = _full_attention_layers(current)
+                expected = _full_attention_layers(expected)
+            logging.warning(
+                "params declares %s=%s but %s declares %s; using the HF config value.",
+                _HF_MODEL_ARG_FIELDS[hf_key],
+                current,
+                path,
+                expected,
+            )
+        logging.info(
+            "Synced %d model arg(s) from %s: %s.",
+            len(synced),
+            path,
+            ", ".join(synced),
+        )
+    else:
+        logging.info("Model args match %s.", path)
+    return model_args
 
 
 def _is_qwen35_decoder_model(decoder_model: str) -> bool:
@@ -486,6 +594,12 @@ class TextDecoder(Component):
             )
             with open(params_path) as f:
                 model_args_dict = _flatten_model_args_for_static_llama(json.load(f))
+                model_args_dict = _sync_model_args_from_hf_config(
+                    model_args_dict,
+                    # --checkpoint 的权重不一定来自 repo_id，只有直接下载时才信任它。
+                    sources=(getattr(control_args, "source_safetensors", None),)
+                    + ((config.repo_id,) if control_args.checkpoint is None else ()),
+                )
                 self.model_args = process_model_args(
                     control_args,
                     ModelArgs(**model_args_dict),
