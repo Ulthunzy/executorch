@@ -5,6 +5,7 @@
 # LICENSE file in the root directory of this source tree.
 
 import os
+import json
 from pathlib import Path
 import shutil
 import subprocess
@@ -30,6 +31,9 @@ from executorch.examples.qualcomm.oss_scripts.llama.masking_utils import (
 from executorch.examples.qualcomm.oss_scripts.llama.model.static_llama import (
     LlamaModel,
     Qwen35ModelWithoutEmbedding_swa,
+)
+from executorch.examples.qualcomm.oss_scripts.llama.wrappers.llm_wrappers import (
+    _sync_model_args_from_hf_config,
 )
 from executorch.exir import to_edge
 
@@ -60,6 +64,35 @@ def model_args(context_len, sliding_window):
         kv_io_bit_width=8,
         mrope_section=[1, 1, 0],
     )
+
+
+def test_model_args_follow_weights_layer_types(tmp_path):
+    """Read the layout from the weights' config.json, not from the params file."""
+    weights = tmp_path / "weights"
+    weights.mkdir()
+    layer_types = ["sliding_attention", "full_attention", "sliding_attention"]
+    (weights / "config.json").write_text(
+        json.dumps(
+            {
+                "num_hidden_layers": 3,
+                "layer_types": layer_types,
+                "sliding_window": 512,
+            }
+        )
+    )
+    model_args_dict = {
+        "n_layers": 3,
+        "layer_types": [
+            "full_attention",
+            "sliding_attention",
+            "sliding_attention",
+        ],
+        "sliding_window": 512,
+    }
+
+    synced = _sync_model_args_from_hf_config(model_args_dict, sources=(str(weights),))
+
+    assert synced["layer_types"] == layer_types
 
 
 @pytest.mark.parametrize("window", [4, 8, 16])
