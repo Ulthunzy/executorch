@@ -24,6 +24,7 @@ from executorch.backends.qualcomm.export_utils import (
     setup_common_args_and_variables,
     SimpleADB,
 )
+from executorch.backends.qualcomm.utils.check_qnn_version import describe_sdk_build_id
 
 from executorch.backends.qualcomm.utils.utils import (
     dump_context_from_pte,
@@ -73,6 +74,9 @@ from executorch.examples.qualcomm.oss_scripts.llama.evaluator.device_evaluator i
     DefaultEval,
     SqnrEval,
     TaskEval,
+)
+from executorch.examples.qualcomm.oss_scripts.llama.model_validation.common.lineage import (
+    write_export_lineage,
 )
 
 from executorch.examples.qualcomm.oss_scripts.llama.tokenizer import TokenizerWrapper
@@ -441,6 +445,13 @@ def compile(
         _generate_optrace_reports(args, multi_modal_mgr, pte_filenames)
 
 
+def _file_state(path):
+    if not os.path.isfile(path):
+        return None
+    stat = os.stat(path)
+    return stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns
+
+
 def inference(
     args,
     decoder_model_config: LLMModelConfig,
@@ -686,6 +697,13 @@ def _build_parser():
     parser.add_argument(
         "--checkpoint",
         help="Pass llama checkpoint.",
+        required=False,
+        type=str,
+    )
+
+    parser.add_argument(
+        "--source_safetensors",
+        help="Original local SafeTensors model file/directory used to create --checkpoint. Provenance only; export still reads --checkpoint.",
         required=False,
         type=str,
     )
@@ -1330,6 +1348,9 @@ def export_llama(args) -> None:
         print(f"Finish the running pre_gen_pte from {args.pre_gen_pte}")
         return
 
+    decode_qdq_path = os.path.join(args.artifact, DECODE_QDQ_FILENAME)
+    decode_qdq_before = _file_state(decode_qdq_path)
+    text_decoder_pte_before = _file_state(text_decoder_pte_path)
     compile(
         args,
         decoder_model_config,
@@ -1344,6 +1365,36 @@ def export_llama(args) -> None:
             text_decoder_pte_path,
             attention_sink_evictor_pte_path,
         )
+
+    decode_qdq_after = _file_state(decode_qdq_path)
+    text_decoder_pte_after = _file_state(text_decoder_pte_path)
+    if (
+        text_decoder_pte_after is None
+        or text_decoder_pte_after == text_decoder_pte_before
+    ):
+        raise RuntimeError(
+            "Compilation did not produce a fresh text decoder PTE; refusing stale lineage"
+        )
+    decode_qdq_produced = (
+        not args.skip_qdq_save
+        and not args.use_fp16
+        and decode_qdq_after is not None
+        and decode_qdq_after != decode_qdq_before
+    )
+    if not decode_qdq_produced:
+        logging.warning(
+            "No fresh %s was produced by this export; lineage will be incomplete",
+            DECODE_QDQ_FILENAME,
+        )
+    lineage_path = write_export_lineage(
+        args,
+        pte_path=text_decoder_pte_path,
+        pt2_path=decode_qdq_path if decode_qdq_produced else None,
+        runtime_tokenizer_path=runtime_tokenizer_path,
+        qnn_sdk_build_id=describe_sdk_build_id(),
+        repo=os.path.abspath(os.path.join(os.path.dirname(__file__), "../../../..")),
+    )
+    logging.info("Export lineage saved to %s", lineage_path)
 
     if args.compile_only:
         if args.ip and args.port != -1:
