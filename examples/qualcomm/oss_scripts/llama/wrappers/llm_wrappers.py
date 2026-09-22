@@ -1499,6 +1499,7 @@ class TextDecoder(Component):
                 self.control_args.verbose
                 and self.mode == Mode.CALIBRATE
                 and not self.apply_embedding
+                and self.control_args.eval_tasks
             ):
                 run_lm_eval(
                     module=self.decoder,
@@ -1624,6 +1625,7 @@ class TextDecoder(Component):
                 self.control_args.verbose
                 and self.mode == Mode.CALIBRATE
                 and not self.apply_embedding
+                and self.control_args.eval_tasks
             ):
                 run_lm_eval(
                     module=self.decoder,

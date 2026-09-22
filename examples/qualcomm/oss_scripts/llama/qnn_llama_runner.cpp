@@ -193,6 +193,18 @@ std::string get_formatted_prompt(
       formatted_prompt.append("<|im_end|>\n");
       formatted_prompt.append("<|im_start|>assistant\n");
       break;
+    case example::DecoderModelVersion::kMiniCPM5:
+      formatted_prompt.append("<s>");
+      if (!system_prompt.empty()) {
+        formatted_prompt.append("<|im_start|>system\n");
+        formatted_prompt.append(system_prompt);
+        formatted_prompt.append("<|im_end|>\n");
+      }
+      formatted_prompt.append("<|im_start|>user\n");
+      formatted_prompt.append(prompt);
+      formatted_prompt.append("<|im_end|>\n<|im_start|>assistant\n");
+      formatted_prompt.append("<think>\n\n</think>\n\n");
+      break;
     case example::DecoderModelVersion::kSmollm2_135m:
       if (!system_prompt.empty()) {
         formatted_prompt.append("<|im_start|>system\n");

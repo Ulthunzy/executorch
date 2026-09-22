@@ -77,4 +77,5 @@ DECODER_MODEL_VERSION = {
     "smolvlm_500m_instruct": "smolvlm",
     "internvl3_1b": "internvl3",
     "gemma4-e2b": "gemma4",
+    "minicpm5_2b": "minicpm5",
 }

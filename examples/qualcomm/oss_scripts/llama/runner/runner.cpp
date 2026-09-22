@@ -217,6 +217,8 @@ Runner::Runner(
     decoder_model_version_ = DecoderModelVersion::kCodegen;
   } else if (decoder_model_version == "glm") {
     decoder_model_version_ = DecoderModelVersion::kGlm;
+  } else if (decoder_model_version == "minicpm5") {
+    decoder_model_version_ = DecoderModelVersion::kMiniCPM5;
   } else {
     ET_CHECK_MSG(false, "Unsupported Decoder Model");
   }
@@ -268,6 +270,7 @@ Error Runner::load() {
   const bool uses_chatml =
       decoder_model_version_ == DecoderModelVersion::kQwen2_5 ||
       decoder_model_version_ == DecoderModelVersion::kQwen3 ||
+      decoder_model_version_ == DecoderModelVersion::kMiniCPM5 ||
       decoder_model_version_ == DecoderModelVersion::kLincal ||
       decoder_model_version_ == DecoderModelVersion::kSmollm2_135m ||
       decoder_model_version_ == DecoderModelVersion::kSmollm3;
@@ -302,7 +305,12 @@ Error Runner::load() {
     // ChatML prompts have no separate BOS; the role delimiters are in the text.
     bos_token_.reset();
     // A standalone tokenizer.json may leave eos_tok() at 0 (ordinary "!").
-    for (const auto* marker : {"<|im_end|>", "<|endoftext|>"}) {
+    std::vector<const char*> end_markers{"<|im_end|>"};
+    end_markers.push_back(
+        decoder_model_version_ == DecoderModelVersion::kMiniCPM5
+            ? "</s>"
+            : "<|endoftext|>");
+    for (const auto* marker : end_markers) {
       auto ids = tokenizer_->encode(marker, 0, 0);
       ET_CHECK_OR_RETURN_ERROR(
           ids.ok() && ids.get().size() == 1,

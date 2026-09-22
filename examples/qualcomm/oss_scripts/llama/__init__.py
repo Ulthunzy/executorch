@@ -66,6 +66,10 @@ from executorch.examples.models.smolvlm import (
     convert_weights as convert_smolvlm_weights,
 )
 
+from executorch.examples.models.minicpm5.convert_weights import (
+    convert_weights as convert_minicpm5_weights,
+)
+
 from executorch.examples.qualcomm.oss_scripts.llama.decoder_constants import (
     AUDIO_ENCODER,
     DECODER_MODEL_VERSION,
@@ -105,6 +109,7 @@ from executorch.examples.qualcomm.oss_scripts.llama.static_llm_quant_recipe impo
     Llama3_3BQuantRecipe,
     LlamaStories110MQuantRecipe,
     LlamaStories260KQuantRecipe,
+    MiniCPM5QuantRecipe,
     Phi4MiniQuantRecipe,
     Qwen2_5_0_5BQuantRecipe,
     Qwen2_5_1_5BQuantRecipe,
@@ -907,3 +912,22 @@ class Gemma4_E2B(LLMModelConfig):
     r2 = False
     r3 = False
     quant_recipe = Gemma4QuantRecipe
+
+
+@register_llm_model("minicpm5_2b")
+@dataclass(init=False, frozen=True)
+class MiniCPM5_2B(LLMModelConfig):
+    repo_id: str = "openbmb/MiniCPM5-2B"
+    params_path: str = os.path.join(
+        BASE_DIR, "../../../models/minicpm5/2b_config.json"
+    )
+    convert_weights = convert_minicpm5_weights
+    transform_weight = False
+    instruct_model = True
+    num_sharding = 1
+    masked_softmax = False
+    seq_mse_candidates = 0
+    r1 = False
+    r2 = False
+    r3 = False
+    quant_recipe = MiniCPM5QuantRecipe

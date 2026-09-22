@@ -46,6 +46,8 @@ usage() {
   echo "TOOLCHAIN_ROOT_TARGET=/path/to/sysroots/xx_target for linux embedded with --enable_linux_embedded)"
   echo ""
   echo "e.g.: executorch$ ./backends/qualcomm/scripts/build.sh --skip_x86_64"
+  echo "For MiniCPM5, add --use_minicpm5_tokenizer to compile its tokenizer override."
+  echo "MiniCPM5 builds use separate build directories with a -minicpm5 suffix."
   echo ""
   echo "Direct mode: Use --build_direct_mode <dsp_type> --soc_model <model> to enable."
   echo "<dsp_type> id is mapped to Hexagon SDK dsp id. Refer to Hexagon SDK for more info."
@@ -79,6 +81,7 @@ ET_QNN_RUNNER_DEV_MEM_LOG="${ET_QNN_RUNNER_DEV_MEM_LOG:-OFF}"
 # Default DSP_TYPE=-1 means direct mode is disabled.
 DSP_TYPE=-1
 SOC_MODEL=""
+MINICPM5_TOKENIZER_FLAG="-DEXECUTORCH_USE_MINICPM5_TOKENIZER=OFF"
 
 if [ -z "$PYTHON_EXECUTABLE" ]; then
   PYTHON_EXECUTABLE="python3"
@@ -88,7 +91,7 @@ if [ -z "$BUCK2" ]; then
   BUCK2="buck2"
 fi
 
-long_options=skip_x86_64,skip_linux_android,enable_linux_embedded,build_direct_mode:,soc_model:,no_clean,release,job_number:
+long_options=skip_x86_64,skip_linux_android,enable_linux_embedded,build_direct_mode:,soc_model:,use_minicpm5_tokenizer,no_clean,release,job_number:
 
 parsed_args=$(getopt -a --options '' --longoptions $long_options --name "$0" -- "$@")
 eval set -- "$parsed_args"
@@ -99,6 +102,12 @@ while true ; do
         --skip_linux_android) BUILD_ANDROID="false"; shift;;
         --build_direct_mode) DSP_TYPE="$2"; BUILD_HEXAGON="true"; shift 2;;
         --soc_model) SOC_MODEL="$2"; shift 2;;
+        --use_minicpm5_tokenizer)
+            MINICPM5_TOKENIZER_FLAG="-DEXECUTORCH_USE_MINICPM5_TOKENIZER=ON"
+            CMAKE_ANDROID="build-android-minicpm5"
+            CMAKE_X86_64="build-x86-minicpm5"
+            CMAKE_OE_LINUX="build-oe-linux-minicpm5"
+            shift;;
         --enable_linux_embedded) BUILD_ANDROID="false"; BUILD_OE_LINUX="true"; shift;;
         --no_clean) CLEAN="false"; shift;;
         --release) BUILD_TYPE="Release"; shift;;
@@ -161,6 +170,7 @@ if [ "$BUILD_ANDROID" = true ]; then
         -DEXECUTORCH_BUILD_DEVTOOLS=ON \
         -DEXECUTORCH_BUILD_EXTENSION_LLM=ON \
         -DEXECUTORCH_BUILD_EXTENSION_LLM_RUNNER=ON \
+        ${MINICPM5_TOKENIZER_FLAG} \
         -DEXECUTORCH_BUILD_EXTENSION_MODULE=ON \
         -DEXECUTORCH_BUILD_EXTENSION_DATA_LOADER=ON \
         -DEXECUTORCH_BUILD_EXTENSION_FLAT_TENSOR=ON \
@@ -319,6 +329,7 @@ if [ "$BUILD_OE_LINUX" = true ]; then
         -DEXECUTORCH_BUILD_DEVTOOLS=ON \
         -DEXECUTORCH_BUILD_EXTENSION_LLM=ON \
         -DEXECUTORCH_BUILD_EXTENSION_LLM_RUNNER=ON \
+        ${MINICPM5_TOKENIZER_FLAG} \
         -DEXECUTORCH_BUILD_EXTENSION_MODULE=ON \
         -DEXECUTORCH_BUILD_EXTENSION_DATA_LOADER=ON \
         -DEXECUTORCH_BUILD_EXTENSION_FLAT_TENSOR=ON \
@@ -392,6 +403,7 @@ if [ "$BUILD_X86_64" = true ]; then
         -DEXECUTORCH_BUILD_DEVTOOLS=ON \
         -DEXECUTORCH_BUILD_EXTENSION_LLM=ON \
         -DEXECUTORCH_BUILD_EXTENSION_LLM_RUNNER=ON \
+        ${MINICPM5_TOKENIZER_FLAG} \
         -DEXECUTORCH_BUILD_EXTENSION_MODULE=ON \
         -DEXECUTORCH_BUILD_EXTENSION_DATA_LOADER=ON \
         -DEXECUTORCH_BUILD_EXTENSION_FLAT_TENSOR=ON \

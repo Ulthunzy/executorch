@@ -988,6 +988,23 @@ if(EXECUTORCH_BUILD_EXTENSION_LLM)
     set(CMAKE_POSITION_INDEPENDENT_CODE ON)
   endif()
   add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/extension/llm/tokenizers)
+  if(EXECUTORCH_USE_MINICPM5_TOKENIZER)
+    set(_upstream_pre_tokenizer
+        ${CMAKE_CURRENT_SOURCE_DIR}/extension/llm/tokenizers/src/pre_tokenizer.cpp
+    )
+    get_target_property(_tokenizers_sources tokenizers SOURCES)
+    list(FIND _tokenizers_sources ${_upstream_pre_tokenizer} _source_index)
+    if(_source_index EQUAL -1)
+      message(FATAL_ERROR "Cannot replace the upstream pre_tokenizer.cpp")
+    endif()
+    list(REMOVE_ITEM _tokenizers_sources ${_upstream_pre_tokenizer})
+    set_property(TARGET tokenizers PROPERTY SOURCES ${_tokenizers_sources})
+    target_sources(
+      tokenizers
+      PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/examples/models/minicpm5/tokenizer/pre_tokenizer.cpp
+    )
+  endif()
   if(EXECUTORCH_BUILD_EXTENSION_LLM_RUNNER)
     set(CMAKE_POSITION_INDEPENDENT_CODE
         ${ORIGINAL_CMAKE_POSITION_INDEPENDENT_CODE_FLAG}

@@ -112,6 +112,11 @@ define_overridable_option(
   OFF
 )
 define_overridable_option(
+  EXECUTORCH_USE_MINICPM5_TOKENIZER
+  "Build the LLM tokenizer with the MiniCPM5 pre-tokenizer implementation" BOOL
+  OFF
+)
+define_overridable_option(
   EXECUTORCH_BUILD_EXTENSION_MODULE "Build the Module extension" BOOL OFF
 )
 define_overridable_option(
@@ -410,6 +415,11 @@ check_required_options_on(
 
 check_required_options_on(
   IF_ON EXECUTORCH_BUILD_EXTENSION_LLM_RUNNER REQUIRES
+  EXECUTORCH_BUILD_EXTENSION_LLM
+)
+
+check_required_options_on(
+  IF_ON EXECUTORCH_USE_MINICPM5_TOKENIZER REQUIRES
   EXECUTORCH_BUILD_EXTENSION_LLM
 )
 

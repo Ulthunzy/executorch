@@ -48,6 +48,7 @@ enum DecoderModelVersion {
   kGlm,
   kGemma2,
   kGemma4,
+  kMiniCPM5,
 };
 
 class Runner : public executorch::extension::llm::IRunner {

@@ -8,6 +8,8 @@ import argparse
 import json
 import logging
 import re
+from functools import partial
+from pathlib import Path
 from typing import Dict, List
 
 from executorch.examples.qualcomm.oss_scripts.llama import LLMModelConfig
@@ -131,7 +133,7 @@ class TokenizerWrapper:
         elif "llama3_2" in self.decoder_model:
             path, self.tokenizer = self._from_tokenizer_model(tokenizer_model)
         else:
-            path, self.tokenizer, self.chat_template = self._from_hf()
+            path, self.tokenizer, self.chat_template = self._from_hf(tokenizer_model)
         return path
 
     def _from_tokenizer_model_and_bin(self, tokenizer_model, tokenizer_bin):
@@ -151,13 +153,26 @@ class TokenizerWrapper:
         runtime_tokenizer_path = tokenizer_model
         return runtime_tokenizer_path, tokenizer
 
-    def _from_hf(self):
-        tokenizer = AutoTokenizer.from_pretrained(self.repo_id)
+    def _from_hf(self, tokenizer_model=None):
+        if self.decoder_model == "minicpm5_2b":
+            if tokenizer_model is not None and not Path(tokenizer_model).is_dir():
+                raise ValueError(
+                    "For MiniCPM5, tokenizer_model must be a local model directory"
+                )
+            tokenizer = AutoTokenizer.from_pretrained(
+                tokenizer_model or self.repo_id,
+                local_files_only=tokenizer_model is not None,
+            )
+        else:
+            tokenizer = AutoTokenizer.from_pretrained(self.repo_id)
         chat_template = (
             tokenizer.apply_chat_template
             if hasattr(tokenizer, "apply_chat_template") and self._instruct_model
             else None
         )
+        if self.decoder_model == "minicpm5_2b" and chat_template is not None:
+            chat_template = partial(chat_template, enable_thinking=False)
+
         tokenizer_artifacts = tokenizer.save_pretrained(self.artifact)
         tokenizer_config = tokenizer_artifacts[0]
         if self.decoder_model == "glm-1_5b":
@@ -169,8 +184,21 @@ class TokenizerWrapper:
                 file.seek(0)
                 json.dump(data, file, indent=4)
                 file.truncate()
-        runtime_tokenizer_path = tokenizer_artifacts[-1]
+        if self.decoder_model == "minicpm5_2b":
+            runtime_tokenizer_path = str(Path(self.artifact) / "tokenizer.json")
+            with open(runtime_tokenizer_path) as f:
+                tokenizer_data = json.load(f)
+
+            # The chat template already supplies BOS.
+            tokenizer_data["post_processor"] = None
+
+            with open(runtime_tokenizer_path, "w") as f:
+                json.dump(tokenizer_data, f, ensure_ascii=False)
+        else:
+            runtime_tokenizer_path = tokenizer_artifacts[-1]
+
         tokenizer = get_tokenizer(runtime_tokenizer_path, tokenizer_config)
+
         if self.decoder_model == "codegen2_1b":
             # Override the default BOS and EOS token IDs for codegen2_1b
             tokenizer.bos_id = 1

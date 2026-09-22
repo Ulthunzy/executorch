@@ -4,6 +4,7 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+from dataclasses import dataclass
 from typing import Tuple
 
 import torch
@@ -34,11 +35,21 @@ from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import (
 )
 from transformers.models.qwen3_vl.modeling_qwen3_vl import (
     apply_rotary_pos_emb_vision as apply_qwen3_vl_rotary_pos_emb,
-    BaseModelOutputWithDeepstackFeatures,
     Qwen3VLVisionConfig,
     Qwen3VLVisionMLP,
     Qwen3VLVisionModel,
 )
+
+try:
+    from transformers.models.qwen3_vl.modeling_qwen3_vl import (
+        BaseModelOutputWithDeepstackFeatures,
+    )
+except ImportError:
+    from transformers.modeling_outputs import BaseModelOutputWithPooling
+
+    @dataclass
+    class BaseModelOutputWithDeepstackFeatures(BaseModelOutputWithPooling):
+        deepstack_features: list[torch.FloatTensor] | None = None
 
 
 # Custom implementation based on `transformers/models/idefics3/modeling_idefics3/Idefics3VisionEmbeddings.py` (Transformers v5.0.0rc1)
