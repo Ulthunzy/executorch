@@ -58,20 +58,25 @@ class PT2Test(unittest.TestCase):
     def test_dynamic_capacity_and_prefix_logits(self):
         """Infer AR and sliding width and return the complete original prefix."""
         for size in (8, 12):
-            engine = PT2Engine(self.exported(size=size), device="cpu")
-            self.assertEqual(engine.max_input_length, size)
-            self.assertEqual(engine.sliding_window, 3)
-            ids = [1, 2, 3, 1]
-            logits = engine(ids)
-            expected = (
-                torch.nn.functional.one_hot(torch.tensor(ids), num_classes=5)
-                .float()
-                .cumsum(0)
-            )
-            self.assertTrue(torch.equal(logits, expected))
-            self.assertTrue(engine.last_causality_check["passed"])
-            self.assertEqual(len(engine.last_causality_check["checks"]), 6)
-            self.assertTrue(engine.validate_causality([1])["passed"])
+            for offload in (False, True):
+                engine = PT2Engine(
+                    self.exported(size=size),
+                    device="cpu",
+                    causality_offload=offload,
+                )
+                self.assertEqual(engine.max_input_length, size)
+                self.assertEqual(engine.sliding_window, 3)
+                ids = [1, 2, 3, 1]
+                logits = engine(ids)
+                expected = (
+                    torch.nn.functional.one_hot(torch.tensor(ids), num_classes=5)
+                    .float()
+                    .cumsum(0)
+                )
+                self.assertTrue(torch.equal(logits, expected))
+                self.assertTrue(engine.last_causality_check["passed"])
+                self.assertEqual(len(engine.last_causality_check["checks"]), 6)
+                self.assertTrue(engine.validate_causality([1])["passed"])
 
     def test_future_leakage_is_rejected_without_patch(self):
         """Refuse leakage both into padding and from within the supplied prefix."""

@@ -1,0 +1,26 @@
+{
+  "schema_version": 1,
+  "ppl": {
+    "hf_to_pt2_max_relative_increase": 0.05,
+    "pt2_to_pte_max_relative_increase": 0.01,
+    "pt2_to_pte_max_mean_nll_increase": 0.01,
+    "pt2_to_pte_min_top1_agreement": 0.98
+  },
+  "generation": {
+    "hf_to_pt2_max_pass_rate_drop_pp": 2.0,
+    "hf_to_pt2_min_quality_retention": 0.98,
+    "pt2_to_pte_max_pass_rate_drop_pp": 1.0,
+    "hf_to_pte_max_pass_rate_drop_pp": 2.0,
+    "max_eos_rate_drop_pp": 1.0,
+    "max_repetition_rate_increase_pp": 1.0,
+    "max_garbled_rate_increase_pp": 1.0,
+    "critical_turn_ids": []
+  },
+  "correctness": {
+    "require_complete_runs": true,
+    "require_same_ppl_inputs": true,
+    "require_same_generation_cases": true,
+    "require_same_generation_config": true,
+    "require_lineage": true
+  }
+}

@@ -17,6 +17,8 @@ from model_validation.common.audit import audit_run
 from model_validation.ppl.artifacts import digest as ppl_digest
 from model_validation.reporting import compare
 
+PPL_FIXTURE_LOSS = math.log(2)
+
 
 def dialogue(root, reviewed=True):
     root.mkdir(parents=True, exist_ok=True)
@@ -68,7 +70,7 @@ def dialogue(root, reviewed=True):
     return root
 
 
-def ppl_run(root, engine="hf", loss=math.log(2)):
+def ppl_run(root, engine="hf", loss=PPL_FIXTURE_LOSS, top1=True):
     root.mkdir(parents=True, exist_ok=True)
     windows = [
         dict(id="W000000", begin=0, end=4, target_begin=1),
@@ -111,6 +113,8 @@ def ppl_run(root, engine="hf", loss=math.log(2)):
             identity_sha256=ppl_digest(identity),
             details=details,
         )
+        if top1:
+            record["top1_token_ids"] = [0] * len(values)
         record["record_sha256"] = ppl_digest(record)
         records[window["id"]] = record
         report.write_json(root / (window["id"] + ".json"), record)
@@ -119,38 +123,36 @@ def ppl_run(root, engine="hf", loss=math.log(2)):
     )
     mean = total / 5
     ppl = math.exp(mean) if mean <= math.log(sys.float_info.max) else None
-    report.write_json(
-        root / "summary.json",
-        dict(
-            schema="executorch.ppl.summary.v1",
-            complete=True,
-            standard_ppl_eligible=True,
-            count=5,
-            target_count=5,
-            nll_sum=total,
-            mean_nll=mean,
-            ppl=ppl,
-            ppl_overflow=ppl is None,
-            identity_sha256=ppl_digest(identity),
-            model_sha256=identity["model"]["sha256"],
-            record_hashes={
-                key: value["record_sha256"] for key, value in records.items()
-            },
-            **{
-                key: identity[key]
-                for key in (
-                    "engine",
-                    "metric",
-                    "corpus_sha256",
-                    "tokens_sha256",
-                    "targets_sha256",
-                    "tokenizer_sha256",
-                    "context_len",
-                    "stride",
-                )
-            },
-        ),
+    saved_summary = dict(
+        schema="executorch.ppl.summary.v1",
+        complete=True,
+        standard_ppl_eligible=True,
+        count=5,
+        target_count=5,
+        nll_sum=total,
+        mean_nll=mean,
+        ppl=ppl,
+        ppl_overflow=ppl is None,
+        identity_sha256=ppl_digest(identity),
+        model_sha256=identity["model"]["sha256"],
+        record_hashes={key: value["record_sha256"] for key, value in records.items()},
+        **{
+            key: identity[key]
+            for key in (
+                "engine",
+                "metric",
+                "corpus_sha256",
+                "tokens_sha256",
+                "targets_sha256",
+                "tokenizer_sha256",
+                "context_len",
+                "stride",
+            )
+        },
     )
+    if top1:
+        saved_summary["top1_available"] = True
+    report.write_json(root / "summary.json", saved_summary)
     return root
 
 
@@ -289,6 +291,10 @@ def test_overflow_ppl_is_audited_but_not_published_as_a_score(tmp_path):
     assert compare.collect(root)["ppl"] is None
 
 
+def test_legacy_ppl_without_top1_remains_auditable(tmp_path):
+    assert audit_run(ppl_run(tmp_path, top1=False)) is None
+
+
 @pytest.mark.parametrize("name", ["metadata.json", "W000000.json", "W000001.json"])
 def test_ppl_requires_raw_evidence(tmp_path, name):
     root = ppl_run(tmp_path)
@@ -324,6 +330,7 @@ def test_ppl_summary_is_recomputed(tmp_path, field, value):
         lambda record: record.update(token_nll=[0.0]),
         lambda record: record.update(token_nll=[-1.0, 0.0, 0.0], nll_sum=-1.0),
         lambda record: record.update(token_nll=[True, 0.0, 0.0], nll_sum=1.0),
+        lambda record: record.update(top1_token_ids=[0]),
         lambda record: record.update(nll_sum=100.0),
         lambda record: record.update(identity_sha256="fake"),
         lambda record: record["window"].update(target_begin=2),

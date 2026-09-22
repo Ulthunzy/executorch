@@ -39,7 +39,10 @@ def collect(directory):
         summary = json.loads(path.read_text(encoding="utf-8"))
         if not isinstance(summary, dict):
             raise ValueError("summary.json must contain an object")
-        known = summary.get("schema") == "executorch.ppl.summary.v1" or (
+        known = summary.get("schema") in (
+            "executorch.ppl.summary.v1",
+            "executorch.business.summary.v1",
+        ) or (
             "planned" in summary
             and summary.get("schema") is None
             and summary.get("schema_version", 1) == 1
@@ -88,9 +91,13 @@ def collect(directory):
             "repetition_flags",
         ):
             row[key] = summary.get(key)
+        business = summary.get("schema") == "executorch.business.summary.v1"
+        if business:
+            row["normal_rate"] = summary.get("pass_rate")
         reviewed = bool(row["planned"]) and row["reviewed"] == row["planned"]
         row.update(
-            metric="generation", status="reviewed" if reviewed else "pending_review"
+            metric="business_generation" if business else "generation",
+            status="reviewed" if reviewed else "pending_review",
         )
         if not reviewed:
             row.update(normal_rate=None, identity_correct_rate=None)

@@ -1,0 +1,24 @@
+{
+  "schema_version": 1,
+  "description": "三端 PPL 与已完成复核的三端 generation 结果执行质量门禁。",
+  "variables": {
+    "policy": "${validation}/configs/quality_gate.example.json",
+    "lineage": "/path/to/export_lineage.json",
+    "hf_ppl": "/path/to/ppl/hf",
+    "pt2_ppl": "/path/to/ppl/pt2",
+    "pte_ppl": "/path/to/ppl/pte",
+    "hf_generation": "/path/to/business/hf",
+    "pt2_generation": "/path/to/business/pt2",
+    "pte_generation": "/path/to/business/pte"
+  },
+  "output_root": "${repo}/llama-output/model-validation/new-model-quality-gate",
+  "steps": [
+    {
+      "id": "quality-gate",
+      "tool": "quality-gate",
+      "args": ["--policy", "${policy}", "--lineage", "${lineage}", "--hf-ppl", "${hf_ppl}", "--pt2-ppl", "${pt2_ppl}", "--pte-ppl", "${pte_ppl}", "--hf-generation", "${hf_generation}", "--pt2-generation", "${pt2_generation}", "--pte-generation", "${pte_generation}", "--output", "${output}/gate"],
+      "inputs": ["${policy}", "${lineage}", "${hf_ppl}", "${pt2_ppl}", "${pte_ppl}", "${hf_generation}", "${pt2_generation}", "${pte_generation}"],
+      "outputs": ["${output}/gate/gate.json", "${output}/gate/metrics.json", "${output}/gate/regressions.csv", "${output}/gate/REPORT.md"]
+    }
+  ]
+}

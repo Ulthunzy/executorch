@@ -20,6 +20,23 @@ from hf_benchmark import GenerationTimer, chatml_prompt
 class HFReferenceTest(unittest.TestCase):
     """Verify formatting, timing, and the actual mixed-attention HF cache path."""
 
+    def test_temperature_cli_aliases(self):
+        for option in ("--temperature", "--temp"):
+            with self.subTest(option=option), patch(
+                "sys.argv",
+                [
+                    "hf_benchmark.py",
+                    "--model",
+                    "model",
+                    "--output",
+                    "result",
+                    option,
+                    "0.7",
+                ],
+            ), patch("hf_benchmark.run") as run:
+                hf_benchmark.main()
+                self.assertEqual(run.call_args.args[0].temperature, 0.7)
+
     def test_expected_names_are_optional_cli_arguments(self):
         for flags, expected in (
             ([], ("lu xiaoxi", "陆小兮")),

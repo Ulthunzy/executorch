@@ -128,11 +128,11 @@ run 校验 corpus 文件 hash、完整 windows 分区及 token 范围。HF/PT2 �
 
 ## 输出、比较与安全 resume
 
-成功运行产生 `metadata.json`、逐窗口 `W*.json`、`engine.json`（HF/PT2）或独立设备 attempt（PTE），最后才发布 `summary.json`。
+成功运行产生 `metadata.json`、逐窗口 `W*.json`、`engine.json`（HF/PT2）或独立设备 attempt（PTE），最后才发布 `summary.json`。每个窗口同时保存与 NLL 目标严格对齐的 `top1_token_ids`；三端都覆盖全部目标时 summary 标记 `top1_available: true`。质量门禁使用 PT2/PTE 的这些 teacher-forcing 预测计算 top-1 一致率，不使用自由生成 token。
 
 标准口径为 `PPL = exp(sum(token_nll) / target_count)`，自然对数、逐 token 加权，不能平均各窗口的 PPL。HF/PT2 的交叉熵使用 float32 logits，主机累加使用 float64；PTE 使用 float64 logsumexp，uint16 的等价计算使用导出 scale。PPL 超出 float64 表示范围时保存 `ppl: null`、`ppl_overflow: true` 和有限的 `mean_nll`，不会保存 JSON Infinity。
 
-summary 包含 `complete/count/target_count/nll_sum/mean_nll/ppl`、完整 `metric` 口径、`standard_ppl_eligible`、model/corpus/tokens/targets/tokenizer/identity SHA256、context/stride 和全部 window record hash。只有覆盖完整且验证通过后才标记标准 PPL；PT2 还必须具备每个窗口的因果性检查证据。
+summary 包含 `complete/count/target_count/nll_sum/mean_nll/ppl/top1_available`、完整 `metric` 口径、`standard_ppl_eligible`、model/corpus/tokens/targets/tokenizer/identity SHA256、context/stride 和全部 window record hash。只有覆盖完整且验证通过后才标记标准 PPL；PT2 还必须具备每个窗口的因果性检查证据。旧窗口没有 top-1 时仍可由 audit 按旧格式核对，但不能进入新版质量门禁；请用新目录重跑三端 PPL。
 
 比较时先匹配 `tokens_sha256`、`targets_sha256`、`tokenizer_sha256`、context/stride 和 `metric`；再根据目标明确精度差异。`corpus_sha256` 还绑定 tokenizer 快照文件与准备工具版本。仅相同模型名称或 token 数不证明可比。
 
@@ -166,6 +166,6 @@ python "$MV/run.py" ppl prepare --help
 python "$MV/run.py" ppl run --help
 ```
 
-Python 测试只生成随机小型 CPU HF/PT2 模型，覆盖独立 logsumexp 对照、target 分区、逐值 resume 完整性、同大小不同词表拒绝、PT2 形状与未来泄漏拒绝、PTE dry-run 零 ADB 调用和 mock 结果接收。C++ 契约测试覆盖动态 AR/context 切分、float/uint16 NLL 和非有限值拒绝。顶层 pytest 可能先导入仓库的 `llama/__init__.py` 而要求额外 ExecuTorch 环境，以上 unittest 命令可独立执行。
+Python 测试只生成随机小型 CPU HF/PT2 模型，覆盖独立 logsumexp 对照、target 分区、逐值 resume 完整性、top-1 对齐、同大小不同词表拒绝、PT2 形状与未来泄漏拒绝、PTE dry-run 零 ADB 调用和 mock 结果接收。C++ 契约测试覆盖动态 AR/context 切分、float/uint16 NLL、top-1（含并列时的确定性选择）和非有限值拒绝。顶层 pytest 可能先导入仓库的 `llama/__init__.py` 而要求额外 ExecuTorch 环境，以上 unittest 命令可独立执行。
 
-真机逐 token 数值回归见顶层 [设备测试命令](../README.md#7-兼容验证与注意事项)。`test_ppl_device.py` 显式启用后检查 KV/hybrid 的 166 个目标 token、跨 AR/窗口边界与无重算恢复；未设置设备变量时跳过。PPL 的 `repetition_penalty=1.0` 关闭惩罚，但 runner 仍要求合法的正数窗口，因此 driver 传入 128，不用 0 表示关闭。
+真机逐 token 数值回归见顶层 [设备测试命令](../README.md#8-兼容验证与注意事项)。`test_ppl_device.py` 显式启用后检查 KV/hybrid 的 166 个目标 token、跨 AR/窗口边界与无重算恢复；未设置设备变量时跳过。PPL 的 `repetition_penalty=1.0` 关闭惩罚，但 runner 仍要求合法的正数窗口，因此 driver 传入 128，不用 0 表示关闭。

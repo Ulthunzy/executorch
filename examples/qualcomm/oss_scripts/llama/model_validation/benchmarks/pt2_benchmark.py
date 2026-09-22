@@ -9,8 +9,8 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
-from common.output import atomic_directory, run_lock  # noqa: E402
 from benchmark import completed_session  # noqa: E402
+from common.output import atomic_directory, run_lock  # noqa: E402
 from hf_benchmark import chatml_prompt, WindowedRepetitionPenalty  # noqa: E402
 from report import (
     digest,
@@ -31,6 +31,7 @@ def generate_turn(engine, tokenizer, history, turn, args, eos):
     incremental = tokenizer.encode(payload, add_special_tokens=False)
     inputs = history + incremental
     remaining = args.seq_len - len(inputs)
+    max_new_tokens = getattr(args, "max_new_tokens", -1)
     record = {
         **turn,
         "response": "",
@@ -46,6 +47,7 @@ def generate_turn(engine, tokenizer, history, turn, args, eos):
     if remaining <= 0:
         record.update(error_code=18, stop_reason="context_full", wall_seconds=0)
         return record, history
+    remaining = remaining if max_new_tokens == -1 else min(remaining, max_new_tokens)
     generated = []
     started = time.perf_counter()
     first_token_seconds = None
@@ -76,24 +78,27 @@ def generate_turn(engine, tokenizer, history, turn, args, eos):
     return record, inputs + generated
 
 
-def run(args):
+def run(args, *, report_fn=summarize, evaluation=None):
     with run_lock(args.output):
-        return run_locked(args)
+        return run_locked(args, report_fn=report_fn, evaluation=evaluation)
 
 
-def run_locked(args):
+def run_locked(args, *, report_fn=summarize, evaluation=None):
     import torch
-    from transformers import AutoTokenizer
 
     from engines.pt2 import PT2Engine
+    from transformers import AutoTokenizer
 
     if not args.device.startswith("cuda") or not torch.cuda.is_available():
         raise ValueError("PT2 generation requires CUDA")
     if args.seq_len < 2:
         raise ValueError("--seq-len must be >= 2")
+    max_new_tokens = getattr(args, "max_new_tokens", -1)
+    if max_new_tokens == 0 or max_new_tokens < -1:
+        raise ValueError("max-new-tokens must be -1 or positive")
     WindowedRepetitionPenalty(args.repetition_penalty, args.repeat_last_n)
     torch.manual_seed(42)
-    torch.set_num_threads(4)
+    torch.set_num_threads(args.num_threads)
     torch.backends.cuda.matmul.allow_tf32 = False
     torch.backends.cudnn.allow_tf32 = False
     cases = read_json(args.cases)
@@ -139,15 +144,21 @@ def run_locked(args):
             "transformers": importlib.metadata.version("transformers"),
             "tokenizers": importlib.metadata.version("tokenizers"),
         },
-        "expected": {
-            "english": args.expected_english,
-            "chinese": args.expected_chinese,
-        },
+        "expected": (
+            {}
+            if evaluation is not None
+            else {
+                "english": args.expected_english,
+                "chinese": args.expected_chinese,
+            }
+        ),
         "config": {
             "temperature": 0,
             "seq_len": args.seq_len,
             "repetition_penalty": args.repetition_penalty,
             "repeat_last_n": args.repeat_last_n,
+            "ignore_eos": False,
+            "max_new_tokens": max_new_tokens,
             "thinking_disabled": args.disable_thinking,
             "repair_think_eos": False,
             "enable_think_budget": False,
@@ -155,8 +166,11 @@ def run_locked(args):
             "tf32": False,
             "layout": args.pt2_layout,
             "graph_modified": False,
+            "num_threads": args.num_threads,
         },
     }
+    if evaluation is not None:
+        identity["evaluation"] = evaluation
     root = args.output.resolve()
     if root.exists():
         if not args.resume or read_json(root / "manifest.json")["identity"] != identity:
@@ -244,7 +258,7 @@ def run_locked(args):
                 }
             },
         )
-    summarize(root)
+    report_fn(root)
     print(root / "REPORT.md")
 
 
@@ -259,9 +273,11 @@ def main():
     parser.add_argument("--cases", type=Path, default=ROOT / "benchmarks/cases.json")
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--seq-len", type=int, default=4096)
+    parser.add_argument("--max-new-tokens", type=int, default=-1)
     parser.add_argument("--ids", nargs="+")
     parser.add_argument("--repetition-penalty", type=float, default=1.0)
     parser.add_argument("--repeat-last-n", type=int, default=128)
+    parser.add_argument("--num-threads", type=int, default=4)
     parser.add_argument("--disable-thinking", action="store_true")
     parser.add_argument("--expected-english", default="Lu Xiaoxi")
     parser.add_argument("--expected-chinese", default="陆小兮")

@@ -19,6 +19,13 @@
 目前支持 ChatML QNN Lincal / Qwen3 / Qwen2.5 的 `kv`、`hybrid` 模式，
 不是任意模型架构的通用适配器；其他聊天模板需要另行适配。
 
+通用业务 holdout 不使用本页的姓名专用评分。请改用 `run.py business` 和
+`configs/business.example.json`：HF/PT2/PTE 共用同一份 plain-prompt cases，支持
+`exact_match`、`contains`、`choice`、`numeric` 和 `manual` scorer，并把关键题、
+自动结构检查与人工复核绑定到逐题 record hash。workflow 先冻结 HF ChatML 输入，
+PTE 使用 canonical token IDs，最终门禁还会逐题核对三端实际输入 token。完整运行及质量门禁说明见
+[模型验证 README](../README.md#5-三端业务集与质量门禁)。
+
 ## 首次准备
 
 在仓库根目录运行：

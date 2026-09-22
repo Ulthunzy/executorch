@@ -22,14 +22,19 @@ class PT2Engine:
         dtype="float32",
         layout="lincal-full-sequence",
         pad_token_id=0,
+        causality_offload=False,
     ):
         if layout != "lincal-full-sequence" or dtype != "float32":
             raise ValueError("PT2 supports lincal-full-sequence with float32 only")
-        # Register standard QDQ operators without importing the QNN SDK utilities.
+        # Register every operator namespace serialized by supported QDQ exports.
         from torch.ao.quantization.fx import _decomposed  # noqa: F401
+        import torchao  # noqa: F401
+
+        from executorch.backends.qualcomm.builders import custom_ops  # noqa: F401
 
         self.device = torch.device(device)
         self.pad_token_id = pad_token_id
+        self.causality_offload = causality_offload
         ep = torch.export.load(Path(model_path))
         if ep.range_constraints:
             raise ValueError("PT2 adapter requires a fixed-shape export")
@@ -112,7 +117,7 @@ class PT2Engine:
         self.last_causality_check = None
 
     @torch.inference_mode()
-    def _forward(self, tokens):
+    def _forward(self, tokens, output_length):
         cache = [
             torch.zeros(shape, device=self.device, dtype=dtype)
             for shape, dtype in self.cache_specs
@@ -125,10 +130,17 @@ class PT2Engine:
             or logits.shape[:2] != (1, self.max_input_length)
             or logits.shape[2] < 2
             or not logits.is_floating_point()
-            or not torch.isfinite(logits).all()
         ):
-            raise ValueError("PT2 requires finite floating logits [1, S, vocab >= 2]")
-        return logits[0]
+            raise ValueError("PT2 requires floating logits [1, S, vocab >= 2]")
+        prefix = (
+            logits[0, :output_length].to("cpu")
+            if self.causality_offload
+            else logits[0, :output_length].clone()
+        )
+        del result, logits
+        if not torch.isfinite(prefix).all():
+            raise ValueError("PT2 requires finite prefix logits")
+        return prefix
 
     @torch.inference_mode()
     def _checked_logits(self, ids):
@@ -159,7 +171,7 @@ class PT2Engine:
             dtype=self.token_dtype,
         )
         tokens[0, :length] = raw
-        baseline = self._forward(tokens)
+        baseline = self._forward(tokens, length)
         if max(raw.max().item(), self.pad_token_id) >= baseline.shape[-1]:
             raise ValueError("PT2 input token ID outside logits vocabulary")
         checks = []
@@ -173,7 +185,7 @@ class PT2Engine:
                     tail.fill_(1)
                 else:
                     tail.copy_(torch.arange(tail.numel(), device=self.device) % 2)
-                comparison = self._forward(variant)[:cut]
+                comparison = self._forward(variant, cut)
                 difference = (baseline[:cut] - comparison).abs().max().item()
                 equal = torch.equal(baseline[:cut], comparison)
                 del comparison
@@ -192,6 +204,9 @@ class PT2Engine:
             prefix_length=length,
             checks=checks,
         )
+        if self.causality_offload and self.device.type == "cuda":
+            torch.cuda.empty_cache()
+            baseline = baseline.to(self.device)
         return baseline[:length]
 
     def validate_causality(self, ids):

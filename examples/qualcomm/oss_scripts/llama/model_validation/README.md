@@ -12,7 +12,9 @@ SafeTensors GPU 基线、校准数据准备、QDQ PT2/PTE 精度测试、对话�
 | SafeTensors 对话 | `run.py hf` | CUDA、Qwen3/Lincal ChatML、贪心温度 0；其他架构需新增适配器 |
 | PTE 对话 | `run.py pte run` | 手机 QNN、Lincal/Qwen3/Qwen2.5、KV/hybrid；保留完整真实多轮 KV |
 | PT2 对话 | `run.py pt2` | CUDA、显式 `lincal-full-sequence` QDQ 布局；原图逐次完整历史回放及因果检查，较慢，不是生产 KV 性能 |
+| 三端业务集 | `run.py business` | HF/PT2/PTE 共用 plain prompt、ID、参考答案和 scorer；开放题保留人工复核 |
 | 标准 PPL | `run.py ppl prepare/run` | 固定文本、token IDs、窗口；各后端能力与驱动限制见 [PPL README](ppl/README.md) |
+| 量化质量门禁 | `run.py quality-gate` | 强制审计三端 PPL/生成证据、lineage 和可比性，输出 PASS/FAIL |
 | 外部测试集 | `run.py sample run` | 已有 sample bundle 格式，详见 [测试集说明](benchmarks/SAMPLE_BENCHMARK.md) |
 | 校准准备 | `calibration-build` / `calibration-check` | 现有 Luxi/ChatML think 筛选规则，不是任意架构的通用 SFT 工具 |
 | 量化/PTE 导出 | `run.py export` | 转发原 `llama.py`；不修改它的模型注册、参数或导出行为 |
@@ -26,11 +28,11 @@ SafeTensors GPU 基线、校准数据准备、QDQ PT2/PTE 精度测试、对话�
 model_validation/
 ├── run.py                # 统一入口
 ├── configs/              # 可复制修改的 JSON 流程示例
-├── common/               # 工具注册、调度、输入对齐
+├── common/               # 工具注册、调度、输入对齐、导出 lineage
 ├── engines/              # HF/PT2/PTE PPL 执行适配
 ├── calibration/          # 校准数据准备和校验
 ├── ppl/                  # 标准 PPL、隔离的设备驱动
-├── benchmarks/           # 身份/多轮/外部测试集、生成驱动
+├── benchmarks/           # 身份/多轮/通用业务/外部测试集、生成驱动
 ├── ablation/             # 消融入口与历史归档说明
 ├── reporting/            # 跨运行汇总
 └── tests/                # 新入口及配置回归测试
@@ -52,6 +54,8 @@ python "$VALIDATION/run.py" list
 python "$VALIDATION/run.py" hf --help
 python "$VALIDATION/run.py" ppl --help
 python "$VALIDATION/run.py" pte run --help
+python "$VALIDATION/run.py" business --help
+python "$VALIDATION/run.py" quality-gate --help
 ```
 
 `list`、配置预览和离线汇总不加载模型。HF/PT2 需要环境中的 CUDA PyTorch；PTE 需要已构建的 QNN runner、ADB 及匹配的设备 QNN 库。工具不自动下载安装或升级依赖。
@@ -216,11 +220,56 @@ python "$VALIDATION/run.py" calibration-build inspect-gpu \
 python "$VALIDATION/run.py" export --help
 ```
 
-你已有的 `llama.py` 编译命令可以把开头替换为 `python "$VALIDATION/run.py" export`，后面的参数不变。必须确认当前 decoder 配置/显式 checkpoint 对应的是这次的权重。原 `--checkpoint` 读取转换后的 PyTorch checkpoint，不是直接接收 SafeTensors 文件夹；不要将 HF 测试的 `--model` 参数直接搬给 exporter。
+你已有的 `llama.py` 编译命令可以把开头替换为 `python "$VALIDATION/run.py" export`。为了生成可用于质量门禁的完整 lineage，还要显式增加 `--source_safetensors /path/to/original-hf-model`。原 `--checkpoint` 仍读取转换后的 PyTorch checkpoint；`--source_safetensors` 只记录原始 SafeTensors 内容指纹，不改变导出输入。
 
-校准文件通过现有 `--calib_text_datasets` 和 `--calib_text_preserve_sources` 接入。需要后续 PT2 测试时 **不要使用 `--skip_qdq_save`**；该开关会跳过 QDQ PT2 评估产物。校准 AR 与部署 prefill AR 分别按原导出逻辑配置，不由测试框架强制绑定。
+校准文件通过现有 `--calib_text_datasets` 和 `--calib_text_preserve_sources` 接入。需要后续 PT2 测试时 **不要使用 `--skip_qdq_save`**；该开关会跳过 QDQ PT2 评估产物。导出成功后，artifact 目录新增 `export_lineage.json`，绑定 SafeTensors、checkpoint、tokenizer、本地校准文件、量化/导出参数、代码 commit 与 working-tree 内容指纹、QNN SDK build ID、PT2 与 PTE 内容哈希。只有本次导出调用实际新生成的 `decode_qdq.pt2` 才会进入 lineage，artifact 目录里的旧文件不会冒充本次输出。
 
-## 5. 检查输入，查看完整输出和结果
+缺少本地 SafeTensors、checkpoint、tokenizer、本地且内容可哈希的校准来源或本次 PT2 输出时，manifest 会标记 `complete: false`，不能通过质量门禁。Hub/lm-eval 数据集名称没有固定 revision 和实际样本内容，因此当前只能作为外部描述，不能产生完整 lineage；QAT 的远程训练集同理。需要正式门禁时先物化为本地、受版本控制的输入。校准 AR 与部署 prefill AR 分别按原导出逻辑配置，不由测试框架强制绑定。
+
+## 5. 三端业务集与质量门禁
+
+复制 [business workflow](configs/business.example.json) 和 [业务用例示例](configs/business_cases.example.json)，将自己的 holdout 数据写成同一份 sessions/turns JSON。每个 turn 可声明 `critical: true`，并选择以下 scorer：
+
+- `exact_match`：规范化空白和 Unicode 后精确匹配；可用 `case_sensitive`。
+- `contains`：参考字符串全部或任一包含，`mode` 为 `all|any`。
+- `choice`：保守提取明确的 A～P 选项。
+- `numeric`：保守提取有限十进制或分数并做精确数值比较。
+- `manual`：不自动判断语义，必须人工填写 `passed`。
+
+所有 scorer 还会共同检查执行成功、EOS、最终答复、think 闭合、重复和乱码。自动 scorer 无法保守提取时也保持待复核，不猜测通过。HF/PT2/PTE 使用同一用例 ID 和 shared scorer。workflow 会先用 HF tokenizer 冻结 incremental ChatML token IDs，并将 canonical IDs 交给 PTE；门禁还会逐题比较三端实际记录的 `incremental_input_ids`，并要求 PTE 同时记录的原生 tokenizer IDs 完全相同。文本相同但 token 不同会直接判为证据不可比。
+
+业务 workflow 在三端使用相同的 `--max-new-tokens`。示例默认 128；对于 PT2 完整序列回放，必须根据用例预期长度设置有限预算，否则单个未及时输出 EOS 的用例可能运行很久。达到预算会记录为 `length_limit`，不会伪装成正常 EOS：
+
+```bash
+cp "$VALIDATION/configs/business.example.json" \
+  "$VALIDATION/configs/my-model-business.json"
+python "$VALIDATION/run.py" workflow \
+  --config "$VALIDATION/configs/my-model-business.json" --all
+```
+
+每端运行后，复制其 `review_template.json` 为独立 review 文件，填写待复核项的 `passed: true|false`，保留 `record_hash` 和 `run_fingerprint`，再重新汇总：
+
+```bash
+cp /path/to/business/hf/review_template.json /path/to/business/hf/reviews.json
+# 编辑 reviews.json；PT2/PTE 同样处理。
+python "$VALIDATION/run.py" business summarize /path/to/business/hf \
+  --reviews /path/to/business/hf/reviews.json
+```
+
+三端业务结果全部完成复核，且三端 PPL 都由新版工具重新产生后，复制 [门禁 policy](configs/quality_gate.example.json) 与 [门禁 workflow](configs/quality_gate.workflow.example.json)，填写六个结果目录及 `export_lineage.json`：
+
+```bash
+cp "$VALIDATION/configs/quality_gate.workflow.example.json" \
+  "$VALIDATION/configs/my-model-quality-gate.json"
+python "$VALIDATION/run.py" workflow \
+  --config "$VALIDATION/configs/my-model-quality-gate.json" --all
+```
+
+门禁固定执行原始 evidence audit，并强制检查三端 PPL 的 token/target/tokenizer/context/stride/metric 完全可比、三端业务 ID/生成配置/tokenizer.json/逐题实际输入 token 相同、所有题目已评分、每端业务模型与对应 PPL 模型相同、lineage 与实际评测模型哈希一致。业务 evidence 缺少原始 `session.log` 会被拒绝。这些 correctness 项在 policy 中必须保持 `true`，不能用调低阈值的方式绕过。
+
+输出目录包含 `REPORT.md`、`gate.json`、`metrics.json` 和逐题 `regressions.csv`。`gate.json` 内嵌 policy、六端 evidence 指纹和自哈希；resume 会重新审计源目录并重算完整门禁，四个报告文件都受 workflow 输出指纹保护。报告覆盖三端 PPL/mean NLL、PT2→PTE teacher-forcing top-1 一致率、通过率、EOS、重复、乱码、每个转换阶段的新增回归与恢复，以及所有声明/配置的关键 ID 零新增回归。退出码 `0` 表示 PASS，`1` 表示证据有效但指标 FAIL，`2` 表示证据无效或不可比。workflow 会把退出码 1 保存为“执行完成、结论 FAIL”，恢复时复核并继续返回 1，不会把它误作中断任务重跑。旧 PPL 结果没有 `top1_token_ids`，必须重跑，不能补写 summary 冒充新版证据。
+
+## 6. 检查输入，查看完整输出和结果
 
 `generation.example.json` 的 `inputs` 阶段冻结 HF 编码的增量 ChatML；手机测试显式读取 `canonical.json`。它不等于已验证手机原生 tokenizer。要核对实际设备编码，单独运行：
 
@@ -255,7 +304,7 @@ python "$VALIDATION/run.py" report \
   --output llama-output/model-validation/my-model/comparison-v1
 ```
 
-`pte summarize` 是共享的离线对话报告入口，也能汇总本框架产生的 HF/PT2 会话，不会启动手机。`report` 可同时收集显式传入的 PPL/对话目录，生成 CSV/JSON/Markdown，缺失、待复核、无标准 PPL 有效性证据的结果不会当作零分或合格分数。
+`pte summarize` 是共享的离线身份对话报告入口，也能汇总本框架产生的 HF/PT2 会话，不会启动手机。业务用例使用 `business summarize`。`report` 可同时收集显式传入的 PPL、身份对话或业务目录，生成 CSV/JSON/Markdown，缺失、待复核、无标准 PPL 有效性证据的结果不会当作零分或合格分数。
 
 按会话整理“第一轮输入/实际输出/参考答案、第二轮……”的错误表：
 
@@ -268,7 +317,7 @@ python "$VALIDATION/run.py" errors /path/to/generation-run \
 
 `references.json` 是 `{"I01T1": "参考答复", "I01T2": "参考答复"}` 这样的 ID→文本映射。两项都可省略：未提供复核的会话列为待复核，不冒充错误；未提供参考答案则标注缺失，不自动编造标准答案。报告包含 Markdown、CSV 和来源哈希，并链接原始完整回答。
 
-## 6. 后续如何添加流程
+## 7. 后续如何添加流程
 
 配置格式、参数矩阵、依赖与新增工具的方法见 [扩展指南](EXTENDING.md)。
 
@@ -276,7 +325,7 @@ python "$VALIDATION/run.py" errors /path/to/generation-run \
 
 完整实验至少记录原始权重→PT2→PTE 的对应关系、量化配置和数据来源、tokenizer/template、模式与上下文/AR、生成策略、代码版本及复核口径。单独改图的诊断产物必须使用新的运行名称，不能覆盖原模型的报告。
 
-## 7. 兼容、验证与注意事项
+## 8. 兼容、验证与注意事项
 
 旧 `self_identity_eval/*.py` 和 `calibration/*.py` 保留轻量转发入口；后续维护以本目录为准。旧 `self_identity_eval/ablation/*.py` 已随专项脚本一起归档，不再提供入口。小型旧 JSON 用例路径保留兼容，完整数据集和历史结果未移动。
 

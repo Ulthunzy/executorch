@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <iterator>
 #include <stdexcept>
 #include <vector>
 
@@ -53,6 +54,15 @@ inline double quantized_nll(
     sum += exponential[maximum - value];
   }
   return std::log(sum) + (maximum - logits[target]) * scale;
+}
+
+template <typename T>
+inline size_t top1_token(const std::vector<T>& logits) {
+  if (logits.empty()) {
+    throw std::runtime_error("Cannot select top-1 from empty logits");
+  }
+  return static_cast<size_t>(std::distance(
+      logits.begin(), std::max_element(logits.begin(), logits.end())));
 }
 
 } // namespace ppl

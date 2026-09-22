@@ -60,7 +60,24 @@ def record_values(record, window):
     return values
 
 
-def save_record(output, window, values, identity_hash, details=None):
+def record_top1(record, window, *, required=False):
+    """Validate aligned top-1 token IDs when the producer supports them."""
+    values = record.get("top1_token_ids")
+    count = window["end"] - window["target_begin"]
+    if values is None and not required:
+        return None
+    if (
+        not isinstance(values, list)
+        or len(values) != count
+        or any(type(value) is not int or value < 0 for value in values)
+    ):
+        raise ValueError(f"Invalid completed window/top-1 values: {window['id']}")
+    return values
+
+
+def save_record(
+    output, window, values, identity_hash, details=None, top1_token_ids=None
+):
     """Seal a window with its run identity and a hash covering every NLL."""
     record = dict(
         window=window,
@@ -70,7 +87,10 @@ def save_record(output, window, values, identity_hash, details=None):
         identity_sha256=identity_hash,
         details=details or {},
     )
+    if top1_token_ids is not None:
+        record["top1_token_ids"] = top1_token_ids
     record_values(record, window)
+    record_top1(record, window, required=top1_token_ids is not None)
     record["record_sha256"] = digest(record)
     write_json(output / (window["id"] + ".json"), record)
     return record
@@ -108,6 +128,9 @@ def summary(identity, records, windows):
         mean_nll=mean,
         ppl=ppl,
         ppl_overflow=ppl is None,
+        top1_available=all(
+            record_top1(records[window["id"]], window) is not None for window in windows
+        ),
         metric=METRIC,
         identity_sha256=digest(identity),
         model_sha256=identity["model"]["sha256"],
@@ -240,17 +263,19 @@ def score_window(engine, tokens, window, max_token_id=0):
             )
         labels = torch.as_tensor(tokens[begin + 1 : end], device=logits.device)
         values = []
+        top1_token_ids = []
         for offset in range(target - begin - 1, len(labels), 64):
             chunk = logits[offset : offset + 64].float()
             if not torch.isfinite(chunk).all():
                 raise ValueError("Nonfinite model logits")
+            top1_token_ids.extend(chunk.argmax(dim=-1).cpu().tolist())
             values.extend(
                 F.cross_entropy(chunk, labels[offset : offset + 64], reduction="none")
                 .double()
                 .cpu()
                 .tolist()
             )
-    return values
+    return values, top1_token_ids
 
 
 def run(args):
@@ -370,7 +395,11 @@ def run(args):
         identity["runtime"] = torch_runtime(args.device)
         identity["dtype"] = args.dtype
         if args.engine == "pt2":
-            identity.update(pt2_layout=args.pt2_layout, pad_token_id=args.pad_token_id)
+            identity.update(
+                pt2_layout=args.pt2_layout,
+                pad_token_id=args.pad_token_id,
+                pt2_causality_offload=True,
+            )
     with locked_output(output, args.resume):
         records = cached_records(output, identity, windows)
         pending = [w for w in windows if w["id"] not in records]
@@ -386,8 +415,16 @@ def run(args):
                 if window["id"] not in results:
                     continue
                 values = record_values(results[window["id"]], window)
+                top1_token_ids = record_top1(
+                    results[window["id"]], window, required=True
+                )
                 records[window["id"]] = save_record(
-                    output, window, values, digest(identity), details
+                    output,
+                    window,
+                    values,
+                    digest(identity),
+                    details,
+                    top1_token_ids,
                 )
             if failure:
                 raise RuntimeError(
@@ -415,6 +452,7 @@ def run(args):
                     dtype=args.dtype,
                     layout=args.pt2_layout,
                     pad_token_id=args.pad_token_id,
+                    causality_offload=True,
                 )
                 if manifest["context_len"] - 1 > engine.max_input_length:
                     raise ValueError(
@@ -431,14 +469,19 @@ def run(args):
                 )
             for window in pending:
                 started = time.perf_counter()
-                values = score_window(
+                values, top1_token_ids = score_window(
                     engine, tokens, window, manifest["tokenizer"]["max_token_id"]
                 )
                 details = dict(seconds=time.perf_counter() - started)
                 if args.engine == "pt2":
                     details["causality"] = engine.last_causality_check
                 records[window["id"]] = save_record(
-                    output, window, values, digest(identity), details
+                    output,
+                    window,
+                    values,
+                    digest(identity),
+                    details,
+                    top1_token_ids,
                 )
                 print(
                     f"PPL {args.engine} {window['id']} targets={len(values)}",

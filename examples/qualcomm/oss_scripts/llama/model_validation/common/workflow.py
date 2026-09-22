@@ -212,6 +212,11 @@ def fingerprints(paths):
                     ".txt",
                     ".jsonl",
                     ".u64",
+                    ".log",
+                    ".csv",
+                    ".md",
+                    ".yaml",
+                    ".yml",
                 }
             )
             if not files:
@@ -320,11 +325,15 @@ def run_workflow(args):
 
         def audit_outputs(job):
             from common.audit import audit_run
+            from reporting.quality_gate import audit_report
 
             for path in job.outputs:
                 if path.name == "summary.json":
                     audit_run(path.parent)
+                elif path.name == "gate.json":
+                    audit_report(path.parent)
 
+        workflow_exit_code = 0
         for job in jobs:
             for dependency in job.dependencies:
                 require_completed(dependency)
@@ -343,6 +352,9 @@ def run_workflow(args):
                     if fingerprints(job.outputs) != previous["outputs"]:
                         raise ValueError(f"{job.id}: completed outputs changed")
                     audit_outputs(job)
+                    workflow_exit_code = max(
+                        workflow_exit_code, previous.get("exit_code", 0)
+                    )
                     print("SKIP", job.id, flush=True)
                     continue
             command = job.argv + (job.resume_args if args.resume else [])
@@ -367,10 +379,9 @@ def run_workflow(args):
                                 print(line, end="", flush=True)
                                 log.write(line)
                                 log.flush()
-                            if process.wait() != 0:
-                                raise subprocess.CalledProcessError(
-                                    process.returncode, command
-                                )
+                            exit_code = process.wait()
+                            if exit_code not in TOOLS[job.tool].accepted_exit_codes:
+                                raise subprocess.CalledProcessError(exit_code, command)
                         except BaseException:
                             try:
                                 os.killpg(process.pid, signal.SIGTERM)
@@ -392,7 +403,12 @@ def run_workflow(args):
                 if signature_for(job) != signature:
                     raise ValueError(f"{job.id}: input/script changed during execution")
                 audit_outputs(job)
-                record.update(status="complete", outputs=fingerprints(job.outputs))
+                record.update(
+                    status="complete",
+                    exit_code=exit_code,
+                    outputs=fingerprints(job.outputs),
+                )
+                workflow_exit_code = max(workflow_exit_code, exit_code)
             except BaseException as error:
                 record.update(status="failed", error=str(error))
                 if job.resource.startswith("adb:"):
@@ -408,3 +424,4 @@ def run_workflow(args):
                 raise
             write_json(state_path, state)
         print(f"Workflow finished: {output}")
+        return workflow_exit_code

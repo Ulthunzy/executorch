@@ -97,3 +97,24 @@ def test_thinking_off_changes_only_the_incremental_prefix():
     )
     assert record["prompt_payload"].endswith("<think>\n\n</think>\n\n")
     assert record["generated_ids"] == [7]
+
+
+def test_max_new_tokens_bounds_generation():
+    class NeverEosEngine(Engine):
+        def __call__(self, ids):
+            self.inputs.append(list(ids))
+            result = torch.zeros((len(ids), 8))
+            result[-1, 6] = 10
+            return result
+
+    engine = NeverEosEngine()
+    record, _ = generate_turn(
+        engine,
+        Tokenizer(),
+        [],
+        {"prompt": "你好"},
+        options(max_new_tokens=2),
+        {7},
+    )
+    assert record["generated_ids"] == [6, 6]
+    assert record["stop_reason"] == "length_limit"

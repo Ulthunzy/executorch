@@ -1,0 +1,59 @@
+{
+  "schema_version": 1,
+  "description": "同一份业务 holdout cases 在 HF/PT2/PTE 上执行；开放题运行后需分别复核并 summarize。",
+  "variables": {
+    "hf_model": "/path/to/safetensors-model",
+    "pt2_model": "/path/to/decode_qdq.pt2",
+    "pte_model": "/path/to/hybrid_llama_qnn.pte",
+    "tokenizer": "/path/to/safetensors-model",
+    "pte_tokenizer": "/path/to/tokenizer.json",
+    "cases": "${validation}/configs/business_cases.example.json",
+    "driver": "${repo}/build-android/model_validation/generation/identity_eval_driver",
+    "serial": "YOUR_ADB_SERIAL",
+    "device_lib_dir": "/data/local/tmp/qnn-libs",
+    "gpu": "cuda:0",
+    "seq_len": 4096,
+    "max_new_tokens": 128,
+    "repeat_last_n": 128
+  },
+  "output_root": "${repo}/llama-output/model-validation/new-model-business",
+  "steps": [
+    {
+      "id": "inputs",
+      "tool": "check-inputs",
+      "args": ["--tokenizer", "${tokenizer}", "--cases", "${cases}", "--output", "${output}/inputs"],
+      "inputs": ["${tokenizer}/tokenizer.json", "${tokenizer}/tokenizer_config.json", "${cases}"],
+      "outputs": ["${output}/inputs/canonical.json", "${output}/inputs/validation.json"]
+    },
+    {
+      "id": "hf-business",
+      "tool": "business",
+      "depends_on": ["inputs"],
+      "resource": "gpu:${gpu}",
+      "args": ["run", "--engine", "hf", "--model", "${hf_model}", "--tokenizer", "${tokenizer}", "--cases", "${cases}", "--device", "${gpu}", "--dtype", "bfloat16", "--seq-len", "${seq_len}", "--max-new-tokens", "${max_new_tokens}", "--repetition-penalty", "1.0", "--repeat-last-n", "${repeat_last_n}", "--output", "${output}/hf"],
+      "inputs": ["${hf_model}", "${tokenizer}", "${cases}"],
+      "outputs": ["${output}/hf/summary.json"],
+      "resume_args": ["--resume"]
+    },
+    {
+      "id": "pt2-business",
+      "tool": "business",
+      "depends_on": ["inputs"],
+      "resource": "gpu:${gpu}",
+      "args": ["run", "--engine", "pt2", "--model", "${pt2_model}", "--tokenizer", "${tokenizer}", "--cases", "${cases}", "--device", "${gpu}", "--pt2-layout", "lincal-full-sequence", "--seq-len", "${seq_len}", "--max-new-tokens", "${max_new_tokens}", "--repetition-penalty", "1.0", "--repeat-last-n", "${repeat_last_n}", "--output", "${output}/pt2"],
+      "inputs": ["${pt2_model}", "${tokenizer}", "${cases}"],
+      "outputs": ["${output}/pt2/summary.json"],
+      "resume_args": ["--resume"]
+    },
+    {
+      "id": "pte-business",
+      "tool": "business",
+      "depends_on": ["inputs"],
+      "resource": "adb:${serial}",
+      "args": ["run", "--engine", "pte", "--model", "${pte_model}", "--tokenizer", "${pte_tokenizer}", "--cases", "${cases}", "--device", "${serial}", "--device-lib-dir", "${device_lib_dir}", "--driver", "${driver}", "--mode", "hybrid", "--decoder", "lincal", "--seq-len", "${seq_len}", "--max-new-tokens", "${max_new_tokens}", "--canonical-inputs", "${output}/inputs/canonical.json", "--repetition-penalty", "1.0", "--repeat-last-n", "${repeat_last_n}", "--output", "${output}/pte"],
+      "inputs": ["${pte_model}", "${pte_tokenizer}", "${driver}", "${cases}", "${output}/inputs/canonical.json"],
+      "outputs": ["${output}/pte/summary.json"],
+      "resume_args": ["--resume"]
+    }
+  ]
+}

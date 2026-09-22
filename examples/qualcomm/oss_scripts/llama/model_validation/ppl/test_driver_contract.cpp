@@ -28,6 +28,8 @@ int main() {
   const auto quantized = ppl::quantized_nll({100, 104, 98}, 2, exponential, scale);
   const auto floating = ppl::float_nll({25.f, 26.f, 24.5f}, 2);
   assert(std::abs(quantized - floating) < 1e-12);
+  assert(ppl::top1_token(std::vector<float>{1.f, 4.f, 4.f}) == 1);
+  assert(ppl::top1_token(std::vector<uint16_t>{100, 104, 98}) == 1);
   rejected = false;
   try {
     ppl::float_nll({0.f, std::numeric_limits<float>::infinity()}, 0);

@@ -1,0 +1,45 @@
+{
+  "schema_version": 1,
+  "name": "business-holdout-example-v1",
+  "sessions": [
+    {
+      "id": "B001",
+      "group": "arithmetic",
+      "critical": true,
+      "turns": [
+        {
+          "id": "B001T1",
+          "turn": 1,
+          "prompt": "只回答数字：2+2等于多少？",
+          "reference": "4",
+          "scoring": {"type": "numeric"}
+        }
+      ]
+    },
+    {
+      "id": "B002",
+      "group": "format",
+      "turns": [
+        {
+          "id": "B002T1",
+          "turn": 1,
+          "prompt": "请只回答选项字母：A. 红色 B. 蓝色。天空晴朗时通常是什么颜色？",
+          "reference": "B",
+          "scoring": {"type": "choice"}
+        }
+      ]
+    },
+    {
+      "id": "B003",
+      "group": "open-ended",
+      "turns": [
+        {
+          "id": "B003T1",
+          "turn": 1,
+          "prompt": "用一句话说明量化校准集的作用。",
+          "scoring": {"type": "manual"}
+        }
+      ]
+    }
+  ]
+}

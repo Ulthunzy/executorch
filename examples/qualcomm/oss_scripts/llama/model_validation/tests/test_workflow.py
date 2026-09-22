@@ -155,6 +155,42 @@ def test_failed_job_is_not_complete(tmp_path, monkeypatch):
     assert state["jobs"]["fail"]["status"] == "failed"
 
 
+def test_accepted_nonzero_is_complete_and_resumable(tmp_path, monkeypatch):
+    script = tmp_path / "gate.py"
+    script.write_text(
+        "import pathlib,sys\np=pathlib.Path(sys.argv[1]);p.parent.mkdir(parents=True,exist_ok=True);p.write_text('fail')\nraise SystemExit(1)\n"
+    )
+    monkeypatch.setitem(
+        workflow.TOOLS, "gate", Tool(script, "valid threshold failure", (0, 1))
+    )
+    path = configuration(
+        tmp_path,
+        [
+            {
+                "id": "gate",
+                "tool": "gate",
+                "args": ["${output}/gate.txt"],
+                "outputs": ["${output}/gate.txt"],
+            }
+        ],
+    )
+    assert workflow.run_workflow(arguments(path)) == 1
+    state = json.loads((tmp_path / "results/workflow.json").read_text())
+    assert state["jobs"]["gate"]["status"] == "complete"
+    assert state["jobs"]["gate"]["exit_code"] == 1
+    assert workflow.run_workflow(arguments(path, resume=True)) == 1
+
+
+def test_directory_fingerprint_includes_logs(tmp_path):
+    directory = tmp_path / "evidence"
+    directory.mkdir()
+    log = directory / "session.log"
+    log.write_text("before")
+    before = workflow.fingerprints([directory])
+    log.write_text("after")
+    assert workflow.fingerprints([directory]) != before
+
+
 def test_selected_stage_requires_completed_dependencies(tmp_path):
     path = configuration(
         tmp_path,
@@ -261,7 +297,15 @@ def test_report_does_not_promote_historical_ppl_or_pending_review(tmp_path):
     assert module.collect(tmp_path / "missing")["status"] == "missing"
 
 
-@pytest.mark.parametrize("name", ["generation.example.json", "ppl.example.json"])
+@pytest.mark.parametrize(
+    "name",
+    [
+        "generation.example.json",
+        "ppl.example.json",
+        "business.example.json",
+        "quality_gate.workflow.example.json",
+    ],
+)
 def test_shipped_config_parses(name):
     _, output, jobs = workflow.load_plan(ROOT / "configs" / name)
     assert output.is_relative_to(workflow.REPO / "llama-output")

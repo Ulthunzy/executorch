@@ -89,6 +89,7 @@ def generate_turn(
     settings,
     thinking_disabled=False,
     logits_processor=None,
+    max_new_tokens=-1,
 ):
     """Generate one turn within the shared budget and retain token-exact KV history."""
     import torch
@@ -121,7 +122,9 @@ def generate_turn(
     tokens = torch.tensor([input_ids], dtype=torch.long, device=model.device)
     timer = GenerationTimer()
     turn_settings = copy.deepcopy(settings)
-    turn_settings.max_new_tokens = remaining
+    turn_settings.max_new_tokens = (
+        remaining if max_new_tokens == -1 else min(remaining, max_new_tokens)
+    )
     torch.cuda.synchronize(model.device)
     started = time.time_ns() // 1_000_000
     with torch.inference_mode():
@@ -174,12 +177,12 @@ def generate_turn(
     return record, cache, full_ids
 
 
-def run(args):
+def run(args, *, report_fn=summarize, evaluation=None):
     with run_lock(args.output):
-        return run_locked(args)
+        return run_locked(args, report_fn=report_fn, evaluation=evaluation)
 
 
-def run_locked(args):
+def run_locked(args, *, report_fn=summarize, evaluation=None):
     """Load a local checkpoint once and persist independent two-turn sessions."""
     import torch
     import transformers
@@ -215,6 +218,15 @@ def run_locked(args):
         raise ValueError("This verified reference currently supports Qwen3/Lincal only")
     if args.seq_len < 2 or args.seq_len > config.max_position_embeddings:
         raise ValueError("seq-len must fit the model's position capacity")
+    temperature = getattr(args, "temperature", 0.0)
+    if not math.isfinite(temperature) or temperature < 0:
+        raise ValueError("temperature must be finite and non-negative")
+    sampling = temperature > 0
+    top_p = 0.9 if sampling else 1.0
+    top_k = 0 if sampling else 50
+    max_new_tokens = getattr(args, "max_new_tokens", -1)
+    if max_new_tokens == 0 or max_new_tokens < -1:
+        raise ValueError("max-new-tokens must be -1 or positive")
     weight_files = sorted(model_dir.glob("*.safetensors"))
     if not weight_files:
         raise ValueError("No local safetensors weights found")
@@ -261,19 +273,26 @@ def run_locked(args):
             "torch": torch.__version__,
             "transformers": transformers.__version__,
         },
-        "expected": {
-            "english": args.expected_english,
-            "chinese": args.expected_chinese,
-        },
+        "expected": (
+            {}
+            if evaluation is not None
+            else {
+                "english": args.expected_english,
+                "chinese": args.expected_chinese,
+            }
+        ),
         "config": {
             "decoder": "qwen3",
             "mode": "hf_kv",
             "seq_len": args.seq_len,
-            "temperature": 0,
+            "temperature": temperature,
+            "do_sample": sampling,
+            "top_p": top_p,
+            "top_k": top_k,
             "repetition_penalty": args.repetition_penalty,
             "repeat_last_n": args.repeat_last_n,
             "ignore_eos": False,
-            "max_new_tokens": -1,
+            "max_new_tokens": max_new_tokens,
             "thinking_disabled": args.disable_thinking,
             "prompt_format": "chatml-v1",
             "history": (
@@ -290,6 +309,8 @@ def run_locked(args):
             "num_threads": args.num_threads,
         },
     }
+    if evaluation is not None:
+        identity["evaluation"] = evaluation
     if root.exists():
         if not args.resume:
             raise ValueError(
@@ -368,11 +389,11 @@ def run_locked(args):
         },
     )
     settings = GenerationConfig(
-        do_sample=False,
+        do_sample=sampling,
         num_beams=1,
-        temperature=1.0,
-        top_p=1.0,
-        top_k=50,
+        temperature=temperature if sampling else 1.0,
+        top_p=top_p,
+        top_k=top_k,
         repetition_penalty=1.0,
         use_cache=True,
         return_dict_in_generate=True,
@@ -382,7 +403,8 @@ def run_locked(args):
     )
     print(f"Loaded {model_dir.name}: {model.dtype}, {model.device}", flush=True)
     print(
-        f"Generation: temperature=0, repetition_penalty={args.repetition_penalty}, "
+        f"Generation: temperature={temperature}, top_p={top_p}, top_k={top_k}, "
+        f"repetition_penalty={args.repetition_penalty}, "
         f"repeat_last_n={args.repeat_last_n}, "
         f"thinking_disabled={args.disable_thinking}",
         flush=True,
@@ -413,6 +435,7 @@ def run_locked(args):
                     settings,
                     thinking_disabled=args.disable_thinking,
                     logits_processor=LogitsProcessorList([penalty]),
+                    max_new_tokens=max_new_tokens,
                 )
                 record["session_id"] = session["id"]
                 log.write(
@@ -446,17 +469,17 @@ def run_locked(args):
             },
         )
         del cache
-    summary = summarize(root)
+    summary = report_fn(root)
     print(
         json.dumps(
             {
-                k: summary[k]
+                k: summary.get(k)
                 for k in (
                     "planned",
                     "attempted",
                     "eos",
                     "stop_reasons",
-                    "name_mentions",
+                    "pass_rate",
                 )
             },
             ensure_ascii=False,
@@ -479,6 +502,8 @@ def main():
     parser.add_argument("--ids", nargs="+")
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--seq-len", type=int, default=4096)
+    parser.add_argument("--max-new-tokens", type=int, default=-1)
+    parser.add_argument("--temperature", "--temp", type=float, default=0.0)
     parser.add_argument(
         "--dtype", choices=("bfloat16", "float16", "float32"), default="bfloat16"
     )

@@ -48,7 +48,7 @@ def main():
             for name, tool in TOOLS.items():
                 print(f"{name:20s} {tool.description}")
         else:
-            run_workflow(args)
+            return run_workflow(args)
     except (ValueError, KeyError, OSError, subprocess.SubprocessError) as error:
         parser.exit(1, f"Error: {error}\n")
     return 0

@@ -11,6 +11,7 @@ REPO = ROOT.parents[4]
 class Tool:
     script: Path
     description: str
+    accepted_exit_codes: tuple = (0,)
 
 
 TOOLS = {
@@ -42,6 +43,14 @@ TOOLS = {
     ),
     "errors": Tool(
         ROOT / "reporting/errors.py", "按会话整理输入、实际回答、参考答案及待复核项"
+    ),
+    "business": Tool(
+        ROOT / "benchmarks/business_benchmark.py", "HF/PT2/PTE 共用业务用例与评分"
+    ),
+    "quality-gate": Tool(
+        ROOT / "reporting/quality_gate.py",
+        "量化精度证据审计与 PASS/FAIL 门禁",
+        (0, 1),
     ),
     "export": Tool(
         ROOT.parent / "llama.py", "原有 Qualcomm 量化/PTE 导出入口（显式选择才执行）"

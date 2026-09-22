@@ -220,8 +220,16 @@ int main(int argc, char** argv) {
           throw std::runtime_error("Invalid completed window");
         }
         const auto values = result.at("token_nll").get<std::vector<double>>();
+        const auto top1 =
+            result.at("top1_token_ids").get<std::vector<size_t>>();
         if (values.size() != end - target_begin) {
           throw std::runtime_error("Completed window NLL length mismatch");
+        }
+        if (top1.size() != values.size() ||
+            std::any_of(top1.begin(), top1.end(), [vocab](size_t token) {
+              return token >= vocab;
+            })) {
+          throw std::runtime_error("Completed window top-1 mismatch");
         }
         double checked_nll = 0;
         for (double value : values) {
@@ -278,6 +286,7 @@ int main(int argc, char** argv) {
       }
       logits.seekg((target_begin - begin - 1) * vocab * element_size);
       std::vector<double> nlls;
+      std::vector<size_t> top1_token_ids;
       double nll_sum = 0;
       for (size_t position = target_begin; position < end; ++position) {
         const auto target = tokens[position];
@@ -288,9 +297,11 @@ int main(int argc, char** argv) {
         if (quantized) {
           logits.read(reinterpret_cast<char*>(q.data()), vocab * sizeof(uint16_t));
           nll = ppl::quantized_nll(q, target, exponential, scale);
+          top1_token_ids.push_back(ppl::top1_token(q));
         } else {
           logits.read(reinterpret_cast<char*>(f.data()), vocab * sizeof(float));
           nll = ppl::float_nll(f, target);
+          top1_token_ids.push_back(ppl::top1_token(f));
         }
         if (!logits || !std::isfinite(nll) || nll < 0) {
           throw std::runtime_error("Nonfinite NLL or incomplete logits");
@@ -300,6 +311,7 @@ int main(int argc, char** argv) {
       }
       save(output_path, {{"window", window}, {"nll_sum", nll_sum},
                          {"count", nlls.size()}, {"token_nll", nlls},
+                         {"top1_token_ids", top1_token_ids},
                          {"prefill_tokens", prefill_count}, {"decode_inputs", input_count - prefill_count},
                          {"forced_token_count", example::forced_position}});
       total_nll += nll_sum;

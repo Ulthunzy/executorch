@@ -97,6 +97,16 @@ def extract_choice(answer):
         if re.fullmatch(r"[A-P]", candidate):
             return candidate
     lines = [line.strip() for line in normalized.splitlines() if line.strip()]
+    if len(lines) == 1:
+        labeled = re.findall(
+            r"(?:^|\s)[\(\[（]?([A-P])[\)\]）]?[.。:：、](?=\s|[^A-Za-z])",
+            lines[0],
+            re.IGNORECASE,
+        )
+        if len(labeled) == 1 and re.match(
+            r"^[\(\[（]?[A-P][\)\]）]?[.。:：、]", lines[0], re.IGNORECASE
+        ):
+            return labeled[0].upper()
     if lines and re.fullmatch(
         r"[\(\[（]?[A-P][\)\]）]?[.。]?", lines[-1], re.IGNORECASE
     ):
@@ -117,6 +127,13 @@ def extract_number(answer):
     )
     if marked:
         return marked[-1]
+    equality = re.search(
+        r"[=＝]\s*\$?([-+]?\d[\d,]*(?:\.\d+)?(?:/\d+)?)\$?"
+        r"\s*(?:<\|[^<>\r\n]+\|>\s*)*$",
+        answer,
+    )
+    if equality:
+        return equality[1]
     lines = [line.strip().strip("$") for line in answer.splitlines() if line.strip()]
     if lines and numeric_value(lines[-1]) is not None:
         return lines[-1]

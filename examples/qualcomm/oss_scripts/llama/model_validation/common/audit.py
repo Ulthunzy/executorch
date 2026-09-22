@@ -8,9 +8,11 @@ from pathlib import Path
 
 if __package__ == "common":
     from benchmarks import report
+    from benchmarks.business_scoring import business_counts, collect_business_rows
     from ppl.artifacts import digest as ppl_digest
 else:
     from ..benchmarks import report
+    from ..benchmarks.business_scoring import business_counts, collect_business_rows
     from ..ppl.artifacts import digest as ppl_digest
 
 
@@ -87,6 +89,7 @@ def _dialogue(root, summary):
                     **flags,
                     **report.grade(record, flags, review),
                     "group": session["group"],
+                    "record_hash": report.digest(record),
                 }
             )
     _match(summary, {"source_hashes": source_hashes}, "summary")
@@ -121,6 +124,50 @@ def _dialogue(root, summary):
         statistics.median(speeds) if speeds else None
     )
     _match(summary, expected, "summary counts/grade")
+    return rows
+
+
+def _business(root, summary):
+    reviews = report.read_json(root / "review_template.json")
+    manifest, _, rows, template, source_hashes = collect_business_rows(
+        root, reviews, require_complete=True
+    )
+    scorer_dir = Path(__file__).resolve().parent.parent / "benchmarks"
+    scorer_hashes = {
+        name: report.file_hash(scorer_dir / name)
+        for name in (
+            "business_benchmark.py",
+            "business_scoring.py",
+            "report.py",
+            "sample_scoring.py",
+        )
+    }
+    _match(
+        manifest["identity"].get("evaluation", {}),
+        {"kind": "business", "scorer_hashes": scorer_hashes},
+        "business scorer identity",
+    )
+    fingerprint = report.digest(manifest["identity"])
+    if reviews != {"run_fingerprint": fingerprint, "reviews": template}:
+        raise ValueError("Business review template is stale")
+    expected = {
+        "schema": "executorch.business.summary.v1",
+        "schema_version": 1,
+        "model": manifest["model_label"],
+        "run_fingerprint": fingerprint,
+        "source_hashes": source_hashes,
+        "review_hash": report.digest(reviews),
+        **business_counts(rows),
+        "groups": {
+            group: business_counts([row for row in rows if row["group"] == group])
+            for group in dict.fromkeys(row["group"] for row in rows)
+        },
+        "critical_ids": [row["id"] for row in rows if row["critical"]],
+    }
+    _match(summary, expected, "business summary")
+    if report.read_json(root / "scored_results.json") != rows:
+        raise ValueError("Business scored results are stale")
+    return rows
 
 
 def _ppl(root, summary):
@@ -191,6 +238,13 @@ def _ppl(root, summary):
             )
         ):
             raise ValueError(f"Invalid token NLL values: {window['id']}")
+        top1 = record.get("top1_token_ids")
+        if top1 is not None and (
+            not isinstance(top1, list)
+            or len(top1) != record["count"]
+            or any(type(value) is not int or value < 0 for value in top1)
+        ):
+            raise ValueError(f"Invalid top-1 token IDs: {window['id']}")
         if (
             type(total) not in (int, float)
             or not math.isfinite(total)
@@ -214,33 +268,34 @@ def _ppl(root, summary):
     total = math.fsum(value for record in records for value in record["token_nll"])
     mean = total / count
     ppl = math.exp(mean) if mean <= math.log(sys.float_info.max) else None
-    _match(
-        summary,
-        {
-            "count": count,
-            "target_count": count,
-            "nll_sum": total,
-            "mean_nll": mean,
-            "ppl": ppl,
-            "ppl_overflow": ppl is None,
-            "model_sha256": identity["model"]["sha256"],
-            "record_hashes": record_hashes,
-            **{
-                key: identity[key]
-                for key in (
-                    "engine",
-                    "metric",
-                    "corpus_sha256",
-                    "tokens_sha256",
-                    "targets_sha256",
-                    "tokenizer_sha256",
-                    "context_len",
-                    "stride",
-                )
-            },
+    expected_summary = {
+        "count": count,
+        "target_count": count,
+        "nll_sum": total,
+        "mean_nll": mean,
+        "ppl": ppl,
+        "ppl_overflow": ppl is None,
+        "model_sha256": identity["model"]["sha256"],
+        "record_hashes": record_hashes,
+        **{
+            key: identity[key]
+            for key in (
+                "engine",
+                "metric",
+                "corpus_sha256",
+                "tokens_sha256",
+                "targets_sha256",
+                "tokenizer_sha256",
+                "context_len",
+                "stride",
+            )
         },
-        "PPL summary aggregation",
-    )
+    }
+    if "top1_available" in summary:
+        expected_summary["top1_available"] = all(
+            record.get("top1_token_ids") is not None for record in records
+        )
+    _match(summary, expected_summary, "PPL summary aggregation")
 
 
 def audit_run(directory) -> None:
@@ -250,6 +305,8 @@ def audit_run(directory) -> None:
         summary = report.read_json(root / "summary.json")
         if summary.get("schema") == "executorch.ppl.summary.v1":
             _ppl(root, summary)
+        elif summary.get("schema") == "executorch.business.summary.v1":
+            _business(root, summary)
         elif (
             "planned" in summary
             and summary.get("schema") is None
@@ -268,3 +325,60 @@ def audit_run(directory) -> None:
         OverflowError,
     ) as error:
         raise ValueError(f"Invalid evidence in {directory}: {error}") from error
+
+
+def generation_evidence(directory):
+    """Return normalized, audited per-turn evidence for a generation run."""
+    root = Path(directory)
+    summary = report.read_json(root / "summary.json")
+    if summary.get("schema") == "executorch.business.summary.v1":
+        rows = _business(root, summary)
+        normalized = [
+            {
+                "id": row["id"],
+                "passed": row["passed"],
+                "reviewed": row["passed"] is not None,
+                "critical": row["critical"],
+                "eos": row["stop_reason"] == "eos",
+                "repetition": row["repetition_flag"],
+                "garbled": row["garbled_flag"],
+                "record_hash": row["record_hash"],
+                "incremental_input_ids": row["incremental_input_ids"],
+                "native_input_ids": row["native_input_ids"],
+            }
+            for row in rows
+        ]
+    elif "planned" in summary and summary.get("schema") is None:
+        rows = _dialogue(root, summary)
+        normalized = [
+            {
+                "id": row["id"],
+                "passed": row["normal"],
+                "reviewed": row["reviewed"],
+                "critical": bool(row.get("critical", False)),
+                "eos": row["stop_reason"] == "eos",
+                "repetition": row["repetition_flag"],
+                "garbled": row["garbled_flag"],
+                "record_hash": row["record_hash"],
+            }
+            for row in rows
+        ]
+    else:
+        raise ValueError(f"Unsupported generation evidence: {directory}")
+    manifest = report.read_json(root / "manifest.json")
+    cases = report.read_json(root / "cases.json")
+    result = {
+        "root": str(root.resolve()),
+        "summary": summary,
+        "identity": manifest["identity"],
+        "cases_sha256": report.digest(cases),
+        "rows": normalized,
+    }
+    result["evidence_sha256"] = report.digest(
+        {
+            "summary": summary,
+            "identity": manifest["identity"],
+            "cases_sha256": result["cases_sha256"],
+        }
+    )
+    return result

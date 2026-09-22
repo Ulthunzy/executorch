@@ -17,14 +17,7 @@ import time
 import uuid
 from pathlib import Path, PurePosixPath
 
-from report import (
-    digest,
-    file_hash,
-    read_json,
-    summarize,
-    validate_cases,
-    write_json,
-)
+from report import digest, file_hash, read_json, summarize, validate_cases, write_json
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent))
@@ -311,6 +304,8 @@ def run_locked(
         raise ValueError("seq-len must be >=2; timeout must be positive")
     if not math.isfinite(args.repetition_penalty) or args.repetition_penalty < 1:
         raise ValueError("repetition-penalty must be finite and >=1")
+    if not math.isfinite(args.temperature) or args.temperature < 0:
+        raise ValueError("temperature must be finite and >=0")
     if evaluation is None and (
         not args.expected_english.strip() or not args.expected_chinese.strip()
     ):
@@ -329,12 +324,17 @@ def run_locked(
         for session in cases["sessions"]:
             session_input(session, thinking_disabled, canonical_inputs)
     if thinking_disabled:
-        if evaluation is not None:
-            raise ValueError(
-                "--disable-thinking is only supported by the identity suite"
-            )
         for session in cases["sessions"]:
             session_input(session, True)
+    uses_formatted_prompt = (
+        thinking_disabled
+        or canonical_inputs is not None
+        or any(
+            "formatted_prompt" in turn
+            for session in cases["sessions"]
+            for turn in session["turns"]
+        )
+    )
     if args.ids:
         unknown = set(args.ids) - {session["id"] for session in cases["sessions"]}
         if unknown:
@@ -360,11 +360,13 @@ def run_locked(
         "decoder": args.decoder,
         "mode": args.mode,
         "seq_len": args.seq_len,
-        "temperature": 0,
+        "temperature": args.temperature,
         "repetition_penalty": args.repetition_penalty,
         "ignore_eos": False,
         "max_new_tokens": max_new_tokens,
-        "prompt_format": "chatml-preformatted-v1" if evaluation else "chatml-v1",
+        "prompt_format": (
+            "chatml-preformatted-v1" if uses_formatted_prompt else "chatml-v1"
+        ),
         "thinking_disabled": thinking_disabled,
     }
     if repeat_last_n is not None:
@@ -416,8 +418,8 @@ def run_locked(
         if manifest["device_lib_dir"] != args.device_lib_dir:
             raise ValueError("Resume refused: runtime path changed")
         if (
-            evaluation is None
-            and (root / "summary.json").is_file()
+            (root / "summary.json").is_file()
+            and (evaluation is None or evaluation.get("kind") == "business")
             and all(
                 completed_session(root / "sessions" / s["id"], s)
                 for s in cases["sessions"]
@@ -464,8 +466,7 @@ def run_locked(
     push_verified(args.device, driver, remote + "/driver")
     adb(args.device, "shell", "chmod 755 " + shlex.quote(remote + "/driver"))
     if (
-        evaluation is not None
-        or thinking_disabled
+        uses_formatted_prompt
         or repeat_last_n is not None
         or canonical_inputs is not None
         or repair_think_eos
@@ -606,6 +607,13 @@ def add_device_arguments(run_parser):
     )
     run_parser.add_argument("--seq-len", type=int, default=4096)
     run_parser.add_argument("--repetition-penalty", type=float, default=1.0)
+    run_parser.add_argument(
+        "--temperature",
+        "--temp",
+        type=float,
+        default=0.0,
+        help="Sampling temperature; 0 keeps greedy decoding.",
+    )
     run_parser.add_argument(
         "--ids", nargs="+", help="Session IDs for a smoke test, e.g. I01"
     )

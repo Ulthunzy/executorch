@@ -108,6 +108,13 @@ class PPLTest(unittest.TestCase):
         )
         self.assertEqual(summary["count"], manifest["target_count"])
         self.assertTrue(summary["standard_ppl_eligible"])
+        self.assertTrue(summary["top1_available"])
+        self.assertTrue(
+            all(
+                len(read_json(path)["top1_token_ids"]) == read_json(path)["count"]
+                for path in self.output.glob("W*.json")
+            )
+        )
         self.assertEqual(summary["tokenizer_sha256"], digest(manifest["tokenizer"]))
         self.assertEqual(
             summary["tokens_sha256"], file_hash(self.corpus / "tokens.u64")
@@ -156,6 +163,7 @@ class PPLTest(unittest.TestCase):
         variants = []
         shorter = dict(original, token_nll=original["token_nll"][:-1])
         variants.append(shorter)
+        variants.append(dict(original, top1_token_ids=original["top1_token_ids"][:-1]))
         variants.append(dict(original, token_nll=[-1.0] + original["token_nll"][1:]))
         changed = dict(
             original,
@@ -309,6 +317,7 @@ class PPLTest(unittest.TestCase):
                 window=w,
                 count=w["end"] - w["target_begin"],
                 token_nll=[math.log(5)] * (w["end"] - w["target_begin"]),
+                top1_token_ids=[0] * (w["end"] - w["target_begin"]),
                 nll_sum=math.log(5) * (w["end"] - w["target_begin"]),
             )
             for w in windows

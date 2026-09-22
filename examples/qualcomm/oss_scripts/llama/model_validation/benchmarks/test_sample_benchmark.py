@@ -17,7 +17,13 @@ from unittest.mock import patch
 from benchmark import run_session
 from report import digest, read_json, write_json
 from sample_benchmark import prepare_cases, render_messages, summarize_samples
-from sample_scoring import boxed_answers, extract_choice, numeric_value, score_answer
+from sample_scoring import (
+    boxed_answers,
+    extract_choice,
+    extract_number,
+    numeric_value,
+    score_answer,
+)
 
 
 class CharacterTokenizer:
@@ -67,12 +73,14 @@ class SampleBenchmarkTest(unittest.TestCase):
             "The answer is B.",
             "答案：B。",
             "(B)",
+            "B. 蓝色<|im_end|>",
         ):
             self.assertEqual(extract_choice(answer), "B")
         for answer in (
             "I discuss A and B.",
             "B could be right but I am not sure",
             "Answer: A or B",
+            "A. red B. blue",
         ):
             self.assertIsNone(extract_choice(answer))
         self.assertIsNone(score_answer("MMLU", "A", "I cannot decide.")["correct"])
@@ -98,6 +106,8 @@ class SampleBenchmarkTest(unittest.TestCase):
         self.assertIsNone(numeric_value("1,2"))
         self.assertIsNone(numeric_value("1e999999999"))
         self.assertEqual(numeric_value("1,200"), 1200)
+        self.assertEqual(extract_number("2+2=4<|im_end|>"), "4")
+        self.assertIsNone(extract_number("2+2=4 or 5"))
         self.assertIsNone(numeric_value("__import__('os').system('false')"))
         self.assertIsNone(
             score_answer("GSM8K", "#### 2", "My intermediate result was 2.")["correct"]

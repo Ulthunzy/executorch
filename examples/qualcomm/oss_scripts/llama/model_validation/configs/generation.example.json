@@ -3,6 +3,7 @@
   "description": "Qwen3/Lincal 两轮对话：think 开关 × RP1.0/1.1；温度0、窗口128、无系统提示、保护关闭。修改路径后使用。",
   "variables": {
     "hf_model": "/path/to/safetensors-model",
+    "pt2_model": "/path/to/decode_qdq.pt2",
     "pte_model": "/path/to/hybrid_llama_qnn.pte",
     "tokenizer": "/path/to/safetensors-model",
     "pte_tokenizer": "/path/to/tokenizer.json",
@@ -34,6 +35,18 @@
       "args": ["--model", "${hf_model}", "--tokenizer", "${tokenizer}", "--device", "${gpu}", "--dtype", "bfloat16", "--attention", "sdpa", "--seq-len", "${seq_len}", "--cases", "${cases}", "--repetition-penalty", "${rp}", "--repeat-last-n", "${repeat_last_n}", "--expected-english", "${expected_english}", "--expected-chinese", "${expected_chinese}", "--output", "${output}/generation/${job}"],
       "append_when": [{"parameter": "think", "equals": "off", "args": ["--disable-thinking"]}],
       "inputs": ["${hf_model}", "${tokenizer}", "${cases}"],
+      "outputs": ["${output}/generation/${job}/summary.json"],
+      "resume_args": ["--resume"]
+    },
+    {
+      "id": "pt2-ablation",
+      "tool": "pt2",
+      "depends_on": ["inputs"],
+      "resource": "gpu:${gpu}",
+      "matrix": {"think": ["on", "off"], "rp": [1.0, 1.1]},
+      "args": ["--model", "${pt2_model}", "--tokenizer", "${tokenizer}", "--pt2-layout", "lincal-full-sequence", "--device", "${gpu}", "--seq-len", "${seq_len}", "--cases", "${cases}", "--repetition-penalty", "${rp}", "--repeat-last-n", "${repeat_last_n}", "--expected-english", "${expected_english}", "--expected-chinese", "${expected_chinese}", "--output", "${output}/generation/${job}"],
+      "append_when": [{"parameter": "think", "equals": "off", "args": ["--disable-thinking"]}],
+      "inputs": ["${pt2_model}", "${tokenizer}", "${cases}"],
       "outputs": ["${output}/generation/${job}/summary.json"],
       "resume_args": ["--resume"]
     },
