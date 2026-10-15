@@ -6,6 +6,7 @@
 
 import numbers
 import operator
+import weakref
 from functools import partial
 from typing import Dict, List, Optional, Tuple
 
@@ -198,13 +199,8 @@ class Cat(GeneralOpDef):
             quant_max=quantization_config.output_activation.quant_max,
             quant_min=quantization_config.output_activation.quant_min,
             observer_or_fake_quant_ctr=ConcatObserver.with_args(
-                # we need to know the concat node in order to hack all the input observers' data range
-                # since deep copy of fake tensor (node.meta["val"]) is inhibited
-                # we could only ship grap & node name and perform postprocess inside observer currently
-                **{
-                    "node_name": node.name,
-                    "graph": node.graph,
-                }
+                # Preserve the live node without deep-copying its owning graph.
+                node_ref=weakref.ref(node),
             ),
         )
         node.meta[Q_ANNOTATION_KEY] = QuantizationAnnotation(

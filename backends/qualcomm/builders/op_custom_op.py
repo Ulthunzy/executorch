@@ -3,6 +3,7 @@
 #
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
+import operator
 import warnings
 from typing import Dict, Iterable
 
@@ -111,6 +112,11 @@ class CustomOp(NodeVisitor):
 
         if isinstance(node.meta["val"], tuple):
             custom_output_tensors = []
+            output_nodes = {
+                user.args[1]: user
+                for user in node.users
+                if user.target == operator.getitem
+            }
             for i in range(len(node.meta["val"])):
                 output_tensor = self.get_tensor(node, node, i)
                 output_tensor_wrapper = self.define_tensor(
@@ -120,6 +126,9 @@ class CustomOp(NodeVisitor):
                     PyQnnManager.Qnn_TensorType_t.QNN_TENSOR_TYPE_NATIVE,
                     nodes_to_wrappers,
                     wrapper_idx=i,
+                    # Tuple outputs have independently calibrated encodings
+                    # on getitem; the parent only holds the last one written.
+                    quantization_source_node=output_nodes.get(i, node),
                 )
                 custom_output_tensors.append(output_tensor_wrapper)
         else:

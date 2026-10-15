@@ -199,6 +199,7 @@ class QnnTool:
         adb,
         build_folder,
         workspace="/data/local/tmp/qnn_executorch_test",
+        op_packages: Sequence[Tuple[str, str, str]] = (),
     ):
         # Makes the SDK usable first, because this tool runs a binary from inside it. Setup used to
         # happen while this module was imported, which set the variable read below as a side effect.
@@ -219,6 +220,7 @@ class QnnTool:
         self.workspace = workspace
         self.adb = adb
         self.sample_input = sample_input
+        self.op_packages = op_packages
         self.build_folder = build_folder
         self.root = os.getcwd()
         self.config = {
@@ -289,6 +291,7 @@ class QnnTool:
             f"{self.tmp_dir}/{graph_name}.bin",
             f"{self.qnn_sdk}/bin/{target}/qnn-net-run",
         ]
+        files.extend(path for path, _, _ in self.op_packages)
         cmds = [
             f"export LD_LIBRARY_PATH={self.workspace} &&",
             f"export ADSP_LIBRARY_PATH={self.workspace} &&",
@@ -303,6 +306,12 @@ class QnnTool:
             "--profiling_level detailed",
             "--profiling_option optrace",
         ]
+        if self.op_packages:
+            packages = ",".join(
+                f"{os.path.basename(path)}:{provider}:{target}"
+                for path, provider, target in self.op_packages
+            )
+            cmds.extend(["--op_packages", packages])
         self.adb.push(
             inputs=self.sample_input,
             files=files,
@@ -406,6 +415,7 @@ def generate_optrace(
     adb,
     pte_path: str,
     inputs: Sequence[Tuple[torch.Tensor]],
+    op_packages: Sequence[Tuple[str, str, str]] = (),
 ):
     """
     Generate optrace and QHAS (QNN HTP Analysis Summary) JSON files.
@@ -415,6 +425,7 @@ def generate_optrace(
         adb (SimpleADB): An object for communicating with Android device
         pte_path (str): The path to the generated PTE file, including the file extension (e.g., model.pte).
         inputs Sequence((Tuple[torch.Tensor])): The input tensors for the model.
+        op_packages: Custom packages as (library path, interface provider, target).
 
 
     Returns:
@@ -434,6 +445,7 @@ def generate_optrace(
         adb,
         build_folder=adb.build_path,
         workspace=adb.workspace,
+        op_packages=op_packages,
     )
 
     binaries_trace = {}

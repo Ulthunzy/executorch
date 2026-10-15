@@ -16,8 +16,7 @@ class ConcatObserver(UniformQuantizationObserverBase):
 
     def __init__(
         self,
-        node_name,
-        graph,
+        node_ref,
         dtype=torch.uint8,
         qscheme=torch.per_tensor_affine,
         reduce_range=False,
@@ -43,8 +42,9 @@ class ConcatObserver(UniformQuantizationObserverBase):
         factory_kwargs = torch.nn.factory_kwargs(factory_kwargs)
         self.register_buffer("min_val", torch.tensor(float("inf"), **factory_kwargs))
         self.register_buffer("max_val", torch.tensor(float("-inf"), **factory_kwargs))
-        # get concat node and its inputs
-        self.concat_node = [node for node in graph.nodes if node.name == node_name][0]
+        self.concat_node = node_ref()
+        if self.concat_node is None:
+            raise RuntimeError("Concat node was released before observer construction")
         self.input_nodes = self.concat_node.args[0]
         self.input_observers = []
 

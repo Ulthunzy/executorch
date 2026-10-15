@@ -36,13 +36,21 @@ class To(NodeVisitor):
     def is_cast_node(self, node):
         input_node = node.args[0]
 
-        # Not a case which has two quant node, no need to consider the convert op
+        # A quantized/float boundary needs affine conversion, even when only
+        # one endpoint has quantization metadata.
         if not all(
             [
                 input_node.meta.get(QCOM_QUANT_ATTRS),
                 node.meta.get(QCOM_QUANT_ATTRS),
             ]
         ):
+            input_quantized = bool(input_node.meta.get(QCOM_QUANT_ATTRS))
+            output_quantized = bool(node.meta.get(QCOM_QUANT_ATTRS))
+            if input_quantized != output_quantized:
+                floating = node if input_quantized else input_node
+                if floating.meta["val"].dtype in (torch.float16, torch.float32):
+                    # Convert applies affine scaling at a quantized/float boundary.
+                    return False
             return True
 
         input_tensor = self.get_tensor(input_node, node)

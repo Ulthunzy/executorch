@@ -511,6 +511,7 @@ class NodeVisitor:
         nodes_to_wrappers: Dict[str, Dict[int, PyQnnManager.TensorWrapper]],
         node_name: str = None,
         wrapper_idx: int = 0,
+        quantization_source_node: Optional[torch.fx.Node] = None,
     ) -> PyQnnManager.TensorWrapper:
         """
         Covert torch.Tensor to TensorWrapper
@@ -539,8 +540,9 @@ class NodeVisitor:
         tensor_type = self.get_tensor_type(
             tensor_source_node, tensor_type, output_index
         )
+        quantization_source_node = quantization_source_node or tensor_source_node
         quant_encoding, quant_configs = self.get_quant_encoding_conf(
-            tensor_source_node, target_build_node
+            quantization_source_node, target_build_node
         )
         dtype = self.get_data_type(tensor, quant_configs)
         if isinstance(tensor, torch._subclasses.fake_tensor.FakeTensor):
@@ -560,7 +562,7 @@ class NodeVisitor:
             if quant_configs:
                 tensor = self.get_quant_tensor_value(
                     tensor,
-                    tensor_source_node.meta[QCOM_QUANT_ATTRS],
+                    quantization_source_node.meta[QCOM_QUANT_ATTRS],
                     quant_configs,
                 )
             tensor_wrapper = PyQnnManager.TensorWrapper(
