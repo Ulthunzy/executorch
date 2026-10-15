@@ -1,6 +1,283 @@
 # DeltaNet HTP Custom Op Benchmark
 
+> 2026-10-15 清理说明：本文件归档原 `DeltaNet_benchmark.md` 的算子测试记录。历史独立 benchmark 脚本、实验源码/库副本、日志和 PTE 已清理；下方历史命令仅记录当时参数，实验路径不代表当前可用产物。当前集成导出和验证结果见[llama README](../../../oss_scripts/llama/README.md#validation-record-2026-10-15)，完整模型测试历史见[测试记录归档](../../../oss_scripts/llama/README_QWEN35_TEST_RECORDS.md)。
+
+
 Date: 2026-05-29
+
+## Current package: QHPI kernels only (2026-10-10)
+
+The legacy `src/ops/DeltaNet.cpp` implementation has been removed. The package
+now registers only `DeltaNetCore`, `DeltaNetCoreVtcm`, `DeltaNetCoreStream`, and
+`DeltaNetCoreFp16Accum` through `src/ops/DeltaNetQhpi.cpp`. Package metadata and
+Python export mappings match those four operators. The standalone benchmark
+defaults to `--variants baseline,core`; the full linear-attention benchmark
+continues to use `--fused_recurrence`, with optional `--state_vtcm`.
+
+The older full `DeltaNet`, packed, and probe results below are historical
+measurements from the removed implementation.
+
+Validation after removal: clean x86, Android arm64, and Hexagon v79 builds
+passed, and a fresh `use_16a4w` core graph exported successfully. The cached
+128-token full-layer DDR and VTCM graphs each ran five warmups and three
+measured iterations with the rebuilt package; all three outputs remained
+byte-for-byte identical to the saved baseline. These were functional checks,
+not a new performance comparison. Results are preserved in
+`qwen35-linear-attention-core-fast/experiments/qhpi_only_ddr` and
+`qwen35-linear-attention-core-fast/experiments/qhpi_only_vtcm`.
+
+## SM8750 128-token prefill: vectorized setup and state update (2026-10-09)
+
+Continued from the 5.55 ms register-reuse implementation of the original
+`DeltaNetCore`. The state remains `[B,H,K,V]`, and token recurrence remains
+sequential. Target: Qwen3.5-0.8B layer 0, batch 1, 16 heads, K=V=128,
+`use_16a4w`, SM8750/v79, QNN `2.49.40.260810`, Hexagon SDK `6.7.0.0` /
+Tools `21.0.04`, device `3B1F57E9B8L74X5D`.
+
+Changes in `DeltaNetQhpi.cpp`:
+
+- Vectorize Q/K centering, key range checks, and the exact 64-bit Q/K dot.
+  Unsigned products are split into low/high 16-bit halves before reduction,
+  then the affine zero-point correction is applied in 64 bits.
+- Use non-saturating HVX multiply-accumulate instructions for state
+  reductions. Aligned state pointers use aligned loads and stores; other
+  pointers retain the unaligned path.
+- Update state with unsigned halfword products for nonnegative decay
+  coefficients. Centering becomes a per-token offset, delta lane rearrangement
+  occurs outside the K loop, and the output pack directly restores channel
+  order. Negative coefficients retain the original row update path.
+- Reuse delta vectors and coefficients in the F32 fallback. The key/state
+  quantization-scale ratio is calculated once outside the token loop.
+- Process two 64-value vectors together where alignment and tile size permit,
+  sharing K loads and coefficient preparation. Assign contiguous head ranges
+  to workers; this improves the measured VTCM version's worker balance for
+  this layer and input.
+- Remove shifts by zero and combine repeated range checks with Q/K preparation.
+
+Full linear-attention timing, profiling disabled, five warmup iterations and
+100 measured iterations per run. Each round runs all four variants in order.
+DDR variants use the same PTE with only the HTP library swapped; the VTCM
+variant uses the corresponding PTE with VTCM state placement. All twelve
+runs produce three outputs byte-for-byte identical to the original baseline.
+
+| Round | Original DDR (ms) | Previous register DDR (ms) | Optimized DDR (ms) | Optimized VTCM (ms) |
+| --- | ---: | ---: | ---: | ---: |
+| 1 | 7.69482 | 5.56083 | 3.28848 | 2.79272 |
+| 2 | 7.71292 | 5.52387 | 3.32306 | 2.78274 |
+| 3 | 7.72505 | 5.54263 | 3.28081 | 2.80123 |
+| Mean | 7.71093 | 5.54244 | 3.29745 | 2.79223 |
+
+Optimized DDR takes 40.51% less time than the previous register version.
+Optimized VTCM takes 63.79% less time than the original approximately 7.7 ms
+full layer. VTCM is beneficial with these optimized loops; the older VTCM
+experiment below predates them.
+
+Separate timer instrumentation around each worker's head loop uses the
+19.2 MHz hardware counter. A single measured invocation after five warmups
+gave a slowest-worker interval of 1.48490 ms for DDR and 1.33380 ms for VTCM.
+These are internal GDN worker intervals, excluding QNN scheduling and output
+transfers, rather than complete operator or layer latency. The instrumented
+build places timing markers in final-state output slots; it is retained only
+as a diagnostic artifact and is absent from the production source/library.
+The complete linear-attention layer has not reached 2 ms.
+
+The final DDR and VTCM libraries also pass the separate 128-token graph with
+random nonzero initial state: attention output and final state match the
+previous core byte-for-byte. Its timing includes Q/K normalization and graph
+overhead, and uses different inputs from the real-weight full layer.
+
+Reproduce the fastest full-layer version with the rebuilt v79 package:
+
+```bash
+source /home/hunter/anaconda3/etc/profile.d/conda.sh
+conda activate et_npu
+source env.sh
+python examples/qualcomm/oss_scripts/linear_attention.py \
+  --build_folder build-android --device 3B1F57E9B8L74X5D \
+  --soc_model SM8750 --backend htp --ar_len 128 \
+  --iteration 100 --calibration_samples 2 --quant_dtypes use_16a4w \
+  --fused_recurrence --state_vtcm --profile_level 0 \
+  --workspace /data/local/tmp/executorch/qwen35_core_fast_vtcm \
+  -a qwen35-linear-attention-core-fast-vtcm
+```
+
+Omit `--state_vtcm` to use optimized DDR. The three-round timings, output
+checks, library hashes, standalone checks and instrumented worker intervals
+are in `qwen35-linear-attention-core-fast/final_comparison.json`.
+Source and the final library are preserved in that directory's
+`libraries/optimized` subdirectory; `bench_compare.py` reproduces the
+same-PTE library-swap measurements against the prepared device workspaces.
+
+Rejected experiments in this iteration: independent 64-value tasks across all
+tokens, zero-point correction hoisting in the state reduction, K-loop unroll
+by two, and completing each 64-value block before the next block within a
+token. They preserved the tested outputs but did not improve full-layer time.
+
+## SM8750 128-token prefill: original-core register reuse (2026-10-09)
+
+Optimized the original approximately 7.7 ms `DeltaNetCore` implementation.
+The state layout remains `[B,H,K,V]`, with the same integer arithmetic,
+rounding, and quantization parameters. Target: Qwen3.5-0.8B layer 0,
+batch 1, 16 heads, K=V=128, `use_16a4w`, SM8750/v79, device
+`3B1F57E9B8L74X5D`, QNN `2.49.40.260810`, Hexagon SDK `6.7.0.0` /
+Tools `21.0.04`.
+
+Two changes in the QUInt16 HVX path:
+
+- For each 64-value tile, keep both K/state and Q/state reduction
+  accumulators in four HVX registers across the complete K dimension.
+  Shuffle lanes and write the scratch results once after the reduction.
+- During state update, load the tile's delta vectors once and reuse them
+  across the complete K dimension. Per-token update coefficients are also
+  prepared outside that loop.
+
+The original fallback remains for unsupported tiles or quantization ranges.
+Each token still traverses state twice, for reductions and then updates.
+The optimization reduces temporary-array traffic; these tests do not measure
+actual DDR or VTCM bandwidth.
+
+Full linear-attention timing, profiling disabled, the same PTE with only the
+HTP library swapped, five warmup iterations and 100 measured iterations per
+run:
+
+| Round | Original core (ms) | Register reuse (ms) |
+| --- | ---: | ---: |
+| 1 | 7.71997 | 5.56112 |
+| 2 | 7.71601 | 5.51517 |
+| 3 | 7.73317 | 5.57364 |
+| Mean | 7.72305 | 5.54998 |
+
+The full layer takes **28.14% less time**, a **1.392x speedup**. All three
+full-layer outputs are byte-for-byte identical to the original core.
+A separate 128-token test with random nonzero initial state also produces
+identical attention output and final state. That isolated graph, including
+Q/K normalization, measured 4.23949 ms; it is a separate workload and cannot
+be subtracted from the full-layer timing to infer projection time.
+
+Reproduce with the rebuilt v79 package:
+
+```bash
+source /home/hunter/anaconda3/etc/profile.d/conda.sh
+conda activate et_npu
+source env.sh
+python examples/qualcomm/oss_scripts/linear_attention.py \
+  --build_folder build-android --device 3B1F57E9B8L74X5D \
+  --soc_model SM8750 --backend htp --ar_len 128 \
+  --iteration 100 --calibration_samples 2 --quant_dtypes use_16a4w \
+  --fused_recurrence --profile_level 0 \
+  --workspace /data/local/tmp/executorch/qwen35_core_register \
+  -a qwen35-linear-attention-core-register
+```
+
+The register path is selected automatically by `--fused_recurrence` when
+the tile and quantization checks pass. Paired results, library hashes and
+correctness checks are in
+`qwen35-linear-attention-core-register/register_final_comparison.json`.
+The original and optimized HTP libraries are preserved under that artifact
+directory's `libraries/baseline` and `libraries/register` subdirectories.
+
+## SM8750 128-token prefill: VTCM state experiment (2026-10-09)
+
+Target: Qwen3.5-0.8B layer 0, batch 1, 16 heads, K=V=128,
+`use_16a4w`, SM8750/v79, device `3B1F57E9B8L74X5D`, QNN
+`2.49.40.260810`, Hexagon SDK `6.7.0.0` / Tools `21.0.04`.
+The full block uses real layer weights and deterministic random inputs,
+seed 666, with two calibration samples. QKV/Z fusion is enabled in both versions.
+
+Added the opt-in `DeltaNetCoreVtcm.quint16.hvx` kernel in `DeltaNetQhpi.cpp`:
+
+- State output has `QHPI_MemLoc_TCM_Only`; other inputs and attention output
+  retain their DDR placement. QNN manages the final state transfer to the
+  graph output.
+- Each worker processes a complete head or a V-axis tile with the full K
+  dimension. It copies initial state codes into VTCM once, then runs all 128
+  tokens against the same resident state region.
+- The first step retains the input state's quantization parameters; subsequent
+  steps use the output state's parameters. Arithmetic, rounding, and HVX
+  fallback rules are shared with the DDR kernel.
+- Each head is 32 KiB. QNN reserves the complete 16-head state output, 512 KiB,
+  in VTCM; this version does not recycle a smaller per-worker scratch buffer.
+- A token still needs two local state traversals: combined K/Q reductions,
+  followed by state update. Intermediate states remain in VTCM.
+
+Full-layer timing, profiling disabled, three paired rounds of 100 iterations:
+
+| Round | DDR fused core (ms) | VTCM fused core (ms) |
+| --- | ---: | ---: |
+| 1 | 7.89603 | 8.00964 |
+| 2 | 7.91088 | 8.01856 |
+| 3 | 7.75871 | 7.94162 |
+| Mean | 7.85521 | 7.98994 |
+
+The VTCM version was 1.72% slower in the paired measurements. It is retained
+as an experiment; the default remains the DDR fused core.
+
+Separate single optrace captures gave GDN critical-path contributions of
+6.10805 ms (DDR) and 6.97796 ms (VTCM), with measured graph clocks of
+2.11200 GHz and 2.11201 GHz. These are profile contributions, not the
+100-iteration averages above. QHAS confirms six QUInt16/HVX slices and VTCM
+state output placement. Its tensor-byte accounting does not count repeated
+state accesses inside the custom C++ loop, so it cannot establish the actual
+DDR bandwidth of this recurrence.
+
+Correctness checks:
+
+- All three full-layer outputs are byte-for-byte identical between versions.
+- A separate 128-token core test with random nonzero initial state also has
+  identical attention output and final state. That isolated test, including
+  Q/K normalization, measured 6.47191 ms (DDR) and 7.10066 ms (VTCM) over
+  100 iterations; it uses different inputs from the real-weight full layer.
+
+Reproduce the VTCM full-layer run with the built v79 package:
+
+```bash
+source /home/hunter/anaconda3/etc/profile.d/conda.sh
+conda activate et_npu
+source env.sh
+python examples/qualcomm/oss_scripts/linear_attention.py \
+  --build_folder build-android --device 3B1F57E9B8L74X5D \
+  --soc_model SM8750 --backend htp --ar_len 128 \
+  --iteration 100 --calibration_samples 2 --quant_dtypes use_16a4w \
+  --fused_recurrence --state_vtcm --profile_level 0 \
+  --workspace /data/local/tmp/executorch/qwen35_linear_attention_vtcm \
+  -a qwen35-linear-attention-vtcm-v79-t128-use16a4w-sm8750
+```
+
+Omit `--state_vtcm` for the DDR implementation. For a new optrace export,
+use `--profile_level 3 --optrace` and a separate artifact folder.
+
+Results: `qwen35-linear-attention-vtcm-v79-t128-use16a4w-sm8750/vtcm_comparison.json`.
+
+## SM8750 128-token prefill: token-major state-row experiment (2026-10-09)
+
+`DeltaNetCoreStream` uses a physical state layout of `[B,H,V,K]`. For each
+token and each value channel, the logical state column `S[:,v]` is one
+contiguous K-element row: it is loaded once, used for the `k^T S[:,v]` and
+`q^T S[:,v]` reductions, updated with `decay*S[:,v] + k*delta_v`, and stored
+once. The dot products and K-element state update use HVX for dimensions at
+least 64; smaller dimensions retain the scalar path.
+
+The stream kernel was checked with a non-square standalone case (`K=16,
+V=32`) and with the real Qwen3.5 layer (`K=V=128`). It produces the expected
+transposed state shape and similar quantization error. After fusing the two
+K-reductions into one state-row scan and moving the hot scalar path to float,
+the real layer measured 54.27910 ms for the isolated recurrence versus
+6.47191 ms for the existing V-major DDR kernel. The full linear-attention block
+measured 54.87905 ms versus 7.71547 ms for the existing fused core. This is a
+data-flow validation, not a performance win: processing one state row at a time
+causes many more K-vector loads than the existing kernel's V-vector traversal.
+
+Run it with:
+
+```bash
+python examples/qualcomm/oss_scripts/linear_attention.py \
+  --build_folder build-android --device 3B1F57E9B8L74X5D \
+  --soc_model SM8750 --backend htp --ar_len 128 \
+  --iteration 20 --calibration_samples 2 --quant_dtypes use_16a4w \
+  --fused_recurrence --stream_recurrence --profile_level 0 \
+  --workspace /data/local/tmp/executorch/qwen35_linear_attention_stream \
+  -a qwen35-linear-attention-stream-v79-t128-hvx
+```
 
 ## Environment
 
@@ -593,3 +870,71 @@ The next performance step should continue following the llama.cpp HTP design:
 4. Tune the QHPI inner kernel: reduce the second full state read/convert, use larger `k` tiles only when it helps, and try FMA-form instructions where available.
 5. Add quantized HVX/QHPI kernels instead of scalar dequantize/update/quantize loops.
 6. Compare SQNR and latency after each step before adding more fusion.
+# 2026-10-13：完整精度归约与门控精度修复
+
+单层 128-token prefill 的设备误差测试定位到两个来源：旧快速归约在
+Q/K/state 乘法前丢掉 4 个低位，以及 W4 V 投影误差被 RMSNorm/z 加权放大。
+该实验的 `deltanetQhpiHvxReduceStateU16` 保留完整中心化值并以 HVX FP32
+累加，state 用 UINT16 存储。随后按性能要求将默认实现恢复为快速缩位归约；
+完整精度实验可通过 `DELTANET_U16_FULL_PRECISION_REDUCTION=1` 编译启用。
+
+K/z W8、Q/V/A/B W4，相同校准参数与评估文本：
+
+| 设备 SQNR | 旧缩位归约 | 完整精度归约 | 完整精度 + V W4 GPTQ |
+|---|---:|---:|---:|
+| RMSNorm/z 门控 | 23.77 dB | 28.17 dB | 29.61 dB |
+| out_proj 后 attention | 20.03 dB | 24.66 dB | 25.76 dB |
+| FFN 后层 hidden state | 17.59 dB | 20.50 dB | 21.00 dB |
+
+同一带 22 个检查点的完整层 PTE，包含 FFN，warmup 10、计时 100 次，
+交替两轮平均耗时为 4.731 ms → 6.331 ms。历史 linear-attention 性能表
+使用不同输出和图范围，需分别阅读。GPTQ 结果为单层实验，完整模型 PPL
+尚未复测；全模型导出入口尚未自动加载该实验的 V weight patch。
+
+完整诊断、逐输入替换、量化范围和原始结果见
+[门控精度报告](../../../oss_scripts/llama/README_QWEN35_TEST_RECORDS.md#record-19)。
+
+## 2026-10-13：完整模型 PPL 与整数归约的精度修复
+
+第 7 层 Q/K 的 U16 ReduceMean 执行路径存在明显数值差异；改为二维
+native RMSNorm 后，同八个 128-token 窗口的完整设备 PPL 从 102.343 降至
+87.398。第 8 层的 GDN readout 则受归约前丢弃低四位影响，完整 FP32
+归约进一步把 PPL 降到 50.100，state 仍为 UINT16。
+
+`DELTANET_U16_SPLIT_REDUCTION=1` 实现三项整数 dot：高位积、交叉项和
+低位积，最后以 FP32 合成；K≤128 时这些 int32 项不溢出。一次处理
+64 个 V 的版本，PPL 为 50.076；同轮三输出纯 attention 为原缩位版
+2.947 ms、FP32 归约 4.527 ms、新整数版 3.550 ms。新整数版增加约
+20.5% 耗时，保留为明确启用的选项。Makefile 支持通过
+`HEXAGON_CPPFLAGS=-DDELTANET_U16_SPLIT_REDUCTION=1` 编译该路径。
+
+完整配置、同输入算子证据、量化范围及运行库/PTE 产物见
+[PPL 修复报告](../../../oss_scripts/llama/README_QWEN35_TEST_RECORDS.md#record-12)。
+
+## 2026-10-13：所有 Linear 回退 W4，恢复快速 VTCM
+
+默认恢复 int32 缩位归约。单层实验取消 K/z 拆分，qkv_z、a、b、out_proj、
+FFN w1/w2/w3 全为 block-32 W4；depthwise conv W8、激活和 cache UINT16。
+校准使用 CUDA，8 个 WikiText 128-token 窗口；本轮不使用 GPTQ patch。
+
+性能图只包含完整 linear-attention，输入为前置 RMSNorm 后的 hidden 和两个
+cache，输出为 attention、conv cache、recurrent state。FFN 和精度检查点
+从计时图中删除。相同 8 个输入，warmup 5、计时 100，交替三轮：
+
+| 版本 | 平均耗时 / ms |
+|---|---:|
+| 所有 Linear W4，快速 VTCM | 3.07860 |
+| K/z W8，V W4 GPTQ，快速 VTCM | 3.10889 |
+| K/z W8，V W4 GPTQ，完整精度归约 | 4.66706 |
+
+原历史 VTCM PTE 与原输入复测为 2.68531 ms，三个输出均与当时基线逐字节
+一致。当前新 W4 图采用不同输入、校准、L2 和 block-32 量化配置，实测
+3.07860 ms，尚未达到 2.73 ms；两者分别记录。
+
+当前全 Linear W4 检查点图的设备 SQNR：GDN 输出 29.924 dB、state 输出
+20.896 dB、norm/z 20.968 dB、attention/out_proj 14.454 dB、完整层 hidden
+state 12.735 dB。真实三输出 PTE 复核得到 attention 14.459 dB、state
+20.897 dB。
+
+精度配置、量化范围、统一口径计时和复现命令见
+[全 Linear W4 报告](../../../oss_scripts/llama/README_QWEN35_TEST_RECORDS.md#record-06)。

@@ -640,7 +640,8 @@ Model parameters, observer statistics and decoder inputs return to CPU before
 quantization conversion and QNN compilation. This does not change the deployment
 backend, prefill AR or SWA layout. `--backend gpu` selects a QNN deployment backend,
 not the calibration device. CUDA calibration is PTQ-only, not QAT. Multimodal
-encoder preprocessing/calibration still runs on CPU.
+encoder preprocessing runs on CPU; encoder calibration follows
+`--calibration_device` and passes its quantized features to decoder calibration.
 
 Calibration needs floating-point weights and activations, not just the final
 4-bit model storage. If GPU memory is insufficient, reduce `--batch_size` or
@@ -651,6 +652,128 @@ For device-only validation, add `--skip_qdq_save` to omit the full-sequence
 host memory even with `--model_mode kv`. This option does not skip calibration or
 change the deployed PTE; it cannot be combined with `--eval_methods sqnr_eval`.
 The default still saves the QDQ artifact for later accuracy analysis.
+
+##### Qwen3.5 and Lincal3.5 optimized export
+
+`qwen3_5-0_8b`, `qwen3_5-2b`, `lincal3_5-0_8b` and `lincal3_5-2b`
+use one fixed HTP recipe through `llama.py`:
+
+- Merged K/z W8 per channel; the other large Linear weights use W4 group32.
+  GDN out projections use fixed-grid GPTQ on calibration inputs.
+- W8A16 visual encoder with the checkpoint's tanh GELU formula and INT32 bias
+  range protection. Text and image samples retain their pairing; decoder
+  calibration uses quantized visual features and covers AR128 and warm AR1.
+- Native RMSNorm for decoder, Q/K and gated GDN normalization. All external
+  recurrent, convolution and attention caches use calibrated UINT16 encodings.
+- Prefill AR128 with FP16 chunk64/leaf8 GDN, valid-token state updates and one
+  selected LM-head row. Models with full attention use a FA256 method for
+  short prompts; the normal prefill method handles the full requested context.
+  Decode uses the DeltaNetCoreVtcm op package and direct quantized greedy argmax.
+- Lincal3.5 retains true SWA and its separate window mask. Calibration masks
+  limit each token to the sliding window, including within an AR128 block.
+  SWA caches retain their fixed length when deriving AR1. Pure SWA models
+  skip FA256 buckets and internal full-attention trimming; mixed full/SWA
+  models trim only full attention. MHA-to-SHA conversion is disabled for both
+  families so they use the same grouped-attention transformation.
+
+The experimental split/projection environment variables and GDN dtype/kernel
+CLI switches have been removed. `--gdn_op_package_dir` selects the op package
+source directory; its host, Android and DSP libraries are built incrementally
+using the configured QNN, Hexagon SDK and Android NDK. The default integer
+reduction preserves all UINT16 bits with radix-16 splitting. The ordinary entry
+pins this reduction for host and DSP builds. Build configuration stamps track
+compiler versions, SDK paths, source lists and effective flags, so changing
+an experimental build configuration invalidates the previous objects.
+SM8750 is the validated target for Qwen3.5. Both families require quantized HTP
+device execution, batch size 1, and `hybrid` or `kv` mode. Prefill AR is fixed
+at 128 and shared buffers are
+enabled automatically. Default physical capacity
+is `max_seq_len + 128`. Hybrid mode rounds internal FA capacity up to an AR128
+boundary, with a minimum of 256; an explicit `max_context_len` must accommodate
+that capacity. Calibration uses a single AR128 model; AR1 and the short method
+share its weights and learned encodings. KV mode retains AR128 calibration but
+skips generation prefill graphs, short buckets and the AR128 embedding export.
+
+For a local Hugging Face model directory:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python examples/qualcomm/oss_scripts/llama/llama.py \
+  -a ./llama-output/qwen35-optimized \
+  --build_folder build-android --soc_model SM8750 \
+  --decoder_model qwen3_5-0_8b \
+  --source_safetensors /path/to/Qwen3.5-0.8B \
+  --model_mode hybrid --max_seq_len 4096 \
+  --calibration_device cuda \
+  --calib_samples examples/qualcomm/oss_scripts/llama/assets/samples/vision.json \
+  --calib_text_datasets wikitext-2 --calib_text_samples 8 \
+  --prompt '<image>Describe this image in one sentence.' \
+  --compile_only
+```
+
+Local raw-text JSON/JSONL sources may replace `wikitext-2`. Image calibration
+files may also include text-only samples with an empty `files` list. Generated
+PTEs are `hybrid_llama_qnn.pte`, `tok_embedding_qnn.pte` and
+`vision_encoder_qnn.pte`; `qwen35_export.json` records GPTQ targets and actual
+cache encodings. Without `--skip_qdq_save`, `decode_qdq.pt2` retains full AR128
+logits for analysis and `kv_qdq.pt2` retains the AR1 graph.
+
+`--source_safetensors` supplies weights, tokenizer and encoder config from the
+local directory. An explicit `--checkpoint` still overrides decoder weights.
+No experiment scripts or previously generated PTEs are imported by this flow.
+
+###### Validation record (2026-10-15)
+
+The Qwen3.5/GDN experiment scripts, added validation tests, local logs, tensor
+dumps, QDQ exports and PTEs were removed after integration. This section retains
+the results; the full history of 52 reports is archived in
+[Qwen3.5 test records](README_QWEN35_TEST_RECORDS.md). Historical commands and
+artifact paths in that archive describe the original runs. Use `llama.py`
+above to produce new artifacts.
+
+| Verification | Recorded result |
+|---|---|
+| Final compatibility regression | 103 tests and 12 subtests passed |
+| Pre-push regression (2026-10-15) | 15 existing tests and 3 subtests passed, including SWA calibration, quantized mask IO, cache handling, native ASAN/UBSAN checks and MHA-to-SHA conversion |
+| Fresh normal-entry Qwen3.5-0.8B export | 4K context / AR128 compiled successfully; `kv_forward`, `prefill_forward` and `prefill_forward_256` each contain one QNN delegate with no CPU fallback |
+| Covered models | Qwen3.5 and Lincal3.5 0.8B/2B export configuration, projection precision, calibration and cache layout; existing non-GDN model configuration checks |
+| GDN/quantization | K/z W8, q/v/a/b W4, out_proj GPTQ; shared calibrated UINT16 cache encodings across AR128/AR1; native norms and quantized/float conversion |
+| SWA | Separate window mask, fixed-length cache across AR changes, wraparound and partial updates; AR128 calibration compared with sequential decode, including a window smaller than AR |
+| Generation graphs | Pure SWA skips FA256; mixed FA/SWA trims only full attention; padding preserves valid conv/recurrent state; selected-logit input preserves cache offsets |
+| Prefill bounds | Final AR block checked against history capacity and physical RoPE positions, including non-aligned contexts and continuation |
+| Native runtime | C++ cache tests passed with ASAN/UBSAN; Android `qnn_multimodal_runner` and `qnn_llama_runner` built successfully |
+| Small Lincal PTE | SM8750, dim64, one GDN plus one SWA layer, AR128/AR1; 708,648 bytes; one QNN delegate per method, no CPU fallback; both masks and all public caches UINT16; decode compiled as `DeltaNetCoreVtcm` |
+| Incremental op builds | Compiler/SDK/flag/source changes trigger rebuilds; identical settings reuse objects; normal export pins exact radix-16 reduction |
+
+Final full-model measurements below are for **Qwen3.5-0.8B on SM8750**,
+temperature 0, excluding model loading. Prefill was measured three times;
+decode performance uses a fixed output budget with EOS ignored.
+
+| Workload | Recorded result |
+|---|---:|
+| Text 128 input, 1 output; automatic FA256 | 85/87/86 ms; mean 86 ms, **1488.37 tokens/s** |
+| Text 4096 input, 1 output; full FA4K | 3892/4084/4021 ms; mean 3999 ms, **1024.26 tokens/s** |
+| Decode 16 input, output budget 496 | 495 measured decode forwards; **38.35 tokens/s** |
+| Image/text 217 input, output budget 64 | First token **200.33 ms**, including about 30 ms vision encoding; subsequent decode **37.98 tokens/s** |
+| Vision output SQNR against HF | Calibration cat 23.73 dB; held-out dog 17.88 dB; finite outputs |
+
+WikiText-2 raw test, first 1024 tokens and 1023 prediction targets, with the
+same new embedding PTE:
+
+| Method | Device PPL | HF FP32 PPL |
+|---|---:|---:|
+| KV AR1 | **11.5479** | 10.8785 |
+| Prefill AR128 | **11.6818** | 10.8785 |
+
+These are recorded subset measurements, not full-dataset PPL or a complete
+generation-quality assessment. The earlier 1684–1707 tokens/s result used a
+different frozen short graph. An alternating three-round comparison measured
+78 ms for that graph and 85.33 ms for the final graph, a 9.40% latency increase;
+the accuracy fixes and calibration also differed. Full Lincal PPL, generation
+and device performance have not been validated. The final regression and small
+PTE compilation do not establish those full-model results.
+
+Detailed historical kernel measurements are retained in the
+[DeltaNet package README](../../custom_op/deltanet_op_package_htp/DeltaNetOpPackage/README.md).
 
 ##### Re-exporting after the masked-softmax causality fix
 
