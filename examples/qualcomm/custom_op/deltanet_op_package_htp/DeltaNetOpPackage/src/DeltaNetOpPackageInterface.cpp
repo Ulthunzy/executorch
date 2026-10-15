@@ -3,33 +3,23 @@
 //==============================================================================
 
 #include "HTP/QnnHtpCommon.h"
-#include "HTP/core/constraints.h"
-#include "HTP/core/op_package_feature_support.h"
-#include "HTP/core/op_register_ext.h"
-#include "HTP/core/optimize.h"
-#include "HTP/core/simple_reg.h"
-#include "HTP/core/unique_types.h"
 #include "QnnOpPackage.h"
 #include "QnnSdkBuildId.h"
 
 #include <array>
 #include <string>
 
-DEFINE_UNIQ_TY()
-BEGIN_PKG_OPS_OPTS_LIST()
-
-DECLARE_PKG_OPS_OPTS_LIST(PKG_DeltaNet)
-
-END_PKG_OPS_OPTS_LIST()
+#define STRINGIZE_DETAIL(X) #X
+#define STRINGIZE(X) STRINGIZE_DETAIL(X)
+#define THIS_PKG_NAME_STR STRINGIZE(THIS_PKG_NAME)
 
 static constexpr auto sg_packageName = THIS_PKG_NAME_STR;
-static std::array<const char*, 7> sg_opNames{{"DeltaNet",
-                                              "DeltaNetPacked",
-                                              "DeltaNetCore",
-                                              "DeltaNetCoreFp16Accum",
-                                              "DeltaNetIdentity",
-                                              "DeltaNetDecayState",
-                                              "DeltaNetStatePassthrough"}};
+static std::array<const char*, 4> sg_opNames{{
+    "DeltaNetCore",
+    "DeltaNetCoreStream",
+    "DeltaNetCoreVtcm",
+    "DeltaNetCoreFp16Accum",
+}};
 
 static Qnn_ApiVersion_t sg_sdkApiVersion = QNN_HTP_API_VERSION_INIT;
 static QnnOpPackage_Info_t sg_packageInfo = QNN_OP_PACKAGE_INFO_INIT;
@@ -40,20 +30,11 @@ static QnnLog_Callback_t sg_logCallback = nullptr;
 static QnnLog_Level_t sg_maxLogLevel = (QnnLog_Level_t)0;
 static bool sg_logInitialized = false;
 
-INIT_PACKAGE_OP_DEF()
-INIT_PACKAGE_OPTIMIZATION_DEF()
-INIT_PACKAGE_PARAM_ORDER_DEF()
-INIT_PKG_CORE_INIT_FUNC()
-
 Qnn_ErrorHandle_t DeltaNetOpPackageInit(
     QnnOpPackage_GlobalInfrastructure_t infrastructure) {
   if (sg_packageInitialized) {
     return QNN_OP_PACKAGE_ERROR_LIBRARY_ALREADY_INITIALIZED;
   }
-
-  REGISTER_PACKAGE_PARAM_ORDERS()
-  REGISTER_PACKAGE_AXIS_PARAMS()
-  REGISTER_PACKAGE_PER_CHANNEL_QUANTIZED_OPS()
 
   sg_globalInfra = infrastructure;
   sg_packageInitialized = true;
@@ -120,40 +101,12 @@ Qnn_ErrorHandle_t DeltaNetOpPackageValidateOpConfig(Qnn_OpConfig_t opConfig) {
     return QNN_OP_PACKAGE_ERROR_VALIDATION_FAILURE;
   }
 
-  if (std::string(opConfig.v1.typeName) == "DeltaNet") {
-    if (opConfig.v1.numOfParams != 2 || opConfig.v1.numOfInputs != 6 ||
-        opConfig.v1.numOfOutputs != 2) {
-      return QNN_OP_PACKAGE_ERROR_VALIDATION_FAILURE;
-    }
-  } else if (std::string(opConfig.v1.typeName) == "DeltaNetPacked") {
-    if (opConfig.v1.numOfParams != 0 || opConfig.v1.numOfInputs != 6 ||
-        opConfig.v1.numOfOutputs != 1) {
-      return QNN_OP_PACKAGE_ERROR_VALIDATION_FAILURE;
-    }
-  } else if (std::string(opConfig.v1.typeName) == "DeltaNetCore") {
+  if (std::string(opConfig.v1.typeName) == "DeltaNetCore" ||
+      std::string(opConfig.v1.typeName) == "DeltaNetCoreStream" ||
+      std::string(opConfig.v1.typeName) == "DeltaNetCoreVtcm" ||
+      std::string(opConfig.v1.typeName) == "DeltaNetCoreFp16Accum") {
     if (opConfig.v1.numOfParams != 0 || opConfig.v1.numOfInputs != 6 ||
         opConfig.v1.numOfOutputs != 2) {
-      return QNN_OP_PACKAGE_ERROR_VALIDATION_FAILURE;
-    }
-  } else if (std::string(opConfig.v1.typeName) == "DeltaNetCoreFp16Accum") {
-    if (opConfig.v1.numOfParams != 0 || opConfig.v1.numOfInputs != 6 ||
-        opConfig.v1.numOfOutputs != 2) {
-      return QNN_OP_PACKAGE_ERROR_VALIDATION_FAILURE;
-    }
-  } else if (std::string(opConfig.v1.typeName) == "DeltaNetIdentity") {
-    if (opConfig.v1.numOfParams != 0 || opConfig.v1.numOfInputs != 1 ||
-        opConfig.v1.numOfOutputs != 1) {
-      return QNN_OP_PACKAGE_ERROR_VALIDATION_FAILURE;
-    }
-  } else if (std::string(opConfig.v1.typeName) == "DeltaNetDecayState") {
-    if (opConfig.v1.numOfParams != 0 || opConfig.v1.numOfInputs != 2 ||
-        opConfig.v1.numOfOutputs != 1) {
-      return QNN_OP_PACKAGE_ERROR_VALIDATION_FAILURE;
-    }
-  } else if (
-      std::string(opConfig.v1.typeName) == "DeltaNetStatePassthrough") {
-    if (opConfig.v1.numOfParams != 0 || opConfig.v1.numOfInputs != 2 ||
-        opConfig.v1.numOfOutputs != 1) {
       return QNN_OP_PACKAGE_ERROR_VALIDATION_FAILURE;
     }
   } else {

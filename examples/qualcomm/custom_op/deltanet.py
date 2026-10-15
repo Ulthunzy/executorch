@@ -39,6 +39,7 @@ from executorch.backends.qualcomm.quantizer.qconfig import (
     get_16a8w_qnn_ptq_config,
     get_8a4w_qnn_ptq_config,
     get_8a8w_qnn_ptq_config,
+    get_fp16a8w_qnn_ptq_config,
 )
 from executorch.backends.qualcomm.quantizer.quantizer import QuantDtype
 from executorch.backends.qualcomm.serialization.qc_schema import (
@@ -50,6 +51,8 @@ from executorch.backends.qualcomm.serialization.qc_schema import (
     QnnExecuTorchOpPackageTarget,
 )
 from torch.library import impl, Library
+from torchao.quantization.pt2e.quantizer import SharedQuantizationSpec
+from torchao.quantization.pt2e.quantizer.quantizer import Q_ANNOTATION_KEY
 
 
 _DELTA_NET_SCALING = 0.08838834764831845
@@ -124,6 +127,12 @@ delta_net_lib.define(
     ") -> (Tensor(a!), Tensor(b!))"
 )
 delta_net_lib.define(
+    "deltanet_core_stream("
+    "Tensor query, Tensor key, Tensor value, Tensor decay, Tensor beta, "
+    "Tensor recurrent_state"
+    ") -> (Tensor, Tensor)"
+)
+delta_net_lib.define(
     "deltanet_core_fp16_accum("
     "Tensor query, "
     "Tensor key, "
@@ -146,14 +155,9 @@ delta_net_lib.define(
 )
 delta_net_lib.define("deltanet_identity(Tensor input) -> Tensor")
 delta_net_lib.define(
-    "deltanet_identity.out("
-    "Tensor input, "
-    "*, Tensor(a!) output"
-    ") -> Tensor(a!)"
+    "deltanet_identity.out(Tensor input, *, Tensor(a!) output) -> Tensor(a!)"
 )
-delta_net_lib.define(
-    "deltanet_decay_state(Tensor recurrent_state, Tensor g) -> Tensor"
-)
+delta_net_lib.define("deltanet_decay_state(Tensor recurrent_state, Tensor g) -> Tensor")
 delta_net_lib.define(
     "deltanet_decay_state.out("
     "Tensor recurrent_state, "
@@ -218,9 +222,9 @@ def _deltanet_core_reference(
         ) * delta.unsqueeze(-2)
         outputs.append((last_recurrent_state * q_t.unsqueeze(-1)).sum(dim=-2))
 
-    return torch.stack(outputs, dim=1).to(
+    return torch.stack(outputs, dim=1).to(initial_dtype), last_recurrent_state.to(
         initial_dtype
-    ), last_recurrent_state.to(initial_dtype)
+    )
 
 
 def _deltanet_core_decay_reference(
@@ -258,9 +262,9 @@ def _deltanet_core_decay_reference(
         ) * delta.unsqueeze(-2)
         outputs.append((last_recurrent_state * q_t.unsqueeze(-1)).sum(dim=-2))
 
-    return torch.stack(outputs, dim=1).to(
+    return torch.stack(outputs, dim=1).to(initial_dtype), last_recurrent_state.to(
         initial_dtype
-    ), last_recurrent_state.to(initial_dtype)
+    )
 
 
 def _deltanet_reference(
@@ -383,9 +387,7 @@ def deltanet_packed_out_impl(
     *,
     packed_out: torch.Tensor,
 ) -> torch.Tensor:
-    packed_out.copy_(
-        deltanet_packed_impl(query, key, value, g, beta, recurrent_state)
-    )
+    packed_out.copy_(deltanet_packed_impl(query, key, value, g, beta, recurrent_state))
     return packed_out
 
 
@@ -423,7 +425,33 @@ def deltanet_core_out_impl(
     return core_attn_out, new_recurrent_state
 
 
-@impl(delta_net_lib, "deltanet_core_fp16_accum", dispatch_key="CompositeExplicitAutograd")
+@impl(
+    delta_net_lib,
+    "deltanet_core_stream",
+    dispatch_key="CompositeExplicitAutograd",
+)
+def deltanet_core_stream_impl(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    decay: torch.Tensor,
+    beta: torch.Tensor,
+    recurrent_state: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    ref_out, ref_state = _deltanet_core_decay_reference(
+        query,
+        key,
+        value,
+        decay,
+        beta,
+        recurrent_state.transpose(-1, -2),
+    )
+    return ref_out, ref_state.transpose(-1, -2)
+
+
+@impl(
+    delta_net_lib, "deltanet_core_fp16_accum", dispatch_key="CompositeExplicitAutograd"
+)
 def deltanet_core_fp16_accum_impl(
     query: torch.Tensor,
     key: torch.Tensor,
@@ -484,7 +512,9 @@ def deltanet_decay_state_impl(
     return recurrent_state * g[:, 0].float().exp().unsqueeze(-1).unsqueeze(-1)
 
 
-@impl(delta_net_lib, "deltanet_decay_state.out", dispatch_key="CompositeExplicitAutograd")
+@impl(
+    delta_net_lib, "deltanet_decay_state.out", dispatch_key="CompositeExplicitAutograd"
+)
 def deltanet_decay_state_out_impl(
     recurrent_state: torch.Tensor,
     g: torch.Tensor,
@@ -643,6 +673,26 @@ class CustomOpDeltaNetCoreFp16Accum(BaselineDeltaNet):
         )
 
 
+class CustomOpDeltaNetCoreStream(BaselineDeltaNet):
+    def forward(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        g: torch.Tensor,
+        beta: torch.Tensor,
+        recurrent_state: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        return torch.ops.qnn_custom_ops.deltanet_core_stream.default(
+            _l2norm(query, self.epsilon) * self.scaling,
+            _l2norm(key, self.epsilon),
+            value,
+            torch.exp(g),
+            beta,
+            recurrent_state,
+        )
+
+
 class CustomOpDeltaNetIdentity(torch.nn.Module):
     def forward(
         self,
@@ -717,9 +767,7 @@ def make_inputs(
         (torch.randn(batch, ar_len, heads, head_v_dim) * 0.1).to(input_dtype),
         (-torch.rand(batch, ar_len, heads) * 0.1).to(input_dtype),
         torch.rand(batch, ar_len, heads).to(input_dtype),
-        (torch.randn(batch, heads, head_k_dim, head_v_dim) * 0.1).to(
-            input_dtype
-        ),
+        (torch.randn(batch, heads, head_k_dim, head_v_dim) * 0.1).to(input_dtype),
     )
 
 
@@ -758,6 +806,8 @@ def make_model(
         return CustomOpDeltaNetCore(scaling, epsilon).eval()
     if variant == "core_fp16accum":
         return CustomOpDeltaNetCoreFp16Accum(scaling, epsilon).eval()
+    if variant == "core_stream":
+        return CustomOpDeltaNetCoreStream(scaling, epsilon).eval()
     if variant == "probe_identity":
         return CustomOpDeltaNetIdentity().eval()
     if variant == "probe_decay":
@@ -767,7 +817,7 @@ def make_model(
     raise RuntimeError(f"Unknown variant: {variant}")
 
 
-def quant_config_for_dtype(quant_dtype: QuantDtype):
+def quant_config_for_dtype(quant_dtype: QuantDtype, act_observer=None):
     config_fns = {
         QuantDtype.use_16a16w: get_16a16w_qnn_ptq_config,
         QuantDtype.use_16a8w: get_16a8w_qnn_ptq_config,
@@ -775,22 +825,29 @@ def quant_config_for_dtype(quant_dtype: QuantDtype):
         QuantDtype.use_16a4w_block: get_16a4w_qnn_ptq_config,
         QuantDtype.use_8a8w: get_8a8w_qnn_ptq_config,
         QuantDtype.use_8a4w: get_8a4w_qnn_ptq_config,
+        QuantDtype.use_fp16a8w: get_fp16a8w_qnn_ptq_config,
     }
+    if act_observer is not None:
+        return config_fns[quant_dtype](act_observer=act_observer)
     return config_fns[quant_dtype]()
 
 
-def make_deltanet_quantizer(args, quant_dtype: Optional[QuantDtype]):
-    if quant_dtype is None:
-        return None
-
-    quant_cfg = quant_config_for_dtype(quant_dtype)
+def deltanet_quant_annotations(
+    quant_dtype: QuantDtype,
+    *,
+    act_observer=None,
+    share_state_qparams=False,
+    fp16_state=False,
+    fp32_state=False,
+):
+    float_state = fp16_state or fp32_state
+    core_quant_dtype = QuantDtype.use_fp16a8w if float_state else quant_dtype
+    quant_cfg = quant_config_for_dtype(core_quant_dtype, act_observer=act_observer)
     custom_quant_annotator = CustomOpsQuantAnnotator()
     custom_quant_annotator.register_annotation(
         torch.ops.qnn_custom_ops.deltanet.default,
         IOQuantConfig(
-            input_quant_specs={
-                index: quant_cfg.input_activation for index in range(6)
-            },
+            input_quant_specs={index: quant_cfg.input_activation for index in range(6)},
             output_quant_specs={
                 0: quant_cfg.output_activation,
                 1: quant_cfg.output_activation,
@@ -800,18 +857,24 @@ def make_deltanet_quantizer(args, quant_dtype: Optional[QuantDtype]):
     custom_quant_annotator.register_annotation(
         torch.ops.qnn_custom_ops.deltanet_packed.default,
         IOQuantConfig(
-            input_quant_specs={
-                index: quant_cfg.input_activation for index in range(6)
-            },
+            input_quant_specs={index: quant_cfg.input_activation for index in range(6)},
             output_quant_specs={0: quant_cfg.output_activation},
         ),
     )
     custom_quant_annotator.register_annotation(
         torch.ops.qnn_custom_ops.deltanet_core.default,
         IOQuantConfig(
-            input_quant_specs={
-                index: quant_cfg.input_activation for index in range(6)
+            input_quant_specs={index: quant_cfg.input_activation for index in range(6)},
+            output_quant_specs={
+                0: quant_cfg.output_activation,
+                1: quant_cfg.output_activation,
             },
+        ),
+    )
+    custom_quant_annotator.register_annotation(
+        torch.ops.qnn_custom_ops.deltanet_core_stream.default,
+        IOQuantConfig(
+            input_quant_specs={index: quant_cfg.input_activation for index in range(6)},
             output_quant_specs={
                 0: quant_cfg.output_activation,
                 1: quant_cfg.output_activation,
@@ -821,9 +884,7 @@ def make_deltanet_quantizer(args, quant_dtype: Optional[QuantDtype]):
     custom_quant_annotator.register_annotation(
         torch.ops.qnn_custom_ops.deltanet_core_fp16_accum.default,
         IOQuantConfig(
-            input_quant_specs={
-                index: quant_cfg.input_activation for index in range(6)
-            },
+            input_quant_specs={index: quant_cfg.input_activation for index in range(6)},
             output_quant_specs={
                 0: quant_cfg.output_activation,
                 1: quant_cfg.output_activation,
@@ -858,15 +919,202 @@ def make_deltanet_quantizer(args, quant_dtype: Optional[QuantDtype]):
         ),
     )
     annotate_fn = custom_quant_annotator.build_annotation_fn()
+    if float_state:
+        from torchao.quantization.pt2e.quantizer import QuantizationAnnotation
+
+        cache_cfg = quant_config_for_dtype(quant_dtype, act_observer=act_observer)
+
+        def annotate_conv_state_cat(gm):
+            # The causal-conv history is a graph IO tensor.  Annotate the cat
+            # edge explicitly so PT2E creates the cache encoding and its
+            # calibration qparams; the opaque recurrence core must stay FP16.
+            annotated = 0
+            cache_spec = cache_cfg.input_activation
+
+            # The cache placeholder is sliced before it reaches cat.  PT2E
+            # attaches an input QSpec to the consuming node, so annotating only
+            # cat is too late: the placeholder can otherwise remain a raw
+            # integer graph input with no quantize node to inspect later.
+            for placeholder in gm.graph.nodes:
+                if placeholder.op != "placeholder":
+                    continue
+                value = placeholder.meta.get("val")
+                if not isinstance(value, torch.Tensor) or tuple(value.shape) != (
+                    1,
+                    6144,
+                    4,
+                ):
+                    continue
+                for user in tuple(placeholder.users):
+                    if user.op != "call_function" or "slice" not in str(user.target):
+                        continue
+                    user.meta[Q_ANNOTATION_KEY] = QuantizationAnnotation(
+                        input_qspec_map={placeholder: cache_spec},
+                        output_qspec=cache_spec,
+                        _annotated=True,
+                    )
+                    annotated += 1
+
+            for node in gm.graph.nodes:
+                if node.target != torch.ops.aten.cat.default:
+                    continue
+                inputs = node.args[0] if node.args else ()
+                if not isinstance(inputs, (tuple, list)):
+                    continue
+                cache_inputs = [
+                    value
+                    for value in inputs
+                    if isinstance(value, torch.fx.Node)
+                    and tuple(value.meta.get("val", torch.empty(0)).shape)
+                    == (1, 6144, 4)
+                ]
+                if not cache_inputs:
+                    continue
+                cache_input = cache_inputs[0]
+                input_qspec_map = {cache_input: cache_spec}
+                shared = SharedQuantizationSpec((cache_input, node))
+                for value in inputs:
+                    if value is not cache_input and isinstance(value, torch.fx.Node):
+                        input_qspec_map[value] = shared
+                node.meta[Q_ANNOTATION_KEY] = QuantizationAnnotation(
+                    input_qspec_map=input_qspec_map,
+                    output_qspec=shared,
+                    _annotated=True,
+                )
+                annotated += 1
+
+            # The updated causal-conv history is returned through the model
+            # output tuple.  Annotating the cat alone does not claim the final
+            # output edge when the graph contains a trailing cast/view, so the
+            # exported output can remain FLOAT while its matching input is
+            # UINT16.  Claim each cache output explicitly to keep the IO pair
+            # in one encoding.
+            output_annotated = 0
+            for node in gm.graph.nodes:
+                if node.op != "output" or not node.args:
+                    continue
+                outputs = node.args[0]
+                if not isinstance(outputs, (tuple, list)):
+                    outputs = (outputs,)
+                for value in outputs:
+                    if not isinstance(value, torch.fx.Node):
+                        continue
+                    tensor = value.meta.get("val")
+                    if (
+                        not isinstance(tensor, torch.Tensor)
+                        or tuple(tensor.shape)
+                        != (
+                            1,
+                            6144,
+                            4,
+                        )
+                        or tensor.dtype != torch.float32
+                    ):
+                        continue
+                    value.meta[Q_ANNOTATION_KEY] = QuantizationAnnotation(
+                        input_qspec_map={},
+                        output_qspec=cache_spec,
+                        _annotated=True,
+                    )
+                    output_annotated += 1
+            logging.info(
+                "Annotated %d GDN causal-conv cache cats and %d outputs",
+                annotated,
+                output_annotated,
+            )
+
+        def annotate_float_core_region(gm):
+            conv_targets = {
+                torch.ops.aten.conv2d.default,
+                torch.ops.aten.convolution.default,
+            }
+
+            def add_nodes(value, work):
+                if isinstance(value, torch.fx.Node):
+                    work.append(value)
+                elif isinstance(value, (tuple, list)):
+                    for item in value:
+                        add_nodes(item, work)
+                elif isinstance(value, dict):
+                    for item in value.values():
+                        add_nodes(item, work)
+
+            # Keep projection convolutions quantized, but remove activation QDQ
+            # from the tensor path feeding the recurrent core and out_proj.
+            for node in gm.graph.nodes:
+                if node.target != torch.ops.qnn_custom_ops.deltanet_core.default:
+                    continue
+                attention_users = [
+                    user
+                    for user in node.users
+                    if len(user.args) > 1 and user.args[1] == 0
+                ]
+                work = [node, *attention_users]
+                seen = set()
+                while work:
+                    current = work.pop()
+                    if current in seen or current.op in {"placeholder", "output"}:
+                        continue
+                    seen.add(current)
+                    if current.target in conv_targets:
+                        continue
+                    current.meta[Q_ANNOTATION_KEY] = QuantizationAnnotation(
+                        input_qspec_map={}, output_qspec=None, _annotated=True
+                    )
+                    add_nodes(current.args, work)
+                    work.extend(
+                        user
+                        for user in current.users
+                        if user.target not in conv_targets
+                        and not (
+                            current is node and len(user.args) > 1 and user.args[1] == 1
+                        )
+                    )
+
+        # Keep this cache annotation last.  The float-core pass walks backward
+        # through the graph and may otherwise replace the cache edge annotation
+        # with an empty annotation while removing activation QDQ from the core.
+        return (annotate_fn, annotate_float_core_region, annotate_conv_state_cat)
+
+    if not share_state_qparams:
+        return (annotate_fn,)
+
+    def annotate_shared_state(gm):
+        annotate_fn(gm)
+        stateful_core_targets = {
+            torch.ops.qnn_custom_ops.deltanet_core.default,
+            torch.ops.qnn_custom_ops.deltanet_core_stream.default,
+            torch.ops.qnn_custom_ops.deltanet_core_fp16_accum.default,
+        }
+        for node in gm.graph.nodes:
+            if node.target not in stateful_core_targets:
+                continue
+            # Recurrent state must use one encoding at the graph boundary and
+            # after the core updates it in place.
+            for user in node.users:
+                if user.args[1] == 1:
+                    user.meta[Q_ANNOTATION_KEY].output_qspec = SharedQuantizationSpec(
+                        (node.args[5], node)
+                    )
+
+    return (annotate_shared_state,)
+
+
+def make_deltanet_quantizer(args, quant_dtype: Optional[QuantDtype]):
+    if quant_dtype is None:
+        return None
+
     return make_quantizer(
         quant_dtype=quant_dtype,
-        custom_annotations=(annotate_fn,),
+        custom_annotations=deltanet_quant_annotations(quant_dtype),
         backend=get_backend_type(args.backend),
         soc_model=args.soc_model,
     )
 
 
-def setup_op_package(args):
+def setup_op_package(
+    args, *, state_vtcm: bool = False, stream_recurrence: bool = False
+):
     op_package_dir = Path(args.op_package_dir).resolve()
     op_package_name = "DeltaNetOpPackage"
     interface_provider = f"{op_package_name}InterfaceProvider"
@@ -883,7 +1131,9 @@ def setup_op_package(args):
         build_dir = op_package_dir / "build"
         if build_dir.exists():
             shutil.rmtree(build_dir)
-        _run(["make", "htp_x86", "htp_aarch64", f"htp_v{arch}"], cwd=str(op_package_dir))
+        _run(
+            ["make", "htp_x86", "htp_aarch64", f"htp_v{arch}"], cwd=str(op_package_dir)
+        )
         shutil.copyfile(
             op_package_dir / "build" / f"hexagon-v{arch}" / f"{lib_name}.so",
             op_package_dir / "build" / f"hexagon-v{arch}" / f"{lib_name}_HTP.so",
@@ -891,24 +1141,17 @@ def setup_op_package(args):
 
     workspace = args.workspace
     custom_op_map = [
-        (str(torch.ops.qnn_custom_ops.deltanet.default), "DeltaNet"),
-        (str(torch.ops.qnn_custom_ops.deltanet_packed.default), "DeltaNetPacked"),
-        (str(torch.ops.qnn_custom_ops.deltanet_core.default), "DeltaNetCore"),
+        (
+            str(torch.ops.qnn_custom_ops.deltanet_core.default),
+            "DeltaNetCoreVtcm" if state_vtcm else "DeltaNetCore",
+        ),
+        (
+            str(torch.ops.qnn_custom_ops.deltanet_core_stream.default),
+            "DeltaNetCoreStream",
+        ),
         (
             str(torch.ops.qnn_custom_ops.deltanet_core_fp16_accum.default),
             "DeltaNetCoreFp16Accum",
-        ),
-        (
-            str(torch.ops.qnn_custom_ops.deltanet_identity.default),
-            "DeltaNetIdentity",
-        ),
-        (
-            str(torch.ops.qnn_custom_ops.deltanet_decay_state.default),
-            "DeltaNetDecayState",
-        ),
-        (
-            str(torch.ops.qnn_custom_ops.deltanet_state_passthrough.default),
-            "DeltaNetStatePassthrough",
         ),
     ]
     op_package_infos = []
@@ -1033,6 +1276,8 @@ def run_one(
 ) -> Dict[str, object]:
     qname = quant_name(quant_dtype)
     model = make_model(variant, args.scaling, args.epsilon, args.input_dtype)
+    if variant == "core_stream":
+        dataset = [(*inputs[:5], inputs[5].transpose(-1, -2)) for inputs in dataset]
     sample_input = dataset[0]
     with torch.no_grad():
         refs = model(*sample_input)
@@ -1050,13 +1295,9 @@ def run_one(
     pte_file = case_dir / case_name
     logging.info("Building %s quant=%s", variant, qname)
     uses_op_package = variant in {
-        "custom",
-        "packed",
         "core",
+        "core_stream",
         "core_fp16accum",
-        "probe_identity",
-        "probe_decay",
-        "probe_state_passthrough",
     }
     try:
         build_executorch_binary(
@@ -1066,9 +1307,7 @@ def run_one(
             dataset=dataset,
             quant_dtype=quant_dtype,
             custom_quantizer=(
-                make_deltanet_quantizer(args, quant_dtype)
-                if uses_op_package
-                else None
+                make_deltanet_quantizer(args, quant_dtype) if uses_op_package else None
             ),
             op_package_options=op_package_options if uses_op_package else None,
         )
@@ -1079,6 +1318,7 @@ def run_one(
     result = {
         "case": case_name,
         "variant": variant,
+        "state_vtcm": args.state_vtcm,
         "quant_dtype": qname,
         "batch": args.batch,
         "ar_len": args.ar_len,
@@ -1116,15 +1356,38 @@ def run_one(
 
 
 def main(args) -> None:
+    variants = [variant.strip() for variant in args.variants.split(",") if variant]
+    supported_variants = {"baseline", "core", "core_stream", "core_fp16accum"}
+    if not variants or set(variants) - supported_variants:
+        raise ValueError(
+            "--variants supports baseline,core,core_stream,core_fp16accum; "
+            "the legacy DeltaNet.cpp kernels have been removed"
+        )
     qnn_config = QnnConfig.load_config(args.config_file if args.config_file else args)
     if qnn_config.enable_x86_64:
         raise RuntimeError("DeltaNet benchmark currently expects an Android device")
 
-    if os.path.exists(args.artifact) and not args.keep_artifact and not args.pre_gen_pte:
+    if (
+        os.path.exists(args.artifact)
+        and not args.keep_artifact
+        and not args.pre_gen_pte
+    ):
         shutil.rmtree(args.artifact)
     os.makedirs(args.artifact, exist_ok=True)
 
-    op_package_options, op_package_paths = setup_op_package(args)
+    if args.state_vtcm and (
+        args.variants != "core"
+        or any(
+            dtype is None or not dtype.name.startswith("use_16a")
+            for dtype in parse_quant_dtypes(args.quant_dtypes)
+        )
+    ):
+        raise ValueError("--state_vtcm requires --variants core and 16-bit activations")
+    op_package_options, op_package_paths = setup_op_package(
+        args,
+        state_vtcm=args.state_vtcm,
+        stream_recurrence=args.stream_recurrence,
+    )
     input_dtype = torch.float16 if args.input_dtype == "fp16" else torch.float32
     dataset = [
         make_inputs(
@@ -1139,7 +1402,6 @@ def main(args) -> None:
         for i in range(args.calibration_samples)
     ]
 
-    variants = [variant.strip() for variant in args.variants.split(",") if variant]
     quant_dtypes = parse_quant_dtypes(args.quant_dtypes)
     results = []
     for quant_dtype in quant_dtypes:
@@ -1169,9 +1431,7 @@ if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
     parser = setup_common_args_and_variables()
     default_op_package_dir = (
-        Path(__file__).parent
-        / "deltanet_op_package_htp"
-        / "DeltaNetOpPackage"
+        Path(__file__).parent / "deltanet_op_package_htp" / "DeltaNetOpPackage"
     )
     parser.add_argument(
         "-a",
@@ -1195,10 +1455,15 @@ if __name__ == "__main__":
     parser.add_argument("--epsilon", default=_DELTA_NET_EPS, type=float)
     parser.add_argument("--iteration", default=50, type=int)
     parser.add_argument("--calibration_samples", default=4, type=int)
-    parser.add_argument("--variants", default="baseline,custom", type=str)
+    parser.add_argument(
+        "--variants",
+        default="baseline,core",
+        type=str,
+        help="Comma-separated variants: baseline,core,core_stream,core_fp16accum.",
+    )
     parser.add_argument(
         "--quant_dtypes",
-        default="fp16,use_16a8w,use_16a4w,use_8a8w",
+        default="fp16,use_16a8w,use_16a4w",
         type=str,
     )
     parser.add_argument(
@@ -1213,6 +1478,16 @@ if __name__ == "__main__":
         type=str,
     )
     parser.add_argument("--build_op_package", action="store_true")
+    parser.add_argument(
+        "--stream_recurrence",
+        action="store_true",
+        help="Register the one-token, one-state-column recurrence op.",
+    )
+    parser.add_argument(
+        "--state_vtcm",
+        action="store_true",
+        help="Keep the QUInt16 DeltaNetCore state in VTCM across all tokens.",
+    )
     parser.add_argument("--keep_artifact", action="store_true")
 
     args = parser.parse_args()
