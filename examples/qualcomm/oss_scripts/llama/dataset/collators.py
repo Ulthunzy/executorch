@@ -32,15 +32,24 @@ def _pad_and_stack(
 class ModalityEncoderCollator:
     """Collator for encoder batches (audio or vision).
 
-    Each item from ModalityEncoderDataset is a Tuple[Tensor, ...] (one set of
-    encoder inputs per media file).
+    Each sample contains one input tuple per media file, or an empty list for
+    text. Each tensor already includes the encoder's batch dimension.
 
     Returns:
-        {"inputs": torch.Tensor}
+            {"inputs": List[Tensor]}
     """
 
-    def __call__(self, batch: List[Tuple[torch.Tensor]]) -> Dict[str, torch.Tensor]:
-        return {"inputs": torch.stack([item[0] for item in batch])}
+    def __call__(
+        self, batch: List[List[Tuple[torch.Tensor]]]
+    ) -> Dict[str, List[torch.Tensor]]:
+        return {"inputs": [inputs[0] for sample in batch for inputs in sample]}
+
+
+class ModalityOutputCollator:
+    """Keep media in sample order without stacking variable image counts."""
+
+    def __call__(self, batch: List[List[torch.Tensor]]) -> Tuple[torch.Tensor, ...]:
+        return tuple(value for sample in batch for value in sample)
 
 
 class LLMCalibCollator:

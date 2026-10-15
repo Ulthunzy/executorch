@@ -101,13 +101,21 @@ def process_model_args(
     elif mode == Mode.PREFILL:
         ar_len = control_args.prefill_ar_len
     elif mode == Mode.CALIBRATE:
-        ar_len = control_args.max_context_len
+        ar_len = (
+            128
+            if control_args.decoder_model.startswith(("qwen3_5", "lincal3_5"))
+            else control_args.max_context_len
+        )
     else:
         raise ValueError(f"Unsupported mode: {mode}")
 
     # TODO: support batch inputs for runtime mode if necessary
     model_args.max_batch_size = control_args.batch_size if mode == Mode.CALIBRATE else 1
-    model_args.max_seq_len = control_args.max_seq_len
+    model_args.max_seq_len = (
+        control_args.max_context_len
+        if control_args.decoder_model.startswith(("qwen3_5", "lincal3_5"))
+        else control_args.max_seq_len
+    )
     model_args.max_context_len = control_args.max_context_len
     model_args.use_kv_cache = (
         control_args.max_context_len != ar_len or mode == Mode.CALIBRATE
@@ -144,10 +152,14 @@ def get_model_specific_kwargs(control_args: argparse.Namespace, config: LLMModel
     # in the input sequence. This token is used to mark positions where modality embeddings
     # should be inserted during inference.
     if hasattr(config, AUDIO_ENCODER):
-        hf_config = AutoConfig.from_pretrained(config.repo_id)
+        hf_config = AutoConfig.from_pretrained(
+            getattr(control_args, "source_safetensors", None) or config.repo_id
+        )
         kwargs["audio_token_id"] = hf_config.audio_token_index
     if hasattr(config, VISION_ENCODER):
-        hf_config = AutoConfig.from_pretrained(config.repo_id)
+        hf_config = AutoConfig.from_pretrained(
+            getattr(control_args, "source_safetensors", None) or config.repo_id
+        )
         kwargs["image_token_id"] = hf_config.image_token_id
     return kwargs
 

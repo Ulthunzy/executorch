@@ -5,7 +5,6 @@
 # LICENSE file in the root directory of this source tree.
 
 import argparse
-import getpass
 import logging
 import os
 import subprocess
@@ -74,6 +73,11 @@ from executorch.examples.qualcomm.oss_scripts.llama.decoder_constants import (
     TEXT_DECODER,
     TOK_EMBEDDING,
     VISION_ENCODER,
+)
+from executorch.examples.qualcomm.oss_scripts.llama.gdn import (
+    DEVICE_WORKSPACE,
+    is_qwen35_model,
+    setup_gdn_op_package,
 )
 from executorch.examples.qualcomm.oss_scripts.llama.inference import (
     DecoderInference,
@@ -150,9 +154,7 @@ class EvalBase(ABC):
         self.is_multimodal = is_multimodal
         self.dataset_builder = dataset_builder
 
-        self.device_workspace = (
-            f"/data/local/tmp/{getpass.getuser()}/executorch/static_llm"
-        )
+        self.device_workspace = DEVICE_WORKSPACE
         self.runner = (
             "qnn_multimodal_runner" if self.is_multimodal else "qnn_llama_runner"
         )
@@ -312,6 +314,11 @@ class EvalBase(ABC):
                 workspace=self.device_workspace,
                 runner=f"examples/qualcomm/oss_scripts/llama/{self.runner}",
             )
+            if is_qwen35_model(args.decoder_model):
+                _, package_paths = setup_gdn_op_package(args)
+                EvalBase._adb.backend_library_paths[qnn_config.backend].extend(
+                    package_paths
+                )
         return EvalBase._adb
 
     @abstractmethod
@@ -388,6 +395,7 @@ class DefaultEval(EvalBase):
                 self.args.decoder_model,
                 audio_paths or [],
                 image_paths or [],
+                repo_id=self.args.source_safetensors,
             )
             modality_input_cmd, self.modality_input_files = (
                 self._init_multimodal_base_cmd(modality_inputs)
@@ -574,6 +582,7 @@ class SqnrEval(EvalBase):
                 self.args.decoder_model,
                 audio_paths or [],
                 image_paths or [],
+                repo_id=self.args.source_safetensors,
             )
             modality_input_cmd, self.modality_input_files = (
                 self._init_multimodal_base_cmd(modality_inputs)

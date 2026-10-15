@@ -64,9 +64,13 @@ class Qwen35RMSNorm(Norm):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x_float = x.float()
-        output = x_float * torch.rsqrt(
-            (x_float * x_float).mean(-1, keepdim=True) + self.eps
-        )
+        # Keep variance and epsilon inside RMSNorm: a wide U16 grid can
+        # otherwise round the denominator of a padded token to zero.
+        output = F.rms_norm(
+            x_float.reshape(-1, x_float.shape[-1]),
+            (x_float.shape[-1],),
+            eps=self.eps,
+        ).reshape_as(x_float)
         if self.add_unit_offset:
             return (output * (1.0 + self.weight.float())).to(x.dtype)
         return (output * self.weight.float()).to(x.dtype)
@@ -81,8 +85,10 @@ class Qwen35RMSNormGated(torch.nn.Module):
     def forward(self, hidden_states: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:
         input_dtype = hidden_states.dtype
         hidden_states = hidden_states.to(torch.float32)
-        variance = hidden_states.pow(2).mean(-1, keepdim=True)
-        hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
+        hidden_states = F.rms_norm(
+            hidden_states, (hidden_states.shape[-1],), eps=self.variance_epsilon
+        )
         hidden_states = self.weight * hidden_states.to(input_dtype)
-        hidden_states = hidden_states * F.silu(gate.to(torch.float32))
+        gate = gate.to(torch.float32)
+        hidden_states = hidden_states * (gate * torch.sigmoid(gate))
         return hidden_states.to(input_dtype)

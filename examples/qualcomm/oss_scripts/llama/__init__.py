@@ -31,6 +31,17 @@ from executorch.examples.models.granite_speech import (
 from executorch.examples.models.internvl3 import (
     convert_weights as convert_internvl3_weights,
 )
+from executorch.examples.models.lincal import convert_weights as convert_lincal_weights
+from executorch.examples.models.lincal3_5 import (
+    convert_weights as convert_lincal3_5_weights,
+)
+from executorch.examples.models.lincal_vl import (
+    convert_weights as convert_lincal_vl_weights,
+)
+
+from executorch.examples.models.minicpm5.convert_weights import (
+    convert_weights as convert_minicpm5_weights,
+)
 from executorch.examples.models.phi_4_mini import (
     convert_weights as convert_phi_4_mini_weights,
 )
@@ -40,21 +51,12 @@ from executorch.examples.models.qwen2_5 import (
 from executorch.examples.models.qwen2_5_vl import (
     convert_weights as convert_qwen2_5_vl_weights,
 )
-from executorch.examples.models.qwen3_vl import (
-    convert_weights as convert_qwen3_vl_weights,
-)
-from executorch.examples.models.lincal_vl import (
-    convert_weights as convert_lincal_vl_weights,
-)
 from executorch.examples.models.qwen3 import convert_weights as convert_qwen3_weights
 from executorch.examples.models.qwen3_5 import (
     convert_weights as convert_qwen3_5_weights,
 )
-from executorch.examples.models.lincal3_5 import (
-    convert_weights as convert_lincal3_5_weights,
-)
-from executorch.examples.models.lincal import (
-    convert_weights as convert_lincal_weights,
+from executorch.examples.models.qwen3_vl import (
+    convert_weights as convert_qwen3_vl_weights,
 )
 from executorch.examples.models.smollm2 import (
     convert_weights as convert_smollm2_weights,
@@ -64,10 +66,6 @@ from executorch.examples.models.smollm3 import (
 )
 from executorch.examples.models.smolvlm import (
     convert_weights as convert_smolvlm_weights,
-)
-
-from executorch.examples.models.minicpm5.convert_weights import (
-    convert_weights as convert_minicpm5_weights,
 )
 
 from executorch.examples.qualcomm.oss_scripts.llama.decoder_constants import (
@@ -82,8 +80,8 @@ from executorch.examples.qualcomm.oss_scripts.llama.encoder.encoder_config impor
     InternVL3Encoder,
     MultiModalityConfig,
     Qwen2_5VL3BEncoder,
-    Qwen3VL2BEncoder,
     Qwen35VLEncoder,
+    Qwen3VL2BEncoder,
     SmolVLMEncoder,
     VisionModalityConfig,
 )
@@ -105,6 +103,9 @@ from executorch.examples.qualcomm.oss_scripts.llama.static_llm_quant_recipe impo
     Granite_3_3_2B_InstructQuantRecipe,
     GraniteSpeech_3_3_2B_InstructQuantRecipe,
     InternVL3_1B_QuantRecipe,
+    Lincal_0_6BQuantRecipe,
+    Lincal_1_7BQuantRecipe,
+    Lincal_4BQuantRecipe,
     Llama3_1BQuantRecipe,
     Llama3_3BQuantRecipe,
     LlamaStories110MQuantRecipe,
@@ -116,12 +117,9 @@ from executorch.examples.qualcomm.oss_scripts.llama.static_llm_quant_recipe impo
     Qwen2_5_VL_3BQuantRecipe,
     Qwen3_0_6BQuantRecipe,
     Qwen3_1_7BQuantRecipe,
+    Qwen3_4BQuantRecipe,
     Qwen3_5_0_8BQuantRecipe,
     Qwen3_5_2BQuantRecipe,
-    Qwen3_4BQuantRecipe,
-    Lincal_0_6BQuantRecipe,
-    Lincal_1_7BQuantRecipe,
-    Lincal_4BQuantRecipe,
     Smollm2QATQuantRecipe,
     Smollm2QuantRecipe,
     Smollm3QuantRecipe,
@@ -604,7 +602,7 @@ class _Qwen3_5_0_8BBase(LLMModelConfig):
     transform_weight = False
     instruct_model = True
     num_sharding = 1
-    masked_softmax = True
+    masked_softmax = False
     seq_mse_candidates = 50
     r1 = False
     r2 = False
@@ -615,7 +613,7 @@ class _Qwen3_5_0_8BBase(LLMModelConfig):
 @register_llm_model("qwen3_5-0_8b", modality_encoders=Qwen35VLEncoder)
 @dataclass(init=False, frozen=True)
 class Qwen3_5_0_8B(_Qwen3_5_0_8BBase):
-    repo_id: str = "/home/ubuntu/workspace/xiaoyi/model/Qwen/Qwen3.5-0.8B"
+    repo_id: str = "Qwen/Qwen3.5-0.8B"
     params_path: str = os.path.join(
         BASE_DIR, "../../../models/qwen3_5/config/0_8b_config.json"
     )
@@ -627,7 +625,7 @@ class _Qwen3_5_2BBase(LLMModelConfig):
     transform_weight = False
     instruct_model = True
     num_sharding = 1
-    masked_softmax = True
+    masked_softmax = False
     seq_mse_candidates = 50
     r1 = False
     r2 = False
@@ -638,7 +636,7 @@ class _Qwen3_5_2BBase(LLMModelConfig):
 @register_llm_model("qwen3_5-2b", modality_encoders=Qwen35VLEncoder)
 @dataclass(init=False, frozen=True)
 class Qwen3_5_2B(_Qwen3_5_2BBase):
-    repo_id: str = "/home/ubuntu/workspace/xiaoyi/model/Qwen/Qwen3.5-2B"
+    repo_id: str = "Qwen/Qwen3.5-2B"
     params_path: str = os.path.join(
         BASE_DIR, "../../../models/qwen3_5/config/2b_config.json"
     )
@@ -918,9 +916,7 @@ class Gemma4_E2B(LLMModelConfig):
 @dataclass(init=False, frozen=True)
 class MiniCPM5_2B(LLMModelConfig):
     repo_id: str = "openbmb/MiniCPM5-2B"
-    params_path: str = os.path.join(
-        BASE_DIR, "../../../models/minicpm5/2b_config.json"
-    )
+    params_path: str = os.path.join(BASE_DIR, "../../../models/minicpm5/2b_config.json")
     convert_weights = convert_minicpm5_weights
     transform_weight = False
     instruct_model = True

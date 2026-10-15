@@ -181,6 +181,8 @@ class DecoderInference:
                 tok_embedding,
                 self.audio_token_id or self.image_token_id,
             )
+        elif tok_embedding is not None:
+            inputs_embeds = tok_embedding(input_ids)
         else:
             raw_input_ids = input_ids
         pos_ids = (

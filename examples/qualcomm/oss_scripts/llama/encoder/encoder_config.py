@@ -22,8 +22,8 @@ from executorch.examples.qualcomm.oss_scripts.llama.model.vision_encoder import 
     Idefics3VisionEncoder,
     InternVL3VisionEncoder,
     Qwen2_5VLVisionEncoder,
-    Qwen3VLVisionEncoder,
     Qwen35VLVisionEncoder,
+    Qwen3VLVisionEncoder,
 )
 
 
@@ -74,11 +74,13 @@ class VisionModalityConfig(MultiModalityConfig):
         img_seq_len: Number of image tokens/patches in the sequence.
         img_resized_h: Target height for image resizing (pixels).
         img_resized_w: Target width for image resizing (pixels).
+        use_fp16: Skip PTQ and compile floating point vision operators on HTP.
     """
 
     img_seq_len: int
     img_resized_h: int
     img_resized_w: int
+    use_fp16: bool = False
 
     def create_encoder(self, config):
         return self.encoder_class(
@@ -165,3 +167,4 @@ class Qwen35VLEncoder(VisionModalityConfig):
     img_resized_w = 448
     img_url = "http://images.cocodataset.org/val2017/000000039769.jpg"
     quant_recipe = Qwen35VLEncoderQuantRecipe
+    use_fp16 = False

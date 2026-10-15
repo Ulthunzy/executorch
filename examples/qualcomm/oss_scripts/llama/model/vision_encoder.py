@@ -9,10 +9,10 @@ from typing import Tuple
 
 import torch
 import torch.nn.functional as F
+from executorch.examples.qualcomm.oss_scripts.llama.model import ROTARY_EMB_REGISTRY
 
 from executorch.examples.qualcomm.utils import replace_module_with_custom_class
 from torch import nn
-from executorch.examples.qualcomm.oss_scripts.llama.model import ROTARY_EMB_REGISTRY
 
 from transformers.models.idefics3.modeling_idefics3 import (
     BaseModelOutput,
@@ -30,8 +30,8 @@ from transformers.models.internvl.modeling_internvl import (
 )
 from transformers.models.qwen2.modeling_qwen2 import Qwen2RMSNorm
 from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import (
-    Qwen2_5_VLMLP,
     Qwen2_5_VisionTransformerPretrainedModel,
+    Qwen2_5_VLMLP,
 )
 from transformers.models.qwen3_vl.modeling_qwen3_vl import (
     apply_rotary_pos_emb_vision as apply_qwen3_vl_rotary_pos_emb,
@@ -405,6 +405,15 @@ def _rotate_half_vision(x: torch.Tensor) -> torch.Tensor:
     return torch.cat((-x2, x1), dim=-1)
 
 
+class StaticGELUTanh(nn.Module):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # QNN Gelu uses erf; preserve the checkpoint's tanh formula explicitly.
+        bounded = x.clamp(-10.0, 10.0)
+        inner = bounded * (1.5957691216057308 + 0.07135481642948435 * bounded * bounded)
+        # 1 + tanh(u) = 2 * sigmoid(2u), without FP16 cancellation near -1.
+        return x * torch.sigmoid(inner)
+
+
 class StaticQwen35VLVisionAttention(nn.Module):
     def __init__(self, config) -> None:
         super().__init__()
@@ -451,6 +460,8 @@ class StaticQwen35VLVisionBlock(nn.Module):
         self.norm2 = nn.LayerNorm(config.hidden_size, eps=1e-6)
         self.attn = StaticQwen35VLVisionAttention(config)
         self.mlp = Qwen3VLVisionMLP(config)
+        if config.hidden_act == "gelu_pytorch_tanh":
+            self.mlp.act_fn = StaticGELUTanh()
 
     def forward(
         self,
@@ -709,7 +720,9 @@ class StaticQwen2_5VLVisionAttention(nn.Module):
         key_states = key_states.transpose(0, 1).contiguous()
         value_states = value_states.transpose(0, 1).contiguous()
 
-        query_states = self.apply_rope_emb(query_states.unsqueeze(0), cos, sin).squeeze(0)
+        query_states = self.apply_rope_emb(query_states.unsqueeze(0), cos, sin).squeeze(
+            0
+        )
         key_states = self.apply_rope_emb(key_states.unsqueeze(0), cos, sin).squeeze(0)
 
         if full_attention:
@@ -813,7 +826,9 @@ class StaticQwen2_5VisionTransformerPretrainedModel(
         self.register_buffer(
             "static_rotary_pos_emb", static_rotary_pos_emb, persistent=False
         )
-        self.register_buffer("static_window_index", static_window_index, persistent=False)
+        self.register_buffer(
+            "static_window_index", static_window_index, persistent=False
+        )
         self.register_buffer(
             "static_cu_window_seqlens", static_cu_window_seqlens, persistent=False
         )

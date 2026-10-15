@@ -157,9 +157,10 @@ class EncoderDatasetBuilder:
         self,
         llm_config: LLMModelConfig,
         tokenizer_wrapper: TokenizerWrapper,
+        repo_id: Optional[str] = None,
     ):
         self.llm_config = llm_config
-        self._preprocessor = ModalityPreprocessor(llm_config.repo_id)
+        self._preprocessor = ModalityPreprocessor(repo_id or llm_config.repo_id)
         self._tokenizer_wrapper = tokenizer_wrapper
 
     def load_multimodal_inputs(
@@ -188,23 +189,21 @@ class EncoderDatasetBuilder:
         if not samples:
             return None
 
-        missing = [i for i, s in enumerate(samples) if not s.files]
-        if missing:
-            raise ValueError(
-                f"Multimodal model requires files in each sample, "
-                f"but samples at indices {missing} provide none."
-            )
+        if not hasattr(self.llm_config, modality):
+            return None
 
         # [N samples, N files]
         modality_data: List[List] = []
         for sample in samples:
             prompt = self._tokenizer_wrapper.apply_chat_template(sample.messages)
-            if not hasattr(self.llm_config, modality):
-                continue
-            inputs = self.load_multimodal_inputs(
-                getattr(self.llm_config, modality), prompt, sample.files
+            inputs = (
+                self.load_multimodal_inputs(
+                    getattr(self.llm_config, modality), prompt, sample.files
+                )
+                if sample.files
+                else []
             )
-            modality_data.extend(inputs)
+            modality_data.append(inputs)
         return ModalityEncoderDataset(modality_data)
 
 
@@ -225,10 +224,6 @@ class DatasetBuilder:
         self._is_multimodal = any(
             hasattr(llm_config, m) for m in [AUDIO_ENCODER, VISION_ENCODER]
         )
-        if self._is_multimodal and data_config.calib_text_datasets:
-            raise ValueError(
-                "--calib_text_datasets currently supports text-only models."
-            )
         self._text_decoder_dataset_builder = DecoderDatasetBuilder(
             tokenizer_wrapper=tokenizer_wrapper,
             max_context_len=data_config.max_context_len,
@@ -236,7 +231,9 @@ class DatasetBuilder:
         )
         self._modality_encoder_dataset_builder: Optional[EncoderDatasetBuilder] = (
             EncoderDatasetBuilder(
-                llm_config=llm_config, tokenizer_wrapper=tokenizer_wrapper
+                llm_config=llm_config,
+                tokenizer_wrapper=tokenizer_wrapper,
+                repo_id=data_config.source_safetensors,
             )
             if self._is_multimodal
             else None
@@ -265,6 +262,10 @@ class DatasetBuilder:
         samples: List[MessageSample] = load_conversation_samples(cfg.calib_samples)
 
         # build encoder datasets
+        if self._is_multimodal and not any(sample.files for sample in samples):
+            raise ValueError(
+                "Include at least one image/audio sample to calibrate the encoder."
+            )
         if self._is_multimodal:
             datasets[AUDIO_ENCODER] = (
                 self._modality_encoder_dataset_builder.from_message_samples(
@@ -322,6 +323,21 @@ class DatasetBuilder:
             if len(decoder_datasets) > 1
             else decoder_datasets[0]
         )
+        # Every decoder sample consumes exactly one encoder batch, including
+        # empty batches for text. Do not zip raw text with unrelated images.
+        for modality in (AUDIO_ENCODER, VISION_ENCODER):
+            dataset = datasets.get(modality)
+            if dataset is not None:
+                paired = []
+                for sample, inputs in zip(samples, dataset.data):
+                    count = len(
+                        self._text_decoder_dataset_builder.from_conversation([sample])
+                    )
+                    paired.extend([inputs] * count)
+                paired.extend(
+                    [[] for _ in range(len(datasets[TEXT_DECODER]) - len(paired))]
+                )
+                dataset.data = paired
         self._log_dataset_stats(datasets, cfg.batch_size, phase="calibration")
 
         return dict.fromkeys(_ALL_MODALITY_KEYS) | {
@@ -338,6 +354,7 @@ class DatasetBuilder:
                 ),
             )
             for modality, dataset in datasets.items()
+            if dataset is not None
         }
 
     def build_qat_dataloaders(self) -> Tuple[
@@ -465,6 +482,10 @@ class DatasetBuilder:
     ) -> Dict[str, Optional[DataLoader]]:
         datasets = {}
         # build encoder datasets
+        if self._is_multimodal and not any(sample.files for sample in samples):
+            raise ValueError(
+                "Include at least one image/audio sample to calibrate the encoder."
+            )
         if self._is_multimodal:
             datasets[AUDIO_ENCODER] = (
                 self._modality_encoder_dataset_builder.from_message_samples(
@@ -553,6 +574,8 @@ class DatasetBuilder:
     ) -> None:
         """Log sample/batch counts per modality; raises if any dataset < batch_size."""
         for modality, ds in datasets.items():
+            if ds is None:
+                continue
             n = len(ds)
             n_batches = n // batch_size
             dropped = n - n_batches * batch_size

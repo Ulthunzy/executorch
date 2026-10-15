@@ -18,6 +18,7 @@ class DataConfig:
     max_context_len: int
     token_dtype: Optional[str] = None
     batch_size: int = 1
+    source_safetensors: Optional[str] = None
     seed: int = 42
 
     # PTQ calibration (also used as QAT calib source)
@@ -44,6 +45,7 @@ class DataConfig:
     def from_args(cls, args: argparse.Namespace) -> "DataConfig":
         return cls(
             max_context_len=args.max_context_len,
+            source_safetensors=getattr(args, "source_safetensors", None),
             token_dtype=(
                 torch.int64
                 if getattr(args, "embedding_quantize", None)

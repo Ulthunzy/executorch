@@ -160,5 +160,5 @@ class Qwen35VLEncoderQuantRecipe(EncoderQuantRecipe):
             QuantDtype.use_16a8w,
             False,
             act_observer=MinMaxObserver,
-            granularity=QuantGranularity.PER_TENSOR,
+            granularity=QuantGranularity.PER_CHANNEL,
         )

@@ -75,10 +75,16 @@ from executorch.examples.qualcomm.oss_scripts.llama.evaluator.device_evaluator i
     SqnrEval,
     TaskEval,
 )
+
+from executorch.examples.qualcomm.oss_scripts.llama.gdn import (
+    DEFAULT_OP_PACKAGE_DIR,
+    is_qwen35_model,
+    qwen35_prefill_capacity,
+    setup_gdn_op_package,
+)
 from executorch.examples.qualcomm.oss_scripts.llama.model_validation.common.lineage import (
     write_export_lineage,
 )
-
 from executorch.examples.qualcomm.oss_scripts.llama.tokenizer import TokenizerWrapper
 from executorch.examples.qualcomm.oss_scripts.llama.wrappers import (
     HybridAttentionSinkEvictor,
@@ -204,6 +210,9 @@ def _build_optrace_targets(
         decoder_inputs["prefill_forward"] = [
             multi_modal_mgr.text_decoder.prefill.export_input
         ]
+    for name, bucket in multi_modal_mgr.text_decoder.prefill_buckets:
+        if bucket.decoder is not None:
+            decoder_inputs[name] = [bucket.export_input]
     if decoder_inputs:
         pte_targets[f"{args.artifact}/{pte_filenames[TEXT_DECODER]}.pte"] = (
             decoder_inputs
@@ -345,6 +354,10 @@ def compile(
     is_multimodal,
 ) -> Dict[str, List]:
     os.makedirs(args.artifact, exist_ok=True)
+    op_package_options = None
+    if is_qwen35_model(args.decoder_model):
+        op_package_options, _ = setup_gdn_op_package(args)
+        logging.info("Using DeltaNetCoreVtcm with calibrated UINT16 state")
     multi_modal_mgr = MultiModalManager(control_args=args, config=decoder_model_config)
 
     skip_quantize = {}
@@ -360,7 +373,11 @@ def compile(
     use_weight_sharing = decoder_model_config.use_weight_sharing
     for modality in compile_specs:
         if is_multimodal and modality in {AUDIO_ENCODER, TEXT_ENCODER, VISION_ENCODER}:
-            to_skip = False
+            to_skip = (
+                modality == VISION_ENCODER
+                and decoder_model_config.vision_encoder is not None
+                and decoder_model_config.vision_encoder.use_fp16
+            )
             if args.backend == "htp":
                 backend_options = generate_htp_compiler_spec(
                     use_fp16=to_skip,
@@ -423,7 +440,9 @@ def compile(
                     dump_intermediate_outputs=args.dump_intermediate_outputs,
                     # x86 emulator does not support shared buffer
                     shared_buffer=not args.enable_x86_64,
-                    use_mha2sha=not args.disable_mha2sha,
+                    use_mha2sha=not args.disable_mha2sha
+                    and not is_qwen35_model(args.decoder_model),
+                    op_package_options=op_package_options,
                 )
             ] * len(DECODER_GRAPH_NAMES)
 
@@ -695,6 +714,12 @@ def _build_parser():
     )
 
     parser.add_argument(
+        "--gdn_op_package_dir",
+        default=str(DEFAULT_OP_PACKAGE_DIR),
+        help="DeltaNet VTCM op package source directory for Qwen3.5.",
+    )
+
+    parser.add_argument(
         "--checkpoint",
         help="Pass llama checkpoint.",
         required=False,
@@ -703,7 +728,7 @@ def _build_parser():
 
     parser.add_argument(
         "--source_safetensors",
-        help="Original local SafeTensors model file/directory used to create --checkpoint. Provenance only; export still reads --checkpoint.",
+        help="Local Hugging Face model directory for weights, tokenizer and encoders. When --checkpoint is given, it remains the decoder weight source.",
         required=False,
         type=str,
     )
@@ -1134,6 +1159,15 @@ def _build_parser():
 
 
 def export_llama(args) -> None:
+    if is_qwen35_model(args.decoder_model):
+        if args.backend != "htp" or args.qat or args.use_fp16 or args.enable_x86_64:
+            raise ValueError("GDN VTCM requires quantized HTP device execution.")
+        if args.model_mode not in {"hybrid", "kv"} or args.batch_size != 1:
+            raise ValueError("GDN VTCM supports hybrid/kv with batch_size=1.")
+        if args.max_seq_len < 128:
+            raise ValueError("Qwen3.5 requires max_seq_len >= 128.")
+        args.prefill_ar_len = 128
+        args.shared_buffer = True
     if not set(args.calib_text_preserve_sources or []).issubset(
         args.calib_text_datasets or []
     ):
@@ -1201,7 +1235,11 @@ def export_llama(args) -> None:
         args.enable_true_swa = True
 
     if args.max_context_len is None:
-        args.max_context_len = args.max_seq_len
+        args.max_context_len = args.max_seq_len + (
+            128 if is_qwen35_model(args.decoder_model) else 0
+        )
+    if is_qwen35_model(args.decoder_model) and args.model_mode == "hybrid":
+        qwen35_prefill_capacity(args.max_seq_len, args.max_context_len)
     if args.use_attention_sink is None:
         assert (
             args.max_context_len >= args.max_seq_len
@@ -1265,10 +1303,6 @@ def export_llama(args) -> None:
         ]
     )
     if is_multimodal:
-        if args.calib_text_datasets:
-            raise ValueError(
-                "--calib_text_datasets currently supports text-only models."
-            )
         # TODO: Implement attention sink support for multimodal models (vision/audio).
         if args.use_attention_sink is not None:
             raise ValueError(

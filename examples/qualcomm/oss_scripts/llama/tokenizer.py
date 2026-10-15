@@ -108,7 +108,9 @@ class TokenizerWrapper:
 
         self.control_args = control_args
         self.config = config
-        self.repo_id = config.repo_id
+        self.repo_id = (
+            getattr(control_args, "source_safetensors", None) or config.repo_id
+        )
         self._instruct_model = config.instruct_model
 
         self.tokenizer = None

@@ -11,8 +11,8 @@ import torch
 from executorch.backends.qualcomm.quantizer.custom_annotation import annotate_kv_8bit
 from executorch.backends.qualcomm.quantizer.quant_recipe import (
     QuantGranularity,
-    QuantRecipe,
     QuantizationStrategy,
+    QuantRecipe,
 )
 from executorch.backends.qualcomm.quantizer.quantizer import QuantDtype
 from torchao.quantization.pt2e import MinMaxObserver, MovingAverageMinMaxObserver
@@ -872,11 +872,6 @@ class Qwen3_5_0_8BQuantRecipe(StaticLLMQuantRecipe):
 
     def __init__(self, verbose: bool = False):
         super().__init__()
-
-        conv2d_ops = {
-            torch.ops.aten.conv2d.default,
-        }
-
         self.recipe = (
             RegexTargetQuantRecipe(
                 self.default_quant_dtype,
@@ -884,38 +879,24 @@ class Qwen3_5_0_8BQuantRecipe(StaticLLMQuantRecipe):
                 act_observer=MinMaxObserver,
                 granularity=QuantGranularity.PER_TENSOR,
                 verbose=verbose,
-                note="Qwen3.5 default follows Qwen3-0.6B 16a4w quantization.",
             )
-            .add_regex_node_target(
-                {
-                    r"layers\.\d+\.attention\.(in_proj_qkv_z|in_proj_b)(\.|$)",
-                    r"layers\.\d+\.attention\.(wq|wk|wv)(_conv)?(\.|$)",
-                    r"(^|\.)w(1|3)_conv(\.|$)",
-                },
-                conv2d_ops,
+            .add_node_target(
+                {torch.ops.aten.conv2d.default},
                 QuantDtype.use_16a4w_block,
                 False,
                 act_observer=MinMaxObserver,
                 granularity=QuantGranularity.PER_BLOCK,
-                priority=12,
                 extra_kwargs={"block_size": (1, 32, 1, 1)},
-                note="Qwen3.5 q/k/v-style projection convs use 16a4w per-block.",
             )
             .add_regex_node_target(
-                {
-                    r"layers\.\d+\.attention\.(in_proj_a|out_proj)(\.|$)",
-                    r"layers\.\d+\.attention\.causal_conv2d(\.|$)",
-                    r"layers\.\d+\.attention\.wo(_conv)?(\.|$)",
-                    r"(^|\.)w2_conv(\.|$)",
-                    r"output\.conv",
-                },
-                conv2d_ops,
+                {r"layers\.\d+\.attention\.(in_proj_kz\.conv|causal_conv2d)$"},
+                {torch.ops.aten.conv2d.default},
                 QuantDtype.use_16a8w,
                 False,
                 act_observer=MinMaxObserver,
                 granularity=QuantGranularity.PER_CHANNEL,
-                priority=11,
-                note="Qwen3.5 causal depthwise conv and sensitive projection convs use 16a8w per-channel.",
+                priority=20,
+                note="Keep the merged K/z projection and depthwise convolution in W8.",
             )
         )
 

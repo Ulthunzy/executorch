@@ -4,7 +4,7 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -27,10 +27,10 @@ from executorch.examples.qualcomm.oss_scripts.llama.tokenizer import (
     IMG_TOKEN,
     VLM_SPECIAL_TOKENS,
 )
+from PIL import Image
 
 from transformers import AutoProcessor
 from transformers.image_utils import load_image
-from PIL import Image
 
 
 def _qwen_vl_image_to_patches(
@@ -163,6 +163,7 @@ def preprocess_encoder_inputs(
     decoder_model: str,
     audio_paths: List[str],
     image_paths: List[str],
+    repo_id: Optional[str] = None,
 ) -> Dict[str, List[Tuple[torch.Tensor, ...]]]:
     """
     Preprocess raw encoder inputs for runtime inference.
@@ -170,7 +171,8 @@ def preprocess_encoder_inputs(
     Separated from EncoderDatasetBuilder (calibration-only) because this is
     a runtime inference concern, not a calibration data concern.
     """
-    preprocessor = ModalityPreprocessor(config.repo_id)
+    repo_id = repo_id or config.repo_id
+    preprocessor = ModalityPreprocessor(repo_id)
     result = {}
     for modality, paths in (
         (AUDIO_ENCODER, audio_paths),
@@ -186,7 +188,7 @@ def preprocess_encoder_inputs(
                 preprocessor.preprocess_audio(
                     modality_config,
                     normalized_prompt,
-                    load_audio_file(p, config.repo_id),
+                    load_audio_file(p, repo_id),
                 )
                 for p in paths
             ]
