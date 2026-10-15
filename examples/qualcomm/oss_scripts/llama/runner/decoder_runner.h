@@ -10,6 +10,7 @@
 
 #include <atomic>
 
+#include <executorch/examples/qualcomm/oss_scripts/llama/runner/quantized_logits.h>
 #include <executorch/examples/qualcomm/oss_scripts/llama/runner/repetition_penalty.h>
 #include <executorch/examples/qualcomm/oss_scripts/llama/runner/utils.h>
 #include <executorch/extension/llm/sampler/sampler.h>
@@ -83,7 +84,6 @@ class DecoderRunner {
     std::byte* logits = logits_tensor.mutable_data_ptr<std::byte>();
     auto num_tokens = logits_tensor.size(1);
     auto vocab_size = logits_tensor.size(2);
-    logits_f_.resize(vocab_size);
     std::byte* logits_last = logits;
     // offset to the meaningful logit we want for prefill model.
     executorch::aten::ScalarType logits_dtype = logits_tensor.scalar_type();
@@ -91,6 +91,17 @@ class DecoderRunner {
     if (num_tokens > 1) {
       logits_last += pos * vocab_size * logits_nbytes;
     }
+    if (temperature_ == 0 && !repetition_penalty_.enabled()) {
+      if (logits_dtype == executorch::aten::ScalarType::UInt16) {
+        return quantized_argmax(
+            reinterpret_cast<const uint16_t*>(logits_last), vocab_size);
+      }
+      if (logits_dtype == executorch::aten::ScalarType::Byte) {
+        return quantized_argmax(
+            reinterpret_cast<const uint8_t*>(logits_last), vocab_size);
+      }
+    }
+    logits_f_.resize(vocab_size);
     // Preserve legacy sampling when the repetition penalty is disabled.
     for (int i = 0; i < vocab_size; i++) {
       switch (logits_dtype) {

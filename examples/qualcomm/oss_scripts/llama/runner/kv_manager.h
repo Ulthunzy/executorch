@@ -261,6 +261,10 @@ class KVManager {
     return swa_cache_len_swa_;
   }
 
+  int32_t max_cache_len() const {
+    return metadata_.max_cache_len;
+  }
+
   const std::vector<KVCache>& get_k_cache_() const {
     return k_cache_;
   }
@@ -281,12 +285,14 @@ class KVManager {
 
   void update_key(
       KVCache& k_cache,
+      int32_t cache_ar_len,
       int32_t n_past,
       int32_t n_update,
       const std::vector<int32_t>& selected_indices,
       int64_t head_dim);
   void update_value(
       KVCache& v_cache,
+      int32_t cache_ar_len,
       int32_t n_past,
       int32_t n_update,
       const std::vector<int32_t>& selected_indices,
@@ -339,6 +345,8 @@ class KVManager {
       executorch::aten::ScalarType::Undefined;
   executorch::aten::ScalarType kv_cache_dtype_ =
       executorch::aten::ScalarType::Undefined;
+  std::vector<executorch::aten::ScalarType> k_cache_dtypes_;
+  std::vector<executorch::aten::ScalarType> v_cache_dtypes_;
   // Store start pointer of k and v cache for input and output
   // input: layer -> head * head_dim * cache_len_in(layer)
   // output: layer -> head * head_dim * max_ar_len

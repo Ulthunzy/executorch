@@ -167,8 +167,9 @@ int main(int argc, char** argv) {
       throw std::runtime_error("PTE loading failed");
     }
     const bool quantized = dtype == executorch::aten::ScalarType::UInt16;
-    if (!quantized && dtype != executorch::aten::ScalarType::Float) {
-      throw std::runtime_error("Expected UInt16 or Float logits");
+    const bool half = dtype == executorch::aten::ScalarType::Half;
+    if (!quantized && !half && dtype != executorch::aten::ScalarType::Float) {
+      throw std::runtime_error("Expected UInt16, Half or Float logits");
     }
     double scale = 1;
     int64_t zero_point = 0;
@@ -190,7 +191,7 @@ int main(int argc, char** argv) {
     }
     const json identity = { {"protocol", "executorch.ppl.driver.v1"},
         {"config", settings}, {"vocab", vocab}, {"context_len", context},
-        {"ar", ar}, {"logits_dtype", quantized ? "uint16" : "float32"},
+        {"ar", ar}, {"logits_dtype", quantized ? "uint16" : (half ? "float16" : "float32")},
         {"scale", scale}, {"zero_point", zero_point},
         {"corpus_tokens", tokens.size()}, {"logits_storage", "anonymous_memfd"} };
     std::ifstream previous_metadata(directory + "/metadata.json");
@@ -202,6 +203,7 @@ int main(int argc, char** argv) {
     size_t total_scored = 0;
     std::vector<uint16_t> q(vocab);
     std::vector<float> f(vocab);
+    std::vector<executorch::aten::Half> h(vocab);
     for (const auto& window : settings.at("windows")) {
       const size_t begin = window.at("begin");
       const size_t end = window.at("end");
@@ -278,7 +280,7 @@ int main(int argc, char** argv) {
         throw std::runtime_error("Teacher-forcing cursor mismatch");
       }
       std::ifstream logits(logits_path, std::ios::binary | std::ios::ate);
-      const size_t element_size = quantized ? sizeof(uint16_t) : sizeof(float);
+      const size_t element_size = quantized ? sizeof(uint16_t) : (half ? sizeof(executorch::aten::Half) : sizeof(float));
       const size_t rows = ((prefill_count + ar - 1) / ar) * ar + input_count - prefill_count;
       const size_t expected_bytes = rows * vocab * element_size;
       if (!logits || logits.tellg() != static_cast<std::streamoff>(expected_bytes)) {
@@ -298,6 +300,13 @@ int main(int argc, char** argv) {
           logits.read(reinterpret_cast<char*>(q.data()), vocab * sizeof(uint16_t));
           nll = ppl::quantized_nll(q, target, exponential, scale);
           top1_token_ids.push_back(ppl::top1_token(q));
+        } else if (half) {
+          logits.read(reinterpret_cast<char*>(h.data()), vocab * sizeof(executorch::aten::Half));
+          for (size_t i = 0; i < vocab; ++i) {
+            f[i] = static_cast<float>(h[i]);
+          }
+          nll = ppl::float_nll(f, target);
+          top1_token_ids.push_back(ppl::top1_token(f));
         } else {
           logits.read(reinterpret_cast<char*>(f.data()), vocab * sizeof(float));
           nll = ppl::float_nll(f, target);

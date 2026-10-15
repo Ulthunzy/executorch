@@ -143,6 +143,10 @@ size_t multimodal_prompt_processor_io_size_from_meta(
   if (!is_bert) {
     total_bytes += aligned_input_nbytes(method_meta, idx++);
   }
+  if (has_last_token_index_input(method_meta.get())) {
+    total_bytes +=
+        aligned_input_nbytes(method_meta, method_meta->num_inputs() - 1);
+  }
   total_bytes += aligned_output_nbytes(method_meta, 0);
   return total_bytes;
 }
@@ -310,6 +314,7 @@ Error QNNMultimodalRunner::load() {
   std::string prompt_embedding_method_name, tok_embedding_method_name;
   std::string token_generator_method_name, prompt_processor_method_name;
   std::vector<std::string> method_names;
+  std::vector<MultimodalPromptProcessor::PrefillBucket> prefill_buckets;
   switch (eval_mode_) {
     case EvalMode::kKVCached:
       prompt_embedding_method_name = "tok_embedding_kv_forward";
@@ -368,6 +373,38 @@ Error QNNMultimodalRunner::load() {
       text_decoder_->method_meta(token_generator_method_name);
   Result<MethodMeta> prompt_method_meta =
       text_decoder_->method_meta(prompt_processor_method_name);
+
+  if (prompt_processor_method_name == "prefill_forward") {
+    for (int32_t capacity : {256, 512, 1024, 2048}) {
+      const std::string name = "prefill_forward_" + std::to_string(capacity);
+      if (text_decoder_->method_names()->count(name) == 0) {
+        continue;
+      }
+      const auto bucket = text_decoder_->method_meta(name);
+      ET_CHECK(bucket.ok());
+      ET_CHECK(bucket->num_inputs() == prompt_method_meta->num_inputs());
+      ET_CHECK(bucket->num_outputs() == prompt_method_meta->num_outputs());
+      for (size_t i = 0; i < bucket->num_inputs(); ++i) {
+        const auto actual = bucket->input_tensor_meta(i);
+        const auto expected = prompt_method_meta->input_tensor_meta(i);
+        ET_CHECK(actual->scalar_type() == expected->scalar_type());
+        ET_CHECK(actual->nbytes() == expected->nbytes());
+        ET_CHECK(actual->sizes().size() == expected->sizes().size());
+        ET_CHECK(std::equal(actual->sizes().begin(), actual->sizes().end(), expected->sizes().begin()));
+      }
+      for (size_t i = 0; i < bucket->num_outputs(); ++i) {
+        const auto actual = bucket->output_tensor_meta(i);
+        const auto expected = prompt_method_meta->output_tensor_meta(i);
+        ET_CHECK(actual->scalar_type() == expected->scalar_type());
+        ET_CHECK(actual->sizes().size() == expected->sizes().size());
+        ET_CHECK(std::equal(actual->sizes().begin(), actual->sizes().end(), expected->sizes().begin()));
+      }
+      const int32_t ar_len = bucket->input_tensor_meta(0)->sizes()[1];
+      ET_CHECK(capacity > ar_len);
+      prefill_buckets.push_back({name, capacity - ar_len});
+      method_names.push_back(name);
+    }
+  }
 
   // For some tokenizer.json, runtime vocab_size might be different, use output
   // shape to get vocab size.
@@ -460,7 +497,7 @@ Error QNNMultimodalRunner::load() {
     }
 
     const size_t input_cache_start =
-        method_meta->num_inputs() - 2 * static_cast<size_t>(num_layers);
+        kv_cache_input_start(method_meta.get(), num_layers);
     const int32_t full_cache_len = context_len_ - token_generator_ar_len;
     layer_cache_len.resize(num_layers, 0);
     layer_is_swa.assign(num_layers, false);
@@ -493,7 +530,7 @@ Error QNNMultimodalRunner::load() {
     }
 
     const size_t prompt_input_cache_start =
-        prompt_method_meta->num_inputs() - 2 * static_cast<size_t>(num_layers);
+        kv_cache_input_start(prompt_method_meta.get(), num_layers);
     const int32_t prefill_full_cache_len =
         context_len_ - prompt_processor_ar_len;
     for (int64_t layer = 0; layer < num_layers; ++layer) {
@@ -548,7 +585,7 @@ Error QNNMultimodalRunner::load() {
       }
 
       const size_t input_cache_start =
-          cache_method_meta->num_inputs() - 2 * static_cast<size_t>(num_layers);
+          kv_cache_input_start(cache_method_meta.get(), num_layers);
       for (int64_t layer = 0; layer < num_layers; ++layer) {
         Result<TensorInfo> k_in = cache_method_meta->input_tensor_meta(
             input_cache_start + static_cast<size_t>(layer));
@@ -600,7 +637,7 @@ Error QNNMultimodalRunner::load() {
       (eval_mode_ == EvalMode::kHybrid ||
        eval_mode_ == EvalMode::kLookaheadDecoding)) {
     const size_t input_cache_start =
-        prompt_method_meta->num_inputs() - 2 * static_cast<size_t>(num_layers);
+        kv_cache_input_start(prompt_method_meta.get(), num_layers);
     for (int64_t layer = 0; layer < num_layers; ++layer) {
       if (!layer_is_swa.empty() && layer_is_swa[layer]) {
         Result<TensorInfo> k_in = prompt_method_meta->input_tensor_meta(
@@ -679,6 +716,12 @@ Error QNNMultimodalRunner::load() {
       std::make_unique<MethodMeta>(std::move(
           text_decoder_->method_meta(token_generator_method_name).get())));
 
+  int32_t max_prefill_past = INT32_MAX;
+  if (prompt_processor_method_name == "prefill_forward" &&
+      text_decoder_->method_names()->count("get_prefill_max_past") != 0) {
+    max_prefill_past =
+        read_required_int_metadata(text_decoder_.get(), "get_prefill_max_past");
+  }
   prompt_processor_ = std::make_unique<MultimodalPromptProcessor>(
       decoder_runner_.get(),
       kv_manager_.get(),
@@ -693,9 +736,11 @@ Error QNNMultimodalRunner::load() {
           sliding_window,
           cache_mode_,
           static_cast<int32_t>(dim),
-          position_id_dim_},
+          position_id_dim_,
+          max_prefill_past},
       std::make_unique<MethodMeta>(std::move(
-          text_decoder_->method_meta(prompt_processor_method_name).get())));
+          text_decoder_->method_meta(prompt_processor_method_name).get())),
+      std::move(prefill_buckets));
 
   // Initialize EmbeddingGenerator
   tok_embedding_generator_ = std::make_unique<TokenEmbeddingProcessor>(
@@ -919,16 +964,18 @@ executorch::runtime::Error QNNMultimodalRunner::generate(
 
   // Process each input and add embeddings to merger
   for (const MultimodalInput& input : inputs) {
-    if (input.is_text()) {
-      std::string text = input.get_text();
-      prompt += text;
-
-      tokenizers::Result<std::vector<uint64_t>> encode_res =
-          tokenizer_->encode(text, n_bos, 0);
-      ET_CHECK_TK_OK_OR_RETURN_ERROR(
-          encode_res.error(), "failed to encode prompt %s", text.c_str());
-
-      std::vector<uint64_t> tokens = encode_res.get();
+    if (input.is_text() || input.is_tokens()) {
+      std::vector<uint64_t> tokens;
+      if (input.is_tokens()) {
+        tokens = input.get_tokens();
+      } else {
+        std::string text = input.get_text();
+        prompt += text;
+        auto encode_res = tokenizer_->encode(text, n_bos, 0);
+        ET_CHECK_TK_OK_OR_RETURN_ERROR(
+            encode_res.error(), "failed to encode prompt %s", text.c_str());
+        tokens = encode_res.get();
+      }
       tok_embedding_processor_->prefill(tokens);
       const TensorStruct<float>& text_embeddings =
           tok_embedding_processor_->get_prompt_embeddings();

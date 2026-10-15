@@ -78,6 +78,12 @@ void fill_cache_input(
           bytes / sizeof(uint16_t),
           static_cast<uint16_t>(zero_point));
       break;
+    case executorch::aten::ScalarType::Half:
+      std::fill_n(
+          reinterpret_cast<executorch::aten::Half*>(cache),
+          bytes / sizeof(executorch::aten::Half),
+          executorch::aten::Half(static_cast<float>(zero_point)));
+      break;
     case executorch::aten::ScalarType::Float:
       std::fill_n(
           reinterpret_cast<float*>(cache),
@@ -221,6 +227,8 @@ KVManager::Metadata::CacheUpdateMode KVManager::infer_cache_update_mode(
     ET_CHECK_MSG(
         !is_swa && k_output.sizes().size() == 3 &&
             v_input.sizes().size() == 4 && v_output.sizes().size() == 4 &&
+            k_input.scalar_type() == k_output.scalar_type() &&
+            v_input.scalar_type() == v_output.scalar_type() &&
             k_input.nbytes() == k_output.nbytes() &&
             v_input.nbytes() == v_output.nbytes(),
         "Recurrent cache requires matching input/output state sizes");
@@ -249,6 +257,8 @@ KVManager::KVManager(Metadata metadata, std::unique_ptr<MethodMeta> method_meta)
   k_cache_out_nbytes_.resize(metadata_.num_layers);
   v_cache_in_nbytes_.resize(metadata_.num_layers);
   v_cache_out_nbytes_.resize(metadata_.num_layers);
+  k_cache_dtypes_.resize(metadata_.num_layers);
+  v_cache_dtypes_.resize(metadata_.num_layers);
   layer_is_swa_.assign(metadata_.num_layers, false);
   layer_cache_len_swa_.assign(metadata_.num_layers, 0);
 
@@ -274,20 +284,19 @@ KVManager::KVManager(Metadata metadata, std::unique_ptr<MethodMeta> method_meta)
     if (kv_cache_dtype_ == executorch::aten::ScalarType::Undefined) {
       kv_cache_dtype_ = k_out->scalar_type();
     }
-    ET_CHECK_MSG(
-        k_out->scalar_type() == kv_cache_dtype_,
-        "Mixed scalar type of kv_cache is not allowed (k layer %d)",
-        layer);
-    ET_CHECK_MSG(
-        v_out->scalar_type() == kv_cache_dtype_,
-        "Mixed scalar type of kv_cache is not allowed (v layer %d)",
-        layer);
-
     const Metadata::CacheSpec* spec = metadata_.cache_specs.empty()
         ? nullptr
         : &metadata_.cache_specs[layer];
     const bool full_overwrite =
         spec != nullptr && spec->update_mode == Metadata::kFullOverwrite;
+    k_cache_dtypes_[layer] = k_out->scalar_type();
+    v_cache_dtypes_[layer] = v_out->scalar_type();
+    ET_CHECK_MSG(
+        full_overwrite ||
+            (k_out->scalar_type() == kv_cache_dtype_ &&
+             v_out->scalar_type() == kv_cache_dtype_),
+        "Append/circular KV caches must share their scalar type (layer %d)",
+        layer);
     int64_t k_head_dim = 0;
     int64_t v_head_dim = 0;
     if (!full_overwrite) {
@@ -635,12 +644,12 @@ void KVManager::init_cache(IMemAlloc* buffer_manager, int32_t ar_len) {
         ? 0
         : metadata_.cache_specs[layer].v_zero_point;
     fill_cache_input(
-        kv_cache_dtype_,
+        k_cache_dtypes_[layer],
         k_cache_[layer].buffer,
         k_cache_in_nbytes_[layer],
         k_zero_point);
     fill_cache_input(
-        kv_cache_dtype_,
+        v_cache_dtypes_[layer],
         v_cache_[layer].buffer,
         v_cache_in_nbytes_[layer],
         v_zero_point);
@@ -670,12 +679,12 @@ void KVManager::reset_state(int32_t ar_len, bool clear_buffers) {
         ? 0
         : metadata_.cache_specs[layer].v_zero_point;
     fill_cache_input(
-        kv_cache_dtype_,
+        k_cache_dtypes_[layer],
         k_cache_[layer].buffer,
         k_cache_in_nbytes_[layer],
         k_zero_point);
     fill_cache_input(
-        kv_cache_dtype_,
+        v_cache_dtypes_[layer],
         v_cache_[layer].buffer,
         v_cache_in_nbytes_[layer],
         v_zero_point);
@@ -798,6 +807,23 @@ void KVManager::update_cache(
       "selected contains %zu true values, expected at least n_update (%d)",
       selected_indices.size(),
       n_update);
+  int32_t cache_ar_len = cur_ar_len_;
+  if (cur_ar_len_ != metadata_.context_len &&
+      n_past + n_update > metadata_.context_len - cur_ar_len_) {
+    for (int layer = 0; layer < metadata_.num_layers; ++layer) {
+      if ((!metadata_.cache_specs.empty() &&
+           metadata_.cache_specs[layer].update_mode != Metadata::kAppend) ||
+          (!layer_is_swa_.empty() && layer_is_swa_[layer])) {
+        continue;
+      }
+      ET_CHECK_MSG(
+          n_past + n_update <= metadata_.max_cache_len,
+          "Cache update exceeds the allocated capacity (%d)",
+          metadata_.max_cache_len);
+      cache_ar_len = metadata_.context_len - metadata_.max_cache_len;
+      break;
+    }
+  }
   bool updated_circular_cache = false;
   for (int layer = 0; layer < metadata_.num_layers; ++layer) {
     if (!metadata_.cache_specs.empty() &&
@@ -821,19 +847,28 @@ void KVManager::update_cache(
       updated_circular_cache = true;
       continue;
     }
+    // The final prefill chunk can fill the larger decode cache. Expand each
+    // input layout before appending, while retaining the prefill output stride.
+    if (cache_ar_len != cur_ar_len_) {
+      rearrange_key(k_cache_[layer], cache_ar_len, k_head_dim_[layer]);
+      rearrange_value(v_cache_[layer], cache_ar_len, v_head_dim_[layer]);
+    }
     update_key(
         k_cache_[layer],
+        cache_ar_len,
         n_past,
         n_update,
         selected_indices,
         k_head_dim_[layer]);
     update_value(
         v_cache_[layer],
+        cache_ar_len,
         n_past,
         n_update,
         selected_indices,
         v_head_dim_[layer]);
   }
+  cur_ar_len_ = cache_ar_len;
   if (updated_circular_cache && swa_cache_len_swa_ > 0 && n_update > 0) {
     swa_write_pos_swa_ =
         (swa_write_pos_swa_ + n_update) % swa_cache_len_swa_;
@@ -844,6 +879,7 @@ void KVManager::update_cache(
 
 void KVManager::update_key(
     KVCache& k_cache,
+    int32_t cache_ar_len,
     int32_t n_past,
     int32_t n_update,
     const std::vector<int32_t>& selected_indices,
@@ -852,9 +888,9 @@ void KVManager::update_key(
   std::byte* read_ptr = k_cache.output_buffer;
   const size_t element_size = getDtypeSize(kv_cache_dtype_);
   const size_t copy_size = static_cast<size_t>(n_update) * element_size;
-  const int32_t iter_size = (cur_ar_len_ == metadata_.context_len)
+  const int32_t iter_size = (cache_ar_len == metadata_.context_len)
       ? metadata_.context_len * element_size
-      : (metadata_.context_len - cur_ar_len_) * element_size;
+      : (metadata_.context_len - cache_ar_len) * element_size;
   const int32_t out_size = cur_ar_len_ * element_size;
   const int32_t past_size = n_past * element_size;
   const int32_t n_iter = head_dim * metadata_.num_heads;
@@ -884,6 +920,7 @@ void KVManager::update_key(
 
 void KVManager::update_value(
     KVCache& v_cache,
+    int32_t cache_ar_len,
     int32_t n_past,
     int32_t n_update,
     const std::vector<int32_t>& selected_indices,
@@ -895,9 +932,9 @@ void KVManager::update_value(
       static_cast<size_t>(n_update) * head_dim * element_size;
   const size_t past_size = static_cast<size_t>(n_past) * head_dim * element_size;
   const int32_t n_iter = metadata_.num_heads;
-  const int32_t iter_size = (cur_ar_len_ == metadata_.context_len)
+  const int32_t iter_size = (cache_ar_len == metadata_.context_len)
       ? metadata_.context_len * head_dim * getDtypeSize(kv_cache_dtype_)
-      : (metadata_.context_len - cur_ar_len_) * head_dim *
+      : (metadata_.context_len - cache_ar_len) * head_dim *
           getDtypeSize(kv_cache_dtype_);
   const int32_t out_size =
       cur_ar_len_ * head_dim * getDtypeSize(kv_cache_dtype_);

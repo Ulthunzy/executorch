@@ -9,6 +9,7 @@
 #pragma once
 #include <executorch/examples/qualcomm/oss_scripts/llama/runner/multimodal_runner/tok_embedding_processor.h>
 #include <executorch/examples/qualcomm/oss_scripts/llama/runner/prompt_processor.h>
+#include <algorithm>
 #include <vector>
 
 namespace example {
@@ -19,6 +20,11 @@ namespace example {
  */
 class MultimodalPromptProcessor : public example::PromptProcessor {
  public:
+  struct PrefillBucket {
+    std::string method_name;
+    int32_t max_past;
+  };
+
   struct Metadata {
     int32_t context_len;
     int64_t num_heads;
@@ -30,6 +36,22 @@ class MultimodalPromptProcessor : public example::PromptProcessor {
     CacheMode cache_mode;
     int32_t embedding_dim = 0;
     int32_t position_id_dim = 1;
+    int32_t max_prefill_past = INT32_MAX;
+
+    bool can_prefill(
+        int64_t start_pos,
+        int64_t num_tokens,
+        int64_t max_cache_len) const {
+      if (ar_len <= 0 || context_len < ar_len || start_pos < 0 ||
+          num_tokens <= 0 || start_pos > max_cache_len ||
+          num_tokens > max_cache_len - start_pos) {
+        return false;
+      }
+      const int64_t last_chunk_pos =
+          start_pos + ((num_tokens - 1) / ar_len) * ar_len;
+      // Padding positions and past slots must fit the compiled prefill graph.
+      return last_chunk_pos <= std::min(max_prefill_past, context_len - ar_len);
+    }
   };
 
   MultimodalPromptProcessor(
@@ -37,7 +59,8 @@ class MultimodalPromptProcessor : public example::PromptProcessor {
       KVManager* kv_manager,
       const std::string& method_name,
       Metadata metadata,
-      std::unique_ptr<executorch::extension::MethodMeta> method_meta);
+      std::unique_ptr<executorch::extension::MethodMeta> method_meta,
+      std::vector<PrefillBucket> prefill_buckets = {});
 
   int64_t get_num_heads() const {
     return metadata_.num_heads;
@@ -82,6 +105,7 @@ class MultimodalPromptProcessor : public example::PromptProcessor {
         align_shared_buffer_allocation_size(attention_mask_.size) +
         align_shared_buffer_allocation_size(window_attention_mask_.size) +
         align_shared_buffer_allocation_size(logits_.size) +
+        align_shared_buffer_allocation_size(last_token_index_.size) +
         align_shared_buffer_allocation_size(input_embedding_.size);
   }
 
@@ -101,10 +125,10 @@ class MultimodalPromptProcessor : public example::PromptProcessor {
   using PromptProcessor::method_name_;
   using PromptProcessor::output_tensors_;
   using PromptProcessor::prompt_all_logits_;
+  using PromptProcessor::true_swa_enabled_swa_;
   using PromptProcessor::v_cache_in_;
   using PromptProcessor::v_cache_out_;
   using PromptProcessor::window_attention_mask_;
-  using PromptProcessor::true_swa_enabled_swa_;
   using PromptProcessor::window_context_len_swa_;
 
   /**
@@ -122,8 +146,10 @@ class MultimodalPromptProcessor : public example::PromptProcessor {
 
   // metadata specific to multimodal
   Metadata metadata_;
+  std::vector<PrefillBucket> prefill_buckets_;
 
   // Additional input for multimodal
   TensorStruct<float> input_embedding_;
+  TensorStruct<int32_t> last_token_index_{};
 };
 } // namespace example

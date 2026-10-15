@@ -7,6 +7,7 @@
  */
 
 #include <executorch/examples/qualcomm/oss_scripts/llama/runner/multimodal_runner/multimodal_prompt_processor.h>
+#include <chrono>
 #include <numeric>
 
 using executorch::aten::TensorImpl;
@@ -21,7 +22,8 @@ MultimodalPromptProcessor::MultimodalPromptProcessor(
     KVManager* kv_manager,
     const std::string& method_name,
     Metadata metadata,
-    std::unique_ptr<MethodMeta> method_meta)
+    std::unique_ptr<MethodMeta> method_meta,
+    std::vector<PrefillBucket> prefill_buckets)
     : PromptProcessor(
           decoder_runner,
           kv_manager,
@@ -35,7 +37,8 @@ MultimodalPromptProcessor::MultimodalPromptProcessor(
            metadata.sliding_window,
            metadata.cache_mode},
           std::move(method_meta)),
-      metadata_(metadata) {
+      metadata_(metadata),
+      prefill_buckets_(std::move(prefill_buckets)) {
   // Set input_toks_.size to 0 since we use embeddings instead
   input_toks_.size = 0;
   input_pos_.size =
@@ -151,6 +154,23 @@ void MultimodalPromptProcessor::init_io(
     }
   }
 
+  if (has_last_token_index_input(method_meta.get())) {
+    const size_t index = method_meta->num_inputs() - 1;
+    auto index_meta = method_meta->input_tensor_meta(index);
+    last_token_index_.size = index_meta->nbytes();
+    last_token_index_.data = reinterpret_cast<int32_t*>(
+        buffer_manager->allocate(last_token_index_.size));
+    last_token_index_.tensor = std::make_unique<TensorImpl>(
+        index_meta->scalar_type(),
+        index_meta->sizes().size(),
+        const_cast<TensorImpl::SizesType*>(index_meta->sizes().data()),
+        last_token_index_.data,
+        const_cast<TensorImpl::DimOrderType*>(index_meta->dim_order().data()));
+    input_tensors_.emplace_back(last_token_index_.tensor.get());
+    buffer_manager->add_memory_info(
+        last_token_index_.data, last_token_index_.size, index_meta.get());
+  }
+
   // [O]: logits
   Result<TensorInfo> logits = method_meta->output_tensor_meta(0);
   logits_.data = buffer_manager->allocate(logits_.size);
@@ -201,14 +221,18 @@ void MultimodalPromptProcessor::prepare_io(
     int64_t prompt_pos,
     int64_t start_pos,
     const std::vector<int32_t>* position_ids) {
+  if (last_token_index_.size > 0) {
+    *last_token_index_.data =
+        std::min<int64_t>(metadata_.ar_len, num_prompt_tokens - prompt_pos) - 1;
+  }
   for (int i = 0; i < metadata_.ar_len; i++) {
     if (!is_bert()) {
       // Prepare pos data
       for (int dim = 0; dim < metadata_.position_id_dim; ++dim) {
         int32_t pos = static_cast<int32_t>(start_pos + i);
         if (position_ids != nullptr && prompt_pos + i < num_prompt_tokens) {
-          pos = (*position_ids)[(prompt_pos + i) * metadata_.position_id_dim +
-                                dim];
+          pos = (*position_ids)
+              [(prompt_pos + i) * metadata_.position_id_dim + dim];
         }
         input_pos_.data[dim * metadata_.ar_len + i] = pos;
       }
@@ -236,14 +260,22 @@ Result<uint64_t> MultimodalPromptProcessor::prefill(
     AttentionSinkRopeRunner* attention_sink_rope_runner,
     const std::vector<int32_t>* position_ids) {
   if (dump_logits) {
+    ET_CHECK_MSG(
+        logits_.tensor->sizes()[1] == metadata_.ar_len,
+        "Dumping all prompt logits requires an all-token logits PTE");
     prompt_all_logits_.clear();
   }
   int32_t num_prompt_tokens = prompt_embedding.tensor->size(1);
   if (!is_bert()) {
     ET_CHECK_MSG(
-        (start_pos + num_prompt_tokens) <=
-            (metadata_.context_len - metadata_.ar_len),
-        "The sequence length exceeds the maximum limit that the prompt processor can handle.");
+        metadata_.can_prefill(
+            start_pos, num_prompt_tokens, kv_manager_->max_cache_len()),
+        "Prompt exceeds prefill capacity: start=%ld tokens=%d AR=%d context=%d max_past=%d",
+        start_pos,
+        num_prompt_tokens,
+        metadata_.ar_len,
+        metadata_.context_len,
+        metadata_.max_prefill_past);
   } else {
     ET_CHECK_MSG(
         start_pos == 0, "Bert model doesn't support multi-turn conversation.");
@@ -299,13 +331,44 @@ Result<uint64_t> MultimodalPromptProcessor::prefill(
           executorch::runtime::Error::Ok,
       "Failed to set output tensor for module %s",
       method_name_.c_str());
+  const std::string* previous_method = nullptr;
+  using Clock = std::chrono::steady_clock;
+  std::chrono::duration<double, std::milli> prepare_time{0};
+  std::chrono::duration<double, std::milli> execute_time{0};
+  std::chrono::duration<double, std::milli> cache_time{0};
   for (int i = 0; i < num_iters; ++i) {
     // Fill in the embedding and position data
+    const auto prepare_start = Clock::now();
     prepare_io(
         prompt_embedding, num_prompt_tokens, prompt_pos, pos, position_ids);
 
     // Run inference
-    decoder_runner_->step(method_name_, inputs_);
+    const std::string* selected_method = &method_name_;
+    for (const auto& bucket : prefill_buckets_) {
+      if (pos <= bucket.max_past) {
+        selected_method = &bucket.method_name;
+        break;
+      }
+    }
+    if (*selected_method != method_name_) {
+      ET_CHECK(
+          decoder_runner_->set_outputs(*selected_method, output_tensors_) ==
+          executorch::runtime::Error::Ok);
+    }
+    if (selected_method != previous_method) {
+      ET_LOG(Info, "Prefill pos=%ld method=%s", pos, selected_method->c_str());
+      previous_method = selected_method;
+    }
+    const auto execute_start = Clock::now();
+    prepare_time += execute_start - prepare_start;
+    const auto step_result = decoder_runner_->step(*selected_method, inputs_);
+    const auto cache_start = Clock::now();
+    execute_time += cache_start - execute_start;
+    ET_CHECK_MSG(
+        step_result.ok(),
+        "Prefill execution failed for method %s: 0x%x",
+        selected_method->c_str(),
+        static_cast<unsigned>(step_result.error()));
     if (dump_logits) {
       prompt_all_logits_.insert(
           prompt_all_logits_.end(),
@@ -347,9 +410,16 @@ Result<uint64_t> MultimodalPromptProcessor::prefill(
             metadata_.sliding_window);
       }
     }
+    cache_time += Clock::now() - cache_start;
     prompt_pos += metadata_.ar_len;
     pos += metadata_.ar_len;
   }
+  ET_LOG(
+      Info,
+      "Prefill timing: prepare=%.3f ms execute=%.3f ms cache=%.3f ms",
+      prepare_time.count(),
+      execute_time.count(),
+      cache_time.count());
 
   cur_token = decoder_runner_->logits_to_token(
       output_tensors_[0],

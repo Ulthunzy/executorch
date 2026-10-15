@@ -10,6 +10,7 @@
 #include <executorch/runtime/platform/log.h>
 #include <executorch/runtime/core/exec_aten/exec_aten.h>
 #include <executorch/runtime/core/exec_aten/util/scalar_type_util.h>
+#include <executorch/runtime/executor/method_meta.h>
 #include <cctype>
 #include <cstddef>
 #include <fstream>
@@ -43,6 +44,31 @@ struct TensorStruct {
   // data size in bytes
   size_t size;
 };
+
+namespace example {
+
+inline bool has_last_token_index_input(
+    const executorch::runtime::MethodMeta& metadata) {
+  if (metadata.num_inputs() == 0) {
+    return false;
+  }
+  auto last = metadata.input_tensor_meta(metadata.num_inputs() - 1);
+  return last.ok() &&
+      last->scalar_type() == executorch::aten::ScalarType::Int &&
+      last->sizes().size() == 1 && last->sizes()[0] == 1;
+}
+
+inline size_t kv_cache_input_start(
+    const executorch::runtime::MethodMeta& metadata,
+    size_t num_layers) {
+  // Generation-only prefill can append a row index after the cache inputs.
+  const size_t end =
+      metadata.num_inputs() - (has_last_token_index_input(metadata) ? 1 : 0);
+  ET_CHECK_MSG(end >= 2 * num_layers, "Invalid decoder cache input layout");
+  return end - 2 * num_layers;
+}
+
+} // namespace example
 
 namespace example::dev_mem {
 
@@ -212,6 +238,8 @@ inline size_t getDtypeSize(executorch::aten::ScalarType dtype) {
       return sizeof(uint8_t);
     case executorch::aten::ScalarType::UInt16:
       return sizeof(uint16_t);
+    case executorch::aten::ScalarType::Half:
+      return sizeof(executorch::aten::Half);
     default:
       ET_CHECK_MSG(
           false,

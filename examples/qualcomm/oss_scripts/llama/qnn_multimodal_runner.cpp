@@ -202,9 +202,8 @@ void start_multimodal_runner(
         !FLAGS_audio_path.empty(), "For ALM, please specify audio path.");
     audio_raw_files = example::load_raw_files(FLAGS_audio_path.c_str());
   }
-  if (modality_of(model_version) == example::Modality::kVision) {
-    ET_CHECK_MSG(
-        !FLAGS_image_path.empty(), "For VLM, please specify image path.");
+  if (modality_of(model_version) == example::Modality::kVision &&
+      !FLAGS_image_path.empty()) {
     image_raw_files = example::load_raw_files(FLAGS_image_path.c_str());
   }
 

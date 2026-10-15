@@ -7,6 +7,7 @@
  */
 
 #include <executorch/examples/qualcomm/oss_scripts/llama/runner/token_generator.h>
+#include <chrono>
 #include <numeric>
 
 using executorch::aten::TensorImpl;
@@ -376,6 +377,12 @@ Result<int64_t> TokenGenerator::generate(
       "Failed to set output tensor for module %s",
       method_name_.c_str());
 
+  using Clock = std::chrono::steady_clock;
+  std::chrono::duration<double, std::milli> prepare_time{0};
+  std::chrono::duration<double, std::milli> execute_time{0};
+  std::chrono::duration<double, std::milli> sampling_time{0};
+  std::chrono::duration<double, std::milli> cache_time{0};
+  std::chrono::duration<double, std::milli> callback_time{0};
   // Generate our tokens
   while (pos < seq_len - 1 && !decoder_runner_->is_stop_requested()) {
     // The current position plus the future generated cache exceeds the cache
@@ -412,10 +419,15 @@ Result<int64_t> TokenGenerator::generate(
     }
 
     // Fill in the token and position data
+    const auto prepare_start = Clock::now();
     prepare_io(cur_token, shifted_pos);
+    const auto execute_start = Clock::now();
+    prepare_time += execute_start - prepare_start;
 
     // Run inference
     auto logits_res = decoder_runner_->step(method_name_, inputs_);
+    const auto execute_end = Clock::now();
+    execute_time += execute_end - execute_start;
     if (dump_logits) {
       token_all_logits_.insert(
           token_all_logits_.end(),
@@ -429,6 +441,7 @@ Result<int64_t> TokenGenerator::generate(
 
     prev_token = cur_token;
 
+    const auto sampling_start = Clock::now();
     stats_->on_sampling_begin();
     cur_token =
         decoder_runner_->logits_to_token(logits_tensor, metadata_.ar_len);
@@ -436,6 +449,8 @@ Result<int64_t> TokenGenerator::generate(
     last_token_ = cur_token;
     stats_->on_sampling_end();
     decoder_runner_->record_token(cur_token);
+    const auto cache_start = Clock::now();
+    sampling_time += cache_start - sampling_start;
 
     // Update KV Cache with the output results
     if (true_swa_enabled_swa_) {
@@ -469,6 +484,8 @@ Result<int64_t> TokenGenerator::generate(
     }
     shifted_pos++;
     pos++;
+    const auto callback_start = Clock::now();
+    cache_time += callback_start - cache_start;
 
     // print the token as string, decode it with the Tokenizer object
     ET_ASSIGN_OR_RETURN_TOKENIZER(
@@ -476,12 +493,22 @@ Result<int64_t> TokenGenerator::generate(
     if (token_callback) {
       token_callback(decoded_token__);
     }
+    callback_time += Clock::now() - callback_start;
 
     if (!ignore_eos && eos_ids_->count(cur_token) > 0) {
       ET_LOG(Info, "Reached EOS; stopping generation");
       break;
     }
   }
+  ET_LOG(
+      Info,
+      "Decode timing: steps=%ld prepare=%.3f ms execute=%.3f ms sampling=%.3f ms cache=%.3f ms callback=%.3f ms",
+      pos - start_pos,
+      prepare_time.count(),
+      execute_time.count(),
+      sampling_time.count(),
+      cache_time.count(),
+      callback_time.count());
 
   // Check if generation was truncated due to seq_len limit (no EOS token)
   if (ignore_eos && pos >= seq_len - 1) {
