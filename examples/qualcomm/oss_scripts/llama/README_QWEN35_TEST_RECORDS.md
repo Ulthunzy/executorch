@@ -1,13 +1,14 @@
 # Qwen3.5 / Lincal3.5 测试记录归档
 
-整理日期：2026-10-15。
+最初归档：2026-10-15；最近更新：2026-10-17。
 
 当前导出配置、最终性能/PPL和验证范围见[主 README](README.md#validation-record-2026-10-15)。本文保留清理前52份报告中的测试数据、过程和结论；各记录使用当时的配置与测试口径，较早的实验配置和问题描述不代表当前实现。
 
-历史实验脚本、新增测试代码、日志、PTE/PT2、输入输出张量及临时库副本已清理。文中的历史命令与路径仅用于说明当时的参数和证据来源；导出使用主 README 的普通 `llama.py` 命令。已清理产物的链接改为文字，报告间链接指向本文对应记录。算子测量历史见[DeltaNet README](../../custom_op/deltanet_op_package_htp/DeltaNetOpPackage/README.md)。
+2026-10-15归档的历史实验脚本、新增测试代码、日志、PTE/PT2、输入输出张量及临时库副本已清理。文中的历史命令与路径仅用于说明当时的参数和证据来源；导出使用主 README 的普通 `llama.py` 命令。已清理产物的链接改为文字，报告间链接指向本文对应记录。后续新增的1K–8K矩阵PTE与测量结果仍保留；本轮仅清理临时测试代码，见[正式入口接入记录](#qwen35-cli-integration-20261017)。算子测量历史见[DeltaNet README](../../custom_op/deltanet_op_package_htp/DeltaNetOpPackage/README.md)。
 
 ## 目录
 
+- [2026-10-17：正式入口接入、review与测试代码清理](#qwen35-cli-integration-20261017)
 - [01. llama-output/qwen3_5-mainline-integration/cross-model-fixes/REPORT.md](#record-01)
 - [02. llama-output/qwen3_5-prefill-optimization/FINAL_SUMMARY.md](#record-02)
 - [03. llama-output/qwen3_5-mainline-integration/review-fixes/REPORT.md](#record-03)
@@ -6157,3 +6158,90 @@ python llama-output/qwen3_5-size-comparison/analyze.py
 generation 会跳过已有完整记录；要新跑一轮，应先重命名 `generation/summary.json`，保留原始证据。
 
 当前脚本复用 `llama-output/qwen3_5-0_8b-layer-analysis` 下既有导出、校准、GPTQ 和编译 helper；需要保留这些依赖。本次没有修改 `mybuild.sh`，普通旧 `llama.py` 命令也不会自动得到这里的后校准 GQA/所选行优化。
+
+<!-- QWEN35_CONTEXT_MATRIX_20261016_BEGIN -->
+## 2026-10-17：0.8B／2B，1K–8K，INT4 embedding／KV8性能矩阵
+
+SM8750／sun、PKR110、设备431e3c37，QNN SDK 2.49.40.260810。纯文本，正常生产QNNMultimodalRunner，temperature=0，无profile。
+
+两模型统一INT4/HQQ/group32 embedding、full-attention K/V UINT8（MatMul RHS UINT8），GDN conv/recurrent state UINT16。K/z投影与depthwise conv W8，其余Linear W4/group32，保留既有out_proj GPTQ。Prefill AR128，FP16 chunk64/leaf8；decode使用DeltaNetCoreVtcm。
+
+每模型五套独立hybrid PTE。逻辑长度n=1024/2048/3072/4096/8192，物理容量n+128，便于完整输入n并输出一个token。每个decoder的PTE及QNN context都只有kv_forward、prefill_forward，没有256等短上下文图。
+
+2B/8K的QNN原生MatMul配置另行核对：每图12个FA MatMul，prefill的RHS长度均为8192，decode均为8320。
+
+Prefill输入n、输出1；decode输入16、输出n−16。首个输出来自prefill，decode测速分子为实际n−17次AR1。每项三轮取中位数，共60次测量；同一份8192-token WikiText-2 raw test输入，各进程预热16→32，固定长度忽略EOS。计时含embedding/cache，排除模型加载、tokenization和图片编码；vision PTE加载但未执行。
+
+三轮均确认测前thermal=0，部分长decode结束为1/2；未锁频，因此这些是手机持续生成实测值。1K–4K最长等待300秒，8K最长900秒，冷却不计入推理时间。
+
+
+| 上下文 token | 0.8B Prefill token/s | 0.8B Decode token/s | 2B Prefill token/s | 2B Decode token/s |
+|---:|---:|---:|---:|---:|
+| 1024 | 1726.81 | 67.35 | 1196.26 | 35.25 |
+| 2048 | 1605.02 | 63.36 | 1130.87 | 34.98 |
+| 3072 | 1455.23 | 64.74 | 1042.77 | 36.23 |
+| 4096 | 1261.86 | 63.51 | 926.70 | 35.05 |
+| 8192 | 1293.75 | 39.97 | 773.63 | 27.43 |
+
+0.8B/8K的decode明显低于1K–4K；本轮没有进行算子profile，以上数据只确定端到端性能变化。PPL/SQNR未重测，2B的新INT4/KV8配置不能仅凭性能测试认定精度达标。
+
+校准统一CUDA、seed42、两条图文样本+8条WikiText-2 train序列，每条文本最大1024token。导出和设备测试全串行，单次导出MemoryMax=36GiB、MemorySwapMax=0；导出进程裁剪FX NodeSource的递归调试历史。矩阵测量时2B在测试进程覆盖配方；完成测量后，INT4 embedding／原生KV8和FX内存优化已接入普通`llama.py`入口，见下节。
+
+产物根目录：`llama-output/qwen35-context-performance-20261016/`。模型目录分别为`0_8b/m1024`等和`2b/m1024`等；各目录有decoder、embedding、vision三个PTE和tokenizer。0.8B/4K复用此前验证的无短图PTE，测量是本轮重新执行；另外9套新导出。
+
+`REPORT.md`记录三轮范围、PTE大小与导出峰值；`RESULTS.csv`记录10项中位数，`RAW_MEASUREMENTS.csv`保留60次原始测量，`verification.json`记录IO shape/dtype、两图结构、token计数和全部冷启动状态核对。`performance.png`和`performance.svg`是性能曲线。
+<!-- QWEN35_CONTEXT_MATRIX_20261016_END -->
+
+<a id="qwen35-cli-integration-20261017"></a>
+## 2026-10-17：接入普通llama.py、review和清理
+
+### 接入内容
+
+0.8B和2B现在直接使用主README中的普通`python examples/qualcomm/oss_scripts/llama/llama.py ...`命令。不再通过测试脚本替换模型注册项或临时修改2B配方；本地权重、tokenizer仍由`--source_safetensors`指定。
+
+| 项目 | 正式配置 |
+|---|---|
+| Qwen3.5 0.8B／2B embedding | `aten.embedding.default`节点规则，INT4/HQQ/group32；PTE保持packed，token输入INT64 |
+| Full-attention K/V | 原生`annotate_kv_8bit`；存储和MatMul RHS都是UINT8，Query/概率/输出仍UINT16 |
+| GDN conv/recurrent state | UINT16，保持校准后的独立scale/zero point |
+| 投影/FFN | K/z及depthwise conv W8，其余Linear W4/group32；保留out_proj GPTQ |
+| Prefill | AR128，FP16 chunk64/leaf8，完整上下文图，保留有效token状态更新和末行LM-head选择 |
+| Decode | 快速`DeltaNetCoreVtcm` |
+| Hybrid decoder图数 | `kv_forward`和`prefill_forward`两张；无256等额外短图 |
+| 校准 | 原AR128＋warm AR1共享激活网格，图文＋文本校准；支持CUDA |
+
+将矩阵脚本中的FX内存优化提取为`export_memory.py::compact_fx_provenance()`，由`llama.py::export_llama`仅在Qwen3.5-family编译期间调用。新生成的`NodeSource`保留直接来源，不再递归deepcopy祖先调试历史；节点的ModuleStack、张量、量化参数和计算图语义不变。上下文使用锁和线程局部上下文标记，退出、异常、KeyboardInterrupt时恢复原函数。`--pre_gen_pte`路径不进入该上下文；其他模型族编译仍使用原始来源记录。
+
+矩阵导出时2B最大进程RSS为34.73GiB。这是此前完整导出的实测值，本轮没有重导十套完整模型，也没有重新测量接入后的完整导出峰值。
+
+### Review结论
+
+发现并修正了配置继承隐患：Qwen4B和Lincal2B同样继承原2B基类，如果直接修改共享基类配方，会顺带改变这两个尚未完成本轮消融的模型。现在公共`Qwen3_5QuantRecipe`保留原FP16 embedding／KV16配置，只有注册的Qwen2B显式选择优化配方。Qwen/Lincal0.8B沿用已有INT4/KV8配置。
+
+| 检查范围 | 结论 |
+|---|---|
+| 0.8B／2B默认配置 | 均命中embedding INT4节点规则和原生KV8；没有UINT8历史cache扩展到UINT16计算网格 |
+| Qwen4B／Lincal2B | 保留FP16 embedding／KV16，其他权重量化规则保持原配置 |
+| MHA/SHA、SWA及mask | 本轮没有改变选择条件、窗口长度、mask更新或容量裁剪规则；现有SWA/mask回归通过 |
+| 量化与cache | AR128/AR1、分组attention前后cache编码一致；GDN state未被FA KV8规则改为8bit |
+| FX来源历史 | 正常退出、嵌套、异常、中断恢复和其他线程隔离验证通过；普通模型的递归来源记录保留 |
+| 构建配置 | 新helper已加入`targets.bzl`的`llama_lib`源文件列表；本轮没有新增C++接口或改变runner ABI |
+
+上述范围复查后未发现新的阻断问题。2B INT4/KV8的完整PPL/SQNR仍未补测；短生成验证和此前性能矩阵不能代替完整精度评估。
+
+### 本轮验证
+
+- Python/量化/embedding/cache/内存/SWA/mask等共42个不同用例通过，16项可选测试因环境条件跳过。
+- 沙箱内C++ KV/SWA测试首次受LeakSanitizer线程检查限制；在主机上保持AddressSanitizer／UndefinedBehaviorSanitizer配置原样重跑，1项通过。以上42项包含此重跑通过的用例。
+- 在正式的压缩FX来源上下文内额外复测AR128/AR1校准、分组attention和prefill容量裁剪：1项通过，覆盖0.8B/2B KV8与旧KV16三种配方，GDN state保持16bit。临时测试补上了与生产流程相同的`remove_export_checks`预处理。
+- 新helper的5项恢复/线程隔离/数值测试复跑通过；小模型128-token导出及decomposition输出与原来源记录模式逐元素一致。
+- 普通`llama.py --help`通过。普通`llama.py --pre_gen_pte`在SM8750／PKR110／431e3c37上加载现有完整2B/4K INT4/KV8 PTE，通过`prefill_forward`处理短中文问题，正常输出`2`并EOS结束，无实验注册覆盖。
+- `git diff --check`与本轮修改Python文件的Black格式检查通过。
+
+验证日志在`llama-output/qwen35-context-performance-20261016/integration-review/`，手机输出在同根目录`integration-cli-2b/outputs/outputs.txt`。这次手机运行是功能验证，没有作为新的性能或PPL成绩。
+
+### 清理范围
+
+删除88个Qwen相关临时导出、benchmark、审计、画图脚本及测试driver源码/可执行文件，4个本轮开发的临时回归测试文件，并清理37个对应pyc。保留原有受版本控制的SWA/mask/C++回归测试和正式自定义op源码。
+
+删除清单及各文件SHA256保存在`llama-output/qwen35-context-performance-20261016/test_code_cleanup.json`。清理前后核对77个PTE路径及大小完全一致；所有PTE、输入/输出、日志、报告、CSV、配置与测量结果均保留。后续导出使用[主README的正式命令](README.md#standard-qwen35-export-entry-point-2026-10-17)。上述验证完成时尚未commit或push，后续代码提交由`preview`分支记录跟踪。

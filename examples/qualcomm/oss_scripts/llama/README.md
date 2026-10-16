@@ -655,26 +655,178 @@ The default still saves the QDQ artifact for later accuracy analysis.
 
 ##### Qwen3.5 and Lincal3.5 optimized export
 
-`qwen3_5-0_8b`, `qwen3_5-2b`, `lincal3_5-0_8b` and `lincal3_5-2b`
-use one fixed HTP recipe through `llama.py`:
+`qwen3_5-0_8b`, `qwen3_5-2b`, `qwen3_5-4b`, `lincal3_5-0_8b` and `lincal3_5-2b`
+share the optimized HTP export path through `llama.py`, with precision selected
+by their quantization recipes:
 
 - Merged K/z W8 per channel; the other large Linear weights use W4 group32.
   GDN out projections use fixed-grid GPTQ on calibration inputs.
 - W8A16 visual encoder with the checkpoint's tanh GELU formula and INT32 bias
   range protection. Text and image samples retain their pairing; decoder
   calibration uses quantized visual features and covers AR128 and warm AR1.
-- Native RMSNorm for decoder, Q/K and gated GDN normalization. All external
-  recurrent, convolution and attention caches use calibrated UINT16 encodings.
+- Native RMSNorm for decoder, Q/K and gated GDN normalization. External
+  recurrent and convolution states use calibrated UINT16 encodings; attention
+  cache precision is selected by the recipe.
 - Prefill AR128 with FP16 chunk64/leaf8 GDN, valid-token state updates and one
-  selected LM-head row. Models with full attention use a FA256 method for
-  short prompts; the normal prefill method handles the full requested context.
+  selected LM-head row. Hybrid decoder PTEs contain only `kv_forward` and
+  `prefill_forward`; all prompts use the requested full-context prefill graph.
+  No additional short-context prefill graphs are exported or selected at runtime.
   Decode uses the DeltaNetCoreVtcm op package and direct quantized greedy argmax.
 - Lincal3.5 retains true SWA and its separate window mask. Calibration masks
   limit each token to the sliding window, including within an AR128 block.
   SWA caches retain their fixed length when deriving AR1. Pure SWA models
-  skip FA256 buckets and internal full-attention trimming; mixed full/SWA
+  skip internal full-attention trimming; mixed full/SWA
   models trim only full attention. MHA-to-SHA conversion is disabled for both
   families so they use the same grouped-attention transformation.
+
+Current precision defaults are defined in `static_llm_quant_recipe.py`:
+
+| Recipe / models | Input embedding weights | Attention K/V cache | Attention MatMul RHS | GDN conv/recurrent state |
+|---|---|---|---|---|
+| `Qwen3_5_0_8BQuantRecipe`: Qwen/Lincal 0.8B | Packed INT4, group32, HQQ | UINT8 | UINT8 | UINT16 |
+| `Qwen3_5_2BQuantRecipe`: Qwen 2B | Packed INT4, group32, HQQ | UINT8 | UINT8 | UINT16 |
+| `Qwen3_5QuantRecipe`: Qwen 4B, Lincal 2B | FP16 | UINT16 | INT16 | UINT16 |
+
+The 0.8B and 2B recipes configure the embedding node directly:
+
+```python
+self.recipe.add_node_target(
+    {torch.ops.aten.embedding.default},
+    QuantDtype.use_16a4w_block,
+    False,
+    act_observer=MinMaxObserver,
+    granularity=QuantGranularity.PER_BLOCK,
+    extra_kwargs={"block_size": (1, 32)},
+)
+self.recipe.custom_quant_annotations.append(annotate_kv_8bit)
+```
+
+The separate embedding graph resolves the same node rules and priorities as
+the decoder recipe. `add_regex_node_target` can override this rule by module
+path. Weight bitwidth and group size come from the matched configuration;
+there is no separate embedding setting in the recipe. An explicit legacy
+`--embedding-quantize` remains an override. INT4 lookup uses the CPU portable
+kernel with FP32 output, is applied during decoder calibration, and stays
+packed in the embedding PTE; the tied LM head retains its original source
+weights. Packed embedding inputs use INT64 in both KV and hybrid methods.
+Calibration datasets and SQNR evaluation use the resolved token input dtype
+even when the legacy CLI option is absent.
+
+The 0.8B and 2B recipes use `annotate_kv_8bit`: both FA cache storage and
+the attention MatMul RHS are UINT8. Query and softmax-probability inputs and
+MatMul outputs remain UINT16. New K/V enter the calibrated8bit grid, historical
+entries stay8bit through concatenation, and returned cache entries use the same
+grid. Scale comes from calibration; the symmetric UINT8 grid uses zero point128.
+Grouped attention keeps the calibrated RHS bit width. GDN conv/recurrent state
+remain UINT16. There is no whole-history UINT8→16bit expansion path.
+This applies when re-exporting KV and hybrid 0.8B/2B models, including 4K.
+Previously exported PTEs retain their stored precision until re-exported.
+
+The storage-only `annotate_kv_8bit_io` implementation and its expansion branches
+were removed after the4K regression below. Its measurements describe historical
+PTEs, not current defaults. Switching to native8bit K/V compute passed eight
+recipe/embedding regressions covering AR128/AR1, prefill trimming and GDN
+state precision. The 2B default was subsequently changed to INT4/KV8 after the
+context performance matrix; 4B and Lincal 2B retain their previous defaults.
+Full 0.8B 4K evaluation is recorded under
+`llama-output/qwen3_5-0_8b-4k-kv8-compute-20261016/`.
+
+##### Standard Qwen3.5 export entry point (2026-10-17)
+
+The measured 0.8B/2B configuration now runs directly through `llama.py`.
+No registry override or experimental export wrapper is required. Both models
+use AR128 and export only `kv_forward` and `prefill_forward` in hybrid mode.
+K/z and depthwise convolution stay W8, other Linear weights stay W4/group32,
+and the existing out_proj GPTQ and image/text calibration remain enabled.
+
+```bash
+conda activate et_npu
+source env.sh
+export CUDA_VISIBLE_DEVICES=0
+export LD_LIBRARY_PATH="$ANDROID_NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/lib/x86_64-unknown-linux-gnu:$LD_LIBRARY_PATH"
+
+python examples/qualcomm/oss_scripts/llama/llama.py \
+  -a ./llama-output/qwen3_5-0_8b-m4096-hybrid-ar128 \
+  --build_folder build-android \
+  --soc_model SM8750 \
+  --model_mode hybrid \
+  --max_seq_len 4096 \
+  --prefill_ar_len 128 \
+  --decoder_model qwen3_5-0_8b \
+  --calibration_device cuda \
+  --calibration_num_threads 4 \
+  --seed 42 \
+  --prompt "Describe this image." \
+  --calib_samples examples/qualcomm/oss_scripts/llama/assets/samples/vision.json \
+  --calib_text_datasets wikitext-2 \
+  --calib_text_samples 8 \
+  --source_safetensors /hunter/model/Qwen/Qwen3.5-0.8B \
+  --skip_qdq_save \
+  --compile_only \
+  > run-qwen3_5-0_8b.log 2>&1
+
+python examples/qualcomm/oss_scripts/llama/llama.py \
+  -a ./llama-output/qwen3_5-2b-m4096-hybrid-ar128 \
+  --build_folder build-android \
+  --soc_model SM8750 \
+  --model_mode hybrid \
+  --max_seq_len 4096 \
+  --prefill_ar_len 128 \
+  --decoder_model qwen3_5-2b \
+  --calibration_device cuda \
+  --calibration_num_threads 4 \
+  --seed 42 \
+  --prompt "Describe this image." \
+  --calib_samples examples/qualcomm/oss_scripts/llama/assets/samples/vision.json \
+  --calib_text_datasets wikitext-2 \
+  --calib_text_samples 8 \
+  --source_safetensors /hunter/model/Qwen/Qwen3.5-2B \
+  --skip_qdq_save \
+  --compile_only \
+  > run-qwen3_5-2b.log 2>&1
+```
+
+Run exports serially. Change `--max_seq_len` and the artifact directory for
+1024/2048/3072/8192; the default physical capacity is logical length +128.
+`--source_safetensors` supplies the local model and tokenizer directory.
+
+Qwen3.5-family compilation also uses `compact_fx_provenance()` to stop PyTorch
+from recursively copying FX node origin histories. It retains direct origins
+and numerical/quantization metadata, while discarding nested debug ancestry
+for newly created origins. The change is scoped to the compiling thread and
+restored on normal exit or exceptions. Other model families and `--pre_gen_pte`
+inference retain normal FX behavior. This is the same memory workaround used
+in the matrix exports, where the largest 2B process RSS was 34.73 GiB; that
+measurement is not a guaranteed memory ceiling for every host or SDK version.
+
+Disposable experiment scripts have been removed after verification. PTEs,
+measurements and calibration records are retained. See
+[integration review and test records](README_QWEN35_TEST_RECORDS.md#qwen35-cli-integration-20261017).
+
+Historical storage-only UINT8 verification (2026-10-16): eight recipe/embedding regressions
+passed. Actual Qwen full-attention AR128 and AR1 small PTEs ran on SM8750 with
+one QNN delegate and no CPU fallback. Against PyTorch Q/DQ, the small model's
+output SQNR was 75.92/76.00 dB; returned UINT8 K/V differed by at most one code
+for AR128 and were identical for AR1. This is a conversion correctness check,
+not SQNR against the original HF model. QNN optrace/QHAS confirmed both cache
+load conversions and both output conversions used VTCM with zero DDR reads or
+writes attributed to those conversion nodes. Capacity was 256, so this does
+not establish 4K residency or a full-model speedup. A GDN + full-attention small
+PTE also compiled as one delegate, with GDN UINT16 and attention UINT8 IO.
+Local evidence: `llama-output/qwen3_5-0_8b-4k-embedding-kv-ablation-20261016/storage_io_smoke/README.md`.
+
+Recipe integration checks (2026-10-16): seven embedding/cache tests passed,
+alongside fourteen calibration-memory, SWA and native cache-manager checks.
+The embedding/cache checks cover
+AR128/AR1 with one GDN and one full-attention layer, preservation of GDN UINT16
+grids, unchanged 2B/4B defaults, embedding node-rule/override resolution and packed
+embedding PTE serialization. A small AR128 QNN PTE also compiled successfully
+and its serialized FA cache inputs/outputs were `BYTE`, with GDN cache IO
+`UINT16`; no post-export dtype repair was needed. These checks do not constitute
+a new full-model 4K PPL or performance measurement. Local smoke artifacts:
+`llama-output/qwen35-recipe-integration-20261016`.
+The native cache test retained address/undefined-behavior sanitizers with
+`ASAN_OPTIONS=detect_leaks=0`; LeakSanitizer cannot run under the sandbox's ptrace.
 
 The experimental split/projection environment variables and GDN dtype/kernel
 CLI switches have been removed. `--gdn_op_package_dir` selects the op package
@@ -710,6 +862,43 @@ CUDA_VISIBLE_DEVICES=0 python examples/qualcomm/oss_scripts/llama/llama.py \
   --compile_only
 ```
 
+Compilation also needs host RAM for graph transforms, QNN preparation and context
+serialization. QNN preprocessing copies graph structure while sharing read-only
+weight tensors; methods in one context reuse a single Python binary buffer.
+These savings do not change the model's quantization or runtime graphs.
+Stage cleanup also clears Dynamo export caches, collects Python objects and,
+where glibc provides it, returns free heap pages with `malloc_trim`.
+
+CUDA activation calibration rebuilds the PT2E graph after dead-code elimination
+to discard unused FP32 attributes left by weight folding. Weight dequantization
+and its constant casts/views are scheduled at their first consumer, rather than
+materializing all FP32 weights before the first layer. Calibration retains FP32
+arithmetic, the same quantization grids and the same samples. A regression covers
+W4/W8 dequantization, shared weights, unused parameters and exact output equality.
+
+On a 64 GB Linux host with systemd, run a 2B export inside a memory-limited user
+scope after activating the environment and sourcing `env.sh`:
+
+```bash
+systemd-run --user --scope \
+  -p MemoryMax=48G -p MemorySwapMax=0 \
+  env MALLOC_ARENA_MAX=2 OMP_NUM_THREADS=4 MKL_NUM_THREADS=4 \
+  python examples/qualcomm/oss_scripts/llama/llama.py \
+    -a ./llama-output/qwen3_5-2b-m4096-hybrid-ar128 \
+    --build_folder build-android --soc_model SM8750 \
+    --decoder_model qwen3_5-2b \
+    --source_safetensors /path/to/Qwen3.5-2B \
+    --model_mode hybrid --max_seq_len 4096 --prefill_ar_len 128 \
+    --calibration_device cuda --calibration_num_threads 4 \
+    --calib_samples examples/qualcomm/oss_scripts/llama/assets/samples/vision.json \
+    --calib_text_datasets wikitext-2 --calib_text_samples 8 \
+    --prompt 'Describe this image.' --skip_qdq_save --compile_only
+```
+
+`MemoryMax` terminates the export if it exceeds 48 GiB, and `MemorySwapMax=0`
+prevents this task from consuming swap. Adjust the limits to leave RAM for other
+applications. A W4 deployment does not imply a W4-sized host compilation peak.
+
 Local raw-text JSON/JSONL sources may replace `wikitext-2`. Image calibration
 files may also include text-only samples with an empty `files` list. Generated
 PTEs are `hybrid_llama_qnn.pte`, `tok_embedding_qnn.pte` and
@@ -735,6 +924,8 @@ above to produce new artifacts.
 | Final compatibility regression | 103 tests and 12 subtests passed |
 | Pre-push regression (2026-10-15) | 15 existing tests and 3 subtests passed, including SWA calibration, quantized mask IO, cache handling, native ASAN/UBSAN checks and MHA-to-SHA conversion |
 | Fresh normal-entry Qwen3.5-0.8B export | 4K context / AR128 compiled successfully; `kv_forward`, `prefill_forward` and `prefill_forward_256` each contain one QNN delegate with no CPU fallback |
+| Fresh normal-entry Qwen3.5-2B image export | 4K context / AR128, two image samples and eight WikiText samples; all three decoder methods contain one QNN delegate with no CPU fallback; complete image inference passed on SM8850 |
+| QNN compilation memory regression | 14 tests passed, including graph/state isolation, shared binary buffers across methods/partitions and MHA-to-SHA checks; a three-method quantized QNN compile/serialize smoke test preserved source weights and outputs |
 | Covered models | Qwen3.5 and Lincal3.5 0.8B/2B export configuration, projection precision, calibration and cache layout; existing non-GDN model configuration checks |
 | GDN/quantization | K/z W8, q/v/a/b W4, out_proj GPTQ; shared calibrated UINT16 cache encodings across AR128/AR1; native norms and quantized/float conversion |
 | SWA | Separate window mask, fixed-length cache across AR changes, wraparound and partial updates; AR128 calibration compared with sequential decode, including a window smaller than AR |
@@ -774,6 +965,478 @@ PTE compilation do not establish those full-model results.
 
 Detailed historical kernel measurements are retained in the
 [DeltaNet package README](../../custom_op/deltanet_op_package_htp/DeltaNetOpPackage/README.md).
+
+##### Full Qwen3.5-2B export memory verification (2026-10-15)
+
+The earlier 2B size-comparison script validated text generation and did not
+compile or execute the 2B vision encoder. This run used the ordinary `llama.py`
+entry point, the local Qwen3.5-2B checkpoint, CUDA calibration, two image samples,
+eight WikiText-2 sequences of 1024 tokens, hybrid mode, context 4096 and AR128.
+The default physical context capacity was 4224; `--skip_qdq_save` was enabled.
+
+The preceding failed run ended after all decoder QNN preparation stages, without
+a decoder PTE. The user reported a host freeze and reboot. No kernel OOM record
+was available, so the reboot cause was not established as an OOM kill.
+
+Two host allocation issues were fixed in `QnnBackend`: preprocessing now copies
+graph structure and state mappings while sharing read-only tensor storage, and
+each partition's shared context binary is converted to Python bytes once for all
+methods. Temporary op-wrapper references and the NumPy binary are released before
+packaging the shared bytes. For this run's 1,147,162,880-byte decoder context,
+converting it once avoids two additional binary copies, about 2.14 GiB.
+
+The retry ran serially in a user service with `MemoryMax=48G`,
+`MemorySwapMax=0`, `CPUQuota=800%`, `MALLOC_ARENA_MAX=2`, and four CPU calibration
+threads. Initial 44/46 GiB soft limits caused measurable memory-pressure stalls;
+they were removed during final serialization. The documented command therefore
+uses the hard memory limit without a soft limit.
+
+| Export measurement | Result |
+|---|---:|
+| Exit status | 0 |
+| Wall time, including diagnostic soft-limit stalls | 43 min 44.23 s |
+| User-service memory peak, including charged cache | 50,437,963,776 bytes / 46.97 GiB |
+| Process maximum RSS reported by `/usr/bin/time` | 49,478,300 KiB / 47.19 GiB |
+| User-service swap peak | 0 bytes |
+| Decoder PTE | 1,147,239,680 bytes / 1094.09 MiB |
+| Token embedding PTE | 1,017,203,072 bytes / 970.08 MiB |
+| Vision encoder PTE | 352,615,680 bytes / 336.28 MiB |
+
+The cgroup and process RSS metrics have different accounting scopes. There is no
+comparable peak measurement from the rebooted run, so these results do not
+establish an end-to-end memory reduction percentage.
+
+Device verification reused these SM8750 PTEs on SM8850 / PLK110,
+serial `3B15AK00GLW00000`, with the V81 DeltaNet package and temperature 0.
+Input was the local cow photograph plus `<image>请用中文描述这张图片。`.
+
+| Single image/text generation measurement | Result |
+|---|---:|
+| Prompt / generated tokens | 216 / 172 |
+| Vision execution | 95.86 ms |
+| Decoder prefill execution, two AR128 blocks | 182.69 ms |
+| Prompt evaluation / first token, including vision | 293 ms / 737.20 tokens/s |
+| Decode | 32.75 tokens/s |
+
+Generation reached EOS and correctly described the orange-shirted man, black
+backpack and large white horned cow. This is a single generation check, not a
+full-model PPL evaluation or an SM8850-native compilation benchmark. Local run
+paths were `llama-output/qwen3_5-2b-m4096-hybrid-ar128-memoryfix`,
+`run-qwen3_5-2b-memoryfix.log` and
+`run-qwen3_5-2b-image-sm8850-memoryfix.log`; measurements are preserved here
+independently of those generated files.
+
+##### Qwen3.5-4B export attempt (2026-10-15, incomplete)
+
+The local `/hunter/model/Qwen/Qwen3.5-4B` checkpoint is registered as
+`qwen3_5-4b`. Its existing static config matches the checkpoint: 32 layers,
+hidden size 2560, FFN size 9216, 16 linear key heads and 32 linear value heads.
+The existing grouped GDN path handles the 2:1 value/key head ratio.
+
+The attempt used SM8750, hybrid mode, context 4096, AR128, CUDA calibration,
+two image samples and eight WikiText-2 sequences of 1024 tokens. Precision and
+calibration remained the optimized Qwen3.5 recipe; no DSP kernel rewrite or
+reduction in sample count was used. Only one full export ran at a time, inside
+a service with `MemoryMax=48G`, `MemorySwapMax=0` and `CPUQuota=800%`.
+
+The initial failure was CUDA OOM during quantized activation calibration.
+PT2E retained unused FP32 attributes after folding weights, and placed weight
+DQ ahead of its consumers. Rebuilding the graph after dead-code elimination
+removed unused attributes; calibration now delays the constant DQ/cast/view
+chains until their consumers. This reduced the measured quantized graph GPU
+allocation from 20.57 GiB to 4.86 GiB. Both AR128 passes and all ten warm AR1
+samples subsequently completed; 24 GDN out projections received fixed-grid
+GPTQ and 1306 shared activation grids were calibrated on CUDA.
+
+Host memory remained a separate blocker. Stage cleanup returned about 9.8 GiB
+in the final attempt: RSS went from 39.59 GiB to 29.74 GiB after calibration.
+The vision encoder compiled and wrote a 354,409,728-byte PTE. Embedding graph
+preparation then completed, but the process was killed by OOM before its
+context/PTE was written. The final service reported a peak of
+49,708,736,512 bytes (46.30 GiB) and zero swap; earlier retries reached the
+48 GiB hard limit. The final peak alone does not distinguish a cgroup-limit
+kill from host-wide OOM.
+
+| Component / check | Result |
+|---|---|
+| FP32 AR128, quantized AR128 and warm AR1 calibration | Passed |
+| Vision encoder PTE | Generated |
+| Token embedding PTE | Not generated |
+| Hybrid decoder PTE / device inference | Not reached |
+| Calibration-memory and QNN preprocessing regressions | 4 passed |
+
+The calibration regressions cover W4/W8, shared weights, constant cast/view
+chains, unused FP32 parameters, exact output equality and source-weight cache
+release while a live exported graph remains usable. An eight-layer synthetic
+GPU check measured 46.5 MiB before delayed DQ and 19.0 MiB after, with identical
+outputs; this is a calibration-memory check, not an HTP performance result.
+
+This directory is **not a complete runnable 4B export**:
+`llama-output/qwen3_5-4b-m4096-hybrid-ar128-memoryfix`. The final log is
+`run-qwen3_5-4b-memoryfix.log`, with per-attempt memory CSVs in that directory.
+Full 4B export still requires a lower host-memory peak, for example by compiling
+components in separate processes, or a host with more available RAM. No 4B
+generation accuracy or inference performance is claimed by this attempt.
+
+##### Qwen3.5-4B INT4 input embedding check (2026-10-15)
+
+An isolated test quantized only the `248320 x 2560` input embedding table,
+using the existing packed INT4 embedding kernel, group size 32 and FP32 scales.
+The HQQ variant uses `hqq_scale_only`; RTN uses ordinary affine rounding.
+Neither uses test-set activation calibration. The Transformers decoder, caches
+and original tied LM head remained FP32; the quantized input table was passed
+as `inputs_embeds` without replacing the shared floating-point parameters.
+
+The AR128 test used the first 16,384 tokens of WikiText-2 raw **test** text,
+split into 16 independent 1024-token windows, with 16,368 next-token targets.
+Final hidden SQNR is measured after the last RMSNorm, before the LM head,
+using the reference signal energy. This is a test subset, not full WikiText PPL.
+
+| Input embedding | AR128 PPL | PPL change | Embedding SQNR | Final hidden SQNR |
+|---|---:|---:|---:|---:|
+| FP16 reference | 9.29720 | Baseline | Reference | Reference |
+| INT4 g32, HQQ | 9.29632 | -0.0095% | 20.81 dB | 24.13 dB |
+| INT4 g32, RTN | 9.29962 | +0.0260% | 20.22 dB | 23.98 dB |
+
+On the same first 1024-token window, AR1 PPL was 6.87308 / 6.87516 / 7.00987
+for FP16 / HQQ / RTN. HQQ increased PPL by 0.0302%, with final hidden SQNR
+about 21.5 dB. AR128 on that same window gave effectively the same PPL and
+hidden SQNR; the 16K and 1K aggregates above should not be used to infer an
+encode/decode difference. HQQ's per-window PPL changes ranged from -1.77% to
++0.93%; the near-zero aggregate is not evidence that quantization improves accuracy.
+
+The standalone HQQ PTE is **397,314,304 bytes / 378.91 MiB**, with shared
+packed weights across AR1 and AR128. Table data is 68.75% smaller than the
+theoretical FP16 payload of 1212.50 MiB; no successful FP16 4B embedding PTE
+exists for a measured file-to-file comparison. Execution uses the ExecuTorch
+CPU `embedding_4bit.dtype_out` kernel, not QNN/HTP.
+
+On SM8850 / PLK110 (`3B15AK00GLW00000`), actual C++ PTE execution matched
+PyTorch INT4 output bit-for-bit for all 16,384 AR128 tokens (41,943,040 FP32
+elements) and all 1024 AR1 tokens (2,621,440 elements), maximum absolute error 0.
+The local report and artifact are in
+`llama-output/qwen3_5-4b-embedding-int4-eval/REPORT.md` and
+`tok_embedding_int4_hqq.pte` in that directory.
+
+These measurements support HQQ INT4 input embedding on this text subset.
+They do **not** establish full quantized-decoder PPL, image accuracy or full
+4B generation performance. The normal Qwen3.5 `llama.py` embedding export
+path has not been changed to use this standalone PTE, and full 4B export has
+not been restarted by this test.
+
+##### Qwen3.5-0.8B earlier 1K embedding / KV ablation (2026-10-16)
+
+These results use the separately exported `qwen3_5-0_8b-embedding-kv-ablation/kv16/hybrid_llama_qnn.pte`, not the original `qwen3_5-0_8b-m4096-hybrid-ar128` PTE (physical capacity 4224). The 61.91 tok/s baseline applies only to this 1K export. The original 4K image run on SM8850 recorded 46.7435 tok/s with 216 prompt tokens and 150 AR1 steps. Controlled context comparison: `llama-output/qwen3_5-0_8b-embedding-kv-ablation/context-baseline-check/REPORT.md`.
+
+A subsequent controlled run on the same SM8750, raw text 16→1008, three rounds with the same runner, measured 61.78 tok/s for this 1K PTE and 39.51 tok/s for the original 4K PTE. The 4K PTE was reused unchanged. Single-block 128→1 prompt evaluation was 70 / 69 ms, respectively, since both used the short prefill bucket. No original-4K PPL/SQNR or INT4/UINT8 performance gain is established by the 1K ablation.
+
+SM8750 / PKR110, hybrid AR128, logical 1K / physical capacity 1152. Decoder weights and calibrated grids were frozen: K/z W8, other Linear W4 group32, existing out-projection GPTQ. Only the six full-attention layers use UINT8 K/V; all 18 conv and 18 recurrent states remain UINT16. Pure-text inference; vision was calibrated and loaded but not executed.
+
+PPL/SQNR use the first 8192 WikiText-2 raw test tokens, eight independent 1024-token windows (8184 targets), with the same Transformers FP32 reference. Hidden is measured after final RMSNorm and before LM head; it is not vocabulary-logit SQNR. Reference PPL: 22.90248. This is a subset evaluation.
+
+| Embedding / FA KV | PPL | Final hidden SQNR vs FP32 | 128→1 prompt eval | 1024→1 prompt eval | 16→1008 decode |
+|---|---:|---:|---:|---:|---:|
+| FP16 embedding / KV16（1K消融基准） | 26.93968 | 11.485 dB | 69 ms | 573 ms | 61.91 tok/s |
+| INT4 embedding / KV16 | 26.99978 | 11.369 dB | 72 ms | 577 ms | 63.06 tok/s |
+| FP16 embedding / KV8 | 26.96509 | 11.442 dB | 72 ms | 584 ms | 67.64 tok/s |
+| INT4 embedding / KV8 | 27.07849 | 11.319 dB | 72 ms | 587 ms | 67.19 tok/s |
+
+The earlier KV8 rows also used an 8-bit MatMul RHS. They do not measure the
+the later storage-only UINT8 experiment, whose attention MatMul remained 16-bit.
+
+Performance is the median of three interleaved rounds, after warmup, using the production runner with temperature 0 and EOS ignored. Prompt evaluation includes embedding/cache work, excludes model loading/tokenization/vision, and excludes about 0–1 ms of final sampling/callback. Decode counts 1007 AR1 steps after the first token from prefill.
+
+Embedding PTE shrank from 485.073 to 151.565 MiB (68.75% smaller); INT4 group32 HQQ lookup had 21.089 dB SQNR and exactly matched PyTorch packed lookup on-device. AR1 cache input buffers shrank from 23.332 to 16.588 MiB; this is not total process RSS.
+
+A separate first-1K AR1 check gave PPL 11.69466 / 11.88040 / 11.81462 / 11.85262 in table order (FP32 10.87851). All four variants matched production generation logits code-for-code at positions 0/128/512/896 for both AR1 and AR128, after accounting for the trimmed prefill history layout.
+
+The integration preserves packed embedding weights through a CPU portable PTE with `--embedding-quantize "4,32"`, uses that lookup during normal calibration, and preserves the original tied LM head. UINT8 FA cache selection remains experimental in this ablation, rather than changing the default recipe. Mixed GDN-UINT16 / FA-UINT8 cache allocation/updates and output requantization IO tagging were fixed. The already-compiled UINT8 QNN context was unchanged when correcting its PTE output dtype descriptors. Three Python regressions and the ASAN/UBSAN native cache regression passed.
+
+The combined case added 0.515% PPL, reduced hidden SQNR by 0.166 dB, added 3 ms to AR128 prompt evaluation, and improved median decode speed by 8.53% on this device/context. Existing quantized-decoder error remains larger than these incremental changes; these data do not establish image accuracy or 4K/8K performance.
+
+Local detailed report, configs and raw outputs: `llama-output/qwen3_5-0_8b-embedding-kv-ablation/REPORT.md`. Temporary scripts were removed after integration. Tests were run serially; each full export used a 36 GiB cgroup limit with no swap. That earlier experiment retained the then-current default precision; current recipe defaults are documented above.
+
+##### Qwen3.5-0.8B 4K UINT8 storage / 16-bit compute ablation (2026-10-16)
+
+All four variants were exported and evaluated on SM8750 / PKR110 / `431e3c37`.
+Logical context is 4096, physical capacity 4224, prefill AR128. Only the six
+full-attention layers change cache storage precision; all GDN conv/recurrent
+states remain UINT16. In the KV8 cases, query quantization stays UINT16 and
+MatMul RHS stays INT16, with calibrated cache conversions inside QNN.
+These measurements use the retired storage-only implementation, distinct from the earlier
+1K experiment's 8-bit attention compute.
+
+Each variant was independently calibrated with the same two `vision.json`
+image samples and eight WikiText-2 train samples, seed 42, using AR128 and warm
+AR1. Accuracy uses the first 8192 WikiText-2 raw test tokens as two independent
+4096-token windows, 8190 next-token targets. Transformers FP32 reference PPL
+is 18.04003 / 18.04006 for AR128 / AR1. SQNR compares the final RMSNorm output,
+before the LM head, against the matching FP32 hidden state.
+
+| Embedding / FA KV storage | AR128 PPL | AR1 PPL | AR128 hidden SQNR | AR1 hidden SQNR | 128→1 prefill | 4096→1 prefill | 16→4080 decode |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| FP16 / UINT16 baseline | 21.1945 | 21.9655 | 11.145 dB | 10.498 dB | 74 ms | 3393 ms / 1207.19 tok/s | 38.68 tok/s |
+| INT4 / UINT16 | 20.6700 | 21.5433 | 11.102 dB | 10.511 dB | 86 ms | 3468 ms / 1181.08 tok/s | 38.98 tok/s |
+| FP16 / UINT8 | 21.1870 | 21.9863 | 11.132 dB | 10.501 dB | 74 ms | 5469 ms / 748.95 tok/s | 37.44 tok/s |
+| INT4 / UINT8 | 20.7328 | 21.6102 | 11.080 dB | 10.481 dB | 76 ms | 5614 ms / 729.60 tok/s | 37.99 tok/s |
+
+Performance is the median of three rounds, with warmup and alternating case
+order, using production generation methods. These are pure-text measurements;
+the vision PTE was loaded but not executed. Prefill timing includes embedding
+and cache work, excludes loading/tokenization and final sampling/callback.
+Decode measures 4079 AR1 calls; the first of 4080 outputs comes from prefill.
+Round zero has Android Thermal Status 0 throughout; later rounds reach 1/2,
+with `cdsp`/`cdsp_hw` cooling values still zero. DSP frequency was not locked,
+so small decode differences do not establish a stable speedup. The short-prompt
+INT4 result also varied from 74 to 87 ms across rounds.
+
+Adding KV8 storage to INT4 embedding changes AR1 PPL by +0.0669 (+0.31%) and
+hidden SQNR by −0.031 dB; AR128 changes are +0.0628 (+0.30%) and −0.022 dB.
+Each variant adapts its calibration, so lower PPL in the INT4 rows does not
+establish that embedding quantization itself improves accuracy. The existing
+PTQ gap to FP32 remains. These subset results do not establish image quality.
+
+INT4 embedding reduces its PTE from 485.073 to 151.565 MiB (−68.75%). The measured
+storage-only KV8 version provides no end-to-end speed gain: relative to FP16/KV16, 4K
+prefill latency rises 61.18% with KV8 alone and 65.46% with both changes.
+The regression is already present in round zero without a thermal warning.
+That storage-only version should not be treated as a performance improvement.
+
+Detailed profiling of the production AR128 long-prefill decoder, with matched
+synthetic warm caches and actual embedding inputs, measured HTP execution of
+110.900 ms for KV16 versus 172.716 ms for KV8 (two warmups, three measured calls).
+Twelve cache load conversions contribute 129.450 million aggregate cycles,
+87.8% of the added aggregate cycles. Aggregate node cycles are not additive
+wall-clock time. Compiler estimates show 36 MiB more spill for KV8 long prefill,
+despite about 4.2% less estimated DDR read traffic for decode. These are static
+estimates, not measured bandwidth counters. Small-graph VTCM residency does
+not establish residency for the full 4K graph. Conversion placement and
+temporary-cache lifetime remain performance issues in this implementation.
+
+Production/diagnostic validation at six checkpoints found identical selected
+logits in AR128/AR1 and identical cache codes in AR1. AR128 conv-cache differences
+reach 118 codes with FP16 embedding and 290 with INT4, so complete prefill-cache
+equivalence is not established. PPL/hidden are collected through diagnostic
+methods; performance uses production methods.
+
+The export also exposed a short-prefill trimming bug with the additional
+storage-to-compute Q/DQ pair. `trim_prefill_capacity` now traces the full chain
+and slices UINT8 history before expansion. Eight recipe/embedding regressions
+passed, and an actual physical384/internal256 full-attention PTE matched Q/DQ
+with AR128/AR1 output SQNR 75.56/74.27 dB; returned caches differed by at most
+one code for AR128 and were identical for AR1.
+
+This round recalibrates the original precision baseline; it does not report
+accuracy deltas against the old `qwen3_5-0_8b-m4096-hybrid-ar128` artifact.
+That old PTE measured 3505 ms for 4096→1 and 39.22 tok/s for 16→4080 in a
+separate single run on this SM8750. The SM8850 image log's 46.743534 tok/s uses
+another device and a shorter generation, and is not a baseline for this table.
+Exports ran serially with a 36 GiB memory cap and no swap.
+
+Detailed report, per-round results, prefix SQNR, calibration metadata, IO audits
+and raw profiling events:
+`llama-output/qwen3_5-0_8b-4k-embedding-kv-ablation-20261016/REPORT.md` and `summary.json`.
+
+##### Qwen3-0.6B legacy KV8 execution path (2026-10-16)
+
+An isolated export enabled `annotate_kv_8bit` for the local checkpoint
+`/hunter/model/Qwen/Qwen3-0___6B`: KV mode, AR1, context1024, CUDA calibration
+with eight WikiText-2 train sequences (8192 tokens), seed42, original SeqMSE50.
+The normal Qwen3-0.6B recipe default was retained. The PTE is 652.319 MiB and
+contains one QNN delegate, with 56 UINT8 cache inputs and 56 UINT8 cache outputs.
+These input buffers occupy 55.945 MiB; this is not total process memory.
+
+MHA→SHA produced 896 attention MatMuls (28 layers×16 query heads×2), all with
+UINT16 left input, UINT8 right input and UINT16 output. All56 history-cache paths
+stay UINT8 through per-head slicing, concat and reshape until MatMul. No history
+UINT8→16bit expansion occurs. The672 explicit QNN Converts are UINT16→UINT8
+on new-token tensors containing at most128 elements.
+
+Actual device QHAS shows HVX
+`q::ConvLayer.opt.convert_weights_to_signed.shuffled` producing QInt8 K/V with
+the same scale and zero_offset0, followed by HMX `q::ConvLayer_s1.opt` MatMul
+kernels producing QUInt16. There is internal unsigned-to-signed conversion and
+layout preparation, but the RHS remains8bit. This differs from Qwen3.5's retired
+`annotate_kv_8bit_io` implementation, which stored8bit and used a16bit RHS.
+
+Device graph tracing and normal runner execution completed. The simple prompt
+`What is 1+1? /no_think` generated repeated reasoning without a correct answer
+before the128token limit. This does not establish usable quantized accuracy;
+there was no matched KV16 control, PPL or hidden-SQNR evaluation in this check.
+The PTE enables optrace, so its runtime timing is not a normal-performance result.
+
+The check also repaired the `llama.py --optrace` path's obsolete `args.model`
+references and migrated its `SimpleADB` construction to `QnnConfig`; the existing
+masked-softmax device test's helper call now uses `soc_model`. The same compiled
+PTE was reused to complete device tracing after the post-export failure.
+
+Local PTE, calibrated Q/DQ graph, QNN tensor encodings, full optrace/QHAS
+and detailed explanation: `llama-output/qwen3-0_6b-kv8-flow-20261016/REPORT.md`.
+
+##### Qwen3.5-0.8B 4K native 8-bit K/V compute (2026-10-16)
+
+The 0.8B recipe now uses `annotate_kv_8bit` for both FA cache storage and
+attention MatMul RHS precision. The storage-only annotation and its cache
+expansion branches were removed. New entries enter the calibrated 8-bit grid
+before storage; historical entries remain 8-bit through concat and MatMul.
+Query, softmax probability and MatMul outputs remain UINT16. GDN conv/recurrent
+states retain UINT16. Re-exporting is required; existing PTEs are unchanged.
+At the time of this measurement, 2B/4B retained FP16 embedding and KV16 defaults.
+The subsequent 0.8B/2B performance-matrix integration changed Qwen 2B to
+INT4 embedding/native KV8; 4B and Lincal 2B remain FP16/KV16.
+
+This full export uses INT4/HQQ/group32 embedding, K/z and depthwise convolution
+W8, other Linear weights W4/group32, and the existing out-projection GPTQ.
+The new embedding PTE is byte-identical to the INT4/KV16 baseline. All 36 GDN
+cache scale/zero-point pairs match that baseline. Prefill uses the existing
+FP16 chunk64/leaf8 implementation; decode keeps the VTCM op.
+
+SM8750 / PKR110 / `431e3c37`, logical context4096, physical capacity4224,
+prefill AR128. Calibration uses the same two image/text samples and eight
+WikiText-2 train sequences, seed42, CUDA. A single export ran with a36GiB memory
+cap and no swap:38m14.56s elapsed,29.75GiB maximum RSS. All five decoder methods
+(three production, two diagnostic) contain one QNN delegate without CPU
+fallback. All60 FA MatMuls have UINT16×UINT8→UINT16 tensors; there are no history
+cache8→16 Convert nodes. Production cache IO has12 UINT8 FA tensors and36
+UINT16 GDN tensors in each direction.
+
+Accuracy uses the same first8192 WikiText-2 test tokens as the previous4K
+experiment: two independent4096-token windows,8190 next-token targets, and the
+same Transformers FP32 reference. SQNR measures final RMSNorm hidden before the
+LM head. Each precision variant was calibrated separately; this compares full
+export pipelines rather than replacing one grid with every other grid frozen.
+Baseline accuracy below reuses the preceding matched evaluation.
+
+| INT4 embedding configuration | AR128 PPL | AR1 PPL | AR128 hidden SQNR | AR1 hidden SQNR |
+|---|---:|---:|---:|---:|
+| KV16 | 20.6700 | 21.5433 | 11.102 dB | 10.511 dB |
+| Retired: KV8 storage /16-bit RHS | 20.7328 | 21.6102 | 11.080 dB | 10.481 dB |
+| Current: KV8 storage /8-bit RHS | 20.7568 | 21.5803 | 11.066 dB | 10.474 dB |
+
+Relative to INT4/KV16, native KV8 changes AR128 PPL by+0.42% and hidden SQNR
+by−0.037dB; AR1 PPL changes by+0.17% and hidden SQNR by−0.038dB. HF FP32 PPL
+is18.04; the existing PTQ gap remains separate from the small additional KV8
+error. Six production/diagnostic checkpoints have identical selected logits
+in both modes and identical caches in AR1. AR128 conv-cache differences reach
+290 codes, as in the INT4 baseline, so complete prefill-cache equivalence is
+not established.
+
+Performance below was collected anew for both models, three alternating
+rounds with the same production runner and warmup, taking the median. Inputs
+are raw text tokens; vision is loaded but not executed. Timing includes
+embedding/cache work and excludes loading and tokenization.
+
+| Configuration | 128→1 prefill | 4096→1 prefill | 16→4080 decode |
+|---|---:|---:|---:|
+| INT4/KV16 | 79 ms /1620.25 tok/s | 3467 ms /1181.42 tok/s | 38.95 tok/s |
+| INT4/KV8,8-bit RHS | 78 ms /1641.03 tok/s | 3245 ms /1262.25 tok/s | 61.70 tok/s |
+
+Decode throughput rises58.40% and4K prefill latency falls6.40%. The1ms change
+in128-token prefill is within run variation. Decode counts4079 AR1 steps; the
+first of4080 output tokens comes from prefill. KV16 decode runs span
+38.74–39.50tok/s, KV8 runs60.82–61.90tok/s. Android thermal statuses0/1/2 were
+observed without a frequency lock; snapshots are retained for every run.
+The retired storage-only result5614ms/37.99tok/s is historical, not part of
+this fresh paired timing batch.
+
+All cache input buffers for `kv_forward` shrink from59.332MiB to34.588MiB
+(FA halves; GDN stays unchanged). These are buffer sizes, not total process
+memory. QNN compiler estimates for decode spill/fill fall from26.80/27.86MiB
+to1.75/2.80MiB, estimated reads from554.65MiB to492.47MiB and writes from95.86MiB
+to21.31MiB. These are static estimates, not measured hardware bandwidth.
+
+Eight recipe/embedding regressions passed, covering mixed cache types,
+AR128/AR1, short-prefill trimming and unchanged larger-model defaults.
+Black and `git diff --check` passed. The ordinary `llama.py --pre_gen_pte` path
+also completed a23-token Chinese arithmetic prompt, producing `1+1=2` and
+stopping at EOS after padded AR128 prefill. This is a runner integration check,
+not a general answer-quality evaluation. PTEs, paired timings, accuracy, prefix SQNR,
+calibrated encodings and tensor audits:
+`llama-output/qwen3_5-0_8b-4k-kv8-compute-20261016/REPORT.md` and `summary.json`.
+
+##### Qwen3.5-0.8B complete 4K deployment PTE recheck (2026-10-16)
+
+A deployment bundle is available at
+`llama-output/qwen3_5-0_8b-m4096-hybrid-ar128-e4-kv8/`.
+It contains the complete24-layer decoder, INT4 embedding, vision encoder and tokenizer.
+This package reuses the preceding calibrated production methods and QNN context;
+only the two diagnostic PTE entrypoints were removed. All116 metadata methods are
+preserved. Production method signatures and QNN payload hashes were checked.
+The shared QNN context still contains its original internal graphs, so its size
+is nearly unchanged. This is packaging, without new calibration or compilation.
+
+The actual packaged PTE was pushed to SM8750/431e3c37 and checked by SHA256,
+then measured afresh for three rounds with the same normal production runner.
+Logical context4096, physical capacity4224, AR128; FA K/V storage and RHS UINT8,
+GDN conv/recurrent UINT16. Vision is loaded but not executed.
+
+| Test | Median time | Median throughput |
+|---|---:|---:|
+| 128 → 1 prefill | 75 ms | 1706.67 token/s |
+| 4096 → 1 prefill | 3215 ms | 1274.03 token/s |
+| 16 → 4080 decode | 65664 ms | 62.12 token/s |
+
+Raw times:128-token prefill94/74/75ms;4K prefill3259/3181/3215ms;
+long decode65664/65001/66122ms. All thermal snapshots reported status0;
+DSP frequency was not locked. Each process runs16→32 warmup before its measured
+generation. Timing includes embedding/cache work and excludes loading,
+tokenization and vision. Long decode generates4080 outputs with4079 AR1 steps;
+the first output comes from prefill.4K prefill processes32 AR128 blocks.
+
+The deployment README contains the ordinary `llama.py --pre_gen_pte` command.
+Complete raw logs, configs, counts, thermal snapshots and median calculations:
+`llama-output/qwen3_5-0_8b-m4096-hybrid-ar128-e4-kv8/BENCHMARK.md` and
+`benchmark_summary.json`. Accuracy remains the preceding identical-production-graph
+evaluation; no new PPL/SQNR is claimed for this performance recheck.
+
+##### Qwen3.5-family: remove short-context prefill graphs (2026-10-16)
+
+The exporter no longer clones or compiles `prefill_forward_256`, and the runner
+no longer discovers, loads or selects short-context buckets. The additional
+model plumbing and optrace bucket targets were removed. Hybrid decoder PTEs
+now contain only `kv_forward` and `prefill_forward` inference methods plus their
+metadata; KV mode retains only `kv_forward`. Embedding and encoder methods are
+unchanged. Lincal SWA masks, cache update logic and logical-capacity trimming
+remain in place. AR128 still processes4096 prompt tokens in32 calls.
+
+A full0.8B export was recalibrated on CUDA and recompiled from the local model
+with the same seed/data/precision. Actual PTE methods and QNN context graph
+names were both checked: exactly `kv_forward` and `prefill_forward`, with no
+short-context or diagnostic graph. All metadata and GPTQ statistics match the
+preceding export; embedding PTE bytes match. This is not a bytewise comparison
+of all decoder weights. All48 cache encodings match; FA remains UINT8 and GDN
+state UINT16. Decoder size is458.477MiB. Export took16m28.42s with17.04GiB
+maximum RSS, under a36GiB cap with no swap.
+
+Using newly built Android runners, the new PTE completed three rounds on
+SM8750/431e3c37, with all thermal snapshots0 and no frequency lock:
+
+| Test | Previous bundle median | New two-graph PTE median | New throughput |
+|---|---:|---:|---:|
+| 128→1 prefill | 75ms | 104ms | 1230.77tok/s |
+| 4096→1 prefill | 3215ms | 3225ms | 1270.08tok/s |
+| 16→4080 decode | 65664ms | 64202ms | 63.53tok/s |
+
+The previous figures are historical measurements, not fresh paired controls.
+All short prompts now execute the full-context graph, so128-token prefill
+latency increases38.7%;4K prefill is essentially unchanged. The small decode
+difference is not attributed solely to bucket removal. Raw new times are
+103/104/104ms,3225/3158/3237ms and63752/64873/64202ms, respectively.
+Decode counts4079 AR1 steps; the first output comes from prefill. Timing includes
+embedding/cache work and excludes loading/tokenization/vision execution.
+
+Eight recipe/embedding regressions passed, both Android runner builds passed,
+and the changed Python files passed serial Black checks. The ordinary
+`llama.py --pre_gen_pte` path answered the23-token Chinese arithmetic prompt
+with `1+1=2`, stopped at EOS and logged `method=prefill_forward`.
+No new PPL/SQNR evaluation was performed in this change.
+
+New complete deployment bundle, ordinary run command, raw measurements and
+PTE/QNN audits:
+`llama-output/qwen3_5-0_8b-m4096-hybrid-ar128-e4-kv8-no-bucket/README.md`,
+`BENCHMARK.md` and `deployment_manifest.json`.
+Earlier measurements in this README retain their historical graph selection;
+they do not describe the new single-prefill configuration.
 
 ##### Re-exporting after the masked-softmax causality fix
 
@@ -969,3 +1632,21 @@ python examples/qualcomm/oss_scripts/llama/llama.py --build_folder build-android
 ```
 
 Please make sure to use the same `--max_context_len`, `--prefill_ar_len`, and `--model_mode`, etc., as those used in the LLM to ensure the kv cache shape is correct.
+
+<!-- QWEN35_CONTEXT_MATRIX_20261016_BEGIN -->
+##### Qwen3.5 context performance: 0.8B / 2B (2026-10-17)
+
+SM8750, text only, AR128, three-run medians. Both models use INT4/group32 HQQ embedding and native UINT8 full-attention K/V; GDN states remain UINT16. K/z and depthwise convolution use W8; other Linear layers use W4/group32 with the existing out_proj GPTQ. Decoder contexts contain only `kv_forward` and `prefill_forward`.
+
+| 上下文 token | 0.8B Prefill token/s | 0.8B Decode token/s | 2B Prefill token/s | 2B Decode token/s |
+|---:|---:|---:|---:|---:|
+| 1024 | 1726.81 | 67.35 | 1196.26 | 35.25 |
+| 2048 | 1605.02 | 63.36 | 1130.87 | 34.98 |
+| 3072 | 1455.23 | 64.74 | 1042.77 | 36.23 |
+| 4096 | 1261.86 | 63.51 | 926.70 | 35.05 |
+| 8192 | 1293.75 | 39.97 | 773.63 | 27.43 |
+
+Prefill: n input tokens / 1 output. Decode: 16 input / (n−16) output, timed across the actual n−17 AR1 calls. Physical capacity is n+128. Temperature is 0; loading, tokenization and vision execution are excluded. Every measured run started at thermal status 0; some sustained decode runs ended at 1/2. No frequency lock was used.
+
+The matrix used a local 2B recipe override. After measurement, the same configuration was integrated into the standard `llama.py` entry point for 0.8B/2B. This matrix measures performance; PPL/SQNR were not rerun. Full definitions and results are in [Qwen3.5 test records](README_QWEN35_TEST_RECORDS.md). PTEs, logs, CSVs and plots are under `llama-output/qwen35-context-performance-20261016/`.
+<!-- QWEN35_CONTEXT_MATRIX_20261016_END -->
