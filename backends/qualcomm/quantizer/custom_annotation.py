@@ -23,8 +23,6 @@ from executorch.exir.dialects._ops import ops as exir_ops
 from torch.fx import Node
 from torchao.quantization.pt2e import MinMaxObserver
 from torchao.quantization.pt2e.quantizer import (
-    annotate_input_qspec_map,
-    annotate_output_qspec,
     QuantizationAnnotation,
     SharedQuantizationSpec,
 )
@@ -141,24 +139,6 @@ def annotate_kv_8bit(  # noqa: C901
             _annotated=True,
         )
 
-    def annotate_rms_norm(node: Node, quantization_config: QuantizationConfig) -> None:
-        act_node = node.args[0]
-        weight_node = node.args[2]
-
-        # TODO current only support 16a16w
-        annotate_input_qspec_map(
-            node,
-            act_node,
-            quantization_config.input_activation,
-        )
-
-        annotate_input_qspec_map(
-            node,
-            weight_node,
-            quantization_config.input_activation,
-        )
-        annotate_output_qspec(node, quantization_config.output_activation)
-
     def annotate_single_in_single_out(
         node: Node, quantization_config: QuantizationConfig
     ) -> None:
@@ -237,8 +217,8 @@ def annotate_kv_8bit(  # noqa: C901
                 annotate_stack(node, quantization_config_8a8w)
                 node = node.args[0]
             elif node.target == torch.ops.aten.rms_norm.default:
-                annotate_rms_norm(node, quantization_config_8a8w)
-                node = node.args[0]
+                # Cache precision must not change normalization or its input grid.
+                break
             elif node.target == torch.ops.aten.cat.default:
                 annotate_cat(node, quantization_config_8a8w)
                 # For v, we tag 8a until conv op.

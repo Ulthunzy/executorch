@@ -4,11 +4,13 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+import copy
 import logging
 from collections import defaultdict
 from typing import Dict, final, List
 
 import executorch.backends.qualcomm.python.PyQnnManagerAdaptor as PyQnnManager
+import torch
 from executorch.backends.qualcomm._passes.qnn_pass_manager import (
     get_qnn_pass_manager_cls,
 )
@@ -91,6 +93,22 @@ def _check_io_binding(edge_program: ExportedProgram, nodes_to_wrappers) -> None:
 
 @final
 class QnnBackend(BackendDetails):
+    @classmethod
+    def copy_exported_program_for_preprocess(
+        cls,
+        edge_program: ExportedProgram,
+        compile_specs: List[CompileSpec],
+    ) -> ExportedProgram:
+        # Preprocessing rewrites graphs and replaces tensor entries, but does not
+        # mutate their contents. Keep those mappings isolated without copying weights.
+        tensor_memo = {
+            id(tensor): tensor
+            for values in (edge_program.state_dict, edge_program.constants)
+            for tensor in values.values()
+            if isinstance(tensor, torch.Tensor)
+        }
+        return copy.deepcopy(edge_program, tensor_memo)
+
     @staticmethod
     def _build_op_wrappers(
         edge_program: ExportedProgram,
@@ -277,6 +295,7 @@ class QnnBackend(BackendDetails):
                         ]
                     )
             if len(py_op_wrapper_list) == len(edge_programs.values()):
+                logger.info("Compiling QNN context for methods: %s", graph_names)
                 qnn_context_binary = qnn_manager.Compile(
                     graph_names, py_op_wrapper_list
                 )
@@ -288,12 +307,16 @@ class QnnBackend(BackendDetails):
                 assert (
                     len(qnn_context_binary) != 0
                 ), "Failed to generate Qnn context binary."
+                logger.info("QNN context compiled: %d bytes", len(qnn_context_binary))
                 qnn_manager.DestroyContext()
+                del py_op_wrapper_list, py_op_wrappers
+                processed_bytes = bytes(qnn_context_binary)
+                del qnn_context_binary
                 # methods should share the same context binary for current partition
                 for key in edge_programs.keys():
                     all_processed_results[key].append(
                         PreprocessResult(
-                            processed_bytes=bytes(qnn_context_binary),
+                            processed_bytes=processed_bytes,
                             debug_handle_map=debug_handle_builder.get_delegate_mapping(),
                         )
                     )

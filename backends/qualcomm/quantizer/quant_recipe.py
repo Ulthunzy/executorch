@@ -271,12 +271,9 @@ class QuantRecipe:
         for annotation_func in self.custom_quant_annotations:
             annotation_func(gm)
 
-    def annotate(
-        self, graph_module: torch.fx.GraphModule, rules_map: List[OpQuantRule]
-    ):
-        # Sort node level strategies by (priority, insertion index).
-        # Higher priority value comes first; if priorities are equal, original insertion order is preserved.
-        strategies: List[QuantizationStrategy] = [
+    def _ordered_node_strategies(self) -> List[QuantizationStrategy]:
+        # Higher priority wins; later rules override earlier rules at equal priority.
+        return [
             strategy
             for _, strategy in sorted(
                 enumerate(self._strategies),
@@ -284,6 +281,20 @@ class QuantRecipe:
                 reverse=True,
             )
         ]
+
+    def get_node_quant_config(
+        self, node: torch.fx.Node
+    ) -> Optional[QuantizationConfig]:
+        """Resolve explicit node rules for components lowered outside QNN PT2E."""
+        for strategy in self._ordered_node_strategies():
+            if config := strategy.get_quant_config(node):
+                return config
+        return None
+
+    def annotate(
+        self, graph_module: torch.fx.GraphModule, rules_map: List[OpQuantRule]
+    ):
+        strategies = self._ordered_node_strategies()
         # Ensure the default strategy is appended last
         strategies.append(self._default_strategy)
 
