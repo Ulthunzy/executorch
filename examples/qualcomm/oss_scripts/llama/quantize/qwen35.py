@@ -7,6 +7,7 @@
 """AR128 and warm-cache AR1 calibration with fixed-grid out-projection GPTQ."""
 
 import copy
+import gc
 import logging
 
 import torch
@@ -89,7 +90,7 @@ def calibration_samples(loaders, embedding, image_token_id):
     samples = []
     for text in loaders[TEXT_DECODER]:
         assert len(text["token_ids"]) == 1
-        ids = torch.tensor([text["token_ids"][0]], dtype=torch.int32)
+        ids = torch.tensor([text["token_ids"][0]], dtype=torch.int64)
         hidden = embedding(ids).detach().float()
         images = (
             torch.utils._pytree.tree_leaves(next(vision_batches))
@@ -318,10 +319,40 @@ def observe_activations(module, groups):
             decoded.replace_all_uses_with(observed)
             result.graph.erase_node(decoded)
         result.graph.erase_node(node)
+    # PT2E hoists weight DQ and its following casts/views ahead of all layers.
+    # Emit the whole constant preparation chain only when a layer needs it.
+    constants, weight_preparations = set(), set()
+    for node in result.graph.nodes:
+        if node.op == "get_attr":
+            constants.add(node)
+        if (
+            node.op == "call_function"
+            and node.all_input_nodes
+            and all(source in constants for source in node.all_input_nodes)
+        ):
+            constants.add(node)
+            if node.target in {
+                torch.ops.torchao.dequantize_affine.default,
+                torch.ops.quantized_decomposed.dequantize_per_channel.default,
+                DQ,
+            } or any(source in weight_preparations for source in node.all_input_nodes):
+                weight_preparations.add(node)
+    graph, emitted = torch.fx.Graph(), {}
+
+    def emit(node):
+        if node not in emitted:
+            for source in node.all_input_nodes:
+                emit(source)
+            emitted[node] = graph.node_copy(node, emitted.__getitem__)
+
+    for node in result.graph.nodes:
+        if node not in weight_preparations:
+            emit(node)
+    result.graph = graph
     result.graph.eliminate_dead_code()
     result.graph.lint()
-    result.recompile()
-    return result
+    # Rebuilding also drops unused FP32 attributes retained after PT2E folding.
+    return torch.fx.GraphModule(result, result.graph)
 
 
 def apply_activation_ranges(module, groups):
@@ -409,11 +440,15 @@ def quantize_qwen35(
         capture = ProjectionCapture(prepared)
         calibrate_prefill(prepared, inputs, samples, device, capture, sliding_window)
         quantized = convert_pt2e(prepared)
+        quantized.graph.eliminate_dead_code()
+        quantized = torch.fx.GraphModule(quantized, quantized.graph)
         program = torch.export.export(quantized, inputs, strict=False)
         quantized = program.module()
         remove_export_checks(quantized)
         gptq = optimize_out_projections(quantized, weights, capture, device)
         del prepared, program, capture, weights
+        gc.collect()
+        torch.cuda.empty_cache()
         decode, decode_inputs = specialize_decode(quantized, inputs, sliding_layers)
         groups = {}
         observed = observe_activations(quantized, groups)

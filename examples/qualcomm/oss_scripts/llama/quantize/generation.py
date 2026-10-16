@@ -4,7 +4,7 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""Group queries without repeating KV, and store calibrated matmul cache codes."""
+"""Group queries without repeating KV and preserve calibrated cache precision."""
 
 import copy
 import math
@@ -222,19 +222,30 @@ def trim_prefill_capacity(module, inputs, capacity, sliding_layers=()):
         cat = node.args[1].args[0].args[0].args[0].args[0]
         assert cat.target == torch.ops.aten.cat.default, cat
         cached, current = cat.args[0]
-        source = _decoded_source(cached)
+        transport = cached
+        source = _decoded_source(transport)
+        consumer_quant = None
+        while source.target == DQ:
+            consumer_quant = transport.args[0]
+            transport = source
+            source = _decoded_source(transport)
+        assert source.op == "placeholder", source
         if (placeholders.index(source) - cache_start) % layers in sliding_layers:
             continue
         axis = cat.args[1]
-        with graph.inserting_before(cat):
+        # Slice on the input grid so short buckets only materialize their history.
+        with graph.inserting_before(transport.next):
             prefix = _qdq(
                 graph,
                 graph.call_function(
-                    torch.ops.aten.slice.Tensor, (cached, axis, 0, keep)
+                    torch.ops.aten.slice.Tensor, (transport, axis, 0, keep)
                 ),
-                tuple(cached.args[1:]),
+                tuple(transport.args[1:]),
             )
-        cat.args = ([prefix, current], axis)
+        if consumer_quant is None:
+            cat.args = ([prefix, current], axis)
+        else:
+            consumer_quant.replace_input_with(transport, prefix)
     mode = FakeTensorMode(allow_non_fake_inputs=True)
     tensors = dict(module.named_buffers()) | dict(module.named_parameters())
     env, arguments = {}, iter(inputs)
@@ -433,7 +444,7 @@ def mask_chunk_prefill_padding(module):
 
 
 def optimize_grouped_attention(module):
-    """Rewrite calibrated Qwen3.5 Q/DQ attention for UINT16 cache transport.
+    """Rewrite calibrated Qwen3.5 Q/DQ attention for unsigned cache transport.
 
     Returns cache indices mapped to their new input/output encodings, plus
     a change log. The caller must publish these encodings as runner metadata
@@ -441,11 +452,12 @@ def optimize_grouped_attention(module):
     decode methods must use the same encodings. Existing populated caches
     require conversion before reuse.
 
-    Query heads become rows of each KV head. New cache entries are converted
-    once to the existing calibrated MatMul RHS grid, removing whole-history
-    conversions and repeated KV heads. Weight codes remain unchanged.
-    Run after calibration and cache-output alignment, before QNN lowering;
-    refresh tensor metadata afterwards. Unsupported patterns raise.
+    Query heads become rows of each KV head. Cache storage uses the calibrated
+    MatMul RHS grid, represented as unsigned codes of the same bit width. New
+    entries enter that grid before storage; historical entries retain their
+    bit width through concatenation and MatMul. Weight codes remain unchanged.
+    Run after calibration and cache-output alignment, before QNN lowering.
+    Refresh tensor metadata afterwards. Unsupported patterns raise.
     """
     graph = module.graph
     graph.set_codegen(torch.fx.graph.CodeGen())
@@ -463,9 +475,12 @@ def optimize_grouped_attention(module):
     for matmul in matmuls:
         left, right = matmul.args
         assert left.target == DQ and right.target == DQ
-        signed_quant = right.args[0]
-        assert signed_quant.target == Q and signed_quant.args[-1] == torch.int16
-        repeated = signed_quant.args[0]
+        rhs_quant = right.args[0]
+        assert rhs_quant.target == Q
+        assert rhs_quant.args[-1] in (torch.uint8, torch.int8, torch.int16)
+        repeated = rhs_quant.args[0]
+        if repeated.target != DQ:
+            repeated = right
         reshape = _decoded_source(repeated)
         assert reshape.target == torch.ops.aten.reshape.default
         expand = _decoded_source(reshape.args[0])
@@ -486,13 +501,18 @@ def optimize_grouped_attention(module):
         cache_index = input_index - cache_start
         assert 0 <= cache_index < cache_count
         assert cache_index not in cache_encodings
-        signed = tuple(signed_quant.args[1:])
-        assert signed[1] == 0
-        unsigned = (signed[0], 32768, 0, 65535, torch.int32)
+        rhs_encoding = tuple(rhs_quant.args[1:])
+        if rhs_encoding[-1] == torch.uint8:
+            unsigned = rhs_encoding
+        else:
+            assert rhs_encoding[1] == 0
+            if rhs_encoding[-1] == torch.int8:
+                unsigned = (rhs_encoding[0], 128, 0, 255, torch.uint8)
+            else:
+                unsigned = (rhs_encoding[0], 32768, 0, 65535, torch.int32)
         cache_encodings[cache_index] = unsigned
 
-        # The old graph converted the complete repeated history on every call.
-        # New tokens follow that calibrated conversion once, before storage.
+        # Convert new entries once; the stored history already uses this grid.
         with graph.inserting_before(cat):
             converted_new = _qdq(
                 graph, _qdq(graph, new_value, old_cat_encoding), unsigned
@@ -505,7 +525,7 @@ def optimize_grouped_attention(module):
                 graph, _qdq(graph, outputs[cache_index + 1], old_cat_encoding), unsigned
             )
         outputs[cache_index + 1] = stored
-        signed_quant.args = (base, *signed_quant.args[1:])
+        rhs_quant.args = (base, *rhs_quant.args[1:])
 
         batch, heads, tokens, inner = tuple(left.meta["val"].shape)
         kv_heads = base.meta["val"].shape[1]
@@ -540,8 +560,10 @@ def optimize_grouped_attention(module):
                 "old_heads": heads,
                 "kv_heads": kv_heads,
                 "query_groups": groups,
-                "calibrated_signed_encoding": list(signed[:4]),
+                "calibrated_rhs_encoding": list(rhs_encoding[:4]),
                 "cache_encoding": list(unsigned[:4]),
+                "cache_storage_bits": 8 if unsigned[-1] == torch.uint8 else 16,
+                "attention_rhs_bits": 16 if rhs_encoding[-1] == torch.int16 else 8,
                 "old_cat_encoding": list(old_cat_encoding[:4]),
             }
         )

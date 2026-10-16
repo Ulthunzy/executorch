@@ -281,14 +281,15 @@ KVManager::KVManager(Metadata metadata, std::unique_ptr<MethodMeta> method_meta)
         "Failed to read KV output metadata for layer %d",
         layer);
 
-    if (kv_cache_dtype_ == executorch::aten::ScalarType::Undefined) {
-      kv_cache_dtype_ = k_out->scalar_type();
-    }
     const Metadata::CacheSpec* spec = metadata_.cache_specs.empty()
         ? nullptr
         : &metadata_.cache_specs[layer];
     const bool full_overwrite =
         spec != nullptr && spec->update_mode == Metadata::kFullOverwrite;
+    if (!full_overwrite &&
+        kv_cache_dtype_ == executorch::aten::ScalarType::Undefined) {
+      kv_cache_dtype_ = k_out->scalar_type();
+    }
     k_cache_dtypes_[layer] = k_out->scalar_type();
     v_cache_dtypes_[layer] = v_out->scalar_type();
     ET_CHECK_MSG(
@@ -317,7 +318,7 @@ KVManager::KVManager(Metadata metadata, std::unique_ptr<MethodMeta> method_meta)
     k_head_dim_.push_back(k_head_dim);
     v_head_dim_.push_back(v_head_dim);
 
-    const size_t dtype_size = getDtypeSize(kv_cache_dtype_);
+    const size_t dtype_size = getDtypeSize(k_out->scalar_type());
     if (spec != nullptr) {
       k_cache_in_nbytes_[layer] = spec->k_input_bytes;
       k_cache_out_nbytes_[layer] = spec->k_output_bytes;
@@ -362,6 +363,10 @@ KVManager::KVManager(Metadata metadata, std::unique_ptr<MethodMeta> method_meta)
     }
   }
 
+  if (kv_cache_dtype_ == executorch::aten::ScalarType::Undefined &&
+      !k_cache_dtypes_.empty()) {
+    kv_cache_dtype_ = k_cache_dtypes_.front();
+  }
   ET_CHECK_MSG(
       kv_cache_dtype_ != executorch::aten::ScalarType::Undefined,
       "kv_cache_dtype was not detected from method outputs");

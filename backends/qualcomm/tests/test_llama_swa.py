@@ -4,14 +4,14 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-import os
 import json
-from pathlib import Path
+import os
 import shutil
 import subprocess
+import weakref
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
-import weakref
 
 import pytest
 import torch
@@ -276,12 +276,36 @@ def test_native_kv_manager(tmp_path):
                 return hidden, torch.zeros_like(k), torch.zeros_like(v)
             return hidden, torch.zeros(1, 1, 4, self.ar), torch.zeros(1, 1, self.ar, 4)
 
+    class MixedCacheFixture(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.inputs = (
+                torch.zeros(1, 1, 8),
+                torch.zeros(1, 1, 1, 8),
+                torch.zeros(1, 1, 1, 8),
+                torch.zeros(1, 1, dtype=torch.int32),
+                torch.zeros(1, 12, 4, dtype=torch.uint16),
+                torch.zeros(1, 1, 4, 7, dtype=torch.uint8),
+                torch.zeros(1, 1, 4, 4, dtype=torch.uint16),
+                torch.zeros(1, 1, 7, 4, dtype=torch.uint8),
+            )
+
+        def forward(self, hidden, mask, window_mask, pos, conv, k, state, v):
+            return (
+                hidden,
+                torch.zeros_like(conv),
+                torch.zeros(1, 1, 4, 1, dtype=torch.uint8),
+                torch.zeros_like(state),
+                torch.zeros(1, 1, 1, 4, dtype=torch.uint8),
+            )
+
     fixtures = {
         "prefill": CacheFixture(128, 128),
         "decode": CacheFixture(1, 255),
         "recurrent": CacheFixture(128, 128, recurrent=True),
         "circular_float": CacheFixture(16, 7),
         "circular_uint16": CacheFixture(16, 7, mask_dtype=torch.uint16),
+        "mixed": MixedCacheFixture(),
     }
     pte = to_edge(
         {

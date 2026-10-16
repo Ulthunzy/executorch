@@ -82,6 +82,8 @@ def define_common_targets(is_fbcode = False):
             ],
             deps = [
                 "//caffe2:torch",
+                "//executorch/backends/qualcomm/quantizer:quantizer",
+                "//executorch/examples/models/llama:source_transformation",
                 "//executorch/examples/models/llama:transformer_modules",
                 "fbsource//third-party/pypi/transformers:transformers",
             ],
@@ -277,7 +279,7 @@ def define_common_targets(is_fbcode = False):
 
         runtime.python_library(
             name = "llama_lib",
-            srcs = ["__init__.py", "llama.py"],
+            srcs = ["__init__.py", "export_memory.py", "llama.py"],
             deps = [
                 ":dataset",
                 ":decoder_constants",

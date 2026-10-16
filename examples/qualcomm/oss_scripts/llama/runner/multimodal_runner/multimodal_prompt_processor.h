@@ -20,11 +20,6 @@ namespace example {
  */
 class MultimodalPromptProcessor : public example::PromptProcessor {
  public:
-  struct PrefillBucket {
-    std::string method_name;
-    int32_t max_past;
-  };
-
   struct Metadata {
     int32_t context_len;
     int64_t num_heads;
@@ -59,8 +54,7 @@ class MultimodalPromptProcessor : public example::PromptProcessor {
       KVManager* kv_manager,
       const std::string& method_name,
       Metadata metadata,
-      std::unique_ptr<executorch::extension::MethodMeta> method_meta,
-      std::vector<PrefillBucket> prefill_buckets = {});
+      std::unique_ptr<executorch::extension::MethodMeta> method_meta);
 
   int64_t get_num_heads() const {
     return metadata_.num_heads;
@@ -146,7 +140,6 @@ class MultimodalPromptProcessor : public example::PromptProcessor {
 
   // metadata specific to multimodal
   Metadata metadata_;
-  std::vector<PrefillBucket> prefill_buckets_;
 
   // Additional input for multimodal
   TensorStruct<float> input_embedding_;

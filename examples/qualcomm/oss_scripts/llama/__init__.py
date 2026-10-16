@@ -120,6 +120,7 @@ from executorch.examples.qualcomm.oss_scripts.llama.static_llm_quant_recipe impo
     Qwen3_4BQuantRecipe,
     Qwen3_5_0_8BQuantRecipe,
     Qwen3_5_2BQuantRecipe,
+    Qwen3_5QuantRecipe,
     Smollm2QATQuantRecipe,
     Smollm2QuantRecipe,
     Smollm3QuantRecipe,
@@ -146,6 +147,7 @@ LLM_VARIANT_ARCHS: Dict[str, Type[LlamaModel]] = {
     "lincal3_vl-2b_instruct": MultiScopeAwareLlamaModelWithoutEmbedding,
     "qwen3_5-0_8b": Qwen35ModelWithoutEmbedding,
     "qwen3_5-2b": Qwen35ModelWithoutEmbedding,
+    "qwen3_5-4b": Qwen35ModelWithoutEmbedding,
     "lincal3_5-0_8b": Qwen35ModelWithoutEmbedding,
     "lincal3_5-2b": Qwen35ModelWithoutEmbedding,
     "gemma2-2b": MultiScopeAwareLlamaModel,
@@ -630,15 +632,26 @@ class _Qwen3_5_2BBase(LLMModelConfig):
     r1 = False
     r2 = False
     r3 = False
-    quant_recipe = Qwen3_5_2BQuantRecipe
+    quant_recipe = Qwen3_5QuantRecipe
 
 
 @register_llm_model("qwen3_5-2b", modality_encoders=Qwen35VLEncoder)
 @dataclass(init=False, frozen=True)
 class Qwen3_5_2B(_Qwen3_5_2BBase):
+    quant_recipe = Qwen3_5_2BQuantRecipe
     repo_id: str = "Qwen/Qwen3.5-2B"
     params_path: str = os.path.join(
         BASE_DIR, "../../../models/qwen3_5/config/2b_config.json"
+    )
+    convert_weights = convert_qwen3_5_weights
+
+
+@register_llm_model("qwen3_5-4b", modality_encoders=Qwen35VLEncoder)
+@dataclass(init=False, frozen=True)
+class Qwen3_5_4B(_Qwen3_5_2BBase):
+    repo_id: str = "Qwen/Qwen3.5-4B"
+    params_path: str = os.path.join(
+        BASE_DIR, "../../../models/qwen3_5/config/4b_config.json"
     )
     convert_weights = convert_qwen3_5_weights
 

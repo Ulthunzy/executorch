@@ -867,7 +867,7 @@ class Qwen3_4BQuantRecipe(StaticLLMQuantRecipe):
         self.recipe.custom_quant_annotations.append(annotate_kv_8bit)
 
 
-class Qwen3_5_0_8BQuantRecipe(StaticLLMQuantRecipe):
+class Qwen3_5QuantRecipe(StaticLLMQuantRecipe):
     default_quant_dtype = QuantDtype.use_16a4w
 
     def __init__(self, verbose: bool = False):
@@ -899,6 +899,21 @@ class Qwen3_5_0_8BQuantRecipe(StaticLLMQuantRecipe):
                 note="Keep the merged K/z projection and depthwise convolution in W8.",
             )
         )
+
+
+class Qwen3_5_0_8BQuantRecipe(Qwen3_5QuantRecipe):
+    def __init__(self, verbose: bool = False):
+        super().__init__(verbose)
+        self.recipe.add_node_target(
+            {torch.ops.aten.embedding.default},
+            QuantDtype.use_16a4w_block,
+            False,
+            act_observer=MinMaxObserver,
+            granularity=QuantGranularity.PER_BLOCK,
+            extra_kwargs={"block_size": (1, 32)},
+            note="Pack input embedding weights as INT4 with group32.",
+        )
+        self.recipe.custom_quant_annotations.append(annotate_kv_8bit)
 
 
 class Qwen3_5_2BQuantRecipe(Qwen3_5_0_8BQuantRecipe):

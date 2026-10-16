@@ -300,7 +300,7 @@ def test_qnn_masked_softmax_deployment(ar, quantized_models, tmp_path, monkeypat
     assert len(binaries) == 1
     # Profiling consumes the delegate's IO order/dtypes, not the outer PTE inputs.
     profile_inputs = _build_qnn_profile_inputs(
-        SimpleNamespace(model=config.soc_model), binaries[0], [inputs]
+        SimpleNamespace(soc_model=config.soc_model), binaries[0], [inputs]
     )
     traces = generate_optrace(
         str(tmp_path),

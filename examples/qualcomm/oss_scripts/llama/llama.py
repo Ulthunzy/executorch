@@ -14,6 +14,7 @@ import math
 import os
 import shutil
 import sys
+from contextlib import nullcontext
 from multiprocessing.connection import Client
 from typing import Dict, List
 
@@ -21,6 +22,7 @@ import torch
 from executorch.backends.qualcomm.debugger.utils import QnnTool
 from executorch.backends.qualcomm.export_utils import (
     get_backend_type,
+    QnnConfig,
     setup_common_args_and_variables,
     SimpleADB,
 )
@@ -74,6 +76,9 @@ from executorch.examples.qualcomm.oss_scripts.llama.evaluator.device_evaluator i
     DefaultEval,
     SqnrEval,
     TaskEval,
+)
+from executorch.examples.qualcomm.oss_scripts.llama.export_memory import (
+    compact_fx_provenance,
 )
 
 from executorch.examples.qualcomm.oss_scripts.llama.gdn import (
@@ -153,7 +158,7 @@ def _build_qnn_profile_inputs(args, dump_file: str, fallback_inputs):
 
     backend_options = generate_htp_compiler_spec(use_fp16=False)
     compiler_specs = generate_qnn_executorch_compiler_spec(
-        soc_model=get_soc_to_chipset_map()[args.model],
+        soc_model=get_soc_to_chipset_map()[args.soc_model],
         backend_options=backend_options,
         is_from_context_binary=True,
     )
@@ -210,9 +215,6 @@ def _build_optrace_targets(
         decoder_inputs["prefill_forward"] = [
             multi_modal_mgr.text_decoder.prefill.export_input
         ]
-    for name, bucket in multi_modal_mgr.text_decoder.prefill_buckets:
-        if bucket.decoder is not None:
-            decoder_inputs[name] = [bucket.export_input]
     if decoder_inputs:
         pte_targets[f"{args.artifact}/{pte_filenames[TEXT_DECODER]}.pte"] = (
             decoder_inputs
@@ -283,20 +285,14 @@ def _generate_optrace_reports(
                 args, copied_dump, example_inputs
             )
             adb = SimpleADB(
-                qnn_sdk=os.getenv("QNN_SDK_ROOT"),
-                build_path=f"{args.build_folder}",
+                qnn_config=QnnConfig.load_config(args),
                 pte_path=pte_path,
                 workspace=workspace,
-                device_id=args.device,
-                host_id=args.host,
-                soc_model=args.model,
-                shared_buffer=args.shared_buffer,
-                target=args.target,
             )
             qnn_tool = QnnTool(
                 method_trace_dir,
                 profiling_inputs,
-                get_soc_to_chipset_map()[args.model],
+                get_soc_to_chipset_map()[args.soc_model],
                 adb,
                 build_folder=args.build_folder,
                 workspace=workspace,
@@ -536,8 +532,16 @@ def inference(
     image_token_id = multi_modal_mgr.text_decoder.calibration_prefill.meta.get(
         "image_token_id", None
     )
+    data_config = DataConfig.from_args(
+        args,
+        token_dtype=(
+            tok_embedding.get_example_input()[0].dtype
+            if tok_embedding is not None
+            else source_model.get_example_inputs()[0].dtype
+        ),
+    )
     dataset_builder = DatasetBuilder(
-        DataConfig.from_args(args),
+        data_config,
         decoder_model_config,
         tokenizer_wrapper,
         attn_mask=source_model.get_example_inputs()[1],
@@ -586,6 +590,7 @@ def inference(
             tok_embedding=tok_embedding,
             audio_token_id=audio_token_id,
             image_token_id=image_token_id,
+            token_dtype=data_config.token_dtype,
         )
         sqnr, golden_logits, _ = sqnr_evaluator.run(
             message, audio_paths=args.audio_path, image_paths=args.image_path
@@ -619,6 +624,7 @@ def inference(
                 tok_embedding=tok_embedding,
                 audio_token_id=audio_token_id,
                 image_token_id=image_token_id,
+                token_dtype=data_config.token_dtype,
             )
             qdq_sqnr, cpu_qdq_logits, _ = qdq_sqnr_evaluator.run(
                 message, audio_paths=args.audio_path, image_paths=args.image_path
@@ -1385,13 +1391,18 @@ def export_llama(args) -> None:
     decode_qdq_path = os.path.join(args.artifact, DECODE_QDQ_FILENAME)
     decode_qdq_before = _file_state(decode_qdq_path)
     text_decoder_pte_before = _file_state(text_decoder_pte_path)
-    compile(
-        args,
-        decoder_model_config,
-        pte_filenames,
-        tokenizer_wrapper,
-        is_multimodal,
-    )
+    with (
+        compact_fx_provenance()
+        if is_qwen35_model(args.decoder_model)
+        else nullcontext()
+    ):
+        compile(
+            args,
+            decoder_model_config,
+            pte_filenames,
+            tokenizer_wrapper,
+            is_multimodal,
+        )
     if args.use_attention_sink:
         compile_attention_sink_evictor(
             args,

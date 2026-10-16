@@ -22,8 +22,7 @@ MultimodalPromptProcessor::MultimodalPromptProcessor(
     KVManager* kv_manager,
     const std::string& method_name,
     Metadata metadata,
-    std::unique_ptr<MethodMeta> method_meta,
-    std::vector<PrefillBucket> prefill_buckets)
+    std::unique_ptr<MethodMeta> method_meta)
     : PromptProcessor(
           decoder_runner,
           kv_manager,
@@ -37,8 +36,7 @@ MultimodalPromptProcessor::MultimodalPromptProcessor(
            metadata.sliding_window,
            metadata.cache_mode},
           std::move(method_meta)),
-      metadata_(metadata),
-      prefill_buckets_(std::move(prefill_buckets)) {
+      metadata_(metadata) {
   // Set input_toks_.size to 0 since we use embeddings instead
   input_toks_.size = 0;
   input_pos_.size =
@@ -331,7 +329,7 @@ Result<uint64_t> MultimodalPromptProcessor::prefill(
           executorch::runtime::Error::Ok,
       "Failed to set output tensor for module %s",
       method_name_.c_str());
-  const std::string* previous_method = nullptr;
+  ET_LOG(Info, "Prefill pos=%ld method=%s", pos, method_name_.c_str());
   using Clock = std::chrono::steady_clock;
   std::chrono::duration<double, std::milli> prepare_time{0};
   std::chrono::duration<double, std::milli> execute_time{0};
@@ -343,31 +341,15 @@ Result<uint64_t> MultimodalPromptProcessor::prefill(
         prompt_embedding, num_prompt_tokens, prompt_pos, pos, position_ids);
 
     // Run inference
-    const std::string* selected_method = &method_name_;
-    for (const auto& bucket : prefill_buckets_) {
-      if (pos <= bucket.max_past) {
-        selected_method = &bucket.method_name;
-        break;
-      }
-    }
-    if (*selected_method != method_name_) {
-      ET_CHECK(
-          decoder_runner_->set_outputs(*selected_method, output_tensors_) ==
-          executorch::runtime::Error::Ok);
-    }
-    if (selected_method != previous_method) {
-      ET_LOG(Info, "Prefill pos=%ld method=%s", pos, selected_method->c_str());
-      previous_method = selected_method;
-    }
     const auto execute_start = Clock::now();
     prepare_time += execute_start - prepare_start;
-    const auto step_result = decoder_runner_->step(*selected_method, inputs_);
+    const auto step_result = decoder_runner_->step(method_name_, inputs_);
     const auto cache_start = Clock::now();
     execute_time += cache_start - execute_start;
     ET_CHECK_MSG(
         step_result.ok(),
         "Prefill execution failed for method %s: 0x%x",
-        selected_method->c_str(),
+        method_name_.c_str(),
         static_cast<unsigned>(step_result.error()));
     if (dump_logits) {
       prompt_all_logits_.insert(

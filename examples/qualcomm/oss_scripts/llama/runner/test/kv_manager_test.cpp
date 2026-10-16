@@ -165,6 +165,54 @@ int main(int argc, char** argv) {
       program->method_meta("circular_float").get(), 0.f);
   check_masks_and_cache<uint16_t>(
       program->method_meta("circular_uint16").get(), 65535);
+  {
+    const auto meta = program->method_meta("mixed").get();
+    std::vector<KVManager::Metadata::CacheSpec> specs;
+    for (int layer = 0; layer < 2; ++layer) {
+      specs.push_back(
+          {meta.input_tensor_meta(4 + layer)->nbytes(),
+           meta.output_tensor_meta(1 + layer)->nbytes(),
+           meta.input_tensor_meta(6 + layer)->nbytes(),
+           meta.output_tensor_meta(3 + layer)->nbytes(),
+           layer == 0 ? KVManager::Metadata::kFullOverwrite
+                      : KVManager::Metadata::kAppend,
+           layer == 0 ? 30000 : 128,
+           layer == 0 ? 31000 : 129});
+    }
+    ClientMem memory;
+    KVManager manager(
+        {8, 1, 7, 1, 2, specs}, std::make_unique<MethodMeta>(meta));
+    manager.init_cache(&memory, 1);
+    const auto& keys = manager.get_k_cache_();
+    const auto& values = manager.get_v_cache_();
+    check(
+        reinterpret_cast<const uint16_t*>(keys[0].buffer)[0] == 30000,
+        "GDN state must keep UINT16 zero point");
+    check(
+        reinterpret_cast<const uint8_t*>(keys[1].buffer)[0] == 128,
+        "FA cache must use UINT8 zero point");
+    for (int step = 0; step < 4; ++step) {
+      for (int dim = 0; dim < 4; ++dim) {
+        reinterpret_cast<uint8_t*>(keys[1].output_buffer)[dim] =
+            step + dim * 10;
+        reinterpret_cast<uint8_t*>(values[1].output_buffer)[dim] =
+            step + dim * 20;
+      }
+      manager.update_cache(1, step, 1, {});
+    }
+    for (int step = 0; step < 4; ++step) {
+      for (int dim = 0; dim < 4; ++dim) {
+        check(
+            reinterpret_cast<const uint8_t*>(keys[1].buffer)[dim * 7 + step] ==
+                step + dim * 10,
+            "mixed cache K append used the wrong byte stride");
+        check(
+            reinterpret_cast<const uint8_t*>(values[1].buffer)[step * 4 + dim] ==
+                step + dim * 20,
+            "mixed cache V append used the wrong byte stride");
+      }
+    }
+  }
   std::cout << "KV modes, ring cache, AR transitions and SWA masks passed"
             << std::endl;
 }

@@ -483,6 +483,7 @@ class SqnrEval(EvalBase):
         tok_embedding: Optional[Union[torch.nn.Module, torch.fx.GraphModule]] = None,
         audio_token_id: Optional[int] = None,
         image_token_id: Optional[int] = None,
+        token_dtype: Optional[torch.dtype] = None,
     ):
         super().__init__(
             args, pte_paths, runtime_tokenizer_path, is_multimodal, dataset_builder
@@ -509,7 +510,11 @@ class SqnrEval(EvalBase):
                 audio_token_id=audio_token_id,
                 image_token_id=image_token_id,
                 max_context_len=self.max_seq_length,
-                use_i64_token=args.embedding_quantize is not None,
+                use_i64_token=(
+                    token_dtype == torch.int64
+                    if token_dtype is not None
+                    else args.embedding_quantize is not None
+                ),
             ),
             encoder=EncoderInference() if encoder is not None else None,
         )

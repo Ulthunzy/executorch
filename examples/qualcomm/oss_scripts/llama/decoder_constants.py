@@ -66,6 +66,7 @@ DECODER_MODEL_VERSION = {
     "qwen3-4b": "qwen3",
     "qwen3_5-0_8b": "qwen3_5",
     "qwen3_5-2b": "qwen3_5",
+    "qwen3_5-4b": "qwen3_5",
     "lincal3_5-0_8b": "lincal3_5",
     "lincal3_5-2b": "lincal3_5",
     "lincal-0_6b": "lincal",

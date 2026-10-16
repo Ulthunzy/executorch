@@ -5,6 +5,7 @@
 # LICENSE file in the root directory of this source tree.
 import argparse
 import copy
+import ctypes
 import gc
 import inspect
 import json
@@ -33,6 +34,8 @@ from executorch.backends.qualcomm.quantizer.quantizer import QuantDtype
 from executorch.backends.qualcomm.utils.constants import (
     QCOM_PASS_ACTIVATE_KEY,
     QCOM_PASS_ARGS_KWARGS_DEFAULTS_KEY,
+    QCOM_QUANT_ATTRS,
+    QCOM_REQUANTIZE,
 )
 from executorch.backends.qualcomm.utils.utils import (
     convert_linear_to_conv2d,
@@ -46,6 +49,7 @@ from executorch.examples.models.llama.hf_download import (
 )
 from executorch.examples.models.llama.source_transformation.quantize import (
     get_quant_embedding_transform,
+    QuantizedGroupEmbedding,
 )
 from executorch.examples.qualcomm.custom_op.deltanet import deltanet_quant_annotations
 from executorch.examples.qualcomm.oss_scripts.llama import (
@@ -120,6 +124,7 @@ from executorch.examples.qualcomm.oss_scripts.llama.wrappers.base_component impo
     Processor,
     Request,
 )
+from executorch.exir import EdgeCompileConfig, to_edge
 from executorch.exir.backend.compile_spec_schema import CompileSpec
 from executorch.exir.capture._config import ExecutorchBackendConfig
 from executorch.exir.delegate import executorch_call_delegate
@@ -138,9 +143,16 @@ from transformers import AutoConfig, AutoModel, AutoModelForSpeechSeq2Seq
 
 
 def _release_memory():
+    torch._dynamo.reset()
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
+    if os.name == "posix":
+        try:
+            # Large temporary tensor allocations can stay in glibc's free arenas.
+            ctypes.CDLL(None).malloc_trim(0)
+        except AttributeError:
+            pass
 
 
 _HF_VLM_MODEL_CACHE: Dict[str, Any] = {}
@@ -576,6 +588,11 @@ class TextDecoder(Component):
         self.quant_recipe: StaticLLMQuantRecipe = (
             recipe_cls(mode == Mode.CALIBRATE) if recipe_cls else None
         )
+        self.embedding_transform = (
+            get_quant_embedding_transform(control_args.embedding_quantize)
+            if control_args.embedding_quantize
+            else None
+        )
 
         # For multimodal embedding
         self.apply_embedding = apply_embedding
@@ -653,7 +670,7 @@ class TextDecoder(Component):
                 image_token_id=self.meta.get("image_token_id", None),
                 max_context_len=self.meta["get_max_context_len"],
                 max_batch_size=self.meta["get_max_batch_size"],
-                use_i64_token=self.control_args.embedding_quantize is not None,
+                use_i64_token=self.embedding_transform is not None,
             )
             if self.decoder is not None
             else None
@@ -794,7 +811,7 @@ class TextDecoder(Component):
             decoder = decoder.to(dtype_override.to_torch_dtype())
 
         # check embedding fallback
-        if self.control_args.embedding_quantize:
+        if self.embedding_transform is not None:
             self.passes_job[I64toI32][QCOM_PASS_ARGS_KWARGS_DEFAULTS_KEY][
                 "skip_node"
             ] = {"tokens"}
@@ -811,7 +828,7 @@ class TextDecoder(Component):
     def _get_model_instance(self) -> LlamaModel:
         if self.mode == Mode.PREFILL and self.control_args.model_mode == "kv":
             return None
-        use_i64_token = self.control_args.embedding_quantize is not None
+        use_i64_token = self.embedding_transform is not None
 
         # get embedding model
         tok_embedding = None
@@ -845,6 +862,12 @@ class TextDecoder(Component):
                 self.model_args.dim,
                 use_i64_token,
             )
+            if self.embedding_transform is None and self.quant_recipe is not None:
+                self.embedding_transform = tok_embedding.get_quantization_transform(
+                    self.quant_recipe.recipe
+                )
+            use_i64_token = self.embedding_transform is not None
+            tok_embedding.use_i64_token = use_i64_token
         # get decoder model
         if self.control_args.decoder_model in {"gemma-2b", "gemma3-1b"}:
             # For gemma, we have preprocessed the weight of rmsnorm
@@ -1317,6 +1340,20 @@ class TextDecoder(Component):
 
         freq_op = {exir_ops.edge.aten.select.int, exir_ops.edge.aten.select_copy.int}
         quant_io_type = None
+        cache_type = fixed_point_type["kv_type"]
+        cache_quant_attrs = node.meta.get(QCOM_QUANT_ATTRS, {})
+        if is_graph_output(node):
+            # Output requantization is materialized after IO tagging.
+            for user in node.users:
+                if user.op == "output":
+                    cache_quant_attrs = node.meta.get(QCOM_REQUANTIZE, {}).get(
+                        user.name, cache_quant_attrs
+                    )
+        if (
+            _is_qwen35_decoder_model(self.control_args.decoder_model)
+            and cache_quant_attrs.get("dtype") == torch.uint8
+        ):
+            cache_type = torch.uint8
 
         if node.op == "placeholder":
             users = [
@@ -1329,14 +1366,14 @@ class TextDecoder(Component):
                 _is_qwen35_decoder_model(self.control_args.decoder_model)
                 and node_shape in self.cache_io_shape
             ):
-                quant_io_type = fixed_point_type["kv_type"]
+                quant_io_type = cache_type
             elif (
                 len(users) > 0
                 and "args_" in node.name
                 and isinstance(users[0].meta.get("val"), torch.Tensor)
                 and users[0].meta["val"].size()[-2:] in self.kv_cache_shape
             ):
-                quant_io_type = fixed_point_type["kv_type"]
+                quant_io_type = cache_type
             elif node_shape in self.io_shape:
                 quant_io_type = fixed_point_type["io_type"]
             elif _is_attention_mask_placeholder(node, atten_mask_shape):
@@ -1348,9 +1385,9 @@ class TextDecoder(Component):
                 _is_qwen35_decoder_model(self.control_args.decoder_model)
                 and node_shape in self.cache_io_shape
             ):
-                quant_io_type = fixed_point_type["kv_type"]
+                quant_io_type = cache_type
             elif node.meta["val"].size()[-2:] in self.kv_cache_shape:
-                quant_io_type = fixed_point_type["kv_type"]
+                quant_io_type = cache_type
             elif node_shape in self.io_shape:
                 quant_io_type = fixed_point_type["io_type"]
 
@@ -1515,14 +1552,10 @@ class TextDecoder(Component):
                 )
 
         # embedding fallback and quantization
-        if self.control_args.embedding_quantize:
-            self.decoder = get_quant_embedding_transform(
-                embedding_quantize=self.control_args.embedding_quantize
-            )(self.decoder)
+        if self.embedding_transform is not None:
+            self.decoder = self.embedding_transform(self.decoder)
             if self.apply_embedding:
-                self.tok_embedding = get_quant_embedding_transform(
-                    embedding_quantize=self.control_args.embedding_quantize
-                )(self.tok_embedding)
+                self.tok_embedding = self.embedding_transform(self.tok_embedding)
 
         data = request.method_data[TEXT_DECODER]
 
@@ -1590,7 +1623,7 @@ class TextDecoder(Component):
                     tokenizer=data.tokenizer,
                     max_seq_length=self.meta["get_max_context_len"],
                     tasks=self.control_args.eval_tasks,
-                    use_i64_token=self.control_args.embedding_quantize is not None,
+                    use_i64_token=self.embedding_transform is not None,
                     num_fewshot=self.control_args.eval_num_fewshot,
                     limit=self.control_args.eval_limit,
                     max_batch_size=self.meta["get_max_batch_size"],
@@ -1716,7 +1749,7 @@ class TextDecoder(Component):
                     tokenizer=data.tokenizer,
                     max_seq_length=self.meta["get_max_context_len"],
                     tasks=self.control_args.eval_tasks,
-                    use_i64_token=self.control_args.embedding_quantize is not None,
+                    use_i64_token=self.embedding_transform is not None,
                     num_fewshot=self.control_args.eval_num_fewshot,
                     limit=self.control_args.eval_limit,
                     max_batch_size=self.meta["get_max_batch_size"],
@@ -1776,7 +1809,6 @@ class HybridTextDecoder(Component):
             apply_embedding=apply_embedding,
         )
 
-        self.prefill_buckets = []
         self.control_args = control_args
         self.config = config
         self.set_next(self.decode).set_next(self.prefill)
@@ -2167,57 +2199,79 @@ class HybridTextDecoder(Component):
 
         self._compile_models(request)
 
-    def _compile_models(self, request, extra_models=()):
+    def _compile_models(self, request):
         # prepare lowering tok_embedding if applicable
         if self.apply_embedding:
             tok_embedding_data = request.method_data[TOK_EMBEDDING]
-            models = [
+            embedding_models = [
                 d for d in [self.decode, self.prefill] if d.tok_embedding is not None
             ]
             tok_embedding_example_inputs = [
-                m.tok_embedding_export_input for m in models if m is not None
+                m.tok_embedding_export_input for m in embedding_models
             ]  # tokens
-            tok_embedding_graph_names = TOK_EMBEDDING_GRAPH_NAMES[: len(models)]
+            tok_embedding_graph_names = TOK_EMBEDDING_GRAPH_NAMES[
+                : len(embedding_models)
+            ]
 
         # prepare lowering decoder
         data = request.method_data[TEXT_DECODER]
         models = [d for d in [self.decode, self.prefill] if d.decoder is not None]
-        example_inputs = [m.export_input for m in models if m is not None]
-        graph_names = [
-            *DECODER_GRAPH_NAMES[: len(models)],
-            *[name for name, _ in extra_models],
-        ]
-        models.extend(model for _, model in extra_models)
+        graph_names = DECODER_GRAPH_NAMES[: len(models)]
         example_inputs = [model.export_input for model in models]
 
         # start lowering
         if self.apply_embedding:
-            tok_embedding_edge_prog_mgr = to_edge_transform_and_lower_to_qnn(
-                module=dict(
-                    zip(
-                        tok_embedding_graph_names,
-                        [model.tok_embedding for model in models],
-                    )
-                ),
-                inputs=dict(
-                    zip(tok_embedding_graph_names, tok_embedding_example_inputs)
-                ),
-                compiler_specs=dict(
-                    zip(tok_embedding_graph_names, tok_embedding_data.compile_spec)
-                ),
-                dep_table=dict(
-                    zip(
-                        tok_embedding_graph_names,
-                        [model.tok_embedding_dep_table for model in models],
-                    )
-                ),
-                passes_job=dict(
-                    zip(
-                        tok_embedding_graph_names,
-                        [model.tok_embedding_passes_job for model in models],
-                    )
-                ),
-            )
+            if (
+                isinstance(self, Qwen35TextDecoder)
+                and self.decode.embedding_transform is not None
+            ):
+                # Preserve packed weights; QNN embedding would materialize a full table.
+                tok_embedding_edge_prog_mgr = to_edge(
+                    {
+                        name: torch.export.export(
+                            model.tok_embedding,
+                            model.tok_embedding_export_input,
+                            strict=True,
+                        )
+                        for name, model in zip(
+                            tok_embedding_graph_names, embedding_models
+                        )
+                    },
+                    compile_config=EdgeCompileConfig(_check_ir_validity=False),
+                )
+            else:
+                tok_embedding_edge_prog_mgr = to_edge_transform_and_lower_to_qnn(
+                    module=dict(
+                        zip(
+                            tok_embedding_graph_names,
+                            [model.tok_embedding for model in embedding_models],
+                        )
+                    ),
+                    inputs=dict(
+                        zip(tok_embedding_graph_names, tok_embedding_example_inputs)
+                    ),
+                    compiler_specs=dict(
+                        zip(tok_embedding_graph_names, tok_embedding_data.compile_spec)
+                    ),
+                    dep_table=dict(
+                        zip(
+                            tok_embedding_graph_names,
+                            [
+                                model.tok_embedding_dep_table
+                                for model in embedding_models
+                            ],
+                        )
+                    ),
+                    passes_job=dict(
+                        zip(
+                            tok_embedding_graph_names,
+                            [
+                                model.tok_embedding_passes_job
+                                for model in embedding_models
+                            ],
+                        )
+                    ),
+                )
             if self.control_args.verbose:
                 for ep in tok_embedding_edge_prog_mgr._edge_programs.values():
                     print_delegation_info(ep.graph_module)
@@ -2251,12 +2305,7 @@ class HybridTextDecoder(Component):
         edge_prog_mgr = to_edge_transform_and_lower_to_qnn(
             module=dict(zip(graph_names, [model.decoder for model in models])),
             inputs=dict(zip(graph_names, example_inputs)),
-            compiler_specs=dict(
-                zip(
-                    graph_names,
-                    data.compile_spec + [data.compile_spec[-1]] * len(extra_models),
-                )
-            ),
+            compiler_specs=dict(zip(graph_names, data.compile_spec)),
             constant_methods={**self.decode.meta},
             dep_table=dict(zip(graph_names, [model.dep_table for model in models])),
             passes_job=dict(zip(graph_names, [model.passes_job for model in models])),
@@ -2318,7 +2367,6 @@ class Qwen35TextDecoder(HybridTextDecoder):
         )
         self.decode = None
         self.prefill = None
-        self.prefill_buckets = []
 
     def _clone_decoder(self, module, inputs, mode):
         from executorch.examples.qualcomm.oss_scripts.llama.quantize.generation import (
@@ -2372,6 +2420,10 @@ class Qwen35TextDecoder(HybridTextDecoder):
 
         base = self.calibration_prefill
         data = request.method_data[TEXT_DECODER]
+        if base.embedding_transform is not None:
+            base.tok_embedding = base.embedding_transform(base.tok_embedding)
+            _release_memory()
+            logging.info("Qwen3.5 quantized CPU embedding used for calibration")
         sliding_layers = tuple(
             index
             for index, kind in enumerate(base.model_args.layer_types)
@@ -2413,9 +2465,13 @@ class Qwen35TextDecoder(HybridTextDecoder):
         del module, samples
         self.decode = self._clone_decoder(decode, decode_inputs, Mode.DECODE)
         self.prefill = self._clone_decoder(prefill, inputs, Mode.PREFILL)
+        attention_conversions = {}
         for model in (self.decode, self.prefill):
             model._align_kv_cache_io_qparams()
-            optimize_grouped_attention(model.decoder)
+            _, attention_conversions[model.mode.name] = optimize_grouped_attention(
+                model.decoder
+            )
+            model._align_kv_cache_io_qparams()
             model.decoder = torch.export.export(
                 model.decoder, model.export_input, strict=False
             ).module()
@@ -2450,15 +2506,31 @@ class Qwen35TextDecoder(HybridTextDecoder):
 
         del prefill, decode
         self._prepare_generation_graphs(base, inputs)
+        embedding_module = base.tok_embedding.input_embedding_module
         report.update(
             calibration_ar=128,
             prefill_ar=128 if self.prefill.decoder is not None else None,
             chunk_size=64 if self.prefill.decoder is not None else None,
             inverse_leaf=8 if self.prefill.decoder is not None else None,
-            cache_dtype="uint16",
+            cache_dtype=(
+                "attention:uint8; gdn_recurrent/conv:uint16"
+                if base.quant_recipe.get_kv_io_bit_width() == 8
+                else "uint16"
+            ),
+            attention_cache_conversions=attention_conversions,
             language_precision="K/z W8; other Linear W4 group32; out_proj GPTQ",
-            prefill_buckets=[name for name, _ in self.prefill_buckets],
             mha_to_sha=False,
+            embedding_quantize=(
+                {
+                    "bitwidth": base.tok_embedding.input_embedding_module.bitwidth,
+                    "group_size": base.tok_embedding.input_embedding_module.group_size,
+                }
+                if isinstance(embedding_module, QuantizedGroupEmbedding)
+                else self.control_args.embedding_quantize
+            ),
+            embedding_backend=(
+                "cpu" if base.embedding_transform is not None else "qnn"
+            ),
             calibration_device=self.control_args.calibration_device,
             metadata=self.decode.meta,
         )
@@ -2492,7 +2564,6 @@ class Qwen35TextDecoder(HybridTextDecoder):
             mask_chunk_prefill_padding(prefill)
             prefill = torch.export.export(prefill, inputs, strict=False).module()
             remove_export_checks(prefill)
-            # Buckets share external cache shapes, weights and calibrated encodings.
             sliding_layers = tuple(
                 index
                 for index, kind in enumerate(base.model_args.layer_types)
@@ -2506,20 +2577,6 @@ class Qwen35TextDecoder(HybridTextDecoder):
                 if has_full_attention
                 else inputs[1].shape[-1]
             )
-            if has_full_attention and capacity > 256:
-                short = torch.fx.GraphModule(prefill, copy.deepcopy(prefill.graph))
-                trim_prefill_capacity(short, inputs, 256, sliding_layers)
-                replace_prefill_cores(short)
-                short = torch.export.export(short, inputs, strict=False).module()
-                bucket = self._clone_decoder(short, inputs, Mode.PREFILL)
-                bucket.passes_job[TagQuantIO][QCOM_PASS_ACTIVATE_KEY] = True
-                bucket.passes_job[TagQuantIO][QCOM_PASS_ARGS_KWARGS_DEFAULTS_KEY][
-                    "get_quant_io_dtype_fn"
-                ] = partial(
-                    bucket._tag_ios,
-                    fixed_point_type={"kv_type": torch.uint16, "io_type": torch.uint16},
-                )
-                self.prefill_buckets.append(("prefill_forward_256", bucket))
             if has_full_attention:
                 trim_prefill_capacity(prefill, inputs, capacity, sliding_layers)
             replace_prefill_cores(prefill)
@@ -2539,7 +2596,7 @@ class Qwen35TextDecoder(HybridTextDecoder):
 
     @log_info
     def compile(self, request):
-        self._compile_models(request, self.prefill_buckets)
+        self._compile_models(request)
 
 
 class Modality(Component):
@@ -2850,7 +2907,15 @@ class MultiModalManager(Component):
         backend,
         soc_model,
     ):
-        data_config = DataConfig.from_args(self.control_args)
+        calibration_decoder = self.text_decoder.calibration_prefill
+        data_config = DataConfig.from_args(
+            self.control_args,
+            token_dtype=(
+                calibration_decoder.tok_embedding_export_input[0].dtype
+                if calibration_decoder.apply_embedding
+                else calibration_decoder.export_input[0].dtype
+            ),
+        )
         if _is_qwen35_decoder_model(self.control_args.decoder_model):
             data_config.max_context_len = min(self.control_args.max_context_len, 1024)
         dataset_builder = DatasetBuilder(

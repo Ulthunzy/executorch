@@ -70,6 +70,11 @@ VLM_SPECIAL_TOKENS = {
         "fake_wrap_start": "",
         "fake_wrap_end": "",
     },
+    "qwen3_5-4b": {
+        IMG_TOKEN: "<|image_pad|>",
+        "fake_wrap_start": "",
+        "fake_wrap_end": "",
+    },
     "lincal3_5-0_8b": {
         IMG_TOKEN: "<|image_pad|>",
         "fake_wrap_start": "",

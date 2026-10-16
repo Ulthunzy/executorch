@@ -314,7 +314,6 @@ Error QNNMultimodalRunner::load() {
   std::string prompt_embedding_method_name, tok_embedding_method_name;
   std::string token_generator_method_name, prompt_processor_method_name;
   std::vector<std::string> method_names;
-  std::vector<MultimodalPromptProcessor::PrefillBucket> prefill_buckets;
   switch (eval_mode_) {
     case EvalMode::kKVCached:
       prompt_embedding_method_name = "tok_embedding_kv_forward";
@@ -373,38 +372,6 @@ Error QNNMultimodalRunner::load() {
       text_decoder_->method_meta(token_generator_method_name);
   Result<MethodMeta> prompt_method_meta =
       text_decoder_->method_meta(prompt_processor_method_name);
-
-  if (prompt_processor_method_name == "prefill_forward") {
-    for (int32_t capacity : {256, 512, 1024, 2048}) {
-      const std::string name = "prefill_forward_" + std::to_string(capacity);
-      if (text_decoder_->method_names()->count(name) == 0) {
-        continue;
-      }
-      const auto bucket = text_decoder_->method_meta(name);
-      ET_CHECK(bucket.ok());
-      ET_CHECK(bucket->num_inputs() == prompt_method_meta->num_inputs());
-      ET_CHECK(bucket->num_outputs() == prompt_method_meta->num_outputs());
-      for (size_t i = 0; i < bucket->num_inputs(); ++i) {
-        const auto actual = bucket->input_tensor_meta(i);
-        const auto expected = prompt_method_meta->input_tensor_meta(i);
-        ET_CHECK(actual->scalar_type() == expected->scalar_type());
-        ET_CHECK(actual->nbytes() == expected->nbytes());
-        ET_CHECK(actual->sizes().size() == expected->sizes().size());
-        ET_CHECK(std::equal(actual->sizes().begin(), actual->sizes().end(), expected->sizes().begin()));
-      }
-      for (size_t i = 0; i < bucket->num_outputs(); ++i) {
-        const auto actual = bucket->output_tensor_meta(i);
-        const auto expected = prompt_method_meta->output_tensor_meta(i);
-        ET_CHECK(actual->scalar_type() == expected->scalar_type());
-        ET_CHECK(actual->sizes().size() == expected->sizes().size());
-        ET_CHECK(std::equal(actual->sizes().begin(), actual->sizes().end(), expected->sizes().begin()));
-      }
-      const int32_t ar_len = bucket->input_tensor_meta(0)->sizes()[1];
-      ET_CHECK(capacity > ar_len);
-      prefill_buckets.push_back({name, capacity - ar_len});
-      method_names.push_back(name);
-    }
-  }
 
   // For some tokenizer.json, runtime vocab_size might be different, use output
   // shape to get vocab size.
@@ -739,8 +706,7 @@ Error QNNMultimodalRunner::load() {
           position_id_dim_,
           max_prefill_past},
       std::make_unique<MethodMeta>(std::move(
-          text_decoder_->method_meta(prompt_processor_method_name).get())),
-      std::move(prefill_buckets));
+          text_decoder_->method_meta(prompt_processor_method_name).get())));
 
   // Initialize EmbeddingGenerator
   tok_embedding_generator_ = std::make_unique<TokenEmbeddingProcessor>(

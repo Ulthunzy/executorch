@@ -16,7 +16,7 @@ class DataConfig:
     """Data pipeline config."""
 
     max_context_len: int
-    token_dtype: Optional[str] = None
+    token_dtype: Optional[torch.dtype] = None
     batch_size: int = 1
     source_safetensors: Optional[str] = None
     seed: int = 42
@@ -42,11 +42,14 @@ class DataConfig:
     train_val_ratio: float = 1.0  # 1.0 disables validation
 
     @classmethod
-    def from_args(cls, args: argparse.Namespace) -> "DataConfig":
+    def from_args(
+        cls, args: argparse.Namespace, token_dtype: Optional[torch.dtype] = None
+    ) -> "DataConfig":
         return cls(
             max_context_len=args.max_context_len,
             source_safetensors=getattr(args, "source_safetensors", None),
-            token_dtype=(
+            token_dtype=token_dtype
+            or (
                 torch.int64
                 if getattr(args, "embedding_quantize", None)
                 else torch.int32
