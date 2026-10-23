@@ -36,7 +36,7 @@ def export_layer(args, layer):
     from executorch.exir._serialize._program import deserialize_pte_binary
     from export.fp16_attention_core import fp16_attention_core
     from export.graph_utils import resize_attention
-    from export.model import FusedFront
+    from export.model import FusedFront, QuantizedFusedFront
     import executorch.examples.qualcomm.custom_op.deltanet  # Registers the frozen graph's operator.
 
     torch.set_num_threads(4)
@@ -53,7 +53,13 @@ def export_layer(args, layer):
             fp16_attention_core(graph, inputs)
         if not all(torch.isfinite(value).all() for value in graph(*inputs)):
             raise ValueError(f"Layer {layer}: nonfinite reference output")
-        model = FusedFront(graph, constants)
+        if args.router_qdq:
+            moe = torch.export.load(
+                args.router_qdq / f"layer{layer}/router-ar1-qdq.pt2"
+            ).module()
+            model = QuantizedFusedFront(graph, moe)
+        else:
+            model = FusedFront(graph, constants)
         package = None
         if linear:
             fields = dict(
@@ -159,6 +165,7 @@ def export_layer(args, layer):
             ar_len=1,
             context=None if linear else capacity,
             frozen_qparams=True,
+            router_quantization="w8a16_gptq" if args.router_qdq else "fp16",
             source=str(source),
             source_sha256=hashlib.file_digest(source.open("rb"), "sha256").hexdigest(),
         )
@@ -180,6 +187,9 @@ def main():
         "--output", type=Path, required=True, help="Output assets directory"
     )
     parser.add_argument("--layers", type=int, nargs="+", default=list(range(40)))
+    parser.add_argument(
+        "--router-qdq", type=Path, help="Calibrated W8A16 GPTQ Router/shared graphs"
+    )
     parser.add_argument(
         "--capacities",
         type=int,
@@ -226,6 +236,8 @@ def main():
             command.extend(["--qnn-binding", str(args.qnn_binding)])
         if args.op_package_host:
             command.extend(["--op-package-host", str(args.op_package_host)])
+        if args.router_qdq:
+            command.extend(["--router-qdq", str(args.router_qdq)])
         subprocess.run(command, check=True)
 
 

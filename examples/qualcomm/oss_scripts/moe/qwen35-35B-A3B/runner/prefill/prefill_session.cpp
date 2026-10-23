@@ -1,13 +1,11 @@
 #include "prefill_session.h"
 
 PrefillSession::PrefillSession(const std::string& path, int plan_tokens)
-    : root(path), core(runtime, path), embedding(path + "/embedding.bf16") {
+    : root(path), core(runtime, path), embedding(path) {
   runtime.defer_contexts = true;
   if (!core.mapped || !core.fuse_residual)
     throw std::runtime_error("native mapped residual required");
 
-  if (embedding.size() != 248320ULL * 2048 * 2)
-    throw std::runtime_error("embedding dimensions");
   for (int layer = 0; layer < 40; layer++) {
     banks.emplace_back(new Bank(root, layer));
     stride = std::max(stride, align4096(banks.back()->maximum + 4095));
@@ -222,7 +220,6 @@ void PrefillSession::embed(const int64_t* tokens, float* out) {
   if (chunk_start < 0 || chunk_start > 896)
     throw std::runtime_error("prefill chunk position");
   auto t = Clock::now();
-  auto* w = reinterpret_cast<const uint16_t*>(embedding.pointer);
   for (int token = 0; token < 128; token++) {
     if (tokens[token] < 0 || tokens[token] >= 248320)
       throw std::runtime_error("token ID");
@@ -234,10 +231,7 @@ void PrefillSession::embed(const int64_t* tokens, float* out) {
       image_cursor += 2048;
       continue;
     }
-    for (int d = 0; d < 2048; d++) {
-      uint32_t bits = uint32_t(w[size_t(tokens[token]) * 2048 + d]) << 16;
-      memcpy(out + token * 2048 + d, &bits, 4);
-    }
+    embedding.lookup(tokens[token], out + token * 2048);
   }
   metrics.embedding += elapsed(t);
   metrics.calls[0]++;

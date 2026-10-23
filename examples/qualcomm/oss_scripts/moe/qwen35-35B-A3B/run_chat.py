@@ -49,6 +49,15 @@ def parse_args():
     )
     parser.add_argument("--remote-weights", default=defaults["remote_weights"])
     parser.add_argument("--remote-root", default=defaults["remote_root"])
+    parser.add_argument(
+        "--embedding-table", type=Path, help="Optional packed group-32 INT4 embedding"
+    )
+    parser.add_argument(
+        "--decode-context-load-mode",
+        choices=["auto", "async", "serial"],
+        default="auto",
+        help="auto uses the artifact manifest; serial enables per-context IO memory estimation",
+    )
     parser.add_argument("--prompt", default="什么是注意力机制,你用python来实现一下")
     parser.add_argument(
         "--prompt-tokens", type=int, choices=list(range(128, 1025, 128))
@@ -114,6 +123,15 @@ def parse_args():
 
 
 def check_artifacts(args):
+    if args.decode_context_load_mode == "auto":
+        manifest = args.artifacts / "ASSETS.json"
+        args.decode_context_load_mode = (
+            json.loads(manifest.read_text()).get("decode_context_load_mode", "async")
+            if manifest.is_file()
+            else "async"
+        )
+    if args.decode_context_load_mode not in ("async", "serial"):
+        raise ValueError("Unsupported decode context loading mode in ASSETS.json")
     required = [
         args.build_dir / "prefill_handoff_runner",
         args.build_dir / "libmoe_decode.so",
@@ -128,6 +146,8 @@ def check_artifacts(args):
             for name in ["cache-encoding.bin", "cos.f32", "sin.f32"]
         ],
     ]
+    if args.embedding_table:
+        required.append(args.embedding_table)
     for layer in range(40):
         required.extend(
             [
@@ -146,6 +166,14 @@ def check_artifacts(args):
         raise FileNotFoundError(
             "Missing artifacts/build outputs:\n" + "\n".join(missing)
         )
+    if args.embedding_table:
+        with args.embedding_table.open("rb") as handle:
+            header = handle.read(24)
+        if (
+            header != struct.pack("<8s4I", b"Q35EMB4", 1, 248320, 2048, 32)
+            or args.embedding_table.stat().st_size != 317849664
+        ):
+            raise ValueError("Expected group-32 INT4 embedding for 248320 x 2048")
     text = json.loads((args.model / "config.json").read_text())["text_config"]
     if (
         text["num_hidden_layers"],
@@ -358,6 +386,8 @@ def main():
         decode_execution="same_process_library",
         vision_residency="model_lifetime" if vision is not None else None,
         state_swap=True,
+        embedding_bits=4 if args.embedding_table else 16,
+        decode_context_load_mode=args.decode_context_load_mode,
         kv_append=True,
         teacher_tokens=(str(args.teacher_tokens) if args.teacher_tokens else None),
         prefill_token_file=(
@@ -424,6 +454,11 @@ def main():
     ]:
         commands.append(f"ln -sfn {prefill_root}/{name} {decode_root}/{name}")
     adb("shell", "\n".join(commands))
+    if args.embedding_table:
+        embedding_remote = args.remote_root + "/embedding.int4"
+        adb("push", args.embedding_table, embedding_remote)
+        for target in (prefill_root, decode_root):
+            adb("shell", f"ln -sfn {embedding_remote} {target}/embedding.int4")
     adb("push", run_dir / "tokens.i64", prefill_root + "/tokens.i64")
     if vision is not None:
         adb("push", args.vision_artifacts / "vision.bin", prefill_root + "/vision.bin")
@@ -489,6 +524,7 @@ def main():
 
     eos = ",".join(map(str, generation["eos_token_id"]))
     environment = dict(
+        EMBEDDING_BITS="4" if args.embedding_table else "16",
         NATIVE_MAPPED_IO="1",
         NATIVE_RESIDUAL="1",
         REUSE_EXPERTS="1",
@@ -528,6 +564,8 @@ def main():
         SEED_PREFILL_LRU="0",
         RESIDENT_PREFAULT="0",
     )
+    if args.decode_context_load_mode == "serial":
+        environment["QNN_SERIAL_CONTEXTS"] = "1"
     if args.ignore_eos:
         environment["BENCH_IGNORE_EOS"] = "1"
     if args.teacher_tokens:

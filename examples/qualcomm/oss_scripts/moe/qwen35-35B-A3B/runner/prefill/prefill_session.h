@@ -8,6 +8,7 @@
 #include "expert_cache.h"
 #include "../handoff.h"
 #include "../resident_handoff.h"
+#include "../embedding.h"
 #include <array>
 #include <chrono>
 #include <cstdlib>
@@ -36,7 +37,7 @@ struct PrefillSession {
   std::string root;
   Runtime runtime;
   NativeCore core;
-  MappedBinary embedding;
+  EmbeddingTable embedding;
   std::vector<std::unique_ptr<Bank>> banks;
   std::vector<std::shared_ptr<Buffer>> expert_slots;
   std::vector<ExpertCache> caches;

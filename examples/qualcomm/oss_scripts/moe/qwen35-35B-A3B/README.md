@@ -10,6 +10,7 @@
 qwen35-35B-A3B/
 ├── run_chat.py              # 部署、实时 token 输出、EOS、状态交接验证
 ├── export.py                # 从已校准逐层 QDQ 图导出融合 AR1 图
+├── export_router.py         # 导出独立 W8A16 GPTQ Router/shared 图
 ├── export_vision.py         # 只读取视觉权重，校准并导出 W8A16 编码器
 ├── multimodal.py            # 图片预处理、image token 展开和三维 MRoPE
 ├── pack_pte.py              # 将逐层 QNN binary 包装为完整 40 层 PTE 调度计划
@@ -24,6 +25,7 @@ qwen35-35B-A3B/
 ├── runner/
 │   ├── prefill/             # 图片编码、AR128、每层专家缓存、向 decode 交接
 │   ├── decode/              # 常驻 context/state、64 槽 LRU、异步 IO、SIMD 采样
+│   ├── embedding.h/.cpp     # 按行读取 BF16 或 packed INT4 embedding
 │   ├── handoff.h
 │   └── resident_handoff.h
 ├── native/
@@ -34,6 +36,8 @@ qwen35-35B-A3B/
 │   └── N2Utils.h/.cpp       # N2→N4 展开接口与实现
 └── quantization/
     ├── quantize.py          # Hessian/GPTQ、完整专家重构与 scale 拟合
+    ├── prepare_router.py    # 用已有逐层输入校准 W8A16 GPTQ Router/shared
+    ├── prepare_embedding.py # one-hot 对角 Hessian、group-32 INT4 表
     └── prepare_experts.py   # 逐层顺序校准、生成 experts.n2 和 bank-index.bin
 ```
 
@@ -207,6 +211,37 @@ PYTHONPATH="$(dirname "$PWD")" python -u \
 
 该步骤需要 CUDA，逐层运行，默认每批 8 个专家。`INPUTS.pt` 包含 `calibration:[8,1024,2048]`、`heldout:[2,1024,2048]` 两个 FP32 embedding tensor。source-dir 包含每层的 `front-qdq.pt2`、`moe-constants.npz`、`reference.pt` 以及 `cos.f32`、`sin.f32`。沿用原来的 8192-token 校准流程，7 条拟合、1 条选择方案，2 条 heldout 不参与拟合；继续保留完整专家输出重构及逐层量化误差传播。
 
+## 可选的 embedding 与 Router/shared 量化
+
+独立权重基准仍使用 BF16 embedding、FP16 Router/shared。`run_chat.py --embedding-table /path/to/embedding.int4` 可切换为 group-32 INT4 查表；每组保存 16 字节 code 和两个 FP16 scale/bias，不展开整张表。两阶段分别 mmap 同一个文件，生成时只解码当前 token 的一行。图片特征继续直接替换 image token 的 embedding。
+
+```bash
+python examples/qualcomm/oss_scripts/moe/qwen35-35B-A3B/quantization/prepare_embedding.py \
+  --source /path/to/embedding.bf16 \
+  --calibration-inputs /path/to/INPUTS.pt \
+  --output /path/to/embedding.int4
+```
+
+embedding 的输入为 one-hot token 索引，标准 GPTQ 的 Hessian 是 token 频率对角阵，跨列误差补偿为零；固定网格下等价于逐行最近舍入。这里明确记录该退化形式，不声称有普通 Linear GPTQ 的补偿收益。输出 JSON 同时记录整表、校准 token、heldout token 的 SQNR；heldout 不参与拟合。文件从 970 MiB 降为 303.125 MiB，实际运行内存须单独采样，不能用文件差值代替。
+
+Router/shared 的五个投影使用真正的固定网格 GPTQ：per-channel W8、UINT16 激活，保留观察器产生的 scale/zero point，沿输入通道做 Hessian 误差补偿。shared down 投影使用已量化 gate/up 的实际中间激活校准。校准输入来自已有逐层 W2 基准的 8 条 1024-token 序列，其中 7 条拟合、1 条留出；另外 2 条 heldout 只评估，不拟合。Attention 图及原 W2 专家保持不变；这一步不重新重构 routed 专家。
+
+```bash
+python examples/qualcomm/oss_scripts/moe/qwen35-35B-A3B/quantization/prepare_router.py \
+  --source-dir /path/to/calibrated-prefill-layers \
+  --sequential /path/to/reconstructed-experts/sequential \
+  --inputs /path/to/INPUTS.pt --output /path/to/router-qdq \
+  --qnn-binding /path/to/PyQnnManagerAdaptor.so
+
+python examples/qualcomm/oss_scripts/moe/qwen35-35B-A3B/export_router.py \
+  --source-dir /path/to/router-qdq --output /path/to/router-contexts \
+  --qnn-binding /path/to/PyQnnManagerAdaptor.so
+```
+
+两步均按层串行处理。校准默认使用 CUDA；导出产生独立的 `prefill/layerN/moe-front.bin`、`decode/layerN/moe-front.bin`。融合 AR1 导出沿用前文的 `export.py`，增加 `--router-qdq /path/to/router-qdq`。打包 PTE 时替换 source-dir 中对应的 `moe-front.bin`，Attention 和 head 沿用原版本；运行时 `--artifacts` 指向包含新融合 AR1 图及原专家 bank/index 别名的目录。P/D 的权重及 head 仍然独立。
+
+本机 SDK/设备下，完整 W8 图在保留 prefill context 后整批恢复 decode 会触发 DSP 装载错误。运行 W8 版需用 `--decode-context-load-mode serial`，逐图创建 context 并启用 SDK IO 内存预估；初始化结束后全部常驻，循环内不创建/销毁。`auto` 模式读取 artifact 根目录 `ASSETS.json` 的 `decode_context_load_mode`，无 manifest 时沿用原版 `async`。这与权重共享无关；内存对照需同时注明装载方式。
+
 ## 测试记录
 
 2026-10-23，回退到已验证的独立权重版本，撤下未通过整模型设备验证的 P/D 常量共享、head/IO 共享及配套 INT4 embedding 实验入口。两个 ARM runner 重新构建后与原已验证二进制的 SHA256 一致，Native MoE 和 V85 GDN 包也重新构建通过。同一张 test.jpg、256-token 图文输入生成相同的 67 个 token（含 EOS），176 份数值文件与原独立权重基准逐字节一致。循环内 context 创建/释放、IO 注册/注销及 RPC buffer 分配/释放均为 0。本轮 prefill 为 2.348 秒，decode 为 14.21 token/s，仅作为回退验证，不据此判断性能提升。核对记录见 [EQUIVALENCE.json](../../../../../llama-output/qwen35-moe-independent-rollback-20261023/EQUIVALENCE.json)。
@@ -362,3 +397,28 @@ prefill/vision context 和 decode context 同时存活，图文 DMA 占用由 pr
 本机 MemTotal 约 10.92 GiB，测试前 MemAvailable 约 5.7 GiB。运行期间整机 Swap 使用分别从 2.42→3.18 GiB、1.89→2.94 GiB，文件缓存也明显减少；系统会调整其它驻留内存，初始可用量并非模型固定配额。PSS＋DMA 分配统计不等于 MemAvailable 的净下降量。本次能运行依赖于实际整机内存及动态回收、交换，不能据此判断可在 4 GiB 物理内存下运行。
 
 原始数据、峰值现场及统计方法见 [运行内存报告](../../../../../llama-output/qwen35-moe-memory-20261023/REPORT.md)。
+
+### INT4 embedding / W8A16 GPTQ Router/shared 消融
+
+2026-10-23，完整 40 层 SM8975 设备验证。原 W2/N4×A8 routed 专家、每层 64 槽 LRU、Attention、UINT16 GDN/conv/KV 以及独立的 P/D 权重和 head 均沿用基准。新增选项没有切换默认配置。
+
+性能使用相同 1024-token 文本输入、8×AR128 prefill、127 次 AR1，decode 容量 2048；各组使用同一份 teacher token。性能运行与内存采样分别执行。PPL 为独立 WikiText 片段的 128 个 next-token 目标，hidden SQNR 对照 FP32 的最后一层 residual hidden；不是整个测试集 PPL，也不是 logits SQNR。FP32 参考 PPL 为 4.01435。
+
+| 配置 | 片段 PPL | Hidden SQNR | 1K prefill | Decode | 全流程采样峰值 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| BF16 embedding / FP16 Router/shared | 6.22984 | 6.13 dB | 173.70 token/s | 13.77 token/s | 6.918 GiB |
+| INT4 embedding / FP16 Router/shared | 6.27619 | 6.22 dB | 166.24 token/s | 13.27 token/s | 6.982 GiB |
+| BF16 embedding / W8A16 GPTQ Router/shared | 6.25557 | 6.09 dB | 168.37 token/s | 13.50 token/s | 7.048 GiB |
+| INT4 embedding / W8A16 GPTQ Router/shared | 6.08134 | 6.24 dB | 167.47 token/s | 13.15 token/s | 7.032 GiB |
+
+基准、组合版各两轮，另外两组各一轮。基准两轮 decode 为 13.57–13.97 token/s，组合版为 13.02–13.28 token/s；prefill 存在约 4–8% 的轮间波动。基准首轮 thermal status 为 0，其余为 1，不能把小幅差值解释为稳定的量化加速。组合版此片段 PPL 低 2.38%，不能据此宣称整体语言质量提升。真实 greedy 中文生成正常结束：`我是一个致力于提供准确、简洁信息的人工智能助手。1加1等于2。`
+
+Router/shared 五个投影使用 per-channel W8 GPTQ，damping=0.01，scale 来自实际 observer；不重新用 RTN 覆盖 GPTQ code。40 层 heldout shared 输出 SQNR 最低 26.58 dB、平均 37.28 dB，Router Top8 重合率最低 97.41%。Embedding 为 one-hot 对角 Hessian 下的最近舍入等价形式，详见前面的校准说明；整表 SQNR 22.10 dB，heldout 查表 SQNR 21.25 dB。
+
+INT4 表从 970 MiB 降为 303.125 MiB，减少 666.875 MiB；这是外部查表文件，PTE 调度中的查表在 ARM 按行解包。原 BF16 表已经是按需 mmap，文件缩小不等于峰值运行内存下降。组合版两轮平均 prefill 查表耗时约 51.47 ms，基准约 77.10 ms；Router/shared 则为 197.75 / 166.99 ms，没有测出局部加速，完整 prefill 仍主要受专家 I/O 和 Native 调度限制。
+
+完整 W8 图的整批 decode context 恢复在本机触发过装载错误，实验版使用 `serial` 加 IO 内存预估；原版使用 `async` 资源共享。相同 `serial` 控制下，W8 版 decode 阶段的 DMA 比 FP16 少 320 MiB，但串行装载后额外的资源占用抵消了相对现有部署方式的节省。FP16 `serial` 的全流程峰值为 6.942 GiB；另一次无采样 decode 为 13.55 token/s。当前组合版没有证明能降低全流程峰值，更不满足 4 GiB 预算，保持为可选实验入口。
+
+上述性能、内存均已在重启设备、清除 DSP 重置后相机 HAL/logd 的异常后台占用后复测；重启前的约 6–7 token/s 异常结果不计入。默认路径与原基准 95 份数值文件逐字节一致。所有版本循环内 context 创建/释放、IO 注册/注销和 rpc buffer 分配/释放均为 0。精度使用已有独立运行结果；本轮没有重新评估视觉质量。
+
+完整分解、装载方式控制组、采样方法与复现记录见 [GPTQ 消融报告](../../../../../llama-output/qwen35-moe-embedding-router-gptq-20261023/REPORT.md)。

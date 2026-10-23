@@ -50,3 +50,15 @@ class FusedFront(torch.nn.Module):
         outputs = self.attention(*inputs)
         ids, scores, shared = self.moe(outputs[0].half())
         return (*outputs, ids, scores.float(), shared.float())
+
+
+class QuantizedFusedFront(torch.nn.Module):
+    def __init__(self, attention, moe):
+        super().__init__()
+        self.attention = attention
+        self.moe = moe
+
+    def forward(self, *inputs):
+        outputs = self.attention(*inputs)
+        ids, scores, shared = self.moe(outputs[0])
+        return (*outputs, ids, scores.float(), shared.float())

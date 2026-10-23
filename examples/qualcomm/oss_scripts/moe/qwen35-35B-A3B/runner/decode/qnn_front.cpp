@@ -278,11 +278,19 @@ Graph::Graph(Runtime& r, const std::string& path, bool metadata_only)
 void Graph::activate() {
   if (context)
     return;
+  // Estimate IO before the SDK selects a process domain for a resident graph.
+  QnnHtpContext_CustomConfig_t custom{};
+  custom.option = QNN_HTP_CONTEXT_CONFIG_OPTION_IO_MEM_ESTIMATION;
+  custom.ioMemEstimation = true;
+  QnnContext_Config_t option = QNN_CONTEXT_CONFIG_INIT;
+  option.option = QNN_CONTEXT_CONFIG_OPTION_CUSTOM;
+  option.customConfig = &custom;
+  const QnnContext_Config_t* config[] = {&option, nullptr};
   check(
       runtime.q.contextCreateFromBinary(
           runtime.backend,
           runtime.device,
-          nullptr,
+          getenv("QNN_SERIAL_CONTEXTS") ? config : nullptr,
           binary.data(),
           binary.size(),
           &context,
@@ -485,6 +493,11 @@ void ContextRestore::notify(
 }
 
 void ContextRestore::load(Runtime& runtime, const std::vector<Graph*>& graphs) {
+  if (getenv("QNN_SERIAL_CONTEXTS")) {
+    for (auto* graph : graphs)
+      graph->activate();
+    return;
+  }
   std::vector<Entry> entries;
   entries.reserve(graphs.size());
   std::vector<QnnContext_Params_t> parameters;
@@ -551,5 +564,4 @@ void ContextRestore::load(Runtime& runtime, const std::vector<Graph*>& graphs) {
         runtime.q.graphRetrieve(
             graph->context, graph->graph_name.c_str(), &graph->graph),
         "graphRetrieve initialized context");
-
 }

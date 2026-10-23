@@ -1,7 +1,7 @@
 #include "decode_session.h"
 
 DecodeSession::DecodeSession(const std::string& path, size_t cache_mib)
-    : root(path), core(runtime, path), embedding(path + "/embedding.bf16") {
+    : root(path), core(runtime, path), embedding(path) {
   runtime.defer_contexts = true;
   if (!core.mapped || !core.fuse_residual)
     throw std::runtime_error("native mapped residual required");
@@ -94,8 +94,7 @@ DecodeSession::DecodeSession(const std::string& path, size_t cache_mib)
   cos = bytes(root + "/cos.f32");
 
   sin = bytes(root + "/sin.f32");
-  if (embedding.size() != 248320ULL * 2048 * 2 || cos.size() < 2048 * 32 * 4 ||
-      sin.size() < 2048 * 32 * 4)
+  if (cos.size() < 2048 * 32 * 4 || sin.size() < 2048 * 32 * 4)
     throw std::runtime_error("embedding/RoPE dimensions");
   if (ready_queue) {
     ready_buffer =
@@ -214,12 +213,7 @@ void DecodeSession::embed(
   metrics = {};
   execution_windows.clear();
   auto t = Clock::now();
-  auto* w =
-      reinterpret_cast<const uint16_t*>(embedding.pointer) + *token * 2048;
-  for (int d = 0; d < 2048; d++) {
-    uint32_t bits = uint32_t(w[d]) << 16;
-    memcpy(out + d, &bits, 4);
-  }
+  embedding.lookup(*token, out);
   metrics.embedding += elapsed(t);
   metrics.calls[0]++;
 }

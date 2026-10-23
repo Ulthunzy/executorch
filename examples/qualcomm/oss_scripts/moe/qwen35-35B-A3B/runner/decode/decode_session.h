@@ -1,6 +1,7 @@
 #pragma once
 
 #include "../runtime_utils.h"
+#include "../embedding.h"
 #include "expert_readers.h"
 #include "native_core.h"
 #include <array>
@@ -40,7 +41,7 @@ struct DecodeSession {
   std::string root;
   Runtime runtime;
   NativeCore core;
-  MappedBinary embedding;
+  EmbeddingTable embedding;
   std::vector<std::unique_ptr<Bank>> banks;
   std::vector<std::shared_ptr<Buffer>> bank_slots;
   std::unique_ptr<ExpertCache> cache;
