@@ -1,0 +1,4 @@
+{
+  global: qwen35_decode_run;
+  local: *;
+};

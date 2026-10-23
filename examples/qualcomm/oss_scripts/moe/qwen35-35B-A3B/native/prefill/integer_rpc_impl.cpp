@@ -1,0 +1,467 @@
+// AR128 的 FastRPC 入口；同一 handle 内复用 DSP worker、线程栈和 IO 映射。
+#include "integer_moe.h"
+#include "../worker_start.h"
+#include "HAP_mem.h"
+#include "qurt_memory.h"
+#include <algorithm>
+#include <cstring>
+#include <cstdio>
+#include "integer_rpc.h"
+#include "HAP_compute_res.h"
+#include "HAP_power.h"
+#include "HAP_dcvs.h"
+#include "qurt.h"
+#include "qurt_hvx.h"
+#include "qurt_sem.h"
+#include <cstdlib>
+#include <new>
+#include <memory>
+
+extern "C" void* qhpi_tensor_raw_data(const QHPI_Tensor* t) {
+  return t->data;
+}
+
+extern "C" uint32_t qhpi_thread_resources(QHPI_RuntimeHandle* h) {
+  return h->resource;
+}
+
+extern "C" uint32_t qhpi_num_slices(QHPI_RuntimeHandle* h) {
+  return h->slices;
+}
+
+extern "C" uint32_t qhpi_slice_number(QHPI_RuntimeHandle* h) {
+  return h->slice;
+}
+
+extern "C" void* qhpi_sync_block(QHPI_RuntimeHandle* h) {
+  return h->sync;
+}
+
+struct Job {
+  QHPI_RuntimeHandle handle;
+  QHPI_Tensor** output;
+  const QHPI_Tensor* const* input;
+  uint32_t resource_context, status;
+  WorkerStart* startup;
+};
+
+static void run_thread(void* data) {
+  Job* job = static_cast<Job*>(data);
+  int locked = 0;
+  if (job->handle.resource == QHPI_RESOURCE_HMX)
+    locked = HAP_compute_res_hmx_lock(job->resource_context);
+  else
+    locked = qurt_hvx_lock(QURT_HVX_MODE_128B);
+  const int error = job->startup->arrive(locked ? 1000 + locked : 0);
+  // 任一锁失败时，所有 worker 跳过 execute，不会留下等待缺席线程的计算屏障。
+  job->status = error
+      ? error
+      : execute_integer_moe(&job->handle, 3, job->output, 5, job->input);
+  if (!locked) {
+    if (job->handle.resource == QHPI_RESOURCE_HMX)
+      HAP_compute_res_hmx_unlock(job->resource_context);
+    else
+      qurt_hvx_unlock();
+  }
+}
+
+struct PoolEntry {
+  Job job{};
+  qurt_sem_t ready, done;
+  qurt_thread_t thread{};
+  volatile uint32_t stop = 0;
+  bool started = false;
+};
+
+static void pool_thread(void* data) {
+  auto* entry = static_cast<PoolEntry*>(data);
+  while (true) {
+    qurt_sem_down(&entry->ready);
+    if (read(&entry->stop))
+      break;
+    run_thread(&entry->job);
+    qurt_sem_up(&entry->done);
+  }
+}
+
+struct IoMapping {
+  int fd = -1;
+  void* pointer = nullptr;
+  unsigned int bytes = 0;
+};
+
+// 线程池随 handle 常驻；每次 RPC 单独申请计算资源，执行完后归还给 QNN。
+struct State {
+  IoMapping io[256];
+  const float* residual = nullptr;
+  int pending = -1, assigned = 0;
+  uint8_t* route = nullptr;
+  void* stacks[kWorkers + 1]{};
+  qurt_mutex_t token_locks[128];
+  PoolEntry entries[kWorkers + 1];
+
+  State() {
+    for (auto& lock : token_locks)
+      qurt_pimutex_init(&lock);
+    for (auto& entry : entries) {
+      qurt_sem_init(&entry.ready);
+      qurt_sem_down(&entry.ready);
+      qurt_sem_init(&entry.done);
+      qurt_sem_down(&entry.done);
+    }
+  }
+
+  ~State() {
+    for (auto& entry : entries)
+      if (entry.started) {
+        write(&entry.stop, 1);
+        qurt_sem_up(&entry.ready);
+      }
+    for (auto& entry : entries) {
+      if (entry.started) {
+        int status;
+        qurt_thread_join(entry.thread, &status);
+      }
+      qurt_sem_destroy(&entry.ready);
+      qurt_sem_destroy(&entry.done);
+    }
+    for (auto& entry : io)
+      if (entry.pointer)
+        HAP_munmap(entry.pointer, entry.bytes);
+    for (auto& lock : token_locks)
+      qurt_pimutex_destroy(&lock);
+    HAP_power_destroy(this);
+    for (auto stack : stacks)
+      free(stack);
+    free(route);
+  }
+};
+
+extern "C" AEEResult integer_rpc_open(const char*, remote_handle64* handle) {
+  auto state = std::unique_ptr<State>(new (std::nothrow) State{});
+  if (!state)
+    return 12;
+  // Original per-token Top8 slots survive all expert batches and VTCM leases.
+  state->route = static_cast<uint8_t*>(memalign(128, 128 * 8 * 2048 * 4));
+  if (!state->route)
+    return 12;
+  for (auto& stack : state->stacks) {
+    stack = memalign(128, 32768);
+    if (!stack)
+      return 13;
+  }
+  HAP_power_request_t power{};
+  power.type = HAP_power_set_apptype;
+  power.apptype = HAP_POWER_COMPUTE_CLIENT_CLASS;
+  int error = HAP_power_set(state.get(), &power);
+  if (error)
+    return error;
+  power = {};
+  power.type = HAP_power_set_DCVS_v3;
+  auto& dcvs = power.dcvs_v3;
+  dcvs.set_dcvs_enable = 1;
+  dcvs.dcvs_enable = 0;
+  dcvs.set_bus_params = 1;
+  dcvs.bus_params.min_corner = dcvs.bus_params.target_corner =
+      dcvs.bus_params.max_corner = HAP_DCVS_VCORNER_MAX;
+  dcvs.set_core_params = 1;
+  dcvs.core_params.min_corner = dcvs.core_params.target_corner =
+      dcvs.core_params.max_corner = HAP_DCVS_VCORNER_MAX;
+  dcvs.set_sleep_disable = 1;
+  dcvs.sleep_disable = 1;
+  HAP_set_dcvs_v3_protected_bus_corners(&power, 1);
+  error = HAP_power_set(state.get(), &power);
+  if (error)
+    return error;
+  power = {};
+  power.type = HAP_power_set_HVX;
+  power.hvx.power_up = 1;
+  error = HAP_power_set(state.get(), &power);
+  if (error)
+    return error;
+  memset(&power, 0, sizeof(power));
+  power.type = HAP_power_set_HMX_v2;
+  power.hmx_v2.set_power = 1;
+  power.hmx_v2.power_up = 1;
+  power.hmx_v2.set_clock = 1;
+  power.hmx_v2.target_corner = power.hmx_v2.min_corner =
+      power.hmx_v2.max_corner = HAP_DCVS_EXP_VCORNER_MAX;
+  power.hmx_v2.perf_mode = HAP_CLK_PERF_HIGH;
+  error = HAP_power_set(state.get(), &power);
+  if (error)
+    return error;
+  for (int i = 0; i < kWorkers + 1; i++) {
+    auto& entry = state->entries[i];
+    qurt_thread_attr_t attr;
+    qurt_thread_attr_init(&attr);
+    qurt_thread_attr_set_stack_addr(&attr, state->stacks[i]);
+    qurt_thread_attr_set_stack_size(&attr, 32768);
+    qurt_thread_attr_set_priority(&attr, 100);
+    char name[16];
+    snprintf(name, sizeof(name), "n4-%d", i);
+    qurt_thread_attr_set_name(&attr, name);
+    int error = qurt_thread_create(&entry.thread, &attr, pool_thread, &entry);
+    if (error)
+      return 100 + error;
+    entry.started = true;
+  }
+  *handle = reinterpret_cast<uintptr_t>(state.release());
+  return 0;
+}
+
+extern "C" AEEResult integer_rpc_close(remote_handle64 handle) {
+  auto* state = reinterpret_cast<State*>(uintptr_t(handle));
+  delete state;
+  return release_banks();
+}
+
+extern "C" AEEResult
+integer_rpc_counts(remote_handle64, int* output, int count) {
+  if (count != 4)
+    return 55;
+  for (int i = 0; i < 4; i++)
+    output[i] = execution_counts[i];
+  return 0;
+}
+
+extern "C" AEEResult
+integer_rpc_profile(remote_handle64, float* output, int count) {
+  if (count != 80)
+    return 1;
+  for (int i = 0; i < 80; i++)
+    output[i] = reinterpret_cast<uint64_t*>(metrics)[i] / 19200.f;
+  HAP_power_response_t clock{};
+  clock.type = HAP_power_get_clk_Freq;
+  if (!HAP_power_get(nullptr, &clock))
+    output[8 * 8 + 5] = clock.clkFreqHz / 1.e6f;
+  clock.type = HAP_power_get_hmx_core_clk_Freq;
+  if (!HAP_power_get(nullptr, &clock))
+    output[8 * 8 + 6] = clock.clkFreqHz / 1.e6f;
+  output[8 * 8 + 7] = (qurt_hvx_get_units() >> 8) & 255;
+  qurt_sysenv_max_hthreads_t hw{};
+  qurt_sysenv_get_max_hw_threads(&hw);
+  output[9 * 8 + 3] = hw.max_hthreads;
+  unsigned int total = 0, available = 0;
+  compute_res_vtcm_page_t total_pages{}, available_pages{};
+  if (!HAP_compute_res_query_VTCM(
+          0, &total, &total_pages, &available, &available_pages)) {
+    output[9 * 8 + 4] = total / 1048576.f;
+    output[9 * 8 + 5] = available / 1048576.f;
+  }
+  return 0;
+}
+
+extern "C" AEEResult integer_rpc_run(
+    remote_handle64 handle,
+    const float* hidden,
+    int hidden_len,
+    const int* ids,
+    int ids_len,
+    const float* scores,
+    int scores_len,
+    const float* shared,
+    int shared_len,
+    const int* descriptor,
+    int descriptor_len,
+    float* result,
+    int result_len) {
+  auto* state = reinterpret_cast<State*>(uintptr_t(handle));
+  // bank 描述符决定本批专家和累加阶段，跨批的路由结果保存在 DSP DRAM。
+  const auto start = tick();
+  auto stamp = start;
+  memset(metrics, 0, sizeof(metrics));
+  if (hidden_len != 128 * 2048 || ids_len != 128 * 8 || scores_len != 128 * 8 ||
+      shared_len != 128 * 2048 || descriptor_len != 8 ||
+      result_len != 128 * 2048)
+    return 14;
+  const int phase = descriptor[4];
+  if (phase < 0 || phase > 3 || descriptor[5] < 1 || descriptor[5] > 256 ||
+      descriptor[6] < 1 || descriptor[6] > 1024)
+    return 54;
+  if ((phase == 0 || phase == 1) && state->pending != -1)
+    return 56;
+  if ((phase == 2 || phase == 3) && state->pending != descriptor[7])
+    return 56;
+  if ((phase == 0 && descriptor[6] != 1024) ||
+      (phase == 3 && state->assigned + descriptor[6] != 1024))
+    return 56;
+#if SM_MOE_ACCUMULATE
+  if (phase)
+    return 57;
+#endif
+  compute_res_attr_t attributes;
+  HAP_compute_res_attr_init(&attributes);
+  HAP_compute_res_attr_set_vtcm_param(
+      &attributes, phase ? 5242880 : 12582912, 1);
+  HAP_compute_res_attr_set_hmx_param(&attributes, 1);
+  const uint32_t context = HAP_compute_res_acquire(&attributes, 1000000);
+  if (!context)
+    return 15;
+  void* vtcm = HAP_compute_res_attr_get_vtcm_ptr(&attributes);
+  if (!vtcm) {
+    HAP_compute_res_release(context);
+    return 16;
+  }
+  metrics[8][0] = tick() - stamp;
+  stamp = tick();
+  QHPI_Tensor input[5] = {
+      {const_cast<float*>(hidden)},
+      {const_cast<int*>(ids)},
+      {const_cast<float*>(scores)},
+      {const_cast<float*>(shared)},
+      {const_cast<int*>(descriptor)}};
+  const QHPI_Tensor* in[] = {input, input + 1, input + 2, input + 3, input + 4};
+#if SM_MOE_ROUTE_VTCM
+  void* route = static_cast<uint8_t*>(vtcm) + 4194304;
+#elif SM_MOE_ACCUMULATE
+  void* route = static_cast<uint8_t*>(vtcm) + 9437184 + 2048;
+#else
+  void* route = state->route;
+#endif
+  if (phase)
+    route = state->route;
+  QHPI_Tensor output[3] = {{result}, {vtcm}, {route}};
+  QHPI_Tensor* out[] = {output, output + 1, output + 2};
+  Sync sync{};
+  sync.token_locks = state->token_locks;
+  sync.residual = state->residual;
+  WorkerStart startup(kWorkers + 1);
+  for (int i = 0; i < kWorkers + 1; i++) {
+    auto& entry = state->entries[i];
+    entry.job = {
+        {uint32_t(i == kWorkers ? QHPI_RESOURCE_HMX : QHPI_RESOURCE_HVX),
+         kWorkers,
+         uint32_t(i == kWorkers ? 0 : i),
+         &sync},
+        out,
+        in,
+        context,
+        0,
+        &startup};
+    qurt_sem_up(&entry.ready);
+  }
+  metrics[8][1] = tick() - stamp;
+  stamp = tick();
+  int error = 0;
+  for (auto& entry : state->entries) {
+    qurt_sem_down(&entry.done);
+    if (entry.job.status)
+      error = entry.job.status;
+  }
+  metrics[8][2] = tick() - stamp;
+  stamp = tick();
+  HAP_compute_res_release(context);
+  metrics[8][3] = tick() - stamp;
+  metrics[8][4] = tick() - start;
+  if (!error && (phase == 1 || phase == 2)) {
+    if (phase == 1)
+      state->assigned = 0;
+    state->pending = descriptor[7];
+    state->assigned += descriptor[6];
+  } else {
+    state->pending = -1;
+    state->assigned = 0;
+  }
+  return error;
+}
+
+extern "C" AEEResult integer_rpc_run_mapped(
+    remote_handle64 handle,
+    const int* descriptors,
+    int count) {
+  if (count != 14)
+    return 40;
+  auto* state = reinterpret_cast<State*>(uintptr_t(handle));
+  void* buffers[6]{};
+  const unsigned int sizes[] = {
+      128 * 2048 * 4,
+      128 * 8 * 4,
+      128 * 8 * 4,
+      128 * 2048 * 4,
+      128 * 2048 * 4,
+      128 * 2048 * 4};
+  for (int i = 0; i < 6; i++) {
+    if (i == 5 && descriptors[i] < 0)
+      continue;
+    IoMapping* found = nullptr;
+    for (auto& entry : state->io)
+      if (entry.fd == descriptors[i]) {
+        found = &entry;
+        break;
+      }
+    if (!found)
+      for (auto& entry : state->io)
+        if (entry.fd == -1) {
+          found = &entry;
+          break;
+        }
+    if (!found)
+      return 41;
+    if (found->fd == -1) {
+      auto* pointer = HAP_mmap2(
+          nullptr,
+          sizes[i],
+          HAP_PROT_READ | HAP_PROT_WRITE,
+          0,
+          descriptors[i],
+          0);
+      if (!pointer || pointer == (void*)-1)
+        return 42 + i;
+      found->fd = descriptors[i];
+      found->pointer = pointer;
+      found->bytes = sizes[i];
+    }
+    if (found->bytes != sizes[i])
+      return 47;
+    buffers[i] = found->pointer;
+  }
+  if (qurt_mem_cache_clean(
+          uintptr_t(buffers[3]),
+          sizes[3],
+          QURT_MEM_CACHE_INVALIDATE,
+          QURT_MEM_DCACHE))
+    return 48;
+  if (buffers[5] &&
+      qurt_mem_cache_clean(
+          uintptr_t(buffers[5]),
+          sizes[5],
+          QURT_MEM_CACHE_INVALIDATE,
+          QURT_MEM_DCACHE))
+    return 50;
+  state->residual = static_cast<const float*>(buffers[5]);
+  int error = integer_rpc_run(
+      handle,
+      static_cast<const float*>(buffers[0]),
+      128 * 2048,
+      static_cast<const int*>(buffers[1]),
+      128 * 8,
+      static_cast<const float*>(buffers[2]),
+      128 * 8,
+      static_cast<const float*>(buffers[3]),
+      128 * 2048,
+      descriptors + 6,
+      8,
+      static_cast<float*>(buffers[4]),
+      128 * 2048);
+  state->residual = nullptr;
+  if (error)
+    return error;
+  if (qurt_mem_cache_clean(
+          uintptr_t(buffers[4]),
+          sizes[4],
+          QURT_MEM_CACHE_FLUSH,
+          QURT_MEM_DCACHE))
+    return 49;
+  return 0;
+}
+
+extern "C" AEEResult integer_rpc_release_io(remote_handle64 handle) {
+  auto* state = reinterpret_cast<State*>(uintptr_t(handle));
+  for (auto& entry : state->io)
+    if (entry.pointer) {
+      if (HAP_munmap(entry.pointer, entry.bytes))
+        return 51;
+      entry = IoMapping{};
+    }
+  return 0;
+}

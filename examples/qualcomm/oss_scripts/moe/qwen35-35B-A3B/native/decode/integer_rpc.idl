@@ -1,0 +1,11 @@
+#include "AEEStdDef.idl"
+#include "remote.idl"
+interface integer_rpc : remote_handle64 {
+ AEEResult run(in sequence<float> hidden,in sequence<long> ids,in sequence<float> scores,in sequence<float> shared,in sequence<long> descriptor,rout sequence<float> result);
+ AEEResult profile(rout sequence<float> result);
+ AEEResult run_mapped(in sequence<long> descriptors);
+ AEEResult release_io();
+ AEEResult release_fds(in sequence<long> descriptors);
+ AEEResult configure_banks(in sequence<long> descriptors);
+ AEEResult serve(in long mailbox_fd);
+};

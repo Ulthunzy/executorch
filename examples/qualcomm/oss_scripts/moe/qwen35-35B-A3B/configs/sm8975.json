@@ -1,0 +1,10 @@
+{
+  "device": "A7SR026915000282",
+  "model": "/hunter/model/Qwen/Qwen3.6-35B-A3B",
+  "artifacts": "llama-output/qwen36-gdn-router-v85-sm8975-20261023",
+  "vision_artifacts": "llama-output/qwen35-moe-vision-sm8975-20261023",
+  "prefill_pte": "/data/local/tmp/qwen36-full-prefill-pte-sm8975-20261021/qwen36-full-prefill-ar128.pte",
+  "decode_pte": "/data/local/tmp/qwen36-full-decode-pte-sm8975-20261021/qwen36-full-decode-ar1.pte",
+  "remote_weights": "/data/local/tmp/qwen36-w2-reconstruction-sm8975-20261023/weights",
+  "remote_root": "/data/local/tmp/qwen35-35B-A3B"
+}

@@ -1,0 +1,5 @@
+BasedOnStyle: InheritParentConfig
+SortIncludes: Never
+SortUsingDeclarations: Never
+SeparateDefinitionBlocks: Always
+AllowShortLambdasOnASingleLine: Empty
