@@ -27,8 +27,7 @@ PrefillSession::PrefillSession(const std::string& path, int plan_tokens)
       sequence_tokens,
       sequence_tokens > 128,
       layer_memo ? 256 * stride : 0);
-  // 当前复用路径为 40×64 槽；旧四层池分支会在下方被明确拒绝。
-  capacity = reuse ? kExpertSlots : 64;
+  capacity = configuredExpertSlots();
   pool_count = reuse ? 40 : 4;
   if (!reuse)
     throw std::runtime_error("all-LRU cache requires direct buffer reuse");
@@ -66,7 +65,7 @@ PrefillSession::PrefillSession(const std::string& path, int plan_tokens)
   if (async_io)
     for (int i = 0; i < 2; i++) {
       pipeline_banks.push_back(std::make_shared<Buffer>(
-          runtime, 4096 + kExpertSlots * stride, initialize_experts));
+          runtime, 4096 + capacity * stride, initialize_experts));
       auto& b = *pipeline_banks.back();
       check(
           fastrpc_mmap(
@@ -86,13 +85,14 @@ PrefillSession::PrefillSession(const std::string& path, int plan_tokens)
     if (!async_io)
       throw std::runtime_error("startup preload requires pipeline");
     const auto table = bytes(root + "/cold-experts.i32");
-    if (table.size() != 40 * kExpertSlots * 4)
+    // 启动 profile 仍有每层 64 个候选，仅加载当前容量对应的前缀。
+    if (table.size() != 40 * kMaxExpertSlots * 4)
       throw std::runtime_error("cold table dimensions");
     const auto* ids = reinterpret_cast<const int32_t*>(table.data());
     for (int layer = 0; layer < 40; layer++) {
       std::set<int> seen;
-      for (int i = 0; i < kExpertSlots; i++) {
-        const int expert = ids[layer * kExpertSlots + i], slot = i;
+      for (int i = 0; i < capacity; i++) {
+        const int expert = ids[layer * kMaxExpertSlots + i], slot = i;
         if (expert < 0 || expert >= 256 || !seen.insert(expert).second)
           throw std::runtime_error("invalid cold IDs");
         auto& bank = *banks[layer];
@@ -658,7 +658,7 @@ void PrefillSession::experts(
     for (size_t slot = 0; slot < recent.size(); slot++)
       layer_history[layer][slot] = {recent[slot], 0, stamp_of(recent[slot])};
   } else
-    for (int slot = 0; slot < 64; slot++)
+    for (int slot = 0; slot < capacity; slot++)
       layer_history[layer][slot] = {
           cache.entries[slot].expert, 0, cache.entries[slot].stamp};
   layer_clocks[layer] = cache.clock;
@@ -679,7 +679,10 @@ void PrefillSession::project(const float* x, float* logits) {
   auto t = Clock::now();
   core.end_output_read();
   int in = head->index(true, 0), out = head->index(false, 0);
-  memcpy(head->input(in), x, 128 * 2048 * 4);
+  const size_t count = Graph::elements(head->inputs[in]);
+  if (count != 2048 && count != 128 * 2048)
+    throw std::runtime_error("prefill head shape");
+  memcpy(head->input(in), x + 128 * 2048 - count, count * 4);
   head->execute();
   memcpy(logits, head->output(out), 248320 * 4);
   metrics.head += elapsed(t);

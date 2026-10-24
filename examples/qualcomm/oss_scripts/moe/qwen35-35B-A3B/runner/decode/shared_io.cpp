@@ -33,7 +33,6 @@ SharedIo::SharedIo(
   mask = allocate(2048 * 4);
   for (size_t i = 0; i < attention.size(); i++) {
     auto& a = *attention[i];
-    auto& r = *router[i];
     bind(a.graph, true, a.input[0], chain);
     a.alias = chain;
     // Recurrent and KV buffers remain private to each layer for the full
@@ -50,6 +49,9 @@ SharedIo::SharedIo(
       bind(a.graph, false, a.output[5], scores);
       bind(a.graph, false, a.output[6], shared);
     }
+    if (!router[i])
+      continue;
+    auto& r = *router[i];
     bind(r, true, r.index(true, 0), hidden);
     bind(r, false, r.index(false, 0), ids);
     bind(r, false, r.index(false, 1), scores);

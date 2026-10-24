@@ -20,61 +20,43 @@ class ChunkGDN(torch.nn.Module):
             "lower", torch.tril(torch.ones(chunk_size, chunk_size, dtype=dtype))
         )
         self.register_buffer(
-            "strict",
-            torch.tril(torch.ones(chunk_size, chunk_size, dtype=dtype), diagonal=-1),
+            "negative_strict",
+            -torch.tril(torch.ones(chunk_size, chunk_size, dtype=dtype), diagonal=-1),
         )
-        self.inverse_leaf = 8
+        self.inverse_leaf = chunk_size // 2
         self.register_buffer("leaf_eye", torch.eye(self.inverse_leaf, dtype=dtype))
-        block = torch.arange(chunk_size // self.inverse_leaf)[:, None, None]
-        row = block * self.inverse_leaf + torch.arange(self.inverse_leaf)[None, :, None]
-        col = block * self.inverse_leaf + torch.arange(self.inverse_leaf)[None, None, :]
-        self.register_buffer("leaf_indices", (row * chunk_size + col).flatten().int())
-        indices = []
-        for level in range(chunk_size.bit_length() - 1):
-            width = 1 << level
-            block = torch.arange(chunk_size // (2 * width))[:, None, None]
-            row = block * (2 * width) + width + torch.arange(width)[None, :, None]
-            col = block * (2 * width) + torch.arange(width)[None, None, :]
-            indices.append((row * chunk_size + col).flatten())
-        self.inverse_sizes = tuple(index.numel() for index in indices)
-        self.register_buffer("inverse_indices", torch.cat(indices).to(torch.int32))
+        row = torch.arange(self.inverse_leaf)[:, None]
+        col = torch.arange(self.inverse_leaf)[None, :]
+        self.register_buffer("leaf_diagonal", (row // 8 == col // 8).to(dtype))
+        self.register_buffer(
+            "merge_8", ((row // 16 == col // 16) & (row // 8 == col // 8 + 1)).to(dtype)
+        )
+        self.register_buffer("merge_16", ((row >= 16) & (col < 16)).to(dtype))
 
     def triangular_inverse(self, lower):
-        batch, heads, count, _ = lower.shape
-        flat = lower.flatten(-2)
-        leaf = self.inverse_leaf
-        power = flat.index_select(-1, self.leaf_indices).reshape(
-            batch, heads * count // leaf, leaf, leaf
-        )
+        batch, heads, _, _ = lower.shape
+        width = self.inverse_leaf
+        blocks = torch.stack(
+            (lower[:, :, :width, :width], lower[:, :, width:, width:]), dim=2
+        ).reshape(batch, heads * 2, width, width)
+        # Embed 8x8 leaves in 32x32 operands. High-order dense triangular powers
+        # overflow FP16 for aligned keys, even when the inverse is bounded.
+        power = blocks * self.leaf_diagonal
         inverse = self.leaf_eye + power
-        for _ in range(leaf.bit_length() - 2):
+        for _ in range(2):
             power = power @ power
             inverse = inverse @ (self.leaf_eye + power)
-        indices = self.inverse_indices.split(self.inverse_sizes)
-        for level, index in enumerate(indices):
-            width = 1 << level
-            if width < leaf:
-                continue
-            blocks = heads * count // (2 * width)
-            even = torch.arange(
-                0, blocks * 2, 2, device=lower.device, dtype=torch.int32
-            )
-            odd = torch.arange(1, blocks * 2, 2, device=lower.device, dtype=torch.int32)
-            a = inverse.index_select(1, even)
-            # Materialize the odd gather: direct QNN Concat reads the wrong
-            # stride in this graph. The smallest FP16 subnormal prevents that
-            # view optimization; its numerical effect is checked on device.
-            b = inverse.index_select(1, odd) + 2**-24
-            off_diagonal = flat.index_select(-1, index).reshape(
-                batch, blocks, width, width
-            )
-            # Inverse of [[A, 0], [-T, B]] has lower block B^-1 T A^-1.
-            cross = b @ off_diagonal @ a
-            inverse = torch.cat(
-                (torch.cat((a, torch.zeros_like(a)), -1), torch.cat((cross, b), -1)),
-                -2,
-            )
-        return inverse.reshape(batch, heads, count, count)
+        for mask in (self.merge_8, self.merge_16):
+            inverse = inverse + inverse @ (blocks * mask) @ inverse
+        a = inverse[:, 0::2]
+        # Materialize the odd slice: direct QNN Concat otherwise reads the wrong
+        # stride. Retain the device-validated FP16 subnormal workaround.
+        b = inverse[:, 1::2] + 2**-24
+        # Inverse of [[A, 0], [-T, B]] has lower block B^-1 T A^-1.
+        cross = b @ lower[:, :, width:, :width] @ a
+        return torch.cat(
+            (torch.cat((a, torch.zeros_like(a)), -1), torch.cat((cross, b), -1)), -2
+        )
 
     def forward(self, query, key, value, decay, beta, state):
         query = query.to(self.dtype).transpose(1, 2)
@@ -93,11 +75,11 @@ class ChunkGDN(torch.nn.Module):
             d = decay[:, :, start : start + c].clamp_min(2**-14)
             # A matrix prefix sum avoids an unsupported scan in some backends.
             g = (d.log().unsqueeze(-2) @ self.lower.transpose(0, 1)).squeeze(-2)
-            weights = ((g.unsqueeze(-1) - g.unsqueeze(-2)) * self.lower).clamp(
+            weights = (g.unsqueeze(-1) - g.unsqueeze(-2)).clamp(
                 min=-16, max=0
             ).exp() * self.lower
             prefix = g.clamp(min=-16, max=0).exp().unsqueeze(-1)
-            lower = -((k * b) @ k.transpose(-1, -2)) * weights * self.strict
+            lower = ((k * b) @ k.transpose(-1, -2)) * (weights * self.negative_strict)
             inverse = self.triangular_inverse(lower)
             correction = inverse @ (b * (v - prefix * (k @ state)))
             y = (

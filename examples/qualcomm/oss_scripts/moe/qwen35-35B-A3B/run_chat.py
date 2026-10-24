@@ -58,6 +58,9 @@ def parse_args():
         default="auto",
         help="auto uses the artifact manifest; serial enables per-context IO memory estimation",
     )
+    parser.add_argument(
+        "--shared-model", type=Path, help="Separated shared contexts for all 40 layers"
+    )
     parser.add_argument("--prompt", default="什么是注意力机制,你用python来实现一下")
     parser.add_argument(
         "--prompt-tokens", type=int, choices=list(range(128, 1025, 128))
@@ -73,6 +76,13 @@ def parse_args():
         "--decode-capacity", type=int, choices=[1152, 2048], default=1152
     )
     parser.add_argument("--max-new-tokens", type=int, default=128)
+    parser.add_argument(
+        "--cache-experts",
+        type=int,
+        choices=[32, 64],
+        default=defaults.get("cache_experts", 64),
+        help="Resident LRU expert slots per layer, shared by prefill and decode",
+    )
     parser.add_argument("--prefill-token-file", type=Path)
     parser.add_argument("--teacher-tokens", type=Path)
     parser.add_argument("--ignore-eos", action="store_true")
@@ -146,6 +156,24 @@ def check_artifacts(args):
             for name in ["cache-encoding.bin", "cos.f32", "sin.f32"]
         ],
     ]
+    if args.shared_model:
+        required.extend(
+            [
+                args.build_dir / "libqwen35_shared.so",
+                args.shared_model / "head/graph.qnn",
+                args.shared_model / "head/weights.bin",
+            ]
+        )
+        for group in range(10):
+            required.extend(
+                args.shared_model / f"group{group}" / name
+                for name in ("graph.qnn", "weights.bin", "GRAPHS.json")
+            )
+            for layer in range(group * 4, group * 4 + 4):
+                required.extend(
+                    args.shared_model / f"group{group}" / f"layer{layer}_{method}.io"
+                    for method in ("prefill_attention", "prefill_router", "decode")
+                )
     if args.embedding_table:
         required.append(args.embedding_table)
     for layer in range(40):
@@ -166,6 +194,23 @@ def check_artifacts(args):
         raise FileNotFoundError(
             "Missing artifacts/build outputs:\n" + "\n".join(missing)
         )
+    if args.shared_model:
+        covered = set()
+        for group in range(10):
+            manifest = json.loads(
+                (args.shared_model / f"group{group}/GRAPHS.json").read_text()
+            )
+            expected = list(range(group * 4, group * 4 + 4))
+            if (
+                manifest["layers"] != expected
+                or manifest["capacity"] != args.decode_capacity
+                or not manifest["weight_sharing"]
+                or manifest.get("prefill_core") != "chunked_mixed_fp16"
+            ):
+                raise ValueError(f"Shared group {group}: layer/capacity mismatch")
+            covered.update(manifest["layers"])
+        if covered != set(range(40)):
+            raise ValueError("Shared model must contain all 40 layers")
     if args.embedding_table:
         with args.embedding_table.open("rb") as handle:
             header = handle.read(24)
@@ -363,12 +408,16 @@ def main():
                 "Teacher token file is too short or contains invalid token IDs"
             )
     generation = json.loads((args.model / "generation_config.json").read_text())
-    label = f"w2a8-fused-c{args.decode_capacity}-p{args.prompt_tokens}-cache64"
+    label = (
+        f"w2a8-fused-c{args.decode_capacity}-p{args.prompt_tokens}"
+        f"-cache{args.cache_experts}"
+    )
     run_dir = args.output / (datetime.now().strftime("%Y%m%d-%H%M%S-%f") + "-" + label)
     run_dir.mkdir(parents=True)
     np.asarray(ids, dtype="<i8").tofile(run_dir / "tokens.i64")
     (run_dir / "PROMPT.txt").write_text(tokenizer.decode(ids), encoding="utf-8")
     record = dict(
+        shared_model=str(args.shared_model) if args.shared_model else None,
         model=str(args.model),
         input_ids=ids,
         messages=messages,
@@ -380,8 +429,8 @@ def main():
         activation_bits=8,
         expert_bank_variant="reconstructed",
         weight_codebook=[-7, -2, 2, 7],
-        cache_experts=64,
-        cache_policy="lru64",
+        cache_experts=args.cache_experts,
+        cache_policy=f"lru{args.cache_experts}",
         front_variant="fused",
         decode_execution="same_process_library",
         vision_residency="model_lifetime" if vision is not None else None,
@@ -510,6 +559,8 @@ def main():
         decode_root + "/cache-encoding.bin",
     )
     for layer in range(40):
+        if args.shared_model:
+            continue
         full_attention = layer % 4 == 3
         local = (
             args.artifacts / f"assets/context{args.decode_capacity}-fused"
@@ -523,11 +574,36 @@ def main():
         adb("push", local / "attention.bin", local / "io.bin", target + "/")
 
     eos = ",".join(map(str, generation["eos_token_id"]))
+    if args.shared_model:
+        shared_remote = args.remote_root + "/shared-model"
+        adb("shell", "mkdir -p " + shared_remote)
+        adb("push", args.build_dir / "libqwen35_shared.so", prefill_root + "/")
+        adb("shell", "mkdir -p " + shared_remote + "/head")
+        adb(
+            "push",
+            args.shared_model / "head/graph.qnn",
+            args.shared_model / "head/weights.bin",
+            shared_remote + "/head/",
+        )
+        for group in range(10):
+            local = args.shared_model / f"group{group}"
+            target = shared_remote + f"/group{group}"
+            adb("shell", "mkdir -p " + target)
+            adb(
+                "push",
+                local / "graph.qnn",
+                local / "weights.bin",
+                local / "GRAPHS.json",
+                *sorted(local.glob("*.io")),
+                target + "/",
+            )
+
     environment = dict(
         EMBEDDING_BITS="4" if args.embedding_table else "16",
         NATIVE_MAPPED_IO="1",
         NATIVE_RESIDUAL="1",
         REUSE_EXPERTS="1",
+        EXPERT_CACHE_SLOTS=str(args.cache_experts),
         ASYNC_EXPERT_IO="1",
         ASYNC_DECODE_IO="0",
         EXPERT_IO_WORKERS=str(args.io_workers),
@@ -564,6 +640,12 @@ def main():
         SEED_PREFILL_LRU="0",
         RESIDENT_PREFAULT="0",
     )
+    if args.shared_model:
+        environment["SHARED_MODEL_ROOT"] = shared_remote
+        environment["SHARED_OP_PACKAGE"] = (
+            decode_root + "/libQnnDeltaNetOpPackage_HTP.so"
+        )
+        environment.pop("FRONT_OVERRIDE")
     if args.decode_context_load_mode == "serial":
         environment["QNN_SERIAL_CONTEXTS"] = "1"
     if args.ignore_eos:

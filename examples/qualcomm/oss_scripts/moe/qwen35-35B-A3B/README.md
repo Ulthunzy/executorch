@@ -1,6 +1,6 @@
 # Qwen3.5-35B-A3B MoE，SM8975/V85
 
-本目录维护已验证的 40 层 MoE 推理、融合图导出及专家重构代码。独立于 `llama.py`。默认使用融合后的 Attention＋Router/shared、AR128 prefill、AR1 decode、每层 64 槽 LRU、命中专家先计算与缺失专家异步读取。
+本目录维护已验证的 40 层 MoE 推理、融合图导出及专家重构代码。独立于 `llama.py`。默认使用融合后的 Attention＋Router/shared、AR128 prefill、AR1 decode、每层 32 槽 LRU（可用 `--cache-experts 64` 切换）、命中专家先计算与缺失专家异步读取。
 
 当前 prefill/decode 各自持有独立的 QNN 图权重及 head。专家缓存仍跨阶段交接复用；视觉 context 在整个模型会话中常驻。Router/shared 为 FP16，embedding 为外部 BF16 表。
 
@@ -10,10 +10,12 @@
 qwen35-35B-A3B/
 ├── run_chat.py              # 部署、实时 token 输出、EOS、状态交接验证
 ├── export.py                # 从已校准逐层 QDQ 图导出融合 AR1 图
+├── export_shared.py         # 四层 AR128/AR1 联合编译与公共权重去重验证
 ├── export_router.py         # 导出独立 W8A16 GPTQ Router/shared 图
 ├── export_vision.py         # 只读取视觉权重，校准并导出 W8A16 编码器
 ├── multimodal.py            # 图片预处理、image token 展开和三维 MRoPE
 ├── pack_pte.py              # 将逐层 QNN binary 包装为完整 40 层 PTE 调度计划
+├── pack_shared_weights.py   # 按 SDK 回调范围分离图元数据与权重文件
 ├── build.sh                 # Android model runner、decode 动态库、Native MoE
 ├── build_op_package.sh      # 复用共享 GDN 源码构建 host/V85 包
 ├── configs/sm8975.json      # 本机模型、外部产物和设备路径
@@ -24,7 +26,8 @@ qwen35-35B-A3B/
 │   └── fp16_attention_core.py
 ├── runner/
 │   ├── prefill/             # 图片编码、AR128、每层专家缓存、向 decode 交接
-│   ├── decode/              # 常驻 context/state、64 槽 LRU、异步 IO、SIMD 采样
+│   ├── decode/              # 常驻 context/state、32/64 槽 LRU、异步 IO、SIMD 采样
+│   ├── shared/              # 共享 context 的外部权重文件映射与 DMA 回调
 │   ├── embedding.h/.cpp     # 按行读取 BF16 或 packed INT4 embedding
 │   ├── handoff.h
 │   └── resident_handoff.h
@@ -422,3 +425,119 @@ INT4 表从 970 MiB 降为 303.125 MiB，减少 666.875 MiB；这是外部查表
 上述性能、内存均已在重启设备、清除 DSP 重置后相机 HAL/logd 的异常后台占用后复测；重启前的约 6–7 token/s 异常结果不计入。默认路径与原基准 95 份数值文件逐字节一致。所有版本循环内 context 创建/释放、IO 注册/注销和 rpc buffer 分配/释放均为 0。精度使用已有独立运行结果；本轮没有重新评估视觉质量。
 
 完整分解、装载方式控制组、采样方法与复现记录见 [GPTQ 消融报告](../../../../../llama-output/qwen35-moe-embedding-router-gptq-20261023/REPORT.md)。
+
+### 四层 prefill/decode 共享权重与分离加载
+
+2026-10-23，QNN 2.48.1、SM8975/V85，验证真实第 0–3 层：3 个 GDN 层、1 个 full-attention 层。联合编译为一个 context，包含每层 AR128 Attention、AR128 Router/shared 和融合 AR1 三个入口，共 12 个图；编译时开启 `weightSharingEnabled`。同一层两阶段的公共权重只保存一份，各图仍有少量私有常量。Attention 冻结图、W8A16 GPTQ Router/shared、W2 routed 专家和 UINT16 state/KV 沿用前面的验证版本。
+
+通过 `QnnContext_createFromBinaryWithCallback` 捕获 SDK 的权重 section 范围，再打包为两个文件：
+
+| 产物 | 大小 |
+| --- | ---: |
+| 关闭去重的四层 context，12 个图 | 199.579 MiB |
+| 开启去重的四层 context | 102.539 MiB |
+| 分离后的 `graph.qnn`，含图元数据和 section 表 | 2.996 MiB |
+| 分离后的 `weights.bin` | 99.547 MiB |
+
+`runner/shared/weight_source.h/.cpp` 预留虚拟地址区间，将图元数据和权重 section 以只读文件映射拼接成原 context 视图，避免复制完整 binary 到匿名内存。重建视图的 SHA256 与原始 context 完全一致。SDK 预读的权重 blob 描述头仍由权重文件映射提供，不修改或解析内部权重格式。
+
+回调将权重读入 DMA，再由 QNN 映射到 DSP。实际初始化共申请 13 个不同 fd：一个 97.582 MiB 公共权重 section，12 个图私有 section；总 DMA 权重 buffer 为 99.547 MiB。AR128 prefill 后连续执行 32 步 AR1，provide 次数仍为 13；切换图和 token 时不重载，最后 contextFree 触发 13 次 release，live=0。没有将两个独立 context 的 weights buffer 强行指向同一块内存。
+
+四层 Attention/Router/shared 组件验证进程的内存采样如下。统计 CPU PSS＋去重 DMA，并扣除已计入 PSS 的 DMA 映射；**本表不包含 routed 专家缓存、embedding 或 head，不是完整模型峰值**。
+
+| 方式 | 进程采样峰值 | 同时刻 DMA | 同时刻 CPU PSS |
+| --- | ---: | ---: | ---: |
+| 关闭权重去重 | 822.66 MiB | 614.87 MiB | 207.79 MiB |
+| 共享权重，普通 context 加载 | 612.17 MiB | 498.87 MiB | 113.29 MiB |
+| 共享权重，分离文件＋DMA 回调 | 491.49 MiB | 476.42 MiB | 15.07 MiB |
+
+分离加载相对关闭去重降低 331.18 MiB、40.26%；相对普通共享加载降低 120.68 MiB。该差值包含 CPU 文件映射页和 SDK 内部分配变化，不能直接当作公共权重大小，也不能线性推算 40 层峰值。
+
+三种组件加载方式的 924 份输出逐字节一致，覆盖 prefill、32 步 decode、Top8、shared、GDN state 和 KV。进一步将真实 W2 Native MoE 和残差串入四层，上一层输出直接作为下一层输入，关闭共享与分离加载的 **1056 份产物逐字节一致**。正式 Native 算子源码未修改；损坏包头和截断权重也都在创建 QNN context 前被拒绝。
+
+真实四层串联的两轮无转储均值：关闭共享为 75.130 ms/AR128、7.711 ms/AR1；分离共享为 72.009 ms/AR128、7.967 ms/AR1。为隔离共享机制，该互操作验证预载四层各 256 个 N2 专家，两个阶段复用相同 bank；计时含 Native、state/KV 和桥接复制，排除初始化及 bank 预载。它不是原 64 槽 LRU/UFS 调度的性能基准，也不包含 embedding、head、采样或视觉塔。本轮证明内存下降和数值一致，尚未证明稳定的执行加速。
+
+联合编译入口是 `export_shared.py --layers 0 1 2 3`；传 `--router-qdq` 复用已验证 GPTQ 图，`--independent` 生成相同 12 图但关闭去重的控制组。打包入口如下，requests 文件来自设备加载时的公开 DMA 回调：
+
+```bash
+python examples/qualcomm/oss_scripts/moe/qwen35-35B-A3B/pack_shared_weights.py \
+  --context llama-output/qwen35-moe-sharing-four-layer-20261023/shared/context0.bin \
+  --requests llama-output/qwen35-moe-sharing-four-layer-20261023/four-requests.txt \
+  --output llama-output/qwen35-moe-sharing-four-layer-20261023/separated
+```
+
+同一 context 最多共享 64 个图；本轮为 12 个。该先导实验之后已完成下节的 40 层扩展；完整模型默认入口仍保持独立权重。具体限制以 SDK 版本为准，参见[高通 HTP 文档](https://docs.qualcomm.com/bundle/publicresource/topics/80-63442-10/htp_backend.html)。
+
+本轮按用户要求清理了 265 个有对应 QNN binary 的历史单图 PTE 中间文件，释放约 5.49 GiB；完整基准 PTE、source QDQ、模型权重与测试记录保留。完整命令、验证驱动、数值对照、内存现场及清理清单见[四层权重共享报告](../../../../../llama-output/qwen35-moe-sharing-four-layer-20261023/REPORT.md)。
+
+### 完整 40 层共享权重实测
+
+2026-10-23，SM8975/V85、SDK 2.48.1，已按每四层一个 context 扩展到完整 40 层，head 共用一个 context/graph。十个层组共 120 个静态图，加上 head 为 **11 个 context、121 个图**。Prefill/decode 的公共权重在同一层组内去重，分离为 `graph.qnn` 与 `weights.bin`，初始化后一直保留到模型结束。通过 `run_chat.py --shared-model` 显式启用，默认入口继续使用独立权重。
+
+沿用冻结校准结果：embedding INT4/group32、Router/shared 为 GPTQ W8A16、routed 专家保持 W2/N4×A8、GDN/conv/KV 为 UINT16。专家仍是每层 64 槽 LRU，40 层共 2560 槽、约 2.051 GiB，缺失专家走真实 UFS；未采用四层先导测试中的全专家预载方式。本轮为纯文本，未包含视觉 encoder。
+
+| 指标 | 独立权重 | 共享权重 |
+| --- | ---: | ---: |
+| 128 输入 prefill | 1.376 秒 / 93.01 token/s | 1.372 秒 / 93.27 token/s |
+| 随后 127 步 decode | 13.25 token/s | 12.86 token/s |
+| 1024 输入，8×AR128 prefill | 6.631 秒 / 154.42 token/s | 6.028 秒 / 169.88 token/s |
+| 随后 127 步 decode | 13.45 token/s | 13.04 token/s |
+| 128 输入全流程采样峰值 | 7.130 GiB | **4.979 GiB** |
+| 128 个 WikiText 预测目标 PPL | 6.081342397 | **6.081342397** |
+| 对 FP32 的末层 hidden SQNR | 6.243535 dB | **6.243535 dB** |
+
+128 输入和 1024 输入的两组测试，各有 **86 份 hidden、logits、输出 token 和 40 层 state/KV 文件逐字节一致**。相对原量化版本的 hidden 噪声为零。自由生成中文回答正常、18 个 token 后 EOS：`我是一个致力于提供准确、简洁信息的人工智能助手。1加1等于2。`
+
+峰值降低 **2.151 GiB、30.17%**，口径为 CPU PSS＋按 inode 去重的 DMA 容量－已计入 PSS 的 DMA，200 ms 采样；SwapPSS 另外记录。1K 输入共享版另测峰值 **4.941 GiB**。Prefill 使用 Android `PREFILL_TOTAL.loop_ms`，decode 使用 `DECODE_LOOP`，不含初始化或 ADB 部署。性能为一次完整设备运行，存在设备/I/O 波动，不能将小幅差值视为稳定加速。1K 初始化耗时为 3.400 → 5.624 秒，本轮主要收益是内存下降，decode 并未加速。
+
+整模验证中解决了以下问题：
+
+- 串行加载到第 21 层时，QNN 尝试更换 DSP session，回调权重 offset 校验失败。最终采用 `QnnContext_ParamsV2_t` 的回调批量恢复，并使用 `SHARE_RESOURCES + SEQUENTIAL_WITHOUT_VA_OPTIMIZATION` 共享工作区；SDK 不允许 callback 权重与 `SEQUENTIAL_WITH_VA_OPTIMIZATION` 组合。
+- 同一 context 内跨图复用 IO 时，重复注册同一 fd 会触发错误 8002。由共享库按 context/fd/dtype/shape 缓存 memHandle，并引用计数释放。prefill/decode 通过 C ABI 借用 context 与元数据，不跨 DLO 传递布局不同的 C++ `Buffer`。
+- QNN 常驻后 Native 专家映射触及地址空间限制，出现 `HAP_mmap2` 错误 25。将 Native prefill 的虚拟映射窗口从四个减为两个；ARM 中的 40×64 专家缓存不变。IO 预算由实际 cache tensor 估算，此容量使用 192 MiB。
+- 共享导出必须保留 `replace_prefill_cores` 的 chunked mixed-FP16 GDN。首次遗漏时 PPL 为 6.414，该轮不作为最终结果。补齐后按生成的 `.io` 文件绑定参数，恢复完整数值一致性。上面的四层先导记录对应较早的 recurrent prefill 路径，新导出器以本节的 chunked 路径为准。
+
+最终 token 循环内 context 创建/释放、IO 注册/注销、RPC buffer 分配/释放均为零；130 次层权重回调和一次 head 回调全部正常释放，live=0。默认独立权重路径也已验证新旧 runner 的 86 份结果逐字节一致。
+
+设备上已部署的共享版本可这样运行：
+
+```bash
+python examples/qualcomm/oss_scripts/moe/qwen35-35B-A3B/run_chat.py \
+  --build-dir build/moe/qwen35-35B-A3B-sharing40 \
+  --artifacts llama-output/qwen35-moe-embedding-router-gptq-20261023 \
+  --shared-model llama-output/qwen35-moe-sharing-forty-layer-20261023/corrected/separated \
+  --embedding-table llama-output/qwen35-moe-embedding-router-gptq-20261023/embedding.int4 \
+  --prefill-pte /data/local/tmp/qwen35-sharing-corrected-model/prefill/prefill-seq128.pte \
+  --decode-pte /data/local/tmp/qwen35-sharing-corrected-model/decode/decode.pte \
+  --remote-root /data/local/tmp/qwen35-sharing-corrected \
+  --decode-capacity 1152 \
+  --cache-experts 64 \
+  --prompt-tokens 128 \
+  --max-new-tokens 32 \
+  --prompt "你好，请用中文介绍一下自己，再告诉我1加1等于几。"
+```
+
+完整数值、初始化耗时、内存现场、SHA256、修复经过与导出调用见[40 层共享权重报告](../../../../../llama-output/qwen35-moe-sharing-forty-layer-20261023/REPORT.md)。两种 prefill 计划均为 50,304 字节，decode 计划为 56,832 字节，权重在外部文件。经授权另清理了约 1.93 GiB 的重复中间 PTE；原始 binary、冻结 QDQ、权重、日志与对照结果保留。
+
+### 每层 32 / 64 槽对照
+
+2026-10-24，在上述完整 40 层共享权重版本上，仅修改专家缓存容量，Top8、量化配置和图保持一致。Prefill、decode 与交接共同使用实际的 32 / 64 槽容量，pipeline bank 随容量缩小。原每层 64 个候选的启动 profile 保留；32 槽只加载每层前 32 个候选，推理期间按 LRU 更新。
+
+SM8975/V85，纯文本、AR128、decode capacity=1152；每组随后执行相同的 127 步 teacher-forced AR1。下表两列均为本轮同版本 runner 实测，未混用历史吞吐。
+
+| 指标 | 每层 64 槽 | 每层 32 槽 |
+| --- | ---: | ---: |
+| 128 输入 prefill | 1.363 秒 / 93.92 token/s | 1.569 秒 / 81.56 token/s |
+| 随后 decode | 12.90 token/s | 10.76 token/s |
+| 128 输入全流程采样峰值 | 4.972 GiB | **3.902 GiB** |
+| 1024 输入 prefill，8×AR128 | 6.297 秒 / 162.61 token/s | 7.900 秒 / 129.62 token/s |
+| 随后 decode | 12.97 token/s | 10.85 token/s |
+| 1024 输入全流程采样峰值 | 4.946 GiB | **3.867 GiB** |
+
+峰值口径为 CPU PSS＋去重 DMA，200 ms 采样，SwapPSS 为 0；不含手机系统及其他应用。128 输入组额外保留全部 logits 用于 PPL，1024 输入组只保留最后一步 logits，同一输入长度的两列完全同口径。
+
+常驻专家缓存从 **2.051 → 1.026 GiB**，加上两个 pipeline bank 缩小，整模峰值减少约 **1.07–1.08 GiB**。128 输入后的 decode 命中率由 **84.24% → 68.56%**，127 步读取量由 **5.48 → 10.94 GB**；1K 输入后命中率由 **85.11% → 72.02%**。额外的缺失读取和 prefill 分批调用导致吞吐下降。
+
+128 / 1024 两组各 86 份 hidden、logits、输出 token、state/KV 逐字节一致。短 WikiText 回归 PPL 均为 **6.081342397**，对 FP32 的末层 hidden SQNR 均为 **6.243535 dB**，没有额外数值损失。
+
+`configs/sm8975.json` 现默认每层 32 槽。需要重编译 runner；本轮已编译目录是 `build/moe/qwen35-35B-A3B-cache32-20261024`。显式传 `--cache-experts 32` 或 `64` 控制两个阶段，无需重新导出 PTE。完整命令、原始日志、峰值 fdinfo/smaps 与数值对照见[32 槽测试报告](../../../../../llama-output/qwen35-moe-cache32-20261024/REPORT.md)。

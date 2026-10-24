@@ -1340,6 +1340,7 @@ def get_soc_to_htp_arch_map():
         "SM8650": HtpArch.V75,
         "SM8750": HtpArch.V79,
         "SM8850": HtpArch.V81,
+        "SM8975": HtpArch.V85,
         "SSG2115P": HtpArch.V73,
         "SSG2125P": HtpArch.V73,
         "SXR1230P": HtpArch.V73,
@@ -1357,6 +1358,7 @@ def get_soc_to_htp_arch_map():
 def get_soc_to_lpai_hw_ver_map():
     return {
         "SM8850": LpaiHardwareVersion.V6,
+        "SM8975": LpaiHardwareVersion.V7,
         "SAR2230P": LpaiHardwareVersion.V6,
     }
 
@@ -1376,6 +1378,7 @@ def get_soc_to_chipset_map():
         "SM8650": QcomChipset.SM8650,
         "SM8750": QcomChipset.SM8750,
         "SM8850": QcomChipset.SM8850,
+        "SM8975": QcomChipset.SM8975,
         "SSG2115P": QcomChipset.SSG2115P,
         "SSG2125P": QcomChipset.SSG2125P,
         "SXR1230P": QcomChipset.SXR1230P,

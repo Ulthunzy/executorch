@@ -252,7 +252,9 @@ static void projection(
   request->w = weight_buffers;
 }
 
-static BankMapping mappings[4];
+// Only the current call uses its bank. Two DSP VA windows suffice while the
+// 40-layer ARM cache keeps every resident payload.
+static BankMapping mappings[2];
 
 int release_banks() {
   int error = 0;
@@ -315,7 +317,7 @@ uint32_t execute_integer_moe(
           break;
         }
     if (!mapping) {
-      auto& victim = mappings[unsigned(descriptor[3]) % 4];
+      auto& victim = mappings[unsigned(descriptor[3]) % 2];
       if (victim.pointer && HAP_munmap(victim.pointer, victim.bytes))
         sync->error = 52;
       else {

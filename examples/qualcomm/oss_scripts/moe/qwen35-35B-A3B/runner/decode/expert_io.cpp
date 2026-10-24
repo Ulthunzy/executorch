@@ -12,7 +12,7 @@ ExpertCache::ExpertCache(
     bool direct,
     const std::string& root)
     : layers(count),
-      capacity(kExpertSlots),
+      capacity(configuredExpertSlots()),
       stride(maximum),
       entries(count * capacity),
       mapped(direct) {
@@ -30,8 +30,8 @@ ExpertCache::ExpertCache(
       throw std::runtime_error("resident handoff size");
     memcpy(&transfer, raw.data(), sizeof(transfer));
     if (memcmp(transfer.magic, "Q36DATA2", 8) || transfer.layers != 40 ||
-        transfer.capacity != kExpertSlots || capacity != kExpertSlots ||
-        stride != transfer.stride || !mapped)
+        transfer.capacity != uint32_t(capacity) || stride != transfer.stride ||
+        !mapped)
       throw std::runtime_error("resident handoff dimensions");
     if (transfer.data_offset != 4096)
       throw std::runtime_error("reuse data offset");
@@ -57,8 +57,10 @@ ExpertCache::ExpertCache(
       if (ioctl(b.fd, DMA_BUF_IOCTL_SYNC, &sync))
         throw std::runtime_error("resident begin read");
       if (residentFingerprint(
-              static_cast<const uint8_t*>(b.data), stride, data_offset) !=
-          metadata.fingerprint)
+              static_cast<const uint8_t*>(b.data),
+              stride,
+              data_offset,
+              capacity) != metadata.fingerprint)
         throw std::runtime_error("resident weight fingerprint");
       sync.flags = DMA_BUF_SYNC_END | DMA_BUF_SYNC_READ;
       if (ioctl(b.fd, DMA_BUF_IOCTL_SYNC, &sync))

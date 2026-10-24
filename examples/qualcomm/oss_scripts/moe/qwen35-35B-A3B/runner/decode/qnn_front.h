@@ -113,6 +113,7 @@ struct MappedBinary {
 struct Graph {
   unsigned profile_calls = 0;
   Runtime& runtime;
+  bool borrowed_context = false;
   Qnn_ContextHandle_t context = nullptr;
   Qnn_GraphHandle_t graph = nullptr;
   QnnSystemContext_Handle_t system = nullptr;

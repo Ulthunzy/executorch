@@ -57,12 +57,26 @@ class DecodeBackend final : public BackendInterface {
       memcpy(&size, p + 24, 8);
       memcpy(&aux_offset, p + 32, 8);
       memcpy(&aux_size, p + 40, 8);
-      if (version != 1 || kind > 4 || layer >= 40 ||
-          size > processed->size() - 128 ||
+      if ((version != 1 && !(version == 3 && getenv("SHARED_MODEL_ROOT"))) ||
+          kind > 4 || layer >= 40 || size > processed->size() - 128 ||
           (aux_size &&
            (aux_offset > processed->size() ||
             aux_size > processed->size() - aux_offset)))
         return Error::DelegateInvalidCompatibility;
+      if (version == 3) {
+        if (kind == 0) {
+          if (size != 1296 || aux_size)
+            return Error::DelegateInvalidCompatibility;
+          cache_encoding = bytes(model_root + "/cache-encoding.bin");
+        } else if (kind == 1) {
+          if (size || aux_size < 8 || aux_size % 4)
+            return Error::DelegateInvalidCompatibility;
+          layer_io[layer].resize(aux_size / 4);
+          memcpy(layer_io[layer].data(), p + aux_offset, aux_size);
+        } else if (size || aux_size)
+          return Error::DelegateInvalidCompatibility;
+        return static_cast<DelegateHandle*>(new Stage{kind, layer});
+      }
       const auto base = model_root + "/layer" + std::to_string(layer);
       if (kind == 0) {
         cache_encoding = bytes(model_root + "/cache-encoding.bin");
@@ -211,7 +225,7 @@ static int decode_main(int argc, const char** argv) try {
   const auto status = module.load_method("decode_forward");
   if (status != Error::Ok)
     throw std::runtime_error("PTE load " + std::to_string(int(status)));
-  if (embedded_binaries.size() != 71)
+  if (embedded_binaries.size() != 71 && !getenv("SHARED_MODEL_ROOT"))
     throw std::runtime_error("missing embedded QNN graphs");
   session = std::make_unique<DecodeSession>(model_root, cache_mib);
 

@@ -7,6 +7,7 @@
 #include "vision_encoder.h"
 #include "../handoff.h"
 #include "../decode_api.h"
+#include "../shared/graph_binding.h"
 
 using namespace executorch::runtime;
 static std::string model_root;
@@ -45,6 +46,9 @@ class PrefillBackend final : public BackendInterface {
       memcpy(&aux_offset, p + 32, 8);
       memcpy(&aux_size, p + 40, 8);
       if (!((version == 1 && plan_tokens == 0) ||
+            (version == 3 && getenv("SHARED_MODEL_ROOT") &&
+             plan_tokens >= 128 && plan_tokens <= 1024 &&
+             plan_tokens % 128 == 0) ||
             (version == 2 && plan_tokens > 128 && plan_tokens <= 1024 &&
              plan_tokens % 128 == 0)) ||
           kind > 4 || layer >= 40 || size > processed->size() - 128 ||
@@ -52,6 +56,12 @@ class PrefillBackend final : public BackendInterface {
            (aux_offset > processed->size() ||
             aux_size > processed->size() - aux_offset)))
         return Error::DelegateInvalidCompatibility;
+      if (version == 3) {
+        if (size || aux_size)
+          return Error::DelegateInvalidCompatibility;
+        return static_cast<DelegateHandle*>(
+            new Stage{kind, layer, plan_tokens});
+      }
       std::string base = model_root + "/layer" + std::to_string(layer);
       if (kind == 1) {
         if (!size)
@@ -184,7 +194,7 @@ int main(int argc, char** argv) try {
   auto error = module.load_method("prefill_forward");
   if (error != Error::Ok)
     throw std::runtime_error("PTE load_method " + std::to_string(int(error)));
-  if (embedded_binaries.size() != 91)
+  if (embedded_binaries.size() != 91 && !getenv("SHARED_MODEL_ROOT"))
     throw std::runtime_error("missing embedded context binaries");
   auto meta = module.method_meta("prefill_forward");
   if (!meta.ok())
@@ -216,9 +226,10 @@ int main(int argc, char** argv) try {
   if (data.size() != size_t(prompt_tokens) * 8)
     throw std::runtime_error("token input size");
   printf(
-      "PTE_READY layers=40 ar_len=128 prompt_tokens=%d chunks=%d plan_calls=122 embedded_qnn_contexts=81 expert_slots=%zu expert_buffer_bytes=%zu rpc_buffer_bytes=%llu peak_rpc_buffer_bytes=%llu setup_ms=%.6f context_creates=%llu memory_registers=%llu hot=0\n",
+      "PTE_READY layers=40 ar_len=128 prompt_tokens=%d chunks=%d plan_calls=122 embedded_qnn_contexts=%d expert_slots=%zu expert_buffer_bytes=%zu rpc_buffer_bytes=%llu peak_rpc_buffer_bytes=%llu setup_ms=%.6f context_creates=%llu memory_registers=%llu hot=0\n",
       prompt_tokens,
       prompt_tokens / 128,
+      getenv("SHARED_MODEL_ROOT") ? 0 : 81,
       session->expert_slots.size() * session->capacity,
       session->expert_slots.size() * session->expert_slots[0]->size,
       (unsigned long long)session->runtime.buffer_bytes,
@@ -409,12 +420,12 @@ int main(int argc, char** argv) try {
       throw std::runtime_error("invalid direct reuse handoff");
     auto started = Clock::now();
     // decode 导入同一组 DMA buffer；dup 的 fd 由导入端关闭，原 fd 仍由
-    // prefill session 持有，不重新读取或复制整套 40×64 专家。
+    // prefill session 持有，不重新读取或复制整套常驻专家。
     ResidentExperts transfer{};
     memcpy(transfer.magic, "Q36DATA2", 8);
     transfer.stride = session->stride;
     transfer.data_offset = 4096;
-    transfer.capacity = kExpertSlots;
+    transfer.capacity = session->capacity;
     transfer.layers = 40;
     std::vector<int32_t> selected;
     std::vector<uint64_t> selected_stamps;
@@ -430,8 +441,9 @@ int main(int argc, char** argv) try {
       record.fingerprint = residentFingerprint(
           static_cast<const uint8_t*>(buffer.data),
           transfer.stride,
-          transfer.data_offset);
-      for (int slot = 0; slot < kExpertSlots; slot++) {
+          transfer.data_offset,
+          transfer.capacity);
+      for (int slot = 0; slot < session->capacity; slot++) {
         const auto entry = session->caches[layer].entries[slot];
         if (entry.expert < 0)
           throw std::runtime_error("empty reuse seed");
@@ -469,7 +481,7 @@ int main(int argc, char** argv) try {
         masks.size() * 4);
     printf(
         "EXPERT_RESIDENT_EXPORT layers=40 experts=%d buffer_bytes=%llu metadata_bytes=%zu read_bytes=0 copy_bytes=0 export_ms=%.6f\n",
-        40 * kExpertSlots,
+        40 * session->capacity,
         (unsigned long long)total_bytes,
         sizeof(transfer),
         elapsed(started));
@@ -509,7 +521,8 @@ int main(int argc, char** argv) try {
       throw std::runtime_error("prefill/vision lifetime changed during decode");
     printf(
         "MODEL_RESIDENT retained_contexts=%llu vision_alive=%d context_frees_during_decode=0 decode_exit=%d\n",
-        (unsigned long long)session->runtime.live_contexts,
+        (unsigned long long)(session->runtime.live_contexts +
+                             shared_context_count()),
         session->vision != nullptr,
         result);
     return result;

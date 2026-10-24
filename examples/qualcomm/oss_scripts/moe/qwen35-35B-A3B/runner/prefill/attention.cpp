@@ -23,6 +23,19 @@ Attention::Attention(
                                : std::vector<int>{0, 1, 2, 5, 4, 3};
   std::vector<int> om =
       linear ? std::vector<int>{3, 2, 0, 1} : std::vector<int>{3, 2, 1, 0};
+  if (graph.borrowed_context) {
+    const auto mapping = bytes(
+        std::string(getenv("SHARED_MODEL_ROOT")) + "/group" +
+        std::to_string(layer / 4) + "/layer" + std::to_string(layer) +
+        "_prefill_attention.io");
+    const auto* order = reinterpret_cast<const uint32_t*>(mapping.data());
+    if (mapping.size() !=
+            4 * (2 + graph.inputs.size() + graph.outputs.size()) ||
+        order[0] != graph.inputs.size() || order[1] != graph.outputs.size())
+      throw std::runtime_error("shared prefill IO order");
+    im.assign(order + 2, order + 2 + order[0]);
+    om.assign(order + 2 + order[0], order + 2 + order[0] + order[1]);
+  }
   for (int i : im)
     input.push_back(graph.index(true, i));
   for (int i : om)
@@ -43,10 +56,9 @@ Attention::Attention(
     swap_state[i] = linear && identity[i] &&
         FIELD(in, dataType) == FIELD(out, dataType) &&
         FIELD(in, rank) == FIELD(out, rank) &&
-        std::equal(
-            FIELD(in, dimensions),
-            FIELD(in, dimensions) + FIELD(in, rank),
-            FIELD(out, dimensions));
+        std::equal(FIELD(in, dimensions),
+                   FIELD(in, dimensions) + FIELD(in, rank),
+                   FIELD(out, dimensions));
     if (!linear)
       handoff_cache[i].resize(512 * 1024);
     cache_host[i].resize(Graph::elements(cache_owner().inputs[cache_input[i]]));

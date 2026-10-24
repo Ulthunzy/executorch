@@ -1,3 +1,4 @@
+#include "../shared/graph_binding.h"
 #include "qnn_front.h"
 
 std::map<std::string, EmbeddedBinary> embedded_binaries;
@@ -169,6 +170,8 @@ Buffer::~Buffer() {
 }
 
 MappedBinary::MappedBinary(const std::string& path) {
+  if (path.empty())
+    return;
   auto it = embedded_binaries.find(path);
   if (it != embedded_binaries.end()) {
     pointer = const_cast<uint8_t*>(it->second.pointer);
@@ -212,21 +215,28 @@ size_t Graph::size(const Qnn_Tensor_t& t) {
 }
 
 Graph::Graph(Runtime& r, const std::string& path, bool metadata_only)
-    : runtime(r), binary(path), name(path) {
-  check(r.s.systemContextCreate(&system), "systemContextCreate");
-  const QnnSystemContext_BinaryInfo_t* info = nullptr;
-  Qnn_ContextBinarySize_t n = 0;
-  check(
-      r.s.systemContextGetBinaryInfo(
-          system, binary.data(), binary.size(), &info, &n),
-      "getBinaryInfo");
-  QnnSystemContext_GraphInfo_t* g =
-      info->version == QNN_SYSTEM_CONTEXT_BINARY_INFO_VERSION_1
-      ? info->contextBinaryInfoV1.graphs
-      : info->version == QNN_SYSTEM_CONTEXT_BINARY_INFO_VERSION_2
-      ? info->contextBinaryInfoV2.graphs
-      : info->contextBinaryInfoV3.graphs;
-  auto& gi = g[0].graphInfoV1;
+    : runtime(r), binary(shared_graph_enabled(path) ? "" : path), name(path) {
+  borrowed_context = shared_graph_enabled(path);
+  const QnnSystemContext_GraphInfoV1_t* selected = nullptr;
+  if (borrowed_context) {
+    selected = borrow_shared_graph(path, &context, &graph);
+  } else {
+    check(r.s.systemContextCreate(&system), "systemContextCreate");
+    const QnnSystemContext_BinaryInfo_t* info = nullptr;
+    Qnn_ContextBinarySize_t n = 0;
+    check(
+        r.s.systemContextGetBinaryInfo(
+            system, binary.data(), binary.size(), &info, &n),
+        "getBinaryInfo");
+    QnnSystemContext_GraphInfo_t* g =
+        info->version == QNN_SYSTEM_CONTEXT_BINARY_INFO_VERSION_1
+        ? info->contextBinaryInfoV1.graphs
+        : info->version == QNN_SYSTEM_CONTEXT_BINARY_INFO_VERSION_2
+        ? info->contextBinaryInfoV2.graphs
+        : info->contextBinaryInfoV3.graphs;
+    selected = &g[0].graphInfoV1;
+  }
+  const auto& gi = *selected;
   graph_name = gi.graphName;
   inputs.assign(gi.graphInputs, gi.graphInputs + gi.numGraphInputs);
   outputs.assign(gi.graphOutputs, gi.graphOutputs + gi.numGraphOutputs);
@@ -322,6 +332,12 @@ void Graph::deactivate() {
   if (!context)
     return;
   unregister_io();
+  if (borrowed_context) {
+    release_shared_graph(context);
+    context = nullptr;
+    graph = nullptr;
+    return;
+  }
   check(runtime.q.contextFree(context, nullptr), "contextFree");
   ++runtime.context_frees;
   --runtime.live_contexts;
@@ -351,9 +367,14 @@ void Graph::unregister_io() {
   std::vector<Qnn_MemHandle_t> handles;
   for (auto& item : registered)
     handles.push_back(item.second);
-  check(
-      runtime.q.memDeRegister(handles.data(), handles.size()),
-      "memDeRegister IO");
+  if (borrowed_context) {
+    for (auto handle : handles)
+      check(unregister_shared_io(context, handle), "shared IO unregister");
+  } else {
+    check(
+        runtime.q.memDeRegister(handles.data(), handles.size()),
+        "memDeRegister IO");
+  }
   runtime.memory_deregisters += handles.size();
   registered.clear();
 }
@@ -372,7 +393,10 @@ void Graph::register_tensor(
     descriptor.memType = QNN_MEM_TYPE_ION;
     descriptor.ionInfo.fd = buffer->fd;
     check(
-        runtime.q.memRegister(context, &descriptor, 1, &handle), "memRegister");
+        borrowed_context
+            ? register_shared_io(context, &descriptor, &handle)
+            : runtime.q.memRegister(context, &descriptor, 1, &handle),
+        "memRegister");
     ++runtime.memory_registers;
     registered[key] = handle;
   } else
@@ -493,6 +517,11 @@ void ContextRestore::notify(
 }
 
 void ContextRestore::load(Runtime& runtime, const std::vector<Graph*>& graphs) {
+  if (getenv("SHARED_MODEL_ROOT")) {
+    for (auto* graph : graphs)
+      graph->activate();
+    return;
+  }
   if (getenv("QNN_SERIAL_CONTEXTS")) {
     for (auto* graph : graphs)
       graph->activate();

@@ -64,7 +64,7 @@ for stage in prefill decode; do
     -I"$task_repo/runtime/core/portable_type/c10" -I"$runtime_build/include" \
     -I"$generated" -I"$HEXAGON_SDK_ROOT/incs" -I"$HEXAGON_SDK_ROOT/incs/stddef" \
     -I"$QNN_SDK_ROOT/include/QNN" "${host_flags[@]}" "$moe_root/runner/$stage/"*.cpp \
-    "$moe_root/runner/"*.cpp \
+    "$moe_root/runner/"*.cpp "$moe_root/runner/shared/graph_binding.cpp" \
     "$generated/integer_rpc_stub.o" -Wl,--start-group \
     "$runtime_build/libexecutorch.a" "$runtime_build/libexecutorch_core.a" \
     "$runtime_build/extension/module/libextension_module.a" \
@@ -75,5 +75,10 @@ for stage in prefill decode; do
     -L"$HEXAGON_SDK_ROOT/ipc/fastrpc/remote/ship/android_aarch64" \
     -lcdsprpc -ldl -llog -o "$host_output"
 done
+"$compiler" -O3 -std=c++17 -static-libstdc++ -fPIC -shared -fvisibility=hidden \
+  -fvisibility-inlines-hidden -Wl,-Bsymbolic -Wl,--exclude-libs,ALL \
+  -I"$QNN_SDK_ROOT/include/QNN" "$moe_root/runner/shared/context_store.cpp" \
+  "$moe_root/runner/shared/weight_source.cpp" "$moe_root/runner/shared/graph_binding.cpp" \
+  "$moe_root/runner/decode/qnn_front.cpp" -ldl -o "$task_build/libqwen35_shared.so"
 "$moe_root/build_op_package.sh"
 echo "Built runners and V85 Native MoE libraries in $task_build"

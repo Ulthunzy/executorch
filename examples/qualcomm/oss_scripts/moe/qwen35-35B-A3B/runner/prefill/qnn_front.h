@@ -109,6 +109,7 @@ struct MappedBinary {
 // QNN 内存句柄属于各自的 context，即使多张图绑定的是同一个 Buffer。
 struct Graph {
   Runtime& runtime;
+  bool borrowed_context = false;
   Qnn_ContextHandle_t context = nullptr;
   Qnn_GraphHandle_t graph = nullptr;
   QnnSystemContext_Handle_t system = nullptr;

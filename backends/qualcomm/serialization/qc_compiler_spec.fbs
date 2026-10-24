@@ -19,6 +19,7 @@ enum HtpArch: int {
   V75 = 75,
   V79 = 79,
   V81 = 81,
+  V85 = 85,
 }
 
 table HtpInfo {
@@ -57,6 +58,7 @@ enum QcomChipset: int {
   SM8650 = 57,
   SM8750 = 69,
   SM8850 = 87,
+  SM8975 = 103,
   SSG2115P = 46,
   SSG2125P = 58,
   SXR1230P = 45,

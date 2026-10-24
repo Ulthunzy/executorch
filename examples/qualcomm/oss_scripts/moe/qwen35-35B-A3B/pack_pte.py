@@ -21,6 +21,9 @@ def main():
         default=128,
         help="Host plan sequence length; QNN and Native kernels remain AR128",
     )
+    parser.add_argument(
+        "--shared-model", type=Path, help="Separated four-layer context groups"
+    )
     args = parser.parse_args()
     if args.phase == "decode" and args.cache_encoding is None:
         parser.error("Decode packing requires --cache-encoding")
@@ -80,6 +83,13 @@ def main():
         return len(values) - 1
 
     def stage(kind, layer, arguments, primary=None, auxiliary=None):
+        if args.shared_model:
+            primary = args.cache_encoding if decode and kind == 0 else None
+            auxiliary = (
+                (args.shared_model / f"group{layer // 4}" / f"layer{layer}_decode.io")
+                if decode and kind == 1
+                else None
+            )
         data = primary.read_bytes() if primary else b""
         aux = auxiliary.read_bytes() if auxiliary else b""
         offset = (128 + len(data) + 127) & ~127
@@ -87,10 +97,10 @@ def main():
         header = struct.pack(
             "<8sIIIIQQQ",
             magic,
-            2 if ar_len > 128 else 1,
+            3 if args.shared_model else (2 if ar_len > 128 else 1),
             kind,
             layer,
-            ar_len if ar_len > 128 else 0,
+            ar_len if args.shared_model or ar_len > 128 else 0,
             len(data),
             offset,
             len(aux),
@@ -181,6 +191,10 @@ def main():
                 ar_len=1 if decode else 128,
                 plan_tokens=ar_len,
                 layers=40,
+                weight_mode=(
+                    "external_shared" if args.shared_model else "embedded_independent"
+                ),
+                shared_model=str(args.shared_model) if args.shared_model else None,
                 stages=records,
             ),
             indent=2,

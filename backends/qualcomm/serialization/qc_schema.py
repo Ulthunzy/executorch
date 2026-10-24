@@ -28,6 +28,7 @@ class HtpArch(IntEnum):
     V75 = 75
     V79 = 79
     V81 = 81
+    V85 = 85
 
 
 @dataclass
@@ -64,6 +65,7 @@ class QcomChipset(IntEnum):
     SM8650 = 57  # v75
     SM8750 = 69  # v79
     SM8850 = 87  # v81
+    SM8975 = 103  # v85
     SSG2115P = 46  # v73
     SSG2125P = 58  # v73
     SXR1230P = 45  # v73
@@ -99,6 +101,12 @@ _soc_info_table = {
     QcomChipset.SM8750: SocInfo(QcomChipset.SM8750, HtpInfo(HtpArch.V79, 8)),
     QcomChipset.SM8850: SocInfo(
         QcomChipset.SM8850, HtpInfo(HtpArch.V81, 8), LpaiInfo(LpaiHardwareVersion.V6)
+    ),
+    QcomChipset.SM8975: SocInfo(
+        # Zero lets QNN select the target's maximum VTCM size.
+        QcomChipset.SM8975,
+        HtpInfo(HtpArch.V85, 0),
+        LpaiInfo(LpaiHardwareVersion.V7),
     ),
     QcomChipset.SSG2115P: SocInfo(QcomChipset.SSG2115P, HtpInfo(HtpArch.V73, 2)),
     QcomChipset.SSG2125P: SocInfo(QcomChipset.SSG2125P, HtpInfo(HtpArch.V73, 2)),

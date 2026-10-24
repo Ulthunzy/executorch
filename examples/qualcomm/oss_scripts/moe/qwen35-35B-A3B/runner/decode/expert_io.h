@@ -13,7 +13,7 @@
 // 一个专家的对齐磁盘范围和有效 payload；cached 与 cache_destination
 // 区分命中/缺失。
 
-// 40 层各有独立的 64 槽 LRU，层号是缓存键的一部分。
+// 40 层各有独立的 LRU，层号是缓存键的一部分。
 // 相同 expert ID 在不同层对应不同权重，不能跨层共享一个槽。
 class ExpertCache {
   struct Entry {

@@ -64,8 +64,11 @@ DecodeSession::DecodeSession(const std::string& path, size_t cache_mib)
     tasks.reserve(2);
   for (int layer = 0; layer < 40; layer++) {
     attention.emplace_back(new Attention(runtime, root, layer, layer % 4 != 3));
-    router.emplace_back(new Graph(
-        runtime, root + "/layer" + std::to_string(layer) + "/moe-front.bin"));
+    if (attention.back()->output.size() == 7)
+      router.emplace_back(nullptr);
+    else
+      router.emplace_back(new Graph(
+          runtime, root + "/layer" + std::to_string(layer) + "/moe-front.bin"));
   }
   shared_io =
       std::make_unique<SharedIo>(runtime, attention, router, core.outbuf[0]);
@@ -250,13 +253,13 @@ void DecodeSession::route(
   if (!in_step || layer != next_layer)
     throw std::runtime_error("router layer order");
   auto t = Clock::now();
-  auto& r = *router[layer];
   if (attention[layer]->output.size() == 7) {
     auto& a = *attention[layer];
     memcpy(ids, a.graph.output(a.output[4]), 8 * 4);
     memcpy(scores, a.graph.output(a.output[5]), 8 * 4);
     memcpy(shared, a.graph.output(a.output[6]), 2048 * 4);
   } else {
+    auto& r = *router[layer];
     memcpy(r.input(r.index(true, 0)), x, 2048 * 4);
     r.execute();
     memcpy(ids, r.output(r.index(false, 0)), 8 * 4);
