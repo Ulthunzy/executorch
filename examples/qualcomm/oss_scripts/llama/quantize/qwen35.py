@@ -51,6 +51,60 @@ def tensor(module, node):
         return module.get_parameter(node.target)
 
 
+@torch.no_grad()
+def stabilize_gdn_weight_scales(module):
+    """Requantize tiny GDN weight encodings that saturate on QNN HTP."""
+    minimum = torch.finfo(torch.float16).tiny
+    changed = 0
+    for node in module.graph.nodes:
+        path = next(
+            reversed(node.meta.get("nn_module_stack", {"": ("", "")}).values())
+        )[0]
+        if node.target != torch.ops.aten.conv2d.default or not path.endswith(
+            (
+                ".attention.in_proj_qvab.conv",
+                ".attention.in_proj_kz.conv",
+                ".attention.causal_conv2d",
+            )
+        ):
+            continue
+        weight = node.args[1]
+        if weight.target == torch.ops.torchao.dequantize_affine.default:
+            codes = tensor(module, weight.args[0])
+            scales = tensor(module, weight.args[2])
+            zero = tensor(module, weight.args[3])
+            shape = (scales.shape[0], scales.shape[1], -1)
+            broadcast = (scales.shape[0], scales.shape[1], 1)
+            quant_min, quant_max = weight.args[-2:]
+        elif (
+            weight.target
+            == torch.ops.quantized_decomposed.dequantize_per_channel.default
+        ):
+            codes = tensor(module, weight.args[0])
+            scales = tensor(module, weight.args[1])
+            zero = tensor(module, weight.args[2])
+            assert weight.args[3] == 0
+            shape = codes.shape
+            broadcast = (scales.numel(),) + (1,) * (codes.ndim - 1)
+            quant_min, quant_max = weight.args[4:6]
+        else:
+            continue
+        small = scales < minimum
+        if not small.any():
+            continue
+        assert not zero.any(), "GDN weights must use symmetric quantization"
+        safe = scales.clamp_min(minimum)
+        # Preserve the represented weights: raising scales alone amplifies the
+        # tiny channels rather than fixing their encoding.
+        values = codes.reshape(shape).float() * scales.reshape(broadcast)
+        updated = (values / safe.reshape(broadcast)).round().clamp(quant_min, quant_max)
+        codes.copy_(updated.reshape_as(codes).to(codes.dtype))
+        scales.copy_(safe)
+        changed += int(small.sum())
+    logging.info("Stabilized %d tiny GDN weight scales for QNN HTP", changed)
+    return changed
+
+
 def protect_linear_bias(module):
     """Ensure INT32 biases fit activation_scale * per-channel weight_scale."""
     changed = 0
@@ -445,6 +499,7 @@ def quantize_qwen35(
         program = torch.export.export(quantized, inputs, strict=False)
         quantized = program.module()
         remove_export_checks(quantized)
+        stabilize_gdn_weight_scales(quantized)
         gptq = optimize_out_projections(quantized, weights, capture, device)
         del prepared, program, capture, weights
         gc.collect()

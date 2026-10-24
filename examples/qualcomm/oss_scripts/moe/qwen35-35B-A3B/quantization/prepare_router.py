@@ -1,11 +1,14 @@
 import argparse
 import json
+import math
 from pathlib import Path
 import subprocess
 import sys
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
+
+from model_config import add_model_config_argument, load_model_config
 
 
 def attention_inputs(args, layer):
@@ -16,6 +19,11 @@ def attention_inputs(args, layer):
     )
     import executorch.examples.qualcomm.custom_op.deltanet
     from executorch.examples.qualcomm.oss_scripts.llama.model import chunk_gdn
+
+    if args.normalized_inputs:
+        return torch.load(args.normalized_inputs, weights_only=True, mmap=True)[
+            "norm"
+        ].to(args.device)
 
     if layer:
         hidden = torch.load(
@@ -230,7 +238,11 @@ def prepare_layer(args, layer):
         activation_grid_tokens=7168,
         validation_used_for_fitting=False,
         heldout_used_for_fitting=False,
-        calibration_state="existing sequential W2 baseline; unchanged attention",
+        calibration_state=(
+            str(args.normalized_inputs)
+            if args.normalized_inputs
+            else "existing sequential W2 baseline; unchanged attention"
+        ),
         shared_output_sqnr_db=sqnr(reference[2], actual[2]),
         router_score_sqnr_db=sqnr(reference[1], actual[1]),
         router_top8_overlap=float(
@@ -254,23 +266,38 @@ def main():
     parser = argparse.ArgumentParser(
         description="Calibrate W8A16 Router/shared using GPTQ on frozen sequential W2 inputs"
     )
+    add_model_config_argument(parser)
     parser.add_argument("--source-dir", type=Path, required=True)
     parser.add_argument("--sequential", type=Path, required=True)
     parser.add_argument("--inputs", type=Path, required=True)
+    parser.add_argument("--normalized-inputs", type=Path)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--qnn-binding", type=Path)
     parser.add_argument("--layers", type=int, nargs="+", default=list(range(40)))
     parser.add_argument("--device", choices=["cuda", "cpu"], default="cuda")
-    parser.add_argument("--damping", type=float, default=0.01)
+    parser.add_argument("--damping", type=float)
     parser.add_argument("--worker", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args()
+    settings = load_model_config(args.model_config)
+    if settings.quantization.router_shared != "w8a16_gptq":
+        parser.error(
+            "FP16 Router/shared uses checkpoint constants; skip GPTQ preparation"
+        )
+    args.damping = (
+        settings.quantization.router_gptq_damping
+        if args.damping is None
+        else args.damping
+    )
     if (
         not args.layers
         or any(layer not in range(40) for layer in args.layers)
+        or not math.isfinite(args.damping)
         or args.damping <= 0
     ):
         parser.error("Expected layer IDs 0..39 and positive damping")
     args.output.mkdir(parents=True, exist_ok=True)
+    if args.normalized_inputs and len(args.layers) != 1:
+        parser.error("--normalized-inputs requires one layer")
     if args.worker:
         if len(args.layers) != 1:
             parser.error("Worker requires exactly one layer")
@@ -281,6 +308,8 @@ def main():
             sys.executable,
             "-u",
             __file__,
+            "--model-config",
+            str(args.model_config),
             "--worker",
             "--layers",
             str(layer),
@@ -299,6 +328,8 @@ def main():
         ]
         if args.qnn_binding:
             command += ["--qnn-binding", str(args.qnn_binding)]
+        if args.normalized_inputs:
+            command += ["--normalized-inputs", str(args.normalized_inputs)]
         subprocess.run(command, check=True)
 
 

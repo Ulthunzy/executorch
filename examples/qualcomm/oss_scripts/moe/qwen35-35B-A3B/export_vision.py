@@ -3,11 +3,14 @@ import hashlib
 import json
 from pathlib import Path
 
+from model_config import add_model_config_argument, load_model_config
+
 
 def main():
     parser = argparse.ArgumentParser(
         description="Export the checkpoint's W8A16 vision encoder for SM8975"
     )
+    add_model_config_argument(parser)
     parser.add_argument("--model", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--calib-images", type=Path, nargs="+", required=True)
@@ -16,6 +19,7 @@ def main():
     parser.add_argument("--calibration-device", choices=["cpu", "cuda"], default="cuda")
     parser.add_argument("--qnn-binding", type=Path)
     args = parser.parse_args()
+    settings = load_model_config(args.model_config)
     if (
         min(args.image_height, args.image_width) < 32
         or args.image_height % 32
@@ -102,9 +106,29 @@ def main():
     np.asarray(reference, dtype="<f4").tofile(args.output / "reference.f32")
     np.asarray(inputs[0], dtype="<f4").tofile(args.output / "reference-pixels.f32")
     model.cpu()
+    position_report = []
+    if settings.quantization.vision.endswith("_gptq"):
+        from quantization.matrix import quantize_vision_positions
+
+        position_report = [
+            quantize_vision_positions(
+                model.visual,
+                args.calibration_device,
+                settings.quantization.matrix_gptq_damping,
+            )
+        ]
     model = torch.export.export(model, inputs, strict=True).module()
+    gptq_weights = None
+    if settings.quantization.vision.endswith("_gptq"):
+        from quantization.matrix import original_weights
+
+        gptq_weights = original_weights(model)
     quantizer = QnnQuantizer(soc_model=QcomChipset.SM8975)
-    quantizer.set_recipe(Qwen35VLEncoderQuantRecipe().recipe)
+    recipes = {
+        "w8a16": Qwen35VLEncoderQuantRecipe,
+        "w8a16_gptq": Qwen35VLEncoderQuantRecipe,
+    }
+    quantizer.set_recipe(recipes[settings.quantization.vision]().recipe)
     model = prepare_pt2e(model, quantizer)
     move_graph(model, args.calibration_device)
     for number, pixels in enumerate(examples, 1):
@@ -115,6 +139,19 @@ def main():
         )
     protect_linear_bias(model)
     model = convert_pt2e(model)
+    model = torch.export.export(
+        model, (inputs[0].to(args.calibration_device),), strict=False
+    ).module()
+    gptq_report = []
+    if gptq_weights is not None:
+        from quantization.matrix import HessianCapture, apply_gptq
+
+        capture = HessianCapture(model)
+        for pixels in examples:
+            capture.run(pixels.to(args.calibration_device))
+        gptq_report = position_report + apply_gptq(
+            model, gptq_weights, capture, settings.quantization.matrix_gptq_damping
+        )
     outputs = torch.utils._pytree.tree_leaves(
         model(inputs[0].to(args.calibration_device))
     )
@@ -165,7 +202,8 @@ def main():
         model_config_sha256=hashlib.sha256(
             (args.model / "config.json").read_bytes()
         ).hexdigest(),
-        precision="W8A16",
+        precision=settings.quantization.vision.removesuffix("_gptq").upper(),
+        gptq=gptq_report,
         image_height=args.image_height,
         image_width=args.image_width,
         image_token_id=config.image_token_id,

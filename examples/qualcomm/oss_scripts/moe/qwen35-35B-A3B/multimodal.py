@@ -13,6 +13,7 @@ def vision_metadata(model: Path, artifacts: Path):
     patches = height // patch * (width // patch)
     if (
         metadata["version"] != 1
+        or metadata.get("precision") != "W8A16"
         or metadata["model_config_sha256"] != hashlib.sha256(config_bytes).hexdigest()
         or metadata["image_token_id"] != config["image_token_id"]
         or config["image_token_id"] != 248056
@@ -33,11 +34,34 @@ def vision_metadata(model: Path, artifacts: Path):
     return metadata
 
 
-def image_prompt(tokenizer, prompt, image_tokens, target_tokens):
+def pad_prompt(tokenizer, ids, target_tokens, ar_len=128, max_tokens=1024):
+    target = target_tokens or ((len(ids) + ar_len - 1) // ar_len * ar_len)
+    if target < len(ids) or target > max_tokens or target % ar_len:
+        raise ValueError(
+            f"Prompt needs {len(ids)} tokens; choose an AR{ar_len} multiple through {max_tokens}"
+        )
+    if target == len(ids):
+        return ids
+    space = tokenizer.encode(" ", add_special_tokens=False)
+    if len(space) != 1:
+        raise ValueError("Expected a single whitespace token")
+    # Pad the system message so the final state remains at the generation prompt.
+    end = ids.index(tokenizer.convert_tokens_to_ids("<|im_end|>"))
+    return ids[:end] + space * (target - len(ids)) + ids[end:]
+
+
+def image_prompt(
+    tokenizer,
+    prompt,
+    image_tokens,
+    target_tokens,
+    enable_thinking=False,
+    system_prompt="你是一个有帮助的助手，请根据图片和用户的问题准确回答。",
+):
     messages = [
         {
             "role": "system",
-            "content": "你是一个有帮助的助手，请根据图片和用户的问题准确回答。",
+            "content": system_prompt,
         },
         {
             "role": "user",
@@ -52,7 +76,7 @@ def image_prompt(tokenizer, prompt, image_tokens, target_tokens):
         tokenize=True,
         return_dict=False,
         add_generation_prompt=True,
-        enable_thinking=False,
+        enable_thinking=enable_thinking,
     )
     image_id = tokenizer.convert_tokens_to_ids("<|image_pad|>")
     if ids.count(image_id) != 1:
@@ -60,19 +84,7 @@ def image_prompt(tokenizer, prompt, image_tokens, target_tokens):
     index = ids.index(image_id)
     ids[index : index + 1] = [image_id] * image_tokens
     unfilled = len(ids)
-    target = target_tokens or ((unfilled + 127) // 128 * 128)
-    if target < unfilled or target > 1024 or target % 128:
-        raise ValueError(
-            f"Image prompt needs {unfilled} tokens; choose an AR128 multiple through 1024"
-        )
-    # 原有 AR128 图递推全部 128 步；在 system 内补真实空白 token，避免在末尾
-    # 填充后错误地把 padding 的 state/logits 交给 decode。
-    space = tokenizer.encode(" ", add_special_tokens=False)
-    if len(space) != 1:
-        raise ValueError("Expected a single whitespace token")
-    end = ids.index(tokenizer.convert_tokens_to_ids("<|im_end|>"))
-    ids[end:end] = space * (target - unfilled)
-    return messages, ids, unfilled
+    return messages, pad_prompt(tokenizer, ids, target_tokens), unfilled
 
 
 def prepare_image(args, ids, metadata, run_dir, np):

@@ -5,9 +5,22 @@ from pathlib import Path
 import struct
 import subprocess
 import sys
+from dataclasses import replace
+
+from model_config import add_model_config_argument, load_model_config
 
 
 def export_layer(args, layer):
+    settings = load_model_config(args.model_config)
+    if settings.quantization.attention == "gptq":
+        provenance = json.loads(
+            (args.source_dir / f"layer{layer}/GPTQ.json").read_text()
+        )
+        if (
+            provenance.get("source") != "safetensors"
+            or provenance.get("method") != "all_projection_gptq"
+        ):
+            raise ValueError(f"Layer {layer} is missing all-projection GPTQ provenance")
     from export.binding import load_binding
 
     qnn = load_binding(args.qnn_binding)
@@ -37,6 +50,7 @@ def export_layer(args, layer):
     from export.fp16_attention_core import fp16_attention_core
     from export.graph_utils import resize_attention
     from export.model import FusedFront, QuantizedFusedFront
+    from export.quantization import validate_router_graph, validate_router_source
     import executorch.examples.qualcomm.custom_op.deltanet  # Registers the frozen graph's operator.
 
     torch.set_num_threads(4)
@@ -46,6 +60,14 @@ def export_layer(args, layer):
     constants = args.source_dir / f"layer{layer}/moe-constants.npz"
     if linear and args.op_package_host is None:
         raise ValueError("GDN export requires --op-package-host")
+    router_calibration = (
+        validate_router_source(
+            args.router_qdq / f"layer{layer}",
+            settings.quantization.router_gptq_damping,
+        )
+        if args.router_qdq
+        else None
+    )
     for capacity in [args.capacities[0]] if linear else args.capacities:
         graph = torch.export.load(source).module()
         inputs = resize_attention(graph, capacity)
@@ -57,6 +79,7 @@ def export_layer(args, layer):
             moe = torch.export.load(
                 args.router_qdq / f"layer{layer}/router-ar1-qdq.pt2"
             ).module()
+            validate_router_graph(moe)
             model = QuantizedFusedFront(graph, moe)
         else:
             model = FusedFront(graph, constants)
@@ -114,7 +137,7 @@ def export_layer(args, layer):
                     or any(user.op == "output" for user in node.users)
                 )
             ):
-                return torch.uint16
+                return {"uint16": torch.uint16}[settings.cache.kv_dtype]
 
         jobs[TagQuantIO][QCOM_PASS_ACTIVATE_KEY] = True
         jobs[TagQuantIO][QCOM_PASS_ARGS_KWARGS_DEFAULTS_KEY][
@@ -161,11 +184,15 @@ def export_layer(args, layer):
             )
         )
         info.update(
+            compile_settings=replace(
+                settings, context=replace(settings.context, max_seq_len=capacity)
+            ).compile_settings(),
             layer=layer,
             ar_len=1,
             context=None if linear else capacity,
             frozen_qparams=True,
             router_quantization="w8a16_gptq" if args.router_qdq else "fp16",
+            router_calibration=router_calibration,
             source=str(source),
             source_sha256=hashlib.file_digest(source.open("rb"), "sha256").hexdigest(),
         )
@@ -177,6 +204,8 @@ def main():
     parser = argparse.ArgumentParser(
         description="Export optimized AR1 attention/router/shared graphs from calibrated per-layer QDQ programs"
     )
+    add_model_config_argument(parser)
+    parser.add_argument("--max-seq-len", type=int, choices=[1152, 2048])
     parser.add_argument(
         "--source-dir",
         type=Path,
@@ -195,7 +224,6 @@ def main():
         type=int,
         choices=[1152, 2048],
         nargs="+",
-        default=[1152, 2048],
     )
     parser.add_argument(
         "--qnn-binding",
@@ -210,6 +238,16 @@ def main():
         default="/data/local/tmp/qwen35-35B-A3B/libQnnDeltaNetOpPackage_HTP.so",
     )
     args = parser.parse_args()
+    settings = load_model_config(args.model_config)
+    if args.capacities and args.max_seq_len:
+        parser.error("Choose --max-seq-len or --capacities")
+    args.capacities = args.capacities or [
+        args.max_seq_len or settings.context.max_seq_len
+    ]
+    if bool(args.router_qdq) != (settings.quantization.router_shared == "w8a16_gptq"):
+        parser.error(
+            "w8a16_gptq needs --router-qdq; fp16 uses checkpoint constants without --router-qdq"
+        )
     if not args.layers or any(layer not in range(40) for layer in args.layers):
         parser.error("--layers must contain layer IDs from 0 through 39")
     if len(args.layers) == 1:
@@ -221,6 +259,8 @@ def main():
             sys.executable,
             "-u",
             __file__,
+            "--model-config",
+            str(args.model_config),
             "--source-dir",
             str(args.source_dir),
             "--output",

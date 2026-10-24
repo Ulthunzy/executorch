@@ -1,5 +1,82 @@
 import torch
+import copy
 from torch._subclasses.fake_tensor import FakeTensorMode
+
+
+def specialize_front_ar1(original, inputs):
+    """Specialize one calibrated AR128 front while retaining its Q/DQ grids."""
+    from executorch.examples.qualcomm.oss_scripts.llama.quantize.generation import (
+        remove_export_checks,
+    )
+
+    graph = torch.fx.GraphModule(original, copy.deepcopy(original.graph))
+    remove_export_checks(graph)
+    values = [inputs[0][:, :1].clone()]
+    if len(inputs) == 3:
+        values.extend(inputs[1:])
+    elif len(inputs) == 6:
+        values.extend(
+            (
+                inputs[1][:1].clone(),
+                inputs[2][:1].clone(),
+                torch.zeros(1, 1, 1, 1024),
+                torch.zeros(1, 2, 256, 1023),
+                torch.zeros(1, 2, 1023, 256),
+            )
+        )
+    elif len(inputs) != 1:
+        raise ValueError("Expected a head or single-layer attention signature")
+    attributes = dict(graph.named_buffers()) | dict(graph.named_parameters())
+    mode = FakeTensorMode(allow_non_fake_inputs=True)
+    env, arguments = {}, iter(values)
+    with mode:
+        for node in graph.graph.nodes:
+            if node.op == "placeholder":
+                value = mode.from_tensor(next(arguments))
+            elif node.op == "get_attr":
+                value = mode.from_tensor(attributes[node.target])
+            elif node.op == "output":
+                value = torch.fx.map_arg(node.args[0], env.__getitem__)
+            else:
+                args = list(node.args)
+                if node.target in {
+                    torch.ops.aten.reshape.default,
+                    torch.ops.aten.view.default,
+                    torch.ops.aten.expand.default,
+                }:
+                    shape = list(args[1])
+                    old = args[0].meta["val"]
+                    new = env[args[0]]
+                    if old.numel() == 128 * new.numel():
+                        if len(shape) <= 2:
+                            if shape[0] > 0:
+                                if shape[0] % 128:
+                                    raise ValueError(
+                                        f"Cannot specialize {node.name}: {shape}"
+                                    )
+                                shape[0] //= 128
+                        elif 128 in shape:
+                            shape[shape.index(128)] = 1
+                    args[1] = shape
+                elif node.target == torch.ops.aten.slice.Tensor:
+                    axis = args[1]
+                    old = args[0].meta["val"].shape[axis]
+                    new = env[args[0]].shape[axis]
+                    if len(args) > 2 and args[2] == -128 and new == old - 127:
+                        args[2] = -1
+                    if len(args) > 3 and args[3] == old == 128 and new == 1:
+                        args[3] = 1
+                node.args = tuple(args)
+                value = node.target(
+                    *torch.fx.map_arg(node.args, env.__getitem__),
+                    **torch.fx.map_arg(node.kwargs, env.__getitem__),
+                )
+            env[node] = value
+    for node, value in env.items():
+        node.meta["val"] = value
+    graph.graph.lint()
+    graph.recompile()
+    return graph, tuple(values)
 
 
 def resize_attention(module, capacity):

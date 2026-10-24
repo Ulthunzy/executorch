@@ -4,11 +4,24 @@ import json
 from pathlib import Path
 import struct
 
+from dataclasses import replace
+from model_config import (
+    add_model_config_argument,
+    load_model_config,
+    shared_model_signature,
+)
 
-def main():
+
+def main(argv=None):
     parser = argparse.ArgumentParser(
         description="Pack calibrated per-layer QNN binaries into a complete 40-layer MoE PTE plan"
     )
+    add_model_config_argument(parser)
+    parser.add_argument(
+        "--quiet", action="store_true", help="Suppress per-stage packing output"
+    )
+    parser.add_argument("--max-seq-len", type=int)
+    parser.add_argument("--prefill-order", choices=["layer_major", "chunk_major"])
     parser.add_argument("--phase", choices=["prefill", "decode"], required=True)
     parser.add_argument("--source-dir", type=Path, required=True)
     parser.add_argument("--head", type=Path, required=True)
@@ -24,9 +37,40 @@ def main():
     parser.add_argument(
         "--shared-model", type=Path, help="Separated four-layer context groups"
     )
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
+    settings = load_model_config(args.model_config)
+    settings = replace(
+        settings,
+        context=replace(
+            settings.context,
+            max_seq_len=args.max_seq_len or settings.context.max_seq_len,
+        ),
+        schedule=replace(
+            settings.schedule,
+            prefill_order=args.prefill_order or settings.schedule.prefill_order,
+        ),
+    ).validate()
     if args.phase == "decode" and args.cache_encoding is None:
         parser.error("Decode packing requires --cache-encoding")
+    if args.shared_model:
+        for group in range(10):
+            manifest = json.loads(
+                (args.shared_model / f"group{group}/GRAPHS.json").read_text()
+            )
+            if (
+                manifest["capacity"] != settings.context.max_seq_len
+                or manifest["router"] != settings.quantization.router_shared
+            ):
+                parser.error(
+                    f"Shared group {group} does not match --model-config/--max-seq-len"
+                )
+            if (
+                "compile_settings" in manifest
+                or settings.quantization.attention == "gptq"
+            ) and manifest.get("compile_settings") != settings.compile_settings():
+                parser.error(
+                    f"Shared group {group}: compiled quantization/KV/context mismatch"
+                )
     from executorch.exir._serialize._program import (
         PTEFile,
         serialize_pte_binary,
@@ -52,7 +96,15 @@ def main():
     )
 
     decode = args.phase == "decode"
-    ar_len = 1 if decode else args.prefill_tokens
+    ar_len = (
+        1
+        if decode
+        else (
+            args.prefill_tokens
+            if settings.schedule.prefill_order == "layer_major"
+            else settings.context.prefill_ar_len
+        )
+    )
     hidden_bytes = ar_len * 2048 * 4
     route_bytes = max(4096, ar_len * 8 * 4)
     offsets = dict(
@@ -127,7 +179,8 @@ def main():
                 sha256=hashlib.sha256(data).hexdigest() if data else None,
             )
         )
-        print("STAGE", index, kind, layer, len(blob), flush=True)
+        if not args.quiet:
+            print("STAGE", index, kind, layer, len(blob), flush=True)
 
     tokens = tensor([1, ar_len], dtype=ScalarType.LONG)
     position = tensor([1], dtype=ScalarType.LONG) if decode else None
@@ -190,6 +243,19 @@ def main():
                 phase=args.phase,
                 ar_len=1 if decode else 128,
                 plan_tokens=ar_len,
+                requested_prefill_tokens=args.prefill_tokens,
+                prefill_order=settings.schedule.prefill_order,
+                compile_settings=settings.compile_settings(),
+                shared_signature=(
+                    shared_model_signature(args.shared_model)
+                    if args.shared_model
+                    else None
+                ),
+                cache_encoding_sha256=(
+                    hashlib.sha256(args.cache_encoding.read_bytes()).hexdigest()
+                    if decode
+                    else None
+                ),
                 layers=40,
                 weight_mode=(
                     "external_shared" if args.shared_model else "embedded_independent"

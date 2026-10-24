@@ -4,6 +4,10 @@ import gc
 import json
 import struct
 import time
+import sys
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from model_config import add_model_config_argument, load_model_config
 
 import numpy as np
 import torch
@@ -22,6 +26,7 @@ def main():
     parser = argparse.ArgumentParser(
         description="Reconstruct W2 experts with sequential layer calibration"
     )
+    add_model_config_argument(parser)
     parser.add_argument("--model", type=Path, required=True)
     parser.add_argument(
         "--source-dir",
@@ -37,11 +42,46 @@ def main():
     )
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--last-layer", type=int, default=39)
-    parser.add_argument("--batch", type=int, choices=[1, 2, 4, 8], default=8)
-    parser.add_argument("--joint-steps", type=int, default=80)
+    parser.add_argument("--first-layer", type=int, default=0)
+    parser.add_argument("--front-output", type=Path)
+    parser.add_argument("--router-qdq", type=Path)
+    parser.add_argument("--batch", type=int, choices=[1, 2, 4, 8, 16, 32], default=8)
+    parser.add_argument("--joint-steps", type=int)
+    parser.add_argument("--gptq-damping", type=float)
     args = parser.parse_args()
-    if args.last_layer not in range(40):
+    settings = load_model_config(args.model_config)
+    args.joint_steps = (
+        settings.quantization.reconstruction_steps
+        if args.joint_steps is None
+        else args.joint_steps
+    )
+    args.gptq_damping = (
+        settings.quantization.expert_gptq_damping
+        if args.gptq_damping is None
+        else args.gptq_damping
+    )
+    if (
+        args.joint_steps < 0
+        or not np.isfinite(args.gptq_damping)
+        or args.gptq_damping <= 0
+    ):
+        parser.error(
+            "Expected nonnegative reconstruction steps and positive GPTQ damping"
+        )
+    expert_settings = dict(
+        bits=2,
+        activation_bits=8,
+        gu_group=1024,
+        down_group=512,
+        damping=args.gptq_damping,
+        joint_steps=args.joint_steps,
+        gptq_only=settings.quantization.expert_gptq_only,
+        router_shared="w8a16_gptq" if args.router_qdq else "fp16",
+    )
+    if not 0 <= args.first_layer <= args.last_layer < 40:
         parser.error("--last-layer must be between 0 and 39")
+    if args.front_output and args.first_layer != args.last_layer:
+        parser.error("--front-output requires a single layer")
     ROOT = args.output
     REFERENCE = args.source_dir
     MODEL = args.model
@@ -63,6 +103,12 @@ def main():
             "Expected eight calibration and two heldout FP32 embedding sequences"
         )
     hidden = torch.cat((data["calibration"], data["heldout"])).cuda()
+    if args.first_layer:
+        hidden = torch.load(
+            ROOT / f"sequential/layer{args.first_layer-1}.pt",
+            weights_only=True,
+            mmap=True,
+        )["hidden"].cuda()
     cos = torch.from_numpy(
         np.fromfile(REFERENCE / "cos.f32", "<f4").reshape(-1, 32)
     ).cuda()
@@ -157,17 +203,30 @@ def main():
         )
         return torch.cat((selected, global_rows)), weights, count
 
-    for layer in range(args.last_layer + 1):
+    for layer in range(args.first_layer, args.last_layer + 1):
         checkpoint = ROOT / f"sequential/layer{layer}.pt"
         directory = ROOT / f"banks/layer{layer}"
         if checkpoint.is_file() and (directory / "BANK.json").is_file():
+            if (
+                json.loads((directory / "BANK.json").read_text()).get(
+                    "quantization_config"
+                )
+                != expert_settings
+            ):
+                raise ValueError(
+                    f"Layer {layer}: existing bank has different or unrecorded quantization settings; use a new output directory"
+                )
             hidden = torch.load(checkpoint, weights_only=True, mmap=True)[
                 "hidden"
             ].cuda()
             print("REUSED", layer, flush=True)
             continue
         started = time.monotonic()
-        norm, residual = attention(layer, hidden)
+        if args.front_output:
+            front = torch.load(args.front_output, weights_only=True, mmap=True)
+            norm, residual = front["norm"].cuda(), front["residual"].cuda()
+        else:
+            norm, residual = attention(layer, hidden)
         print(
             "FRONT_READY",
             layer,
@@ -191,6 +250,23 @@ def main():
         shared = (
             shared * F.linear(x.half(), weights["shared_expert_gate_weight"]).sigmoid()
         ).float()
+        if args.router_qdq:
+            from executorch.examples.qualcomm.oss_scripts.llama.quantize.generation import (
+                remove_export_checks,
+            )
+
+            router = move_graph(
+                torch.export.load(
+                    args.router_qdq / f"layer{layer}/router-ar128-qdq.pt2"
+                ).module(),
+                "cuda",
+            )
+            remove_export_checks(router)
+            ids, score, shared = router(norm)
+            ids = ids.reshape(-1, 8).long()
+            score = score.reshape(-1, 8)
+            shared = shared.reshape(-1, 2048)
+            del router
         fit_x = norm[fit_sequences].reshape(-1, 2048)
         fit_ids = ids.reshape(10, 1024, 8)[fit_sequences].reshape(-1, 8)
         val_x = norm[3]
@@ -248,17 +324,28 @@ def main():
                     torch.empty_like(wd[:, :, :1]),
                 ]
                 method = torch.zeros(len(experts), dtype=torch.int64, device="cuda")
-                for gu_gptq in [False, True]:
-                    qgu, sgu = quantize(wgu, weighted_x, 1024, levels, gu_gptq)
+                methods = (
+                    [True] if settings.quantization.expert_gptq_only else [False, True]
+                )
+                for gu_gptq in methods:
+                    qgu, sgu = quantize(
+                        wgu,
+                        weighted_x,
+                        1024,
+                        levels,
+                        gu_gptq,
+                        damping=args.gptq_damping,
+                    )
                     gu = dequantize(qgu, sgu, 1024)
                     mid = middle(actual_x, gu)
-                    for down_gptq in [False, True]:
+                    for down_gptq in methods:
                         qd, sd = quantize(
                             wd,
                             mid * row_weights.sqrt()[:, :, None],
                             512,
                             levels,
                             down_gptq,
+                            damping=args.gptq_damping,
                         )
                         down = dequantize(qd, sd, 512)
                         prediction = middle(a8(validation, 1024), gu).bmm(
@@ -372,6 +459,7 @@ def main():
             )
         )
         report = dict(
+            quantization_config=expert_settings,
             layer=layer,
             codebook=[-7, -2, 2, 7],
             bits=2,
@@ -389,6 +477,7 @@ def main():
             details=details,
             seconds=time.monotonic() - started,
             cuda_peak_mib=torch.cuda.max_memory_allocated() / 2**20,
+            expert_batch_size=args.batch,
         )
         checkpoint.parent.mkdir(exist_ok=True)
         torch.save(dict(hidden=hidden.cpu()), checkpoint)

@@ -438,20 +438,21 @@ int main(int argc, char** argv) try {
         throw std::runtime_error("duplicate reuse fd");
       record.bytes = buffer.size;
       total_bytes += buffer.size;
-      record.fingerprint = residentFingerprint(
-          static_cast<const uint8_t*>(buffer.data),
-          transfer.stride,
-          transfer.data_offset,
-          transfer.capacity);
       for (int slot = 0; slot < session->capacity; slot++) {
         const auto entry = session->caches[layer].entries[slot];
-        if (entry.expert < 0)
-          throw std::runtime_error("empty reuse seed");
+        if (entry.expert < -1 || (entry.expert == -1 && entry.stamp))
+          throw std::runtime_error("invalid reuse seed");
         record.ids[slot] = entry.expert;
         record.stamps[slot] = entry.stamp;
         selected.push_back(entry.expert);
         selected_stamps.push_back(entry.stamp);
       }
+      record.fingerprint = residentFingerprint(
+          static_cast<const uint8_t*>(buffer.data),
+          transfer.stride,
+          transfer.data_offset,
+          transfer.capacity,
+          record.ids);
       if (record.hot_mask)
         throw std::runtime_error("all-LRU cache forbids hot slots");
       printf(

@@ -1,0 +1,49 @@
+{
+  "version": 1,
+  "quantization": {
+    "attention": "gptq",
+    "vision": "w8a16_gptq",
+    "head": "w4a16_gptq",
+    "matrix_gptq_damping": 0.01,
+    "expert_gptq_only": true,
+    "expert_bits": 2,
+    "expert_activation_bits": 8,
+    "expert_gu_group": 1024,
+    "expert_down_group": 512,
+    "expert_gptq_damping": 0.1,
+    "reconstruction_steps": 80,
+    "router_shared": "w8a16_gptq",
+    "router_gptq_damping": 0.01,
+    "embedding": "int4_g32"
+  },
+  "cache": {
+    "kv_dtype": "uint16",
+    "gdn_state_dtype": "uint16",
+    "conv_state_dtype": "uint16",
+    "append_only": true,
+    "state_swap": true
+  },
+  "context": {
+    "max_seq_len": 1152,
+    "prefill_ar_len": 128,
+    "max_prefill_tokens": 1024
+  },
+  "generation": {
+    "enable_thinking": false,
+    "system_prompt": "你是一个有帮助的人工智能助手。",
+    "max_new_tokens": 128
+  },
+  "schedule": {
+    "prefill_order": "layer_major",
+    "cache_experts": 32,
+    "prefill_async_io": true,
+    "startup_prefetch": "overlap",
+    "io_workers": 8,
+    "startup_io_workers": 4,
+    "read_chunk_kib": 256,
+    "decode_hit_first": true,
+    "decode_ready_io": true,
+    "overlap_feedback": true,
+    "context_load_mode": "auto"
+  }
+}

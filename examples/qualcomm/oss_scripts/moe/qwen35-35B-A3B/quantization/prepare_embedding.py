@@ -3,6 +3,10 @@ import hashlib
 import json
 from pathlib import Path
 import struct
+import sys
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from model_config import add_model_config_argument, load_model_config
 
 import numpy as np
 import torch
@@ -12,10 +16,13 @@ def main():
     parser = argparse.ArgumentParser(
         description="Group-32 INT4 embedding with the diagonal one-hot GPTQ objective"
     )
+    add_model_config_argument(parser)
     parser.add_argument("--source", type=Path, required=True)
     parser.add_argument("--calibration-inputs", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
+    if load_model_config(args.model_config).quantization.embedding != "int4_g32":
+        parser.error("BF16 embedding uses the original table; skip INT4 preparation")
     shape = (248320, 2048)
     if args.source.resolve() == args.output.resolve():
         parser.error("Source and output must differ")

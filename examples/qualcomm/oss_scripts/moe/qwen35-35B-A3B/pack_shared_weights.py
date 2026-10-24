@@ -3,6 +3,7 @@ import hashlib
 import json
 from pathlib import Path
 import struct
+import shutil
 
 
 def main():
@@ -12,6 +13,11 @@ def main():
     parser.add_argument("--context", type=Path, required=True)
     parser.add_argument("--requests", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument(
+        "--graph-manifest",
+        type=Path,
+        help="GRAPHS.json and IO orders to preserve beside the separated context",
+    )
     args = parser.parse_args()
     ranges = sorted(
         {
@@ -82,6 +88,12 @@ def main():
         layout="Opaque context image reconstructed with read-only file mappings; no weight copy into graph file",
     )
     (args.output / "WEIGHTS.json").write_text(json.dumps(report, indent=2) + "\n")
+    manifest = args.graph_manifest or args.context.parent / "GRAPHS.json"
+    if manifest.is_file():
+        for path in [manifest, *sorted(manifest.parent.glob("*.io"))]:
+            target = args.output / path.name
+            if path.resolve() != target.resolve():
+                shutil.copy2(path, target)
     print(json.dumps(report), flush=True)
 
 

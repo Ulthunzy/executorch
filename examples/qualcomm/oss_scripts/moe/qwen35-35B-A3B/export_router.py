@@ -5,9 +5,17 @@ from pathlib import Path
 import subprocess
 import sys
 
+from model_config import add_model_config_argument, load_model_config
+
 
 def export_layer(args, layer):
     from export.binding import load_binding
+    from export.quantization import validate_router_graph, validate_router_source
+
+    calibration = validate_router_source(
+        args.source_dir / f"layer{layer}",
+        load_model_config(args.model_config).quantization.router_gptq_damping,
+    )
 
     qnn = load_binding(args.qnn_binding)
     import torch
@@ -24,15 +32,7 @@ def export_layer(args, layer):
     for phase, ar_len in (("prefill", 128), ("decode", 1)):
         source = args.source_dir / f"layer{layer}/router-ar{ar_len}-qdq.pt2"
         model = torch.export.load(source).module()
-        weights = [
-            n
-            for n in model.graph.nodes
-            if n.target == torch.ops.quantized_decomposed.dequantize_per_channel.default
-        ]
-        if len(weights) != 5 or any(
-            n.args[4:7] != (-127, 127, torch.int8) for n in weights
-        ):
-            raise ValueError("Expected five GPTQ W8 projection grids")
+        validate_router_graph(model)
         example = (torch.zeros(1, ar_len, 2048),)
         specs = generate_qnn_executorch_compiler_spec(
             QcomChipset.SM8975,
@@ -63,6 +63,7 @@ def export_layer(args, layer):
             weight_bits=8,
             activation_bits=16,
             method="gptq",
+            calibration=calibration,
             context_bytes=len(binary),
             source_sha256=hashlib.file_digest(source.open("rb"), "sha256").hexdigest(),
             input_order=[arguments[:count].index(i) for i in plan.inputs],
@@ -76,11 +77,16 @@ def main():
     parser = argparse.ArgumentParser(
         description="Export independent W8A16 GPTQ Router/shared contexts"
     )
+    add_model_config_argument(parser)
     parser.add_argument("--source-dir", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--qnn-binding", type=Path)
     parser.add_argument("--layers", type=int, nargs="+", default=list(range(40)))
     args = parser.parse_args()
+    if load_model_config(args.model_config).quantization.router_shared != "w8a16_gptq":
+        parser.error(
+            "export_router.py compiles the w8a16_gptq recipe; fp16 is handled by the fused export"
+        )
     if not args.layers or any(layer not in range(40) for layer in args.layers):
         parser.error("Layer IDs must be in 0..39")
     if len(args.layers) == 1:
@@ -91,6 +97,8 @@ def main():
             sys.executable,
             "-u",
             __file__,
+            "--model-config",
+            str(args.model_config),
             "--source-dir",
             str(args.source_dir),
             "--output",

@@ -46,7 +46,8 @@ ExpertCache::ExpertCache(
         throw std::runtime_error("all-LRU cache forbids hot slots");
       for (int slot = 0; slot < capacity; slot++)
         if (int id = metadata.ids[slot]; true)
-          if (id < 0 || id >= 256 || !unique.insert(id).second)
+          if (id < -1 || id >= 256 || (id >= 0 && !unique.insert(id).second) ||
+              (id == -1 && metadata.stamps[slot]))
             throw std::runtime_error("resident seed IDs");
       if (metadata.bytes != data_offset + capacity * stride)
         throw std::runtime_error("resident pool size");
@@ -60,7 +61,8 @@ ExpertCache::ExpertCache(
               static_cast<const uint8_t*>(b.data),
               stride,
               data_offset,
-              capacity) != metadata.fingerprint)
+              capacity,
+              metadata.ids) != metadata.fingerprint)
         throw std::runtime_error("resident weight fingerprint");
       sync.flags = DMA_BUF_SYNC_END | DMA_BUF_SYNC_READ;
       if (ioctl(b.fd, DMA_BUF_IOCTL_SYNC, &sync))
@@ -172,8 +174,9 @@ void ExpertCache::verify_cache() {
     std::set<int> unique;
     for (int slot = 0; slot < capacity; slot++) {
       const auto& entry = entries[layer * capacity + slot];
-      if (entry.pending || entry.expert < 0 || entry.expert >= 256 ||
-          !unique.insert(entry.expert).second)
+      if (entry.pending || entry.expert < -1 || entry.expert >= 256 ||
+          (entry.expert >= 0 && !unique.insert(entry.expert).second) ||
+          (entry.expert == -1 && entry.stamp))
         throw std::runtime_error("invalid final cold cache");
     }
   }
