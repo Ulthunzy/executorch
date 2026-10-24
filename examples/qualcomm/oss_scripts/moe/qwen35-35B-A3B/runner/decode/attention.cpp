@@ -103,6 +103,17 @@ void Attention::reset() {
     memcpy(state[c]->data, initial[c].data(), initial[c].size() * 2);
 }
 
+void Attention::clear() {
+  last_position = -1;
+  for (int c = 0; c < 2; ++c) {
+    const auto encoding =
+        FIELD(graph.inputs[input[c + (linear ? 1 : 4)]], quantizeParams)
+            .scaleOffsetEncoding;
+    auto* values = static_cast<uint16_t*>(state[c]->data);
+    std::fill(values, values + initial[c].size(), uint16_t(-encoding.offset));
+  }
+}
+
 void Attention::execute(
     const float* hidden,
     int position,

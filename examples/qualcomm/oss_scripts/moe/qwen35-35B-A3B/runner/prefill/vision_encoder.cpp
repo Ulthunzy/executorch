@@ -10,7 +10,8 @@ VisionEncoder::VisionEncoder(Runtime& runtime, const std::string& root)
       FIELD(graph.inputs[0], dataType) != QNN_DATATYPE_FLOAT_32 ||
       FIELD(graph.outputs[0], dataType) != QNN_DATATYPE_FLOAT_32)
     throw std::runtime_error("vision requires one FP32 input and output");
-  load_image(root + "/pixels.f32");
+  if (!getenv("DEVICE_CHAT"))
+    load_image(root + "/pixels.f32");
 }
 
 void VisionEncoder::load_image(const std::string& pixels_path) {

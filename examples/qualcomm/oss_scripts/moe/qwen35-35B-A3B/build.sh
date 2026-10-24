@@ -38,42 +38,60 @@ for stage in prefill decode; do
     native_sources+=("$moe_root/native/decode/bank_mapper.cpp")
   fi
   mkdir -p "$generated"
-  "$qaic" -mdll -o "$generated" -I"$HEXAGON_SDK_ROOT/incs" \
-    -I"$HEXAGON_SDK_ROOT/incs/stddef" "$moe_root/native/$stage/integer_rpc.idl"
-  "$HEXAGON_TOOLS_ROOT/bin/hexagon-clang" "${native_flags[@]}" -I"$generated" \
-    -c "$generated/integer_rpc_skel.c" -o "$generated/integer_rpc_skel.o"
-  "$HEXAGON_TOOLS_ROOT/bin/hexagon-clang++" "${native_flags[@]}" -I"$generated" \
-    -std=c++17 -shared -nostdlib++ "${native_sources[@]}" \
-    "$generated/integer_rpc_skel.o" -Wl,-Bstatic -lc++ -lc++abi -Wl,-Bdynamic \
-    -o "$generated/libinteger_rpc_skel.so"
+  if [[ "${MOE_BUILD_NATIVE:-1}" == 1 ]]; then
+    "$qaic" -mdll -o "$generated" -I"$HEXAGON_SDK_ROOT/incs" \
+      -I"$HEXAGON_SDK_ROOT/incs/stddef" "$moe_root/native/$stage/integer_rpc.idl"
+    "$HEXAGON_TOOLS_ROOT/bin/hexagon-clang" "${native_flags[@]}" -I"$generated" \
+      -c "$generated/integer_rpc_skel.c" -o "$generated/integer_rpc_skel.o"
+    "$HEXAGON_TOOLS_ROOT/bin/hexagon-clang++" "${native_flags[@]}" -I"$generated" \
+      -std=c++17 -shared -nostdlib++ "${native_sources[@]}" \
+      "$generated/integer_rpc_skel.o" -Wl,-Bstatic -lc++ -lc++abi -Wl,-Bdynamic \
+      -o "$generated/libinteger_rpc_skel.so"
 
-  "${compiler%++}" -O3 -fPIC -I"$HEXAGON_SDK_ROOT/incs" \
-    -I"$HEXAGON_SDK_ROOT/incs/stddef" -c "$generated/integer_rpc_stub.c" \
-    -o "$generated/integer_rpc_stub.o"
+    "${compiler%++}" -O3 -fPIC -I"$HEXAGON_SDK_ROOT/incs" \
+      -I"$HEXAGON_SDK_ROOT/incs/stddef" -c "$generated/integer_rpc_stub.c" \
+      -o "$generated/integer_rpc_stub.o"
+  fi
   host_flags=()
   host_output="$task_build/${stage}_handoff_runner"
   if [[ "$stage" == decode ]]; then
     host_flags=(-fPIC -shared -fvisibility=hidden -fvisibility-inlines-hidden
       -DMOE_DECODE_LIBRARY -Wl,-Bsymbolic -Wl,--exclude-libs,ALL
+      -Wl,-rpath,'$ORIGIN/../prefill'
       -Wl,--version-script="$moe_root/runner/decode.exports")
     host_output="$task_build/libmoe_decode.so"
   fi
-  "$compiler" -O3 -std=c++17 -static-libstdc++ -DC10_USING_CUSTOM_GENERATED_MACROS \
-    -DET_EVENT_TRACER_ENABLED -DET_ENABLE_DEPRECATED_CONSTANT_BUFFER=0 \
-    -DET_ENABLE_PROGRAM_VERIFICATION=0 -I"$task_repo/.." \
-    -I"$task_repo/runtime/core/portable_type/c10" -I"$runtime_build/include" \
-    -I"$generated" -I"$HEXAGON_SDK_ROOT/incs" -I"$HEXAGON_SDK_ROOT/incs/stddef" \
-    -I"$QNN_SDK_ROOT/include/QNN" "${host_flags[@]}" "$moe_root/runner/$stage/"*.cpp \
-    "$moe_root/runner/"*.cpp "$moe_root/runner/shared/graph_binding.cpp" \
-    "$generated/integer_rpc_stub.o" -Wl,--start-group \
-    "$runtime_build/libexecutorch.a" "$runtime_build/libexecutorch_core.a" \
-    "$runtime_build/extension/module/libextension_module.a" \
-    "$runtime_build/extension/data_loader/libextension_data_loader.a" \
-    "$runtime_build/extension/tensor/libextension_tensor.a" \
-    "$runtime_build/extension/flat_tensor/libextension_flat_tensor.a" \
-    "$runtime_build/extension/named_data_map/libextension_named_data_map.a" -Wl,--end-group \
+  host_sources=("$moe_root/runner/$stage/"*.cpp "$moe_root/runner/"*.cpp
+    "$moe_root/runner/shared/graph_binding.cpp")
+  runtime_libraries=(
+    "$runtime_build/libexecutorch.a" "$runtime_build/libexecutorch_core.a"
+    "$runtime_build/extension/module/libextension_module.a"
+    "$runtime_build/extension/data_loader/libextension_data_loader.a"
+    "$runtime_build/extension/tensor/libextension_tensor.a"
+    "$runtime_build/extension/flat_tensor/libextension_flat_tensor.a"
+    "$runtime_build/extension/named_data_map/libextension_named_data_map.a")
+  host_compile=("$compiler" -O3 -std=c++17 -static-libstdc++ -DC10_USING_CUSTOM_GENERATED_MACROS
+    -DET_EVENT_TRACER_ENABLED -DET_ENABLE_DEPRECATED_CONSTANT_BUFFER=0
+    -DET_ENABLE_PROGRAM_VERIFICATION=0 -I"$task_repo/.."
+    -I"$task_repo/runtime/core/portable_type/c10" -I"$runtime_build/include"
+    -I"$generated" -I"$HEXAGON_SDK_ROOT/incs" -I"$HEXAGON_SDK_ROOT/incs/stddef"
+    -I"$QNN_SDK_ROOT/include/QNN")
+  "${host_compile[@]}" "${host_flags[@]}" "${host_sources[@]}" \
+    "$generated/integer_rpc_stub.o" -Wl,--start-group "${runtime_libraries[@]}" -Wl,--end-group \
     -L"$HEXAGON_SDK_ROOT/ipc/fastrpc/remote/ship/android_aarch64" \
     -lcdsprpc -ldl -llog -o "$host_output"
+  if [[ "$stage" == prefill ]]; then
+    tokenizer_libraries=("$runtime_build/lib/libtokenizers.a"
+      "$runtime_build/lib/libsentencepiece.a" "$runtime_build/lib/libre2.a"
+      "$runtime_build/lib/libpcre2-8.a" "$runtime_build/lib/"libabsl_*.a)
+    "${host_compile[@]}" -DMOE_CHAT_RUNNER -fno-emulated-tls -Wl,-rpath,'$ORIGIN' "${host_sources[@]}" \
+      "$moe_root/runner/chat/"*.cpp "$generated/integer_rpc_stub.o" \
+      -Wl,--whole-archive "$runtime_build/lib/libregex_lookahead.a" -Wl,--no-whole-archive \
+      -Wl,--start-group "${runtime_libraries[@]}" "${tokenizer_libraries[@]}" \
+      "$runtime_build/lib/libextension_llm_sampler.a" -Wl,--end-group \
+      -L"$HEXAGON_SDK_ROOT/ipc/fastrpc/remote/ship/android_aarch64" \
+      -lcdsprpc -ldl -llog -o "$task_build/qwen35_moe_runner"
+  fi
 done
 "$compiler" -O3 -std=c++17 -static-libstdc++ -fPIC -shared -fvisibility=hidden \
   -fvisibility-inlines-hidden -Wl,-Bsymbolic -Wl,--exclude-libs,ALL \
@@ -83,5 +101,7 @@ done
 "$compiler" -O2 -std=c++17 -static-libstdc++ -I"$QNN_SDK_ROOT/include/QNN" \
   "$moe_root/tools/capture_weights.cpp" "$moe_root/runner/decode/qnn_front.cpp" \
   "$moe_root/runner/shared/graph_binding.cpp" -ldl -o "$task_build/capture_weights"
-"$moe_root/build_op_package.sh"
+if [[ "${MOE_BUILD_NATIVE:-1}" == 1 ]]; then
+  "$moe_root/build_op_package.sh"
+fi
 echo "Built runners and V85 Native MoE libraries in $task_build"

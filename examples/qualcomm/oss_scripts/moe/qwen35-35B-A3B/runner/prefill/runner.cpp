@@ -8,6 +8,9 @@
 #include "../handoff.h"
 #include "../decode_api.h"
 #include "../shared/graph_binding.h"
+#ifdef MOE_CHAT_RUNNER
+#include "../chat/chat.h"
+#endif
 
 using namespace executorch::runtime;
 static std::string model_root;
@@ -178,7 +181,7 @@ static PrefillBackend backend_instance;
 static Backend backend{"Qwen36PrefillStage", &backend_instance};
 static auto registered = register_backend(backend);
 
-int main(int argc, char** argv) try {
+static int prefill_main(int argc, char** argv) try {
   setvbuf(stdout, nullptr, _IONBF, 0);
   runtime_init();
   if (argc != 4)
@@ -189,7 +192,8 @@ int main(int argc, char** argv) try {
     throw std::runtime_error("sample count");
   const auto setup = Clock::now();
   executorch::extension::Module module(
-      model_root + "/prefill.pte",
+      getenv("CHAT_PREFILL_PLAN") ? std::string(getenv("CHAT_PREFILL_PLAN"))
+                                  : model_root + "/prefill.pte",
       executorch::extension::Module::LoadMode::Mmap);
   auto error = module.load_method("prefill_forward");
   if (error != Error::Ok)
@@ -238,8 +242,12 @@ int main(int argc, char** argv) try {
       (unsigned long long)session->runtime.context_creates,
       (unsigned long long)session->runtime.memory_registers);
   session->reset();
+#ifdef MOE_CHAT_RUNNER
+  session->image_features = moe_chat::initial_image(session->vision.get());
+#else
   if (session->vision)
     session->image_features = session->vision->encode();
+#endif
   std::vector<int32_t> all_routes, seeds;
   std::vector<uint64_t> seed_stamps;
   double graph_total = 0;
@@ -513,7 +521,11 @@ int main(int argc, char** argv) try {
     }
     const char* arguments[] = {
         "decode_session", decode_root, max_tokens, "4096", eos_ids};
+#ifdef MOE_CHAT_RUNNER
+    const int result = moe_chat::converse(decoder);
+#else
     const int result = run(5, arguments);
+#endif
     dlclose(decoder);
     if (session->runtime.context_creates != creates ||
         session->runtime.context_frees != frees ||
@@ -535,4 +547,12 @@ int main(int argc, char** argv) try {
   fprintf(stderr, "FATAL %s\n", e.what());
   session.reset();
   return 1;
+}
+
+int main(int argc, char** argv) {
+#ifdef MOE_CHAT_RUNNER
+  return moe_chat::main(argc, argv, prefill_main);
+#else
+  return prefill_main(argc, argv);
+#endif
 }

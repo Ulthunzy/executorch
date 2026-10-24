@@ -94,9 +94,11 @@ DecodeSession::DecodeSession(const std::string& path, size_t cache_mib)
     core.map_buffer(core.inbuf[i]);
   core.map_buffer(core.outbuf[0]);
   core.map_buffer(core.residual);
-  cos = bytes(root + "/cos.f32");
+  const std::string rope_root =
+      getenv("CHAT_ROPE_ROOT") ? getenv("CHAT_ROPE_ROOT") : root;
+  cos = bytes(rope_root + "/cos.f32");
 
-  sin = bytes(root + "/sin.f32");
+  sin = bytes(rope_root + "/sin.f32");
   if (cos.size() < 2048 * 32 * 4 || sin.size() < 2048 * 32 * 4)
     throw std::runtime_error("embedding/RoPE dimensions");
   if (ready_queue) {
@@ -216,7 +218,13 @@ void DecodeSession::embed(
   metrics = {};
   execution_windows.clear();
   auto t = Clock::now();
-  embedding.lookup(*token, out);
+  if (*token == 248056 && getenv("DEVICE_CHAT")) {
+    if (image_cursor + 2048 > image_features.size())
+      throw std::runtime_error("Image token has no encoded features");
+    std::copy_n(image_features.data() + image_cursor, 2048, out);
+    image_cursor += 2048;
+  } else
+    embedding.lookup(*token, out);
   metrics.embedding += elapsed(t);
   metrics.calls[0]++;
 }

@@ -157,8 +157,10 @@ PrefillSession::PrefillSession(const std::string& path, int plan_tokens)
   core.map_buffer(core.outbuf[0]);
   core.map_buffer(core.residual);
 
-  cos = bytes(root + "/cos.f32");
-  sin = bytes(root + "/sin.f32");
+  const std::string rope_root =
+      getenv("CHAT_ROPE_ROOT") ? getenv("CHAT_ROPE_ROOT") : root;
+  cos = bytes(rope_root + "/cos.f32");
+  sin = bytes(rope_root + "/sin.f32");
   const auto context_finished = Clock::now();
 
   if (startup_policy != "none") {

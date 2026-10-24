@@ -52,6 +52,8 @@ struct DecodeSession {
   std::unique_ptr<Graph> head;
   std::unique_ptr<SharedIo> shared_io;
   std::vector<uint8_t> cos, sin;
+  std::vector<float> image_features;
+  size_t image_cursor = 0;
   int context_capacity = getenv("DECODE_CONTEXT_CAPACITY")
       ? atoi(getenv("DECODE_CONTEXT_CAPACITY"))
       : 1152;

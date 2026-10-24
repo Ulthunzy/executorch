@@ -2,7 +2,7 @@
   "device": "A7SR026915000282",
   "model": "/hunter/model/Qwen/Qwen3.6-35B-A3B",
   "artifacts": "llama-output/qwen35-moe-from-safetensors-gptq-20261024",
-  "build_dir": "build/moe/qwen35-35B-A3B-model-config-20261024",
+  "build_dir": "build/moe/qwen35-35B-A3B-device-chat-20261024",
   "shared_model": "llama-output/qwen35-moe-from-safetensors-gptq-20261024/separated",
   "embedding_table": "llama-output/qwen35-moe-from-safetensors-gptq-20261024/embedding.int4",
   "vision_artifacts": "llama-output/qwen35-moe-from-safetensors-gptq-20261024/vision",

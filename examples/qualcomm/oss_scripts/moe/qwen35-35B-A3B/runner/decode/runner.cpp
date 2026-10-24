@@ -2,15 +2,15 @@
 #include <executorch/extension/module/module.h>
 #include <executorch/extension/tensor/tensor_ptr.h>
 #include <executorch/runtime/platform/runtime.h>
-#include "decode_session.h"
+#include "decoder_state.h"
 #include "sampling.h"
 #include "../decode_api.h"
 #include <set>
 #include <sstream>
 
 using namespace executorch::runtime;
-static std::string model_root;
-static std::unique_ptr<DecodeSession> session;
+std::string model_root;
+std::unique_ptr<DecodeSession> session;
 static std::vector<std::unique_ptr<MappedBinary>> front_overrides;
 
 static void memory_snapshot(const char* stage) {

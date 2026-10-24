@@ -100,3 +100,51 @@ def prepare_plans(args, run_dir):
             "Multi-block prefill needs a local plan/JSON sidecar or shared model so the configured schedule can be verified"
         )
     return plans
+
+
+def prepare_chat_plans(args, run_dir):
+    """Package host schedules for standalone chat; QNN kernels stay AR128."""
+    if not args.shared_model:
+        return None
+    from pack_pte import main as pack_plan
+
+    directory = run_dir / "chat-plans"
+    lengths = range(128, args.model_settings.context.max_prefill_tokens + 1, 128)
+    for length in lengths:
+        pack_plan(
+            [
+                "--quiet",
+                "--model-config",
+                str(args.model_config),
+                "--phase",
+                "prefill",
+                "--source-dir",
+                str(args.artifacts),
+                "--shared-model",
+                str(args.shared_model),
+                "--head",
+                str(args.shared_model / "head/graph.qnn"),
+                "--output",
+                str(directory / f"prefill-{length}.pte"),
+                "--max-seq-len",
+                str(args.decode_capacity),
+                "--prefill-order",
+                "layer_major",
+                "--prefill-tokens",
+                str(length),
+            ]
+        )
+    (directory / "PLANS.json").write_text(
+        json.dumps(
+            dict(
+                version=1,
+                ar_len=128,
+                capacity=args.decode_capacity,
+                prefill_order=args.prefill_order,
+                lengths=list(lengths),
+            ),
+            indent=2,
+        )
+        + "\n"
+    )
+    return directory

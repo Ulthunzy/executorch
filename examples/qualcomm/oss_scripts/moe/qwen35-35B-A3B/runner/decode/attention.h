@@ -39,6 +39,8 @@ struct Attention {
 
   void reset();
 
+  void clear();
+
   void execute(
       const float* hidden,
       int position,

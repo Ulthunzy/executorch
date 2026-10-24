@@ -8,6 +8,97 @@
 
 当前保留的完整导出位于 `llama-output/qwen35-moe-from-safetensors-gptq-20261024`，默认模型配方与设备配置均已对齐这套全矩阵 GPTQ 产物。编译 binding、WikiText 校准语料、两张校准图片及设备运行库已迁入该目录；历史导出的权重、PTE 和中间文件清理，报告归档到其中的 `history-reports/`。下文历史命令用于说明当时测试口径，当前运行请使用上面的默认配置及 `CONFIGURATION.md` 中的命令。
 
+## 设备终端对话
+
+`qwen35_moe_runner` 在设备上完成 ChatML、文本编码、JPG/PNG 解码与预处理、视觉编码、流式吐字及多轮会话，直接读取原始 `tokenizer.json`。模型文件已部署后，在 device shell 执行：
+
+```sh
+cd /data/local/tmp/qwen35-raw-gptq-20261024/runtime/w2a8-fused-c1152-p128-cache32/prefill
+
+./qwen35_moe_runner \
+  --model-root .. \
+  --tokenizer-path ../../tokenizer.json \
+  --interactive \
+  --max-new-tokens 128
+```
+
+输入 `/reset` 清空对话，输入 `/exit` 退出。也可用 `--prompt "第一问" --prompt "第二问"` 连续执行多轮；增加 `--interactive` 可继续从终端读取。`--temperature 0` 为 greedy，`--enable-thinking` 开启思考模板，默认关闭。运行日志及逐 token 时间记录在模型目录的 `chat.log`，可用 `--log-path` 修改。
+
+首轮 QNN/Native 使用 AR128，与原主机入口采用相同的 system-message 空格填充。终端按实际输入长度选择无权重的 host PTE，默认按 `layer_major` 让同一层完成全部 AR128 块并复用专家，再进入下一层。顺序来自部署的 `prefill/plans/PLANS.json`，可用 `--prefill-order chunk_major` 显式对照。后续轮将尚未反馈的最后一个生成 token、轮次分隔符及新问题按 AR1 追加到当前 state/KV，不重新计算历史。后续输入很长时，其处理速度受 AR1 吞吐限制。Context、buffer、每层 LRU 和原生服务在会话内常驻；`/reset` 只清空 state/KV 和位置，不重新装载权重或丢弃专家缓存。达到静态上下文容量时拒绝追加，用户可显式 `/reset`。
+
+设备端使用与 `qnn_llama_runner.cpp` 相同的 HFTokenizer/BPE 和 ExecuTorch sampler。Qwen3.5 的 NFC 使用 Android 公共 ICU API（Android 31+），避免现有内置 NFC 丢失重音字符；原 tokenizer 文件保持不变。
+
+图片也可以直接从设备文件系统读取：
+
+```sh
+./qwen35_moe_runner \
+  --model-root .. \
+  --tokenizer-path ../../tokenizer.json \
+  --image-path ../../test.jpg \
+  --prompt "请用中文描述这张图片。" \
+  --interactive \
+  --max-new-tokens 128
+```
+
+换图使用 `/image /data/local/tmp/another.png 请描述这张图。`；有空格的路径加双引号。每轮支持一张图片，旧图的 state/KV 保留以供追问。`/reset` 同时清除图文历史并恢复文本 RoPE。JPG/PNG 由 Android ImageDecoder 解码，再按校准路径做抗混叠 BICUBIC、RGB 归一化和 patch 排列；形状与 MRoPE 配置来自部署的 `VISION.json` 和 `model-config.json`。当前静态图为 448×448、196 个图像 token，源图最多 32 百万像素。
+
+部署还包括模型根目录的 `base-cos.f32`、`base-sin.f32` 和 `prefill/vision.bin`。`run_chat.py` 在视觉产物存在时一并部署这些文件。视觉 context 和 IO buffer 随完整模型初始化，所有图文轮次复用，结束会话时统一释放。首轮图文用 AR128；后续换图仍按 AR1 追加，当前约 221 个输入 token 需 24 秒，尚未接入多轮 AR128 批量追加。
+
+SM8975 的 JPG、PNG 预处理、256-token 图文模板和 MRoPE 与 Python 路径逐字节一致；看图描述、跨轮追问、新图片、坏路径恢复和 reset 后再次看图均已验证。整个会话保留 11 个共享 context 和 1 个视觉 context，视觉重复执行不创建或释放 context/buffer。详见[设备图片会话记录](../../../../../llama-output/qwen35-moe-from-safetensors-gptq-20261024/device-image-chat-tests/REPORT.md)。
+
+2026-10-24 设备终端性能复测，当前 32 槽专家缓存、1152 静态容量：三轮 256-token 图文 prefill 为 **3.44–3.60 秒 / 71.19–74.35 token/s**，decode 为 **11.47–11.66 token/s**；三轮均输出相同的 79 个 token（含 EOS）。首次启动到首字 **13.51–14.43 秒**，其中模型/运行时 setup 为 6.46–6.99 秒，视觉执行约 118 ms。当前 PTE 按两个 AR128 块执行 `chunk_major`，未启用配置 JSON 的 `layer_major`。换图追加 217 个新 token 为 **24.17–24.42 秒**；其后 decode 一轮遇到长停顿为 5.60 token/s，复测为 9.98 token/s。原始数据、统计口径及 I/O 拆分见[图文性能报告](../../../../../llama-output/qwen35-moe-from-safetensors-gptq-20261024/device-image-performance-20261024/REPORT.md)。
+
+### Prefill / Decode 阶段计时
+
+2026-10-24，增加持久 decode 的逐 token 阶段日志后，按相同图文输入再测三轮；输出 token IDs 与上轮一致。每层缓存 32 个专家，未改变图、权重和量化。以下为三轮均值。
+
+Prefill 为 256 token 的总时间，AR128 分两块；不含模型初始化和视觉编码。
+
+| 环节 | ms / 256 token | 占比 |
+| --- | ---: | ---: |
+| RPC 外读取处理 | 2293.95 | 66.83% |
+| Native MoE，含等待 | 543.59 | 15.84% |
+| Attention | 357.48 | 10.42% |
+| Router/shared | 74.83 | 2.18% |
+| State/KV 反馈、head 及其它 | 162.41 | 4.73% |
+| **总耗时** | **3432.26** | **100%** |
+| **吞吐** | **74.59 token/s** | |
+
+Decode 每轮真正执行 78 步输出 AR1，三轮共 234 步，不把 prefill 直接采样的首 token 算作一次 AR1。
+
+| 环节 | ms/token | 占比 |
+| --- | ---: | ---: |
+| RPC 外读取处理 | 2.236 | 2.57% |
+| Native MoE，含等待 | 39.932 | 45.92% |
+| Attention，含融合 Router/shared 计算 | 38.253 | 43.99% |
+| Router/shared 输出交接 | 0.047 | 0.05% |
+| State/KV 反馈、head 及其它 | 6.491 | 7.46% |
+| **总耗时** | **86.958** | **100%** |
+| **吞吐** | **11.50 token/s** | |
+
+Decode 的 40 层都已融合 Attention 与 Router/shared；约 0.047 ms 只是结果交接，不能解释为 Router 的计算耗时。30 个 GDN 融合图合计约 30.65 ms/token，10 个 full-attention 融合图合计约 7.51 ms/token，均属于上表 Attention 行的子项。Native 包含内部的专家就绪等待，RPC 外约 2.2 ms 不等于完整的专家 I/O 成本。
+
+同一会话换图后，decode 为 99.984 ms/token、10.00 token/s；Native 从同会话首轮的 39.38 增到 51.49 ms，Attention 融合段仍约 38.4 ms。专家命中率 76.17% → 61.95%，直接读取量 65.28 → 104.23 MB/token。阶段增量主要落在 Native，并伴随缓存命中下降。完整主表、逐 token CSV 和原始日志见[阶段拆分报告](../../../../../llama-output/qwen35-moe-from-safetensors-gptq-20261024/device-stage-breakdown-20261024/REPORT.md)。
+
+### 首轮 prefill 调度修复
+
+上述阶段测试后确认：旧终端入口固定加载 `[1,128]` 的 `prefill.pte`，没有使用配置中的 `layer_major`。256 个输入 token 的第二块和第一块有 77.25% 的逐层专家重合，但每层32槽 LRU 不能保留全部工作集，导致重复读取。现在按首轮实际 padding 长度自动选择128～1024的host计划，QNN与Native的AR仍为128；部署自动准备8份计划，含JSON共约0.61MB，不复制权重。
+
+SM8975、相同图文输入、同一目录与二进制：
+
+| 指标 | chunk-major 对照 | 修复后 layer-major，3轮均值 |
+| --- | ---: | ---: |
+| 专家文件读取量 | 9.055 GB | **5.741 GB** |
+| RPC 外读取处理 | 2300.98 ms | **1782.16 ms** |
+| Prefill 总耗时 | 3438.95 ms | **2899.51 ms** |
+| 吞吐 | 74.44 token/s | **88.29 token/s** |
+
+总耗时下降15.69%，文件读取量下降36.60%。路由及最终logits逐字节一致，集成后的三轮输出token也与对照完全一致。额外临时memo为当前层210MiB，进入decode前释放。联合路由实际使用7635个不同专家，扣除预加载命中的929个，剩余6706个专家所需的对齐读取字节数恰好为5.741GB，说明剩余读取量已不是当前样本的重复读；复制、同步及真实外存工作集仍需继续优化。
+
+当前设备已部署更新后的runner与计划集合；已有部署不能只替换二进制而缺少 `prefill/plans/`。完整原因、字节核对、正确性与时间细项见[Prefill I/O 分析报告](../../../../../llama-output/qwen35-moe-from-safetensors-gptq-20261024/prefill-io-analysis-20261024/REPORT.md)。
+
+SM8975 已验证重复 `--prompt`、交互输入、跨轮暗号记忆、超限拒绝后历史不变、`/reset` 与正常退出。8 组编码与 Transformers 逐字节一致；原主机单轮回归的 7 个生成 token 与已有版本完全一致。四轮会话保留 11 个共享 context，换轮与 reset 没有增加 context、IO 注册或 RPC buffer 生命周期操作。详见[设备端会话测试记录](../../../../../llama-output/qwen35-moe-from-safetensors-gptq-20261024/device-chat-tests/REPORT.md)。
+
 ## 代码位置
 
 ```text
@@ -43,8 +134,10 @@ qwen35-35B-A3B/
 │   ├── split_attention_core.py
 │   └── fp16_attention_core.py
 ├── runner/
+│   ├── chat/                # 设备 CLI、tokenizer、图片解码/切块、MRoPE、多轮状态
 │   ├── prefill/             # 图片编码、AR128、每层专家缓存、向 decode 交接
 │   ├── decode/              # 常驻 context/state、32/64 槽 LRU、异步 IO、SIMD 采样
+│   │   └── decoder_api.cpp  # 持久 open/step/reset/close C ABI，供设备会话调用
 │   ├── shared/              # 共享 context 的外部权重文件映射与 DMA 回调
 │   ├── embedding.h/.cpp     # 按行读取 BF16 或 packed INT4 embedding
 │   ├── handoff.h
@@ -98,7 +191,7 @@ GDN recurrence 复用[共享 DeltaNetQhpi.cpp](../../../custom_op/deltanet_op_pa
 - Router/shared 默认为 GPTQ W8A16，可选择旧 FP16 图；embedding 默认为 INT4，可选择原 BF16 表。两种选择都检查实际产物，不在运行时自动重量化。
 - GDN/conv/KV cache 目前仅支持 UINT16；配置中显式保留三个 dtype，UINT8 在当前 MoE runner 上会报错。
 - 已验证静态 decode 容量为 1152、2048；prefill 固定 AR128，支持 128 到 1024 的完整块。文本基准使用 128/1024 两种长度，使用原生 chat template、关闭 thinking。支持原始 token 文件输入。
-- 支持单图输入，默认 448×448、196 个视觉 token、视觉塔 W8A16。图片前处理在主机，视觉编码及完整 MoE prefill/decode 在设备上执行。
+- 支持单图输入，默认 448×448、196 个视觉 token、视觉塔 W8A16。设备 runner 内部完成图片解码、前处理、视觉编码和完整 MoE 推理；Python 入口保留原主机前处理路径。
 - 当前不支持视频、多图、任意模型尺寸和交互式多轮聊天。
 
 本机模型目录名称为 `Qwen3.6-35B-A3B`，其 `config.json` 的 text architecture 是 Qwen3.5 MoE。目录名称通过配置指定。

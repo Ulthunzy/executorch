@@ -51,6 +51,7 @@ def check_artifacts(args):
     if args.decode_context_load_mode not in ("async", "serial"):
         raise ValueError("Unsupported decode context loading mode in ASSETS.json")
     required = [
+        args.build_dir / "qwen35_moe_runner",
         args.build_dir / "prefill_handoff_runner",
         args.build_dir / "libmoe_decode.so",
         args.build_dir / "native-prefill/libinteger_rpc_skel.so",
@@ -58,6 +59,7 @@ def check_artifacts(args):
         args.build_dir / "op-package/hexagon-v85/libQnnDeltaNetOpPackage_HTP.so",
         args.model / "config.json",
         args.model / "generation_config.json",
+        args.model / "tokenizer.json",
         args.artifacts / "cold-experts.i32",
         *[
             args.artifacts / "assets" / name

@@ -27,6 +27,34 @@ python "$MOE_ROOT/run_chat.py" --model-config "$MOE_MODEL_CONFIG" --check
 
 `--print-config` 不读大模型权重或调用 ADB。`--check` 检查本地编译产物和接口，不进行设备推理。
 
+### 设备端运行
+
+`build.sh` 同时生成 `qwen35_moe_runner`。主机 `run_chat.py` 部署时会上传该程序和 `tokenizer.json`；之后可直接在设备终端交互，无需主机参与文本编码或解码：
+
+```sh
+cd /data/local/tmp/qwen35-raw-gptq-20261024/runtime/w2a8-fused-c1152-p128-cache32/prefill
+./qwen35_moe_runner --model-root .. --tokenizer-path ../../tokenizer.json --interactive
+```
+
+`--model-root` 包含 `prefill/` 和 `decode/`；共享权重默认位于它的上一级 `shared-model/`，也可用 `--shared-model` 指定。运行参数包括 `--prompt`（可重复）、`--system-prompt`、`--max-new-tokens`、`--temperature`、`--enable-thinking`、`--max-seq-len` 和 `--cache-experts`。容量必须匹配已编译图，不能在命令行将 1152 图扩展成 2048。当前默认容量 1152、缓存 32 槽。
+
+终端首轮从 `prefill/plans/PLANS.json` 读取配置的 prefill 顺序，并根据真实 padding 后的 token 数选择 `prefill-{N}.pte`。部署时自动生成128、256、…、1024的8个无权重host计划，总计约0.61MB。默认 `layer_major` 在当前层处理完全部AR128块再切到下一层，复用该层已加载的专家；`--prefill-order chunk_major` 仅需选择128计划做对照。QNN/Native kernel仍固定AR128，未重新编译成AR256或AR1024。
+
+计划集合必须与实际编译容量一致，缺少manifest或所选PTE时提前报错。当前单层memo最多额外申请210MiB，在进入decode前释放。原Python运行仍使用该次输入对应的显式PTE，不受终端自动选择影响。
+
+首轮 AR128，后续轮新输入走 AR1；`/reset` 清空历史 state/KV，保留 context 和专家缓存，`/exit` 结束会话。上下文超限时整条新输入拒绝追加，不会截断一部分问题或自动丢失历史。
+
+设备终端直接读取 JPG/PNG，无需主机预处理：
+
+```sh
+./qwen35_moe_runner --model-root .. --tokenizer-path ../../tokenizer.json \
+  --image-path ../../test.jpg --prompt "请用中文描述这张图片。" --interactive
+```
+
+交互中 `/image "图片路径" 问题` 加入新图片；直接输入问题则继续追问。视觉塔在模型初始化时加载并保留到退出，图像 token 的 embedding 和三维 MRoPE 在内部更新。后续图片目前通过 AR1 追加，速度明显低于首轮 AR128。
+
+模型根目录需要 `VISION.json`、`model-config.json`、原始 `base-cos.f32` / `base-sin.f32`，以及 `prefill/vision.bin`；当前部署流程自动准备。原始位置表保持只读，混合位置表写入模型根目录，避免覆盖 Python 入口的 `prefill/cos.f32` 和 `decode/cos.f32`。视觉精度仍为 W8A16 GPTQ，图片尺寸、patch/merge/temporal 参数按编译元数据校验。
+
 ## 量化配置
 
 | 字段 | 当前默认值 | 实际作用 |

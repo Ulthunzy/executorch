@@ -2,9 +2,11 @@ from pathlib import PurePosixPath
 import shlex
 
 from .artifacts import decode_layer_dir
+from .plans import prepare_chat_plans
 
 
 def deploy_artifacts(args, device, paths, run_dir, vision):
+    chat_plans = prepare_chat_plans(args, run_dir)
     adb = device.adb
     prefill_root, decode_root = paths.prefill, paths.decode
     common = [
@@ -57,6 +59,24 @@ def deploy_artifacts(args, device, paths, run_dir, vision):
     ]:
         commands.append(f"ln -sfn {prefill_root}/{name} {decode_root}/{name}")
     adb("shell", "\n".join(commands))
+    adb("push", args.build_dir / "qwen35_moe_runner", prefill_root + "/")
+    if chat_plans is not None:
+        adb("shell", "mkdir -p " + prefill_root + "/plans")
+        adb("push", str(chat_plans) + "/.", prefill_root + "/plans/")
+    adb("push", args.model / "tokenizer.json", args.remote_root + "/tokenizer.json")
+    profile_root = str(PurePosixPath(prefill_root).parent)
+    for name in ("cos", "sin"):
+        adb(
+            "push",
+            args.artifacts / f"assets/{name}.f32",
+            f"{profile_root}/base-{name}.f32",
+        )
+    adb("push", args.model / "config.json", profile_root + "/model-config.json")
+    if args.vision_artifacts and (args.vision_artifacts / "vision.bin").is_file():
+        adb(
+            "push", args.vision_artifacts / "VISION.json", profile_root + "/VISION.json"
+        )
+        adb("push", args.vision_artifacts / "vision.bin", prefill_root + "/vision.bin")
     for local, target in (
         (args.local_prefill_pte, prefill_root + "/prefill.pte"),
         (args.local_decode_pte, decode_root + "/decode.pte"),
@@ -70,7 +90,6 @@ def deploy_artifacts(args, device, paths, run_dir, vision):
             adb("shell", f"ln -sfn {embedding_remote} {target}/embedding.int4")
     adb("push", run_dir / "tokens.i64", prefill_root + "/tokens.i64")
     if vision is not None:
-        adb("push", args.vision_artifacts / "vision.bin", prefill_root + "/vision.bin")
         adb("push", run_dir / "pixels.f32", prefill_root + "/pixels.f32")
     adb(
         "push",
