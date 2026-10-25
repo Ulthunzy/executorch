@@ -332,15 +332,15 @@ uint32_t execute_integer_moe(
       sync->error = 24;
     else {
       if (mapping->fd == -1) {
-        mapping->pointer = static_cast<uint8_t*>(HAP_mmap2(
+        auto* pointer = static_cast<uint8_t*>(HAP_mmap2(
             nullptr,
             descriptor[1],
             HAP_PROT_READ | HAP_PROT_WRITE,
             0,
             descriptor[0],
             0));
-        mapping->fd = descriptor[0];
-        mapping->bytes = descriptor[1];
+        if (pointer && pointer != reinterpret_cast<void*>(-1))
+          *mapping = {descriptor[0], -1, pointer, unsigned(descriptor[1])};
       }
       if (!mapping->pointer || mapping->pointer == (void*)-1)
         sync->error = 25;

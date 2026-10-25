@@ -36,7 +36,9 @@ struct NativeCore {
 
   void publish_inputs();
 
-  void map_buffer(const std::shared_ptr<Buffer>& buffer);
+  void map_buffer(
+      const std::shared_ptr<Buffer>& buffer,
+      fastrpc_map_flags flags = FASTRPC_MAP_FD_DELAYED);
 
   void end_output_read();
 

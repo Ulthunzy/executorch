@@ -60,21 +60,23 @@ void NativeCore::publish_inputs() {
       sync_buffer(inbuf[i], DMA_BUF_SYNC_END | DMA_BUF_SYNC_WRITE);
 }
 
-void NativeCore::map_buffer(const std::shared_ptr<Buffer>& buffer) {
+void NativeCore::map_buffer(
+    const std::shared_ptr<Buffer>& buffer,
+    fastrpc_map_flags flags) {
   if (io_mappings.count(buffer->fd))
     return;
   const int status = fastrpc_mmap(
-      CDSP_DOMAIN_ID,
-      buffer->fd,
-      buffer->data,
-      0,
-      buffer->size,
-      FASTRPC_MAP_FD_DELAYED);
-  if (status != AEE_EALREADY)
+      CDSP_DOMAIN_ID, buffer->fd, buffer->data, 0, buffer->size, flags);
+  if (status != AEE_EALREADY || flags == FASTRPC_MAP_FD)
     check(status, "native fastrpc_mmap");
   if (!status)
     owned_mappings.push_back(buffer->fd);
   io_mappings[buffer->fd] = buffer;
+  if (flags == FASTRPC_MAP_FD)
+    printf(
+        "NATIVE_BANK_PREMAP fd=%d bytes=%zu before_qnn_restore=1\n",
+        buffer->fd,
+        buffer->size);
 }
 
 void NativeCore::end_output_read() {
@@ -106,9 +108,17 @@ void NativeCore::execute(bool read_output) {
       descriptors[5] = residual->fd;
     }
     memcpy(descriptors + 6, input(4), 32);
-    check(
-        integer_rpc_run_mapped(handle, descriptors, 14),
-        "integer_rpc_run_mapped");
+    const int status = integer_rpc_run_mapped(handle, descriptors, 14);
+    if (status == 25)
+      fprintf(
+          stderr,
+          "NATIVE_BANK_MAP_FAILED fd=%d bytes=%d generation=%d tokens=%d layer=%d\n",
+          descriptors[6],
+          descriptors[7],
+          descriptors[8],
+          tokens,
+          descriptors[13]);
+    check(status, "integer_rpc_run_mapped");
     if (read_output) {
       sync_buffer(outbuf[0], DMA_BUF_SYNC_START | DMA_BUF_SYNC_READ);
       output_read = true;
@@ -159,16 +169,23 @@ void NativeCore::close() {
   if (!handle)
     return;
   end_output_read();
-  check(integer_rpc_close(handle), "integer_rpc_close");
+  const int close_status = integer_rpc_close(handle);
   handle = 0;
+  int unmap_status = 0;
   for (int fd : owned_mappings) {
     auto& buffer = io_mappings.at(fd);
-    check(
-        fastrpc_munmap(CDSP_DOMAIN_ID, fd, buffer->data, buffer->size),
-        "native fastrpc_munmap");
+    const int status =
+        fastrpc_munmap(CDSP_DOMAIN_ID, fd, buffer->data, buffer->size);
+    if (status) {
+      fprintf(stderr, "native unmap failed fd=%d status=%d\n", fd, status);
+      if (!unmap_status)
+        unmap_status = status;
+    }
   }
   owned_mappings.clear();
   io_mappings.clear();
+  check(close_status, "integer_rpc_close");
+  check(unmap_status, "native fastrpc_munmap");
 }
 
 NativeCore::~NativeCore() {

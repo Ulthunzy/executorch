@@ -91,13 +91,42 @@ struct IoMapping {
   unsigned int bytes = 0;
 };
 
-// 线程池随 handle 常驻；每次 RPC 单独申请计算资源，执行完后归还给 QNN。
+struct ComputeResources {
+  uint32_t context = 0;
+  void* vtcm = nullptr;
+};
+
+static int prepare_resources(ComputeResources& resources, unsigned bytes) {
+  if (resources.context)
+    return 0;
+  compute_res_attr_t attributes;
+  HAP_compute_res_attr_init(&attributes);
+  HAP_compute_res_attr_set_vtcm_param(&attributes, bytes, 1);
+  HAP_compute_res_attr_set_hmx_param(&attributes, 1);
+  if (HAP_compute_res_attr_set_cache_mode(&attributes, 1))
+    return 70;
+  const auto context = HAP_compute_res_acquire(&attributes, 1000000);
+  if (!context)
+    return 15;
+  auto* vtcm = HAP_compute_res_attr_get_vtcm_ptr(&attributes);
+  if (!vtcm) {
+    HAP_compute_res_release(context);
+    return 16;
+  }
+  // Cacheable creation reserves the address layout, without leasing compute.
+  resources = {context, vtcm};
+  return 0;
+}
+
+// Workers and VTCM address layouts stay with the handle. Compute leases return
+// to QNN after each call; VTCM contents cannot survive that handoff.
 struct State {
   IoMapping io[256];
   const float* residual = nullptr;
   int pending = -1, assigned = 0;
   uint8_t* route = nullptr;
   int capacity = 128;
+  ComputeResources grouped, complete, partitioned;
   void* stacks[kWorkers + 1]{};
   qurt_mutex_t token_locks[128];
   PoolEntry entries[kWorkers + 1];
@@ -130,6 +159,9 @@ struct State {
     for (auto& entry : io)
       if (entry.pointer)
         HAP_munmap(entry.pointer, entry.bytes);
+    for (auto* resources : {&grouped, &complete, &partitioned})
+      if (resources->context)
+        HAP_compute_res_release(resources->context);
     for (auto& lock : token_locks)
       qurt_pimutex_destroy(&lock);
     HAP_power_destroy(this);
@@ -221,16 +253,19 @@ extern "C" AEEResult integer_rpc_configure(remote_handle64 handle, int tokens) {
   auto* state = reinterpret_cast<State*>(uintptr_t(handle));
   if (tokens < 128 || tokens > 1024 || tokens % 128 || state->pending != -1)
     return 14;
-  if (tokens == state->capacity)
-    return 0;
-  auto* route =
-      static_cast<uint8_t*>(memalign(128, size_t(tokens) * 8 * 2048 * 4));
-  if (!route)
-    return 12;
-  free(state->route);
-  state->route = route;
-  state->capacity = tokens;
-  return 0;
+  if (tokens != state->capacity) {
+    auto* route =
+        static_cast<uint8_t*>(memalign(128, size_t(tokens) * 8 * 2048 * 4));
+    if (!route)
+      return 12;
+    free(state->route);
+    state->route = route;
+    state->capacity = tokens;
+  }
+  if (tokens > 128)
+    return prepare_resources(state->grouped, 8388608);
+  const int error = prepare_resources(state->complete, 12582912);
+  return error ? error : prepare_resources(state->partitioned, 5242880);
 }
 
 extern "C" AEEResult
@@ -311,19 +346,18 @@ extern "C" AEEResult integer_rpc_run(
   if (phase || tokens != 128)
     return 57;
 #endif
-  compute_res_attr_t attributes;
-  HAP_compute_res_attr_init(&attributes);
-  HAP_compute_res_attr_set_vtcm_param(
-      &attributes, tokens > 128 ? 8388608 : (phase ? 5242880 : 12582912), 1);
-  HAP_compute_res_attr_set_hmx_param(&attributes, 1);
-  const uint32_t context = HAP_compute_res_acquire(&attributes, 1000000);
-  if (!context)
-    return 15;
-  void* vtcm = HAP_compute_res_attr_get_vtcm_ptr(&attributes);
-  if (!vtcm) {
-    HAP_compute_res_release(context);
-    return 16;
-  }
+  auto& resources = tokens > 128 ? state->grouped
+      : phase                    ? state->partitioned
+                                 : state->complete;
+  const int prepared = prepare_resources(
+      resources, tokens > 128 ? 8388608 : (phase ? 5242880 : 12582912));
+  if (prepared)
+    return prepared;
+  const uint32_t context = resources.context;
+  const int acquired = HAP_compute_res_acquire_cached(context, 1000000);
+  if (acquired)
+    return 71;
+  void* vtcm = resources.vtcm;
   metrics[8][0] = tick() - stamp;
   stamp = tick();
   QHPI_Tensor input[5] = {
@@ -372,7 +406,7 @@ extern "C" AEEResult integer_rpc_run(
   }
   metrics[8][2] = tick() - stamp;
   stamp = tick();
-  HAP_compute_res_release(context);
+  const int released = HAP_compute_res_release_cached(context);
   metrics[8][3] = tick() - stamp;
   metrics[8][4] = tick() - start;
   if (!error && (phase == 1 || phase == 2)) {
@@ -384,7 +418,7 @@ extern "C" AEEResult integer_rpc_run(
     state->pending = -1;
     state->assigned = 0;
   }
-  return error;
+  return error ? error : released;
 }
 
 extern "C" AEEResult integer_rpc_run_mapped(

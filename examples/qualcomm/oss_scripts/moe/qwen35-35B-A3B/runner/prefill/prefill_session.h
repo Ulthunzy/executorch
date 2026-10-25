@@ -75,7 +75,6 @@ struct PrefillSession {
       ? getenv("STARTUP_EXPERT_PREFETCH")
       : "none";
   bool startup_seed_pending = false;
-  bool native_mappings_active = true;
   int sequence_tokens = 128, memo_layer = -1;
   std::shared_ptr<Buffer> layer_memo;
   std::array<bool, 256> memo_valid{};

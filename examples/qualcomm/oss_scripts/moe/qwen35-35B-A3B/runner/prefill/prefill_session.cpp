@@ -22,16 +22,9 @@ PrefillSession::PrefillSession(const std::string& path, int plan_tokens)
     if (async_io) {
       layer_memo =
           std::make_shared<Buffer>(runtime, 4096 + 256 * stride, false, false);
-      auto& buffer = *layer_memo;
-      check(
-          fastrpc_mmap(
-              CDSP_DOMAIN_ID,
-              buffer.fd,
-              buffer.data,
-              0,
-              buffer.size,
-              FASTRPC_MAP_FD_DELAYED),
-          "layer memo map");
+      // Registering a delayed fd does not reserve DSP VA. Map the large bank
+      // before QNN restores its contexts and IO, and keep it until Native ends.
+      core.map_buffer(layer_memo, FASTRPC_MAP_FD);
     }
     sequence_routes.resize(sequence_tokens / 128 * 40 * 128 * 8);
     sequence_seeds.resize(sequence_tokens / 128 * 40 * 64);
@@ -60,11 +53,7 @@ PrefillSession::PrefillSession(const std::string& path, int plan_tokens)
   for (int i = 0; i < pool_count; i++) {
     expert_slots.push_back(std::make_shared<Buffer>(
         runtime, 4096 + capacity * stride, initialize_experts));
-    auto& b = *expert_slots.back();
-    check(
-        fastrpc_mmap(
-            CDSP_DOMAIN_ID, b.fd, b.data, 0, b.size, FASTRPC_MAP_FD_DELAYED),
-        "expert slot map");
+    core.map_buffer(expert_slots.back());
     caches.emplace_back(capacity);
   }
 
@@ -86,11 +75,7 @@ PrefillSession::PrefillSession(const std::string& path, int plan_tokens)
     for (int i = 0; i < 2; i++) {
       pipeline_banks.push_back(std::make_shared<Buffer>(
           runtime, 4096 + capacity * stride, initialize_experts));
-      auto& b = *pipeline_banks.back();
-      check(
-          fastrpc_mmap(
-              CDSP_DOMAIN_ID, b.fd, b.data, 0, b.size, FASTRPC_MAP_FD_DELAYED),
-          "prefill pipeline bank map");
+      core.map_buffer(pipeline_banks.back());
     }
   printf(
       "EXPERT_BUFFER_INIT explicit_zero=%d payload_written_before_use=1\n",
@@ -148,8 +133,12 @@ PrefillSession::PrefillSession(const std::string& path, int plan_tokens)
     router.emplace_back(new Graph(
         runtime, root + "/layer" + std::to_string(layer) + "/moe-front.bin"));
   }
-  shared_io =
-      std::make_unique<SharedIo>(runtime, attention, router, core.outbuf[0]);
+  // Grouped Native output is sequence-sized; QNN registers an AR128 tensor.
+  // Give QNN its own chain so one fd is never registered at both lengths.
+  const auto chain = sequence_tokens >= 512
+      ? std::make_shared<Buffer>(runtime, 128 * 2048 * 4)
+      : core.outbuf[0];
+  shared_io = std::make_unique<SharedIo>(runtime, attention, router, chain);
   // QNN IO remains AR128; grouped Native calls need separate sequence-sized IO.
   if (sequence_tokens < 512) {
     core.inbuf[0] = shared_io->hidden;
@@ -1134,24 +1123,7 @@ void PrefillSession::finish_prefill_native() {
   finish_memo_copy();
   readers.reset();
   core.close();
-  if (!native_mappings_active)
-    return;
-  if (layer_memo) {
-    check(
-        fastrpc_munmap(
-            CDSP_DOMAIN_ID, layer_memo->fd, layer_memo->data, layer_memo->size),
-        "layer memo unmap");
-    layer_memo.reset();
-  }
-  for (auto& b : pipeline_banks)
-    check(
-        fastrpc_munmap(CDSP_DOMAIN_ID, b->fd, b->data, b->size),
-        "pipeline unmap");
-  for (auto& b : expert_slots)
-    check(
-        fastrpc_munmap(CDSP_DOMAIN_ID, b->fd, b->data, b->size),
-        "expert unmap");
-  native_mappings_active = false;
+  layer_memo.reset();
 }
 
 PrefillSession::~PrefillSession() {

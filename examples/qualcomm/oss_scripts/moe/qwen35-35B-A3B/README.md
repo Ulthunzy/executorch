@@ -230,6 +230,16 @@ O_DIRECT 直接读 rpcmem 在该设备返回 EFAULT，因此保留一次 staging
 
 完整分析、对照CSV、错误探针与源码指纹见[1K prefill 320 token/s目标验证](../../../../../llama-output/qwen35-moe-from-safetensors-gptq-20261024/prefill-320-20261025/REPORT.md)。
 
+### Prefill 初始化映射错误 25
+
+2026-10-25，在连续完整1K prefill＋decode会话的第6次启动复现。25是Native自定义错误：约210MiB的当前层专家memo在QNN恢复完成后才通过`HAP_mmap2`建立DSP映射，返回`0xffffffff`。fd有效、注册长度一致，底层日志为`0x80000608 / QuRT Error 12`。SDK把12定义为映射失败，不能直接解释为手机DRAM耗尽。旧代码还缓存失败指针与fd，导致同一handle后续调用持续返回25，并在关闭时尝试解除无效映射。
+
+修复在Native configure时建立cached resource context，先确定VTCM地址布局，再提前映射大memo，之后恢复QNN。每次Native计算仍需`acquire_cached`，完成后`release_cached`将资源归还QNN；关闭会话才最终释放context。仅提前映射memo的中间版本仍曾在首次VTCM申请时返回15，因此最终同时处理两种布局。归并Native的sequence-sized输出与QNN的AR128 chain改用独立fd，消除同一fd注册1MiB/8MiB长度冲突；增加约1MiB工作缓冲。映射缓存只提交有效指针，所有host注册由core统一跟踪并清理。
+
+12轮1K文本与3轮图文完整会话未再出现25、15或清理错误，每轮85份prefill产物和完整生成token均与原版一致。1K prefill为413.56–429.42 token/s，图文为139.05–140.70 token/s，维持原性能范围。AR128/AR1024失败注入确认：旧版同handle重试仍报25，新版能重新映射并正常释放。本轮未改量化、Top8或计算结果，无需重新导出PTE；host runner与prefill skel需配套更新。系统日志尚不能进一步区分VA碎片、页表或底层映射器限制，有限次数通过也不等于任意系统负载下的保证。完整证据、回归、源码指纹与二进制见[错误25定位报告](../../../../../llama-output/qwen35-moe-from-safetensors-gptq-20261024/prefill-map25-20261025/REPORT.md)。
+
+最终排版重建后另补三对原版/修复版回归，覆盖128单块、512归并与chunk-major图文两轮对话，产物和token仍逐字节一致。修复版共18次整模初始化通过，最终配套二进制已留在SM8975测试目录。
+
 ## 代码位置
 
 ```text
