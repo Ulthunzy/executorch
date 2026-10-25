@@ -1,4 +1,5 @@
 #include "expert_readers.h"
+#include "../../native/prefill/expert_stream.h"
 
 #include <algorithm>
 #include <cstdlib>
@@ -20,6 +21,9 @@ void ExpertReaders::perform(ExpertRead& request, void* buffer) {
     request.pread_ms = elapsed(begin);
     if (got != ssize_t(request.read_bytes)) {
       request.error = got < 0 ? errno : EIO;
+      if (request.completion)
+        __atomic_store_n(
+            request.completion, expert_stream::kFailed, __ATOMIC_RELEASE);
       return;
     }
     payload = static_cast<uint8_t*>(buffer) + request.prefix;
@@ -30,6 +34,9 @@ void ExpertReaders::perform(ExpertRead& request, void* buffer) {
   if (request.destination)
     memcpy(request.destination, payload, request.payload_bytes);
   request.copy_ms = elapsed(begin);
+  if (request.completion)
+    __atomic_store_n(
+        request.completion, expert_stream::kReady, __ATOMIC_RELEASE);
 }
 
 void ExpertReaders::worker(int index) {
@@ -45,15 +52,32 @@ void ExpertReaders::worker(int index) {
       seen = epoch;
     }
     while (true) {
-      int job = next.fetch_add(1);
-      if (job >= count)
-        break;
+      int job;
+      {
+        std::unique_lock<std::mutex> lock(mutex);
+        changed.wait(lock, [&] {
+          return stopping || next < count || sealed;
+        });
+        if (stopping)
+          return;
+        if (next >= count)
+          break;
+        job = next++;
+        if (active++ == 0)
+          active_started = Clock::now();
+      }
       perform(requests[job], staging[index]);
+      const auto ended = Clock::now();
+      {
+        std::lock_guard<std::mutex> lock(mutex);
+        completed = std::max(completed, ended);
+        if (--active == 0)
+          active_spans.emplace_back(active_started, completed);
+      }
     }
     {
       std::lock_guard<std::mutex> lock(mutex);
-      if (++finished == int(threads.size()))
-        completed = Clock::now();
+      ++finished;
     }
     changed.notify_all();
   }
@@ -62,6 +86,7 @@ void ExpertReaders::worker(int index) {
 ExpertReaders::ExpertReaders(int workers, size_t maximum)
     : staging(std::max(workers, 1), nullptr) {
   try {
+    active_spans.reserve(1280);
     for (auto& pointer : staging)
       if (posix_memalign(&pointer, 4096, maximum))
         throw std::runtime_error("expert staging allocation");
@@ -92,17 +117,24 @@ ExpertReaders::~ExpertReaders() {
   stop();
 }
 
-void ExpertReaders::start(ExpertRead* jobs, int size) {
+void ExpertReaders::start(ExpertRead* jobs, int size, bool growable) {
   if (pending)
     throw std::runtime_error("expert read batch still pending");
+  if (growable && threads.empty())
+    throw std::runtime_error("growable reads require worker threads");
   requests = jobs;
   count = size;
   started = Clock::now();
+  completed = started;
+  active_spans.clear();
   pending = true;
+  sealed = !growable;
   if (threads.empty()) {
     for (int i = 0; i < size; i++)
       perform(jobs[i], staging[0]);
     completed = Clock::now();
+    if (size)
+      active_spans.emplace_back(started, completed);
   } else {
     std::lock_guard<std::mutex> lock(mutex);
     next = 0;
@@ -112,9 +144,30 @@ void ExpertReaders::start(ExpertRead* jobs, int size) {
   }
 }
 
+void ExpertReaders::extend(int size) {
+  {
+    std::lock_guard<std::mutex> lock(mutex);
+    if (!pending || sealed || size < count)
+      throw std::runtime_error("invalid expert read extension");
+    count = size;
+  }
+  changed.notify_all();
+}
+
+void ExpertReaders::seal() {
+  {
+    std::lock_guard<std::mutex> lock(mutex);
+    if (!pending)
+      throw std::runtime_error("no expert read batch pending");
+    sealed = true;
+  }
+  changed.notify_all();
+}
+
 void ExpertReaders::finish() {
   if (!pending)
     throw std::runtime_error("no expert read batch pending");
+  seal();
   if (!threads.empty()) {
     std::unique_lock<std::mutex> lock(mutex);
     changed.wait(lock, [&] {
@@ -134,11 +187,14 @@ double ExpertReaders::wall_ms() const {
 
 double ExpertReaders::overlap_ms(Clock::time_point begin, Clock::time_point end)
     const {
-  return std::max(
-      0.,
-      std::chrono::duration<double, std::milli>(
-          std::min(end, completed) - std::max(begin, started))
-          .count());
+  double overlap = 0;
+  for (const auto& span : active_spans)
+    overlap += std::max(
+        0.,
+        std::chrono::duration<double, std::milli>(
+            std::min(end, span.second) - std::max(begin, span.first))
+            .count());
+  return overlap;
 }
 
 void ExpertReaders::read(ExpertRead* jobs, int size) {

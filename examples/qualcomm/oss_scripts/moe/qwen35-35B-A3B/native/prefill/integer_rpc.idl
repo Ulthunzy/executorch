@@ -6,4 +6,5 @@ interface integer_rpc : remote_handle64 {
  AEEResult run_mapped(in sequence<long> descriptors);
  AEEResult release_io();
  AEEResult counts(rout sequence<long> result);
+ AEEResult configure(in long tokens);
 };

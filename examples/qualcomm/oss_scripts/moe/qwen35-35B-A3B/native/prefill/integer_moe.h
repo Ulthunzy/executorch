@@ -38,6 +38,8 @@ struct Request {
 struct Sync {
   volatile uint32_t workers, arrived, departed, done, go, next, combined, error,
       prepared, executed, assignments;
+  volatile uint32_t waiting, done_mask;
+  uint64_t ready_wait[8];
   const uint8_t* bank;
   qurt_mutex_t* token_locks;
   const float* residual;

@@ -29,6 +29,14 @@ struct Metrics {
   double io_wall = 0, io_overlap = 0, io_wait = 0, staged_copy = 0;
   uint64_t layer_reuse_bytes = 0;
   double layer_seed_copy = 0;
+  double batch_setup = 0, input_copy_sync = 0;
+  double pread_worker = 0, payload_copy_worker = 0;
+  double ready_native = 0, missing_native = 0;
+  int ready_calls = 0, missing_calls = 0;
+  double seed_wait = 0, seed_overlap = 0, retained_wait = 0,
+         retained_overlap = 0, retained_prepare = 0, input_io_overlap = 0;
+  double router_io_overlap = 0;
+  double attention_io_overlap = 0;
 };
 
 // 完整 40 层 AR128 调度；多块计划逐层处理整段输入，复用当前层的临时权重。
@@ -69,14 +77,36 @@ struct PrefillSession {
   bool startup_seed_pending = false;
   bool native_mappings_active = true;
   int sequence_tokens = 128, memo_layer = -1;
-  std::unique_ptr<uint8_t, decltype(&std::free)> layer_memo{nullptr, std::free};
+  std::shared_ptr<Buffer> layer_memo;
   std::array<bool, 256> memo_valid{};
+  std::array<int, 64> memo_slot_ids{};
+  enum class MemoCopy { None, Seed, Retain };
+  MemoCopy memo_copy = MemoCopy::None;
+  int memo_copy_layer = -1;
+  std::vector<ExpertRead> memo_copies;
+  std::vector<std::pair<Clock::time_point, Clock::time_point>>
+      copy_compute_spans;
+  std::vector<ExpertRead> route_reads;
+  std::vector<int> route_read_ids;
+  std::array<int, 256> route_first_use{};
+  std::vector<std::pair<Clock::time_point, Clock::time_point>>
+      stream_compute_spans, stream_input_spans;
+  std::vector<std::pair<Clock::time_point, Clock::time_point>>
+      attention_io_spans;
+  int staged_router_layer = -1;
+  std::vector<int32_t> staged_ids;
+  std::vector<float> staged_scores, staged_shared;
+  std::vector<std::pair<Clock::time_point, Clock::time_point>> route_io_spans;
   std::vector<int32_t> sequence_routes, sequence_seeds;
   std::vector<uint64_t> sequence_stamps;
 
   explicit PrefillSession(const std::string& path, int plan_tokens = 128);
 
   void prepare_layer_memo(int layer);
+
+  void finish_memo_copy();
+
+  void prefetch_route(int layer, const int32_t* ids);
 
   void finish_prefill_native();
 
@@ -88,6 +118,13 @@ struct PrefillSession {
 
   void
   route(int layer, const float* x, int32_t* ids, float* scores, float* shared);
+
+  void execute_route(
+      int layer,
+      const float* x,
+      int32_t* ids,
+      float* scores,
+      float* shared);
 
   uint64_t fill(
       int layer,
@@ -103,7 +140,8 @@ struct PrefillSession {
       const float* scores,
       const float* shared,
       const float* residual,
-      float* out);
+      float* out,
+      int tokens = 128);
 
   void project(const float* x, float* logits);
 

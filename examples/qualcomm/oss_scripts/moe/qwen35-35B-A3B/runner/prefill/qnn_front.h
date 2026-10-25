@@ -71,7 +71,7 @@ struct Buffer {
   size_t size;
   int fd;
 
-  Buffer(Runtime& r, size_t n, bool initialize = true);
+  Buffer(Runtime& r, size_t n, bool initialize = true, bool cached = true);
 
   ~Buffer();
 };
@@ -129,6 +129,8 @@ struct Graph {
   Graph(Runtime& r, const std::string& path, bool metadata_only = false);
 
   void activate();
+
+  void configure_threads();
 
   void deactivate();
 

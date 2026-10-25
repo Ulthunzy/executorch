@@ -15,6 +15,7 @@ struct Options {
   std::string system_prompt = "你是一个有帮助的人工智能助手。";
   std::vector<std::string> prompts;
   int max_new_tokens = 128, capacity = 1152, cache_experts = 32;
+  int prefill_io_workers = 8;
   float temperature = 0;
   bool interactive = false, thinking = false, tokenize_only = false;
   std::string log_path;

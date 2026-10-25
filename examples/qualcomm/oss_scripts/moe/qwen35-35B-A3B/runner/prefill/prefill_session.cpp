@@ -1,7 +1,10 @@
 #include "prefill_session.h"
+#include "../../native/prefill/expert_stream.h"
 
 PrefillSession::PrefillSession(const std::string& path, int plan_tokens)
-    : root(path), core(runtime, path), embedding(path) {
+    : root(path),
+      core(runtime, path, plan_tokens >= 512 ? plan_tokens : 128),
+      embedding(path) {
   runtime.defer_contexts = true;
   if (!core.mapped || !core.fuse_residual)
     throw std::runtime_error("native mapped residual required");
@@ -14,19 +17,36 @@ PrefillSession::PrefillSession(const std::string& path, int plan_tokens)
     throw std::runtime_error("invalid prefill plan length");
   sequence_tokens = plan_tokens;
   if (sequence_tokens > 128) {
-    void* memory = nullptr;
-    if (posix_memalign(&memory, 4096, 256 * stride))
-      throw std::runtime_error("layer expert memo allocation");
-    layer_memo.reset(static_cast<uint8_t*>(memory));
+    // DSP consumes this layer's memo directly. Uncached memory avoids a
+    // full-bank CPU cache flush each time the selected expert table changes.
+    if (async_io) {
+      layer_memo =
+          std::make_shared<Buffer>(runtime, 4096 + 256 * stride, false, false);
+      auto& buffer = *layer_memo;
+      check(
+          fastrpc_mmap(
+              CDSP_DOMAIN_ID,
+              buffer.fd,
+              buffer.data,
+              0,
+              buffer.size,
+              FASTRPC_MAP_FD_DELAYED),
+          "layer memo map");
+    }
     sequence_routes.resize(sequence_tokens / 128 * 40 * 128 * 8);
     sequence_seeds.resize(sequence_tokens / 128 * 40 * 64);
     sequence_stamps.resize(sequence_seeds.size());
+    if (layer_memo) {
+      staged_ids.resize(sequence_tokens * 8);
+      staged_scores.resize(sequence_tokens * 8);
+      staged_shared.resize(sequence_tokens * 2048);
+    }
   }
   printf(
       "PREFILL_SCHEDULE plan_tokens=%d ar_len=128 layer_major=%d memo_bytes=%zu\n",
       sequence_tokens,
       sequence_tokens > 128,
-      layer_memo ? 256 * stride : 0);
+      layer_memo ? layer_memo->size : 0);
   capacity = configuredExpertSlots();
   pool_count = reuse ? 40 : 4;
   if (!reuse)
@@ -62,7 +82,7 @@ PrefillSession::PrefillSession(const std::string& path, int plan_tokens)
       "PREFILL_IO_CONFIG workers=%d startup_workers=%d\n",
       io_workers,
       startup_workers);
-  if (async_io)
+  if (async_io && !layer_memo)
     for (int i = 0; i < 2; i++) {
       pipeline_banks.push_back(std::make_shared<Buffer>(
           runtime, 4096 + capacity * stride, initialize_experts));
@@ -130,11 +150,15 @@ PrefillSession::PrefillSession(const std::string& path, int plan_tokens)
   }
   shared_io =
       std::make_unique<SharedIo>(runtime, attention, router, core.outbuf[0]);
-  core.inbuf[0] = shared_io->hidden;
-  core.inbuf[1] = shared_io->ids;
-  core.inbuf[2] = shared_io->scores;
-  core.inbuf[3] = shared_io->shared;
-  core.residual = shared_io->residual;
+  // QNN IO remains AR128; grouped Native calls need separate sequence-sized IO.
+  if (sequence_tokens < 512) {
+    core.inbuf[0] = shared_io->hidden;
+    core.inbuf[1] = shared_io->ids;
+    core.inbuf[2] = shared_io->scores;
+    core.inbuf[3] = shared_io->shared;
+    core.residual = shared_io->residual;
+  } else
+    core.residual = std::make_shared<Buffer>(runtime, plan_tokens * 2048 * 4);
   head = std::make_unique<Graph>(runtime, root + "/head.bin");
   std::vector<Graph*> graphs;
   for (int i = 0; i < 40; i++) {
@@ -195,6 +219,7 @@ PrefillSession::PrefillSession(const std::string& path, int plan_tokens)
 
 void PrefillSession::reset() {
   image_cursor = 0;
+  staged_router_layer = -1;
   memo_layer = -1;
   memo_valid.fill(false);
   core.end_output_read();
@@ -242,28 +267,64 @@ void PrefillSession::embed(const int64_t* tokens, float* out) {
 void PrefillSession::prepare_layer_memo(int layer) {
   if (!layer_memo || memo_layer == layer)
     return;
-  const auto started = Clock::now();
+  finish_memo_copy();
   memo_valid.fill(false);
+  memo_slot_ids.fill(-1);
+  route_first_use.fill(-1);
+  memset(
+      static_cast<uint8_t*>(layer_memo->data) + expert_stream::kReadyOffset,
+      0,
+      256 * sizeof(uint32_t));
   std::vector<ExpertRead> copies;
   for (int slot = 0; slot < capacity; slot++) {
     const int expert = caches[layer].entries[slot].expert;
+    memo_slot_ids[slot] = expert;
     if (expert < 0)
       continue;
     ExpertRead request;
     request.payload_bytes = banks[layer]->size(expert);
     request.cached = static_cast<const uint8_t*>(expert_slots[layer]->data) +
         4096 + slot * stride;
-    request.destination = layer_memo.get() + expert * stride +
-        (banks[layer]->offset(expert) & size_t(4095));
+    request.destination = static_cast<uint8_t*>(layer_memo->data) + 4096 +
+        expert * stride + (banks[layer]->offset(expert) & size_t(4095));
     copies.push_back(request);
     memo_valid[expert] = true;
   }
-  // 仅保留当前层的权重；各 chunk 仍使用同样的 Top8、分批次序和累加方式。
-  readers->read(copies.data(), copies.size());
+  // Seed copies overlap this layer's remaining Attention/Router work. The
+  // first MoE chunk joins them before any memo payload becomes consumable.
+  memo_copies = std::move(copies);
+  readers->start(memo_copies.data(), memo_copies.size());
+  memo_copy = MemoCopy::Seed;
+  memo_copy_layer = layer;
+  copy_compute_spans.clear();
   memo_layer = layer;
-  const double duration = elapsed(started);
-  metrics.layer_seed_copy += duration;
-  metrics.read += duration;
+}
+
+void PrefillSession::finish_memo_copy() {
+  if (memo_copy == MemoCopy::None)
+    return;
+  const auto waited = Clock::now();
+  readers->finish();
+  const double wait_ms = elapsed(waited);
+  double overlap_ms = 0;
+  for (const auto& span : copy_compute_spans)
+    overlap_ms += readers->overlap_ms(span.first, span.second);
+  if (memo_copy == MemoCopy::Seed) {
+    metrics.layer_seed_copy += readers->wall_ms();
+    metrics.seed_wait += wait_ms;
+    metrics.seed_overlap += overlap_ms;
+  } else {
+    metrics.staged_copy += readers->wall_ms();
+    metrics.retained_overlap += overlap_ms;
+    core.sync_buffer(
+        expert_slots[memo_copy_layer], DMA_BUF_SYNC_END | DMA_BUF_SYNC_WRITE);
+    metrics.retained_wait += elapsed(waited);
+  }
+  metrics.read += elapsed(waited);
+  memo_copy = MemoCopy::None;
+  memo_copy_layer = -1;
+  memo_copies.clear();
+  copy_compute_spans.clear();
 }
 
 void PrefillSession::attend(
@@ -283,11 +344,51 @@ void PrefillSession::attend(
       reinterpret_cast<const float*>(sin.data()));
   memcpy(norm, a.hidden(), 128 * 2048 * 4);
   memcpy(residual, a.residual(), 128 * 2048 * 4);
+  const auto done = Clock::now();
   metrics.attention += elapsed(t);
   metrics.calls[1]++;
+  if (!route_reads.empty())
+    attention_io_spans.emplace_back(t, done);
+  if (memo_copy != MemoCopy::None)
+    copy_compute_spans.emplace_back(t, done);
+  // Let the preceding layer's final LRU copy run through this first QNN call
+  // before the shared memo is reused for the new layer.
+  if (chunk_start == 0)
+    prepare_layer_memo(layer);
+  if (layer_memo) {
+    if (chunk_start == 0)
+      staged_router_layer = -1;
+    execute_route(
+        layer,
+        norm,
+        staged_ids.data() + chunk_start * 8,
+        staged_scores.data() + chunk_start * 8,
+        staged_shared.data() + chunk_start * 2048);
+    if (chunk_start + 128 == sequence_tokens)
+      staged_router_layer = layer;
+  }
 }
 
 void PrefillSession::route(
+    int layer,
+    const float* x,
+    int32_t* ids,
+    float* scores,
+    float* shared) {
+  if (!layer_memo) {
+    execute_route(layer, x, ids, scores, shared);
+    return;
+  }
+  if (layer != next_layer || staged_router_layer != layer)
+    throw std::runtime_error("prefill router handoff order");
+  const auto started = Clock::now();
+  memcpy(ids, staged_ids.data() + chunk_start * 8, 128 * 8 * 4);
+  memcpy(scores, staged_scores.data() + chunk_start * 8, 128 * 8 * 4);
+  memcpy(shared, staged_shared.data() + chunk_start * 2048, 128 * 2048 * 4);
+  metrics.router += elapsed(started);
+}
+
+void PrefillSession::execute_route(
     int layer,
     const float* x,
     int32_t* ids,
@@ -304,6 +405,65 @@ void PrefillSession::route(
   memcpy(shared, r.output(r.index(false, 2)), 128 * 2048 * 4);
   metrics.router += elapsed(t);
   metrics.calls[2]++;
+  if (memo_copy != MemoCopy::None)
+    copy_compute_spans.emplace_back(t, Clock::now());
+  if (!route_reads.empty())
+    route_io_spans.emplace_back(t, Clock::now());
+  if (layer_memo && chunk_start == 0)
+    finish_memo_copy();
+  if (layer_memo)
+    prefetch_route(layer, ids);
+}
+
+void PrefillSession::prefetch_route(int layer, const int32_t* ids) {
+  if (chunk_start == 0) {
+    if (!route_reads.empty())
+      throw std::runtime_error("unconsumed route prefetch");
+    // Keep the allocation stable while workers consume records already
+    // published by earlier Router chunks.
+    route_reads.resize(256);
+    route_read_ids.clear();
+    route_io_spans.clear();
+    stream_compute_spans.clear();
+    stream_input_spans.clear();
+    attention_io_spans.clear();
+  }
+  auto& bank = *banks[layer];
+  for (int token = 0; token < 128; token++) {
+    std::array<bool, 256> seen{};
+    for (int rank = 0; rank < 8; rank++) {
+      const int expert = ids[token * 8 + rank];
+      if (expert < 0 || expert >= 256 || seen[expert])
+        throw std::runtime_error("Top8 route prefetch");
+      seen[expert] = true;
+      if (route_first_use[expert] >= 0)
+        continue;
+      route_first_use[expert] = (chunk_start + token) * 8 + rank;
+      if (memo_valid[expert])
+        continue;
+      auto& request = route_reads[route_read_ids.size()];
+      const size_t offset = bank.offset(expert),
+                   aligned = offset & ~size_t(4095);
+      request.fd = bank.fd;
+      request.file_offset = aligned;
+      request.prefix = offset - aligned;
+      request.payload_bytes = bank.size(expert);
+      request.read_bytes = align4096(request.prefix + request.payload_bytes);
+      request.cache_destination = static_cast<uint8_t*>(layer_memo->data) +
+          4096 + expert * stride + request.prefix;
+      request.completion = reinterpret_cast<uint32_t*>(
+                               static_cast<uint8_t*>(layer_memo->data) +
+                               expert_stream::kReadyOffset) +
+          expert;
+      route_read_ids.push_back(expert);
+    }
+  }
+  if (chunk_start == 0)
+    readers->start(route_reads.data(), route_read_ids.size(), true);
+  else
+    readers->extend(route_read_ids.size());
+  if (chunk_start + 128 == sequence_tokens)
+    readers->seal();
 }
 
 uint64_t PrefillSession::fill(
@@ -372,12 +532,18 @@ void PrefillSession::experts(
     const float* scores,
     const float* shared,
     const float* residual,
-    float* out) {
+    float* out,
+    int tokens) {
   if (layer != next_layer)
     throw std::runtime_error("MoE layer order");
+  if (tokens < 128 || tokens > sequence_tokens || tokens % 128 ||
+      (tokens > 128 &&
+       (!layer_memo || tokens != sequence_tokens || chunk_start)))
+    throw std::runtime_error("MoE token group");
   auto t = Clock::now();
   prepare_layer_memo(layer);
-  if (sequence_tokens > 128) {
+  finish_memo_copy();
+  if (sequence_tokens > 128 && tokens == 128) {
     const int base = (chunk_start / 128 * 40 + layer) * 64;
     for (int slot = 0; slot < capacity; slot++) {
       sequence_seeds[base + slot] = caches[layer].entries[slot].expert;
@@ -388,18 +554,29 @@ void PrefillSession::experts(
         ids + 128 * 8,
         sequence_routes.begin() + (chunk_start / 128 * 40 + layer) * 128 * 8);
   }
-  memcpy(core.input(0), x, 128 * 2048 * 4);
-  memcpy(core.input(1), ids, 128 * 8 * 4);
-  memcpy(core.input(2), scores, 128 * 8 * 4);
-  memcpy(core.input(3), shared, 128 * 2048 * 4);
-  memcpy(core.residual->data, residual, 128 * 2048 * 4);
-  core.publish_inputs();
-  core.sync_buffer(core.residual, DMA_BUF_SYNC_END | DMA_BUF_SYNC_WRITE);
+  Clock::time_point input_begin{}, input_end{};
+  bool inputs_published = false;
+  auto publish_inputs = [&] {
+    if (inputs_published)
+      return;
+    input_begin = Clock::now();
+    memcpy(core.input(0), x, tokens * 2048 * 4);
+    memcpy(core.input(1), ids, tokens * 8 * 4);
+    memcpy(core.input(2), scores, tokens * 8 * 4);
+    memcpy(core.input(3), shared, tokens * 2048 * 4);
+    memcpy(core.residual->data, residual, tokens * 2048 * 4);
+    core.publish_inputs();
+    core.sync_buffer(core.residual, DMA_BUF_SYNC_END | DMA_BUF_SYNC_WRITE);
+    input_end = Clock::now();
+    metrics.input_copy_sync += elapsed(input_begin);
+    inputs_published = true;
+  };
 
-  // 先统计本层 128×Top8 路由，再按专家聚合 token，重复使用同一份专家权重。
+  // 汇总当前组的 Top8 路由；Attention 的 AR128 与专家归并大小相互独立。
   std::array<int, 256> histogram{}, last_use{};
-  std::copy(ids, ids + 128 * 8, route_history[layer].begin());
-  for (int token = 0; token < 128; token++) {
+  std::copy(
+      ids + (tokens - 128) * 8, ids + tokens * 8, route_history[layer].begin());
+  for (int token = 0; token < tokens; token++) {
     std::array<bool, 256> seen{};
     for (int k = 0; k < 8; k++) {
       int e = ids[token * 8 + k];
@@ -430,7 +607,7 @@ void PrefillSession::experts(
 
   for (int e = 0; e < 256; e++)
     if (histogram[e]) {
-      if (cache.find(e) >= 0)
+      if (layer_memo ? memo_valid[e] : cache.find(e) >= 0)
         cached.push_back(e);
       else
         missing.push_back(e);
@@ -440,7 +617,8 @@ void PrefillSession::experts(
   });
   const int batch_capacity = capacity;
 
-  // 命中专家先算；缺失按槽容量分批，用两块 pipeline bank 交叠读取与计算。
+  // 命中专家先算，缺失读取与计算重叠。多块输入直接消费共享 memo；
+  // 单块输入仍用两个受 LRU 槽容量约束的 pipeline bank。
   std::vector<std::vector<int>> batches;
   if (!cached.empty())
     batches.push_back(cached);
@@ -457,19 +635,33 @@ void PrefillSession::experts(
   auto stage = [&](size_t batch, std::vector<ExpertRead>& requests) {
     const int ping = batch % 2;
     const auto& selected = batches[batch];
-    auto& buffer = *pipeline_banks[ping];
+    if (!route_reads.empty()) {
+      if (selected != route_read_ids)
+        throw std::runtime_error("route prefetch batch mismatch");
+      requests = std::move(route_reads);
+      route_read_ids.clear();
+      for (int expert : selected)
+        memo_valid[expert] = true;
+      return;
+    }
+    auto& buffer = layer_memo ? *layer_memo : *pipeline_banks[ping];
     auto* data = static_cast<uint8_t*>(buffer.data);
     auto& bank = *banks[layer];
-    memcpy(data, bank.index.data(), 4096);
-    auto* table = reinterpret_cast<uint64_t*>(data + 32);
-    std::fill(table, table + 256, 0);
+    // The next batch may load while DSP reads the current header. Publish
+    // the memo's selection only after the preceding native call finishes.
+    if (!layer_memo) {
+      memcpy(data, bank.index.data(), 4096);
+      auto* table = reinterpret_cast<uint64_t*>(data + 32);
+      std::fill(table, table + 256, 0);
+      for (size_t j = 0; j < selected.size(); j++)
+        table[selected[j]] = 4096 + j * stride;
+    }
     bank_ids[ping] = selected;
     requests.resize(selected.size());
     for (size_t j = 0; j < selected.size(); j++) {
       const int expert = selected[j];
       const size_t offset = bank.offset(expert), length = bank.size(expert),
                    aligned = offset & ~size_t(4095);
-      table[expert] = 4096 + j * stride;
       requests[j] = {
           bank.fd,
           0,
@@ -477,14 +669,15 @@ void PrefillSession::experts(
           align4096(offset - aligned + length),
           offset - aligned,
           length,
-          data + table[expert]};
+          layer_memo ? nullptr : data + 4096 + j * stride};
       if (layer_memo) {
-        auto* block = layer_memo.get() + expert * stride;
+        auto* block = data + 4096 + expert * stride;
         if (memo_valid[expert]) {
           requests[j].cached = block + requests[j].prefix;
           metrics.layer_reuse_bytes += length;
         } else {
-          // 保留已读取的有效 payload；下一块直接复制到 DMA bank，跳过 UFS。
+          // O_DIRECT cannot pin rpcmem pages on this device. Copy the miss
+          // from reader staging once; subsequent chunks reuse it in place.
           requests[j].cache_destination = block + requests[j].prefix;
           memo_valid[expert] = true;
         }
@@ -492,89 +685,295 @@ void PrefillSession::experts(
     }
     readers->start(requests.data(), requests.size());
   };
-  for (size_t batch = 0; batch < batches.size(); batch++) {
+  auto record_route_overlap = [&] {
+    for (const auto& span : route_io_spans)
+      metrics.router_io_overlap += readers->overlap_ms(span.first, span.second);
+    route_io_spans.clear();
+  };
+  if (layer_memo) {
     auto stamp = Clock::now();
-    auto& selected = batches[batch];
-    const auto bindings = cache.prepare(selected);
-    int assignments = 0;
-    for (size_t j = 0; j < selected.size(); j++) {
-      metrics.hits += bindings[j].hit;
-      metrics.seed_hits += bindings[j].seed_hit;
-      assignments += histogram[selected[j]];
+    auto* data = static_cast<uint8_t*>(layer_memo->data);
+    auto& bank = *banks[layer];
+    auto* table = reinterpret_cast<uint64_t*>(data + 32);
+    auto* order =
+        reinterpret_cast<uint16_t*>(data + expert_stream::kOrderOffset);
+    auto* ready =
+        reinterpret_cast<uint32_t*>(data + expert_stream::kReadyOffset);
+    memcpy(data, bank.index.data(), 32);
+    std::fill(table, table + 256, 0);
+    std::vector<int> selected = cached;
+    std::vector<int> pending = missing;
+    std::sort(pending.begin(), pending.end(), [&](int a, int b) {
+      return route_first_use[a] < route_first_use[b];
+    });
+    selected.insert(selected.end(), pending.begin(), pending.end());
+    for (size_t i = 0; i < selected.size(); i++) {
+      const int expert = selected[i];
+      order[i] = expert;
+      table[expert] = 4096 + expert * stride + (bank.offset(expert) & 4095);
+      const int slot = cache.find(expert);
+      metrics.hits += slot >= 0;
+      metrics.seed_hits += slot >= 0 && cache.entries[slot].seeded;
     }
-    const bool staged = async_io && !(batch == 0 && !cached.empty());
-
-    std::shared_ptr<Buffer> current;
-    int mapping_index;
-    if (staged) {
-      if (prefetched.empty()) {
-        stage(batch, prefetched);
-        auto waited = Clock::now();
-        readers->finish();
-        metrics.io_wait += elapsed(waited);
-        metrics.io_wall += readers->wall_ms();
-      }
-      for (const auto& read : prefetched)
-        if (!read.cached)
-          metrics.direct += read.read_bytes;
-      current = pipeline_banks[batch % 2];
-      mapping_index = int(batch % 2) + 1;
-      core.sync_buffer(current, DMA_BUF_SYNC_END | DMA_BUF_SYNC_WRITE);
-    } else {
-      metrics.direct += fill(layer, selected, bindings);
-      current = expert_slots[layer];
-      mapping_index = async_io ? 3 : layer % 4;
+    for (int expert : cached) {
+      __atomic_store_n(ready + expert, expert_stream::kReady, __ATOMIC_RELEASE);
+      metrics.layer_reuse_bytes += bank.size(expert);
     }
-    metrics.requests += selected.size();
-    metrics.read += elapsed(stamp);
-
-    std::vector<ExpertRead> next_reads;
-    if (async_io && batch + 1 < batches.size())
-      stage(batch + 1, next_reads);
-    bool last = batch + 1 == batches.size();
-
-    int phase = batch == 0 ? (last ? 0 : 1) : (last ? 3 : 2);
-    // bank fd/大小/generation/映射窗、累加阶段、专家数、路由项数、层号。
-    // phase: 0=单批，1=首批，2=中间批，3=末批；仅末批合入 shared/residual。
+    for (int expert : missing)
+      if (std::find(route_read_ids.begin(), route_read_ids.end(), expert) ==
+          route_read_ids.end())
+        throw std::runtime_error("expert missing from layer route queue");
+    const double setup_ms = elapsed(stamp);
+    metrics.read += setup_ms;
+    metrics.batch_setup += setup_ms;
     int descriptor[] = {
-        current->fd,
-        int(current->size),
-        ++generations[mapping_index],
-        mapping_index,
-        phase,
+        layer_memo->fd,
+        int(layer_memo->size),
+        ++generations[0],
+        tokens == 128 ? 0 : tokens << expert_stream::kTokenShift,
+        expert_stream::kPhase,
         int(selected.size()),
-        assignments,
+        tokens * 8,
         layer};
-    memcpy(core.input(4), descriptor, 32);
-
-    stamp = Clock::now();
+    memcpy(core.input(4), descriptor, sizeof(descriptor));
+    Clock::time_point native_end;
     try {
-      core.execute(last);
+      publish_inputs();
+      stamp = Clock::now();
+      core.execute(true);
+      native_end = Clock::now();
     } catch (...) {
-      // next_reads 的存储被 reader 借用，异常展开前也必须等读取结束。
-      if (!next_reads.empty()) {
+      if (!route_reads.empty()) {
         try {
           readers->finish();
         } catch (const std::exception& error) {
-          fprintf(stderr, "pending expert read failed: %s\n", error.what());
+          fprintf(stderr, "pending stream read failed: %s\n", error.what());
         }
+        route_reads.clear();
+        route_read_ids.clear();
       }
       throw;
     }
-    const auto native_end = Clock::now();
-    metrics.native += elapsed(stamp);
+    const double native_ms = elapsed(stamp);
+    metrics.native += native_ms;
     metrics.native_calls++;
-    metrics.assignments += assignments;
-    if (!next_reads.empty()) {
+    metrics.requests += selected.size();
+    metrics.assignments += tokens * 8;
+    if (missing.empty()) {
+      metrics.ready_native += native_ms;
+      metrics.ready_calls++;
+    } else {
+      metrics.missing_native += native_ms;
+      metrics.missing_calls++;
+    }
+    if (!route_reads.empty()) {
+      stream_compute_spans.emplace_back(stamp, native_end);
+      stream_input_spans.emplace_back(input_begin, input_end);
+    }
+    for (int expert : selected)
+      memo_valid[expert] = true;
+    if (!route_reads.empty() && chunk_start + tokens == sequence_tokens) {
       auto waited = Clock::now();
-      readers->finish();
+      try {
+        readers->finish();
+      } catch (...) {
+        route_reads.clear();
+        route_read_ids.clear();
+        throw;
+      }
       const double duration = elapsed(waited);
       metrics.io_wait += duration;
       metrics.read += duration;
       metrics.io_wall += readers->wall_ms();
-      metrics.io_overlap += readers->overlap_ms(stamp, native_end);
+      for (const auto& span : stream_compute_spans)
+        metrics.io_overlap += readers->overlap_ms(span.first, span.second);
+      for (const auto& span : stream_input_spans)
+        metrics.input_io_overlap +=
+            readers->overlap_ms(span.first, span.second);
+      for (const auto& span : attention_io_spans)
+        metrics.attention_io_overlap +=
+            readers->overlap_ms(span.first, span.second);
+      record_route_overlap();
+      for (size_t i = 0; i < route_read_ids.size(); i++) {
+        const auto& request = route_reads[i];
+        metrics.direct += request.read_bytes;
+        metrics.pread_worker += request.pread_ms;
+        metrics.payload_copy_worker += request.copy_ms;
+      }
+      route_reads.clear();
+      route_read_ids.clear();
     }
-    prefetched = std::move(next_reads);
+  } else
+    for (size_t batch = 0; batch < batches.size(); batch++) {
+      auto stamp = Clock::now();
+      const double wait_before = metrics.io_wait;
+      const double input_before = metrics.input_copy_sync;
+      auto& selected = batches[batch];
+      const auto bindings = layer_memo ? std::vector<ExpertCache::Binding>{}
+                                       : cache.prepare(selected);
+      int assignments = 0;
+      for (size_t j = 0; j < selected.size(); j++) {
+        if (layer_memo) {
+          const int slot = cache.find(selected[j]);
+          metrics.hits += slot >= 0;
+          metrics.seed_hits += slot >= 0 && cache.entries[slot].seeded;
+        } else {
+          metrics.hits += bindings[j].hit;
+          metrics.seed_hits += bindings[j].seed_hit;
+        }
+        assignments += histogram[selected[j]];
+      }
+      const bool staged =
+          async_io && (layer_memo || !(batch == 0 && !cached.empty()));
+
+      std::shared_ptr<Buffer> current;
+      int mapping_index;
+      if (staged) {
+        const bool memo_ready = layer_memo && batch == 0 && !cached.empty();
+        if (prefetched.empty() && !memo_ready) {
+          stage(batch, prefetched);
+          try {
+            publish_inputs();
+          } catch (...) {
+            // The reader borrows prefetched until finish, including error
+            // paths.
+            try {
+              readers->finish();
+            } catch (const std::exception& error) {
+              fprintf(stderr, "pending expert read failed: %s\n", error.what());
+            }
+            throw;
+          }
+          auto waited = Clock::now();
+          readers->finish();
+          metrics.io_wait += elapsed(waited);
+          metrics.io_wall += readers->wall_ms();
+          record_route_overlap();
+          metrics.input_io_overlap +=
+              readers->overlap_ms(input_begin, input_end);
+        }
+        if (memo_ready)
+          for (int expert : selected)
+            metrics.layer_reuse_bytes += banks[layer]->size(expert);
+        for (const auto& read : prefetched) {
+          if (!read.cached)
+            metrics.direct += read.read_bytes;
+          metrics.pread_worker += read.pread_ms;
+          metrics.payload_copy_worker += read.copy_ms;
+        }
+        current = layer_memo ? layer_memo : pipeline_banks[batch % 2];
+        mapping_index = layer_memo ? 0 : int(batch % 2) + 1;
+        if (layer_memo) {
+          auto* data = static_cast<uint8_t*>(current->data);
+          auto& bank = *banks[layer];
+          memcpy(data, bank.index.data(), 4096);
+          auto* table = reinterpret_cast<uint64_t*>(data + 32);
+          std::fill(table, table + 256, 0);
+          for (int expert : selected)
+            table[expert] =
+                4096 + expert * stride + (bank.offset(expert) & size_t(4095));
+        }
+        core.sync_buffer(current, DMA_BUF_SYNC_END | DMA_BUF_SYNC_WRITE);
+      } else {
+        metrics.direct += fill(layer, selected, bindings);
+        current = expert_slots[layer];
+        mapping_index = async_io ? 3 : layer % 4;
+      }
+      metrics.requests += selected.size();
+      const double setup_ms =
+          elapsed(stamp) - (metrics.input_copy_sync - input_before);
+      metrics.read += setup_ms;
+      metrics.batch_setup += setup_ms - (metrics.io_wait - wait_before);
+      const bool ready_batch = batch == 0 && !cached.empty();
+
+      std::vector<ExpertRead> next_reads;
+      if (async_io && batch + 1 < batches.size())
+        stage(batch + 1, next_reads);
+      bool last = batch + 1 == batches.size();
+
+      int phase = batch == 0 ? (last ? 0 : 1) : (last ? 3 : 2);
+      // bank fd/大小/generation/映射窗、累加阶段、专家数、路由项数、层号。
+      // phase: 0=单批，1=首批，2=中间批，3=末批；仅末批合入 shared/residual。
+      int descriptor[] = {
+          current->fd,
+          int(current->size),
+          ++generations[mapping_index],
+          mapping_index,
+          phase,
+          int(selected.size()),
+          assignments,
+          layer};
+      memcpy(core.input(4), descriptor, 32);
+
+      try {
+        publish_inputs();
+        stamp = Clock::now();
+        core.execute(last);
+      } catch (...) {
+        // next_reads 的存储被 reader 借用，异常展开前也必须等读取结束。
+        if (!next_reads.empty()) {
+          try {
+            readers->finish();
+          } catch (const std::exception& error) {
+            fprintf(stderr, "pending expert read failed: %s\n", error.what());
+          }
+        }
+        throw;
+      }
+      const auto native_end = Clock::now();
+      const double native_ms = elapsed(stamp);
+      metrics.native += native_ms;
+      if (ready_batch) {
+        metrics.ready_native += native_ms;
+        metrics.ready_calls++;
+      } else {
+        metrics.missing_native += native_ms;
+        metrics.missing_calls++;
+      }
+      metrics.native_calls++;
+      metrics.assignments += assignments;
+      if (!next_reads.empty()) {
+        auto waited = Clock::now();
+        readers->finish();
+        const double duration = elapsed(waited);
+        metrics.io_wait += duration;
+        metrics.read += duration;
+        metrics.io_wall += readers->wall_ms();
+        record_route_overlap();
+        metrics.io_overlap += readers->overlap_ms(stamp, native_end);
+        metrics.input_io_overlap += readers->overlap_ms(input_begin, input_end);
+      }
+      prefetched = std::move(next_reads);
+    }
+
+  // Preserve the original AR128 physical slot order and per-block handoff
+  // snapshots even when arithmetic consumes all tokens together.
+  if (tokens > 128) {
+    for (int block = 0; block < tokens; block += 128) {
+      const int seed_base = (block / 128 * 40 + layer) * 64;
+      for (int slot = 0; slot < capacity; slot++) {
+        sequence_seeds[seed_base + slot] = cache.entries[slot].expert;
+        sequence_stamps[seed_base + slot] = cache.entries[slot].stamp;
+      }
+      std::copy(
+          ids + block * 8,
+          ids + (block + 128) * 8,
+          sequence_routes.begin() + (block / 128 * 40 + layer) * 128 * 8);
+      if (block + 128 < tokens)
+        cache.advance(ids + block * 8, 128, block);
+    }
+    chunk_start = tokens - 128;
+    histogram.fill(0);
+    last_use.fill(0);
+    for (int i = 0; i < 128 * 8; i++) {
+      const int expert = ids[chunk_start * 8 + i];
+      ++histogram[expert];
+      last_use[expert] = i;
+    }
+    for (int slot = 0; slot < capacity; slot++) {
+      original_ids[slot] = cache.entries[slot].expert;
+      original_stamps[slot] = cache.entries[slot].stamp;
+    }
   }
 
   if (async_io) {
@@ -600,13 +999,22 @@ void PrefillSession::experts(
     for (int e : recent)
       if (std::find(retained.begin(), retained.end(), e) == retained.end())
         *std::find(retained.begin(), retained.end(), -1) = e;
+    const bool flush_payloads =
+        !layer_memo || chunk_start + 128 == sequence_tokens;
     for (int slot = 0; slot < capacity; slot++) {
       const int expert = retained[slot];
       cache.entries[slot] = {expert, expert < 0 ? 0 : stamp_of(expert), false};
-      if (expert < 0 || original_ids[slot] == expert)
+      // Intermediate chunks update LRU metadata only. Payloads remain in the
+      // current-layer memo until its final chunk; compare with physical seeds.
+      const int physical_id =
+          layer_memo ? memo_slot_ids[slot] : original_ids[slot];
+      if (!flush_payloads || expert < 0 || physical_id == expert)
         continue;
-      const uint8_t* source = nullptr;
-      for (int ping = 0; ping < 2; ping++)
+      const uint8_t* source = layer_memo
+          ? static_cast<const uint8_t*>(layer_memo->data) + 4096 +
+              expert * stride + (banks[layer]->offset(expert) & size_t(4095))
+          : nullptr;
+      for (int ping = 0; !layer_memo && ping < 2; ping++)
         if (std::find(bank_ids[ping].begin(), bank_ids[ping].end(), expert) !=
             bank_ids[ping].end()) {
           auto* data = static_cast<uint8_t*>(pipeline_banks[ping]->data);
@@ -624,11 +1032,25 @@ void PrefillSession::experts(
           slot * stride;
       retain.push_back(request);
     }
-    readers->read(retain.data(), retain.size());
-    core.sync_buffer(
-        expert_slots[layer], DMA_BUF_SYNC_END | DMA_BUF_SYNC_WRITE);
-    metrics.staged_copy += elapsed(copied);
-    metrics.read += elapsed(copied);
+    if (flush_payloads) {
+      if (layer_memo) {
+        // The payload memo remains untouched until the following layer's first
+        // Attention finishes. Decode needs the LRU only after final prefill.
+        memo_copies = std::move(retain);
+        readers->start(memo_copies.data(), memo_copies.size());
+        memo_copy = MemoCopy::Retain;
+        memo_copy_layer = layer;
+        copy_compute_spans.clear();
+      } else {
+        readers->read(retain.data(), retain.size());
+        core.sync_buffer(
+            expert_slots[layer], DMA_BUF_SYNC_END | DMA_BUF_SYNC_WRITE);
+        metrics.staged_copy += elapsed(copied);
+      }
+    }
+    const double prepare_ms = elapsed(copied);
+    metrics.retained_prepare += prepare_ms;
+    metrics.read += prepare_ms;
   }
   for (auto& entry : cache.entries)
     if (entry.expert >= 0 && histogram[entry.expert])
@@ -636,8 +1058,12 @@ void PrefillSession::experts(
 
   cache.clock = uint64_t(chunk_start + 128) * 8;
   printf(
-      "PREFILL_PIPE layer=%d async=%d io_wall_ms=%.6f overlap_ms=%.6f wait_ms=%.6f native_ms=%.6f\n",
+      "PREFILL_PIPE layer=%d chunk=%d group_tokens=%d ready_experts=%zu missing_experts=%zu async=%d io_wall_ms=%.6f overlap_ms=%.6f wait_ms=%.6f native_ms=%.6f\n",
       layer,
+      chunk_start,
+      tokens,
+      cached.size(),
+      missing.size(),
       async_io,
       metrics.io_wall - initial_wall,
       metrics.io_overlap - initial_overlap,
@@ -664,13 +1090,13 @@ void PrefillSession::experts(
       layer_history[layer][slot] = {
           cache.entries[slot].expert, 0, cache.entries[slot].stamp};
   layer_clocks[layer] = cache.clock;
-  memcpy(out, core.output(0), 128 * 2048 * 4);
+  memcpy(out, core.output(0), tokens * 2048 * 4);
   auto stamp = Clock::now();
   if (sequence_tokens == 128)
     attention[layer]->feedback();
   metrics.feedback += elapsed(stamp);
   metrics.moe += elapsed(t);
-  metrics.calls[3]++;
+  metrics.calls[3] += tokens / 128;
   if (sequence_tokens == 128 || chunk_start + 128 == sequence_tokens)
     next_layer++;
 }
@@ -689,15 +1115,34 @@ void PrefillSession::project(const float* x, float* logits) {
   memcpy(logits, head->output(out), 248320 * 4);
   metrics.head += elapsed(t);
   metrics.calls[4]++;
+  if (memo_copy != MemoCopy::None)
+    copy_compute_spans.emplace_back(t, Clock::now());
+  finish_memo_copy();
   chunk_start += 128;
 }
 
 void PrefillSession::finish_prefill_native() {
+  if (!route_reads.empty()) {
+    try {
+      readers->finish();
+    } catch (const std::exception& error) {
+      fprintf(stderr, "pending route cleanup failed: %s\n", error.what());
+    }
+    route_reads.clear();
+    route_read_ids.clear();
+  }
+  finish_memo_copy();
   readers.reset();
-  layer_memo.reset();
   core.close();
   if (!native_mappings_active)
     return;
+  if (layer_memo) {
+    check(
+        fastrpc_munmap(
+            CDSP_DOMAIN_ID, layer_memo->fd, layer_memo->data, layer_memo->size),
+        "layer memo unmap");
+    layer_memo.reset();
+  }
   for (auto& b : pipeline_banks)
     check(
         fastrpc_munmap(CDSP_DOMAIN_ID, b->fd, b->data, b->size),

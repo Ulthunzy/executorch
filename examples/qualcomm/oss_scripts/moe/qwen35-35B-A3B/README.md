@@ -24,7 +24,7 @@ cd /data/local/tmp/qwen35-raw-gptq-20261024/runtime/w2a8-fused-c1152-p128-cache3
 
 输入 `/reset` 清空对话，输入 `/exit` 退出。也可用 `--prompt "第一问" --prompt "第二问"` 连续执行多轮；增加 `--interactive` 可继续从终端读取。`--temperature 0` 为 greedy，`--enable-thinking` 开启思考模板，默认关闭。运行日志及逐 token 时间记录在模型目录的 `chat.log`，可用 `--log-path` 修改。
 
-首轮 QNN/Native 使用 AR128，与原主机入口采用相同的 system-message 空格填充。终端按实际输入长度选择无权重的 host PTE，默认按 `layer_major` 让同一层完成全部 AR128 块并复用专家，再进入下一层。顺序来自部署的 `prefill/plans/PLANS.json`，可用 `--prefill-order chunk_major` 显式对照。后续轮将尚未反馈的最后一个生成 token、轮次分隔符及新问题按 AR1 追加到当前 state/KV，不重新计算历史。后续输入很长时，其处理速度受 AR1 吞吐限制。Context、buffer、每层 LRU 和原生服务在会话内常驻；`/reset` 只清空 state/KV 和位置，不重新装载权重或丢弃专家缓存。达到静态上下文容量时拒绝追加，用户可显式 `/reset`。
+首轮 Attention/Router 使用 AR128，与原主机入口采用相同的 system-message 空格填充。512–1024位置的同层专家 token 在 Native 内归并，HMX tile 仍最多32行；较短输入的 Native 维持 AR128。终端按实际输入长度选择无权重的 host PTE，默认按 `layer_major` 让同一层完成全部 AR128 块并复用专家，再进入下一层。顺序来自部署的 `prefill/plans/PLANS.json`，可用 `--prefill-order chunk_major` 显式对照。后续轮将尚未反馈的最后一个生成 token、轮次分隔符及新问题按 AR1 追加到当前 state/KV，不重新计算历史。后续输入很长时，其处理速度受 AR1 吞吐限制。Context、buffer、每层 LRU 和原生服务在会话内常驻；`/reset` 只清空 state/KV 和位置，不重新装载权重或丢弃专家缓存。达到静态上下文容量时拒绝追加，用户可显式 `/reset`。
 
 设备端使用与 `qnn_llama_runner.cpp` 相同的 HFTokenizer/BPE 和 ExecuTorch sampler。Qwen3.5 的 NFC 使用 Android 公共 ICU API（Android 31+），避免现有内置 NFC 丢失重音字符；原 tokenizer 文件保持不变。
 
@@ -46,7 +46,7 @@ cd /data/local/tmp/qwen35-raw-gptq-20261024/runtime/w2a8-fused-c1152-p128-cache3
 
 SM8975 的 JPG、PNG 预处理、256-token 图文模板和 MRoPE 与 Python 路径逐字节一致；看图描述、跨轮追问、新图片、坏路径恢复和 reset 后再次看图均已验证。整个会话保留 11 个共享 context 和 1 个视觉 context，视觉重复执行不创建或释放 context/buffer。详见[设备图片会话记录](../../../../../llama-output/qwen35-moe-from-safetensors-gptq-20261024/device-image-chat-tests/REPORT.md)。
 
-2026-10-24 设备终端性能复测，当前 32 槽专家缓存、1152 静态容量：三轮 256-token 图文 prefill 为 **3.44–3.60 秒 / 71.19–74.35 token/s**，decode 为 **11.47–11.66 token/s**；三轮均输出相同的 79 个 token（含 EOS）。首次启动到首字 **13.51–14.43 秒**，其中模型/运行时 setup 为 6.46–6.99 秒，视觉执行约 118 ms。当前 PTE 按两个 AR128 块执行 `chunk_major`，未启用配置 JSON 的 `layer_major`。换图追加 217 个新 token 为 **24.17–24.42 秒**；其后 decode 一轮遇到长停顿为 5.60 token/s，复测为 9.98 token/s。原始数据、统计口径及 I/O 拆分见[图文性能报告](../../../../../llama-output/qwen35-moe-from-safetensors-gptq-20261024/device-image-performance-20261024/REPORT.md)。
+2026-10-24 调度修复前的设备终端性能复测，32 槽专家缓存、1152 静态容量：三轮 256-token 图文 prefill 为 **3.44–3.60 秒 / 71.19–74.35 token/s**，decode 为 **11.47–11.66 token/s**；三轮均输出相同的 79 个 token（含 EOS）。首次启动到首字 **13.51–14.43 秒**，其中模型/运行时 setup 为 6.46–6.99 秒，视觉执行约 118 ms。当时的 PTE 按两个 AR128 块执行 `chunk_major`，未启用配置 JSON 的 `layer_major`。换图追加 217 个新 token 为 **24.17–24.42 秒**；其后 decode 一轮遇到长停顿为 5.60 token/s，复测为 9.98 token/s。原始数据、统计口径及 I/O 拆分见[图文性能报告](../../../../../llama-output/qwen35-moe-from-safetensors-gptq-20261024/device-image-performance-20261024/REPORT.md)。
 
 ### Prefill / Decode 阶段计时
 
@@ -98,6 +98,137 @@ SM8975、相同图文输入、同一目录与二进制：
 当前设备已部署更新后的runner与计划集合；已有部署不能只替换二进制而缺少 `prefill/plans/`。完整原因、字节核对、正确性与时间细项见[Prefill I/O 分析报告](../../../../../llama-output/qwen35-moe-from-safetensors-gptq-20261024/prefill-io-analysis-20261024/REPORT.md)。
 
 SM8975 已验证重复 `--prompt`、交互输入、跨轮暗号记忆、超限拒绝后历史不变、`/reset` 与正常退出。8 组编码与 Transformers 逐字节一致；原主机单轮回归的 7 个生成 token 与已有版本完全一致。四轮会话保留 11 个共享 context，换轮与 reset 没有增加 context、IO 注册或 RPC buffer 生命周期操作。详见[设备端会话测试记录](../../../../../llama-output/qwen35-moe-from-safetensors-gptq-20261024/device-chat-tests/REPORT.md)。
+
+### Prefill 共享 DMA memo 与计算批次优化
+
+2026-10-24，以已提交的 `6a4573f0a6` 为基线继续优化，保留 SM8975/V85、40 层、AR128、每层 32 槽 LRU 与同一份全矩阵 GPTQ 权重。这里的计算批次指专家个数，token AR 仍为 128。
+
+- 将当前层约 210 MiB 的临时 memo 改为 DSP 可映射的 uncached rpcmem。缺失专家通过对齐 staging 读取后只复制一次到 memo；同层其余块直接消费已有 payload，去掉 memo→pipeline 的重复复制。
+- 持久 decode LRU 保持 32 槽，prefill 缺失专家每批最多处理 128 个；命中专家仍先算，缺失读取与计算重叠。256-token 样本的 Native 调用 **447→203 次**，1024-token 样本 **1484→674 次**。
+- 异步读取只修改不重叠的 payload；当前批 Native 返回后才更新专家索引表。多块计划不再申请两块约 26.25 MiB 的 pipeline bank；临时 memo 在交接 decode 前解除映射并释放。
+
+| 输入 | 已提交基线 | 优化后 | 耗时下降 |
+| --- | ---: | ---: | ---: |
+| 256-token 图文，三轮均值 | 2.916 秒 / 87.78 token/s | **2.646 秒 / 96.73 token/s** | **9.26%** |
+| 1024-token 文本，两轮热态均值 | 6.622 秒 / 154.63 token/s | **5.772 秒 / 177.41 token/s** | **12.84%** |
+
+256-token 三轮范围：基线 **2.889–2.945 秒**，优化后 **2.631–2.661 秒**。1024-token 两轮采用 A/B 交替顺序；先前首轮基线有约 120 ms embedding 文件缺页额外成本，未纳入热态均值。两种输入的读取量分别保持 5.741 GB、6.319 GB；没有减少 Top8、删除专家或改变权重量化。
+
+| 环节 | 基线 ms / 256 token | 优化后 ms / 256 token |
+| --- | ---: | ---: |
+| RPC 外读取处理 | 1799.53 | 1695.58 |
+| Native MoE | 546.24 | 377.63 |
+| Attention | 348.22 | 356.40 |
+| Router/shared | 67.46 | 73.42 |
+| State/KV 反馈、head 及其它 | 154.91 | 143.40 |
+| 总耗时 | 2916.35 | 2646.43 |
+
+图文与 1K 文本各 **85 份 hidden、logits、40 层 state/KV、路由和历史信息逐字节一致**；图文完整 79 个输出 token（含 EOS）和文本 16 个输出 token 也一致。128-token 文本继续走原单块路径，实测 1.363 秒，正常回答 `1加1等于2。`。图文完整 78 步输出 decode 为 11.47→11.50 token/s，本轮收益在 prefill。
+
+O_DIRECT 直接读 rpcmem 在该设备返回 EFAULT，因此保留一次 staging 复制；仅把 O_DIRECT 目的地换成普通 memo 没有稳定加速，已丢弃。256 个专家一批试验为 2.703 秒，比 128 个一批慢，最终保留 128。循环内 context 创建/释放、QNN IO 注册/注销和 RPC buffer 分配/释放仍全部为零。RPC 外读取处理仍占优化后约 64.1%，包含读取、复制、同步与剩余等待，不能当成纯 UFS 时间。
+
+完整运行口径、阶段 CSV、85 份输出指纹、失败试验和源文件指纹见[共享 DMA memo 测试报告](../../../../../llama-output/qwen35-moe-from-safetensors-gptq-20261024/prefill-direct-io-20261024/REPORT.md)。
+
+### Prefill 就绪分组与跨阶段 I/O 重叠
+
+2026-10-25，以前一节的共享 DMA memo 版本为基线继续优化。SM8975/V85、相同全矩阵 GPTQ 导出、静态容量 1152、token AR128、每层 32 槽、当前层约 210 MiB memo、8 个读取线程均保持相同。三轮采用基线/新调度交替运行，专家文件仍用 O_DIRECT。
+
+1. 以当前层 memo 的有效 payload 判定就绪；已就绪专家不再和缺失专家混批，不再经过 reader 线程屏障。真正缺失的权重在后台读取，就绪批立即计算。
+2. 中间 AR128 块只更新 LRU 元数据；本层最后一块才回填常驻 payload。物理槽是否已有同一专家，按本层初始物理槽 ID 判断，不能用中间块已更新的逻辑 LRU ID 跳过复制。
+3. Seed 复制与剩余 Attention/Router 段重叠；最终回填与下一层首个 Attention 或最终 head 重叠，覆盖 memo 和交接 decode 前再确认完成。
+4. 首块 Router 给出真实路由后即预取首批缺失专家，与后续 Router/shared 及 Native 输入发布重叠；未读取完成的 payload 不进入就绪集合。缺失批次只在消费前等待剩余部分。
+
+| 输入，三轮均值 | 上一版，本轮复测 | 新调度 | 耗时下降 |
+| --- | ---: | ---: | ---: |
+| 256-token 图文 | 2.650 秒 / 96.61 token/s | **2.227 秒 / 114.95 token/s** | **15.96%** |
+| 1024-token 文本 | 5.821 秒 / 175.93 token/s | **4.215 秒 / 242.94 token/s** | **27.58%** |
+
+| 环节，ms / 1024 token | 上一版 | 新调度 |
+| --- | ---: | ---: |
+| RPC 外读取处理 | 2286.54 | 1048.46 |
+| Native MoE 调用 | 1362.95 | 1268.48 |
+| Attention | 1401.08 | 1318.14 |
+| Router/shared | 239.26 | 197.21 |
+| State/KV 反馈、head 及其它 | 530.78 | 382.73 |
+| 总耗时 | 5820.62 | 4215.03 |
+
+| RPC 外读取处理子项，ms / 1024 token | 上一版 | 新调度 |
+| --- | ---: | ---: |
+| 批次剩余等待 | 1553.83 | 1017.83 |
+| Seed 复制可见处理 | 75.46 | 0.02 |
+| LRU 回填可见处理，含准备/同步 | 604.17 | 23.14 |
+| 批次准备/发布 | 53.06 | 7.46 |
+| 其它控制/统计 | 0.041 | 0.009 |
+| 合计 | 2286.54 | 1048.46 |
+
+1K 的实测重叠时间：Seed 与 Attention/Router **88.83 ms**，LRU 回填与下一层 Attention/head **94.61 ms**，UFS/复制与输入发布 **161.54 ms**，UFS/复制与后续 Router **167.82 ms**。这些是上表中的重叠子项，不能再次加入总耗时；worker 的 pread/copy 累计时间也不是串行墙钟时间。
+
+1K 前两个 AR128 块承担 **97.28%** 的剩余读取等待；起点 640/768/896 的三块，40 层合计各只等 **0.020/0.029/0.016 ms**，说明这些块的缺失读取已基本被计算隐藏。这里的就绪包含同层 memo 命中，不能当作 32 槽跨层 LRU 命中率。
+
+两种输入仍分别读取 5.741 GB / 6.319 GB，没有减少 Top8 或改变权重。图文与1K各85份 hidden/logits/state/KV/路由/历史信息逐字节一致，图文79个输出 token 和文本16个输出 token 一致。128-token 单块、显式 chunk-major、图片追问均通过；chunk-major 的85份产物也与对照一致。图文完整78步输出 decode 为 11.56→11.52 token/s，本轮未修改 decode 调度。
+
+新增 `PREFILL_PROFILE`、`PREFILL_COPY` 和逐层逐块 `PREFILL_PIPE` 明细。Token 循环内 context、QNN IO 和 RPC buffer 的创建/释放计数仍为0，当前设备保留新 runner。报告和 CSV 见[Prefill 并发调度测试](../../../../../llama-output/qwen35-moe-from-safetensors-gptq-20261024/prefill-overlap-20261025/REPORT.md)。
+
+### Prefill 单次 Native 调用与持续读取队列
+
+2026-10-25，继续以前一节的 2.227 秒 / 4.215 秒版本为基线。40 层、AR128、GPTQ 专家权重、Top8、UINT16 state/KV、每层 32 个常驻专家、约 210 MiB 当前层 memo 和 8 个读取线程均保持相同。三轮交替 A/B，专家文件仍通过 O_DIRECT 读取。
+
+1. 同一 AR128 的就绪和缺失专家合入一次 Native 调用，激活 A8 准备、资源申请、RPC 和最终合并各执行一次。就绪专家先计算，缺失专家按读取线程发布的标记继续计算，不等待整批权重。
+2. Native 使用 12 MiB VTCM，把原先跨批存入 DDR 的 8 MiB 分路结果留在 VTCM；仍按原 Top8 rank 顺序求和，保持数值一致。DRAM 专家缓存没有扩大；旧分批调用申请 5 MiB VTCM。
+3. Router 每完成一个 AR128 块，就把这一层新出现的专家追加到同一读取队列；后续块的权重提前到达。记录数组预分配，读取期间地址保持稳定；本层最后一块完成后才等待队列收尾、回填最终 LRU。
+4. ARM 仅在 payload 复制完成后发布就绪状态，DSP 通过绕过 cache 的 DMA 读取标记。读取失败会发布错误；DSP 等待就绪有 5 秒超时。设备注入错误和超时后，同一 handle 的线程与资源均可继续复用。
+
+| 输入，三轮均值 | 上一版，本轮复测 | 本轮优化 | 耗时下降 |
+| --- | ---: | ---: | ---: |
+| 256-token 图文 | 2.218 秒 / 115.43 token/s | **1.985 秒 / 128.97 token/s** | **10.50%** |
+| 1024-token 文本 | 4.225 秒 / 242.35 token/s | **3.677 秒 / 278.49 token/s** | **12.98%** |
+
+| 环节，ms / 1024 token | 上一版 | 本轮优化 |
+| --- | ---: | ---: |
+| RPC 外读取处理 | 1037.20 | 32.64 |
+| Native MoE，含缺失专家剩余等待 | 1270.69 | 1825.55 |
+| Attention | 1325.37 | 1312.28 |
+| Router/shared | 198.71 | 189.45 |
+| State/KV 反馈、head 及其它 | 393.35 | 316.99 |
+| 总耗时 | 4225.33 | 3676.91 |
+
+本轮将缺失等待移入 Native，因此不能单看 Native 一项判断计算是否变慢。应比较 **RPC 外处理＋Native**：1K 从 **2307.90 ms 降至 1858.20 ms**。Native 调用数：图文 **186→80**，1K **635→320**。
+
+1K 吞吐提高 **14.92%**。图文和1K各85份 hidden/logits/state/KV/路由/历史信息逐字节一致；图文完整79个输出 token 与文本16个输出 token 一致。128-token 单块、显式 chunk-major 和图片追问均通过。完整78步图文 decode 为 11.47→11.45 token/s，本轮收益在 prefill，decode 调度保持原样。
+
+两种输入读取量分别保持 5.741 GB / 6.319 GB。上述 prefill 包含 embedding、40层计算、反馈和 head；不含初始化、图片预处理、视觉编码或输出 decode。详细记录、阶段 CSV、错误探针和源文件指纹见[单次 Native 与持续队列测试报告](../../../../../llama-output/qwen35-moe-from-safetensors-gptq-20261024/prefill-native-stream-20261025/REPORT.md)。新 runner 与新 prefill DSP skel 必须配套部署；`build.sh` 会一起构建。
+
+### Prefill 1K 提前路由与专家跨块归并
+
+2026-10-25，以前一节约278 token/s的版本为基线，目标为1K输入至少320 token/s。保持相同40层、GPTQ量化、Top8、UINT16 state/KV、每层32槽LRU和8个读取线程；Attention/Router仍使用AR128，静态容量1152。
+
+1. 每块Attention完成即执行该块Router/shared，真实路由立即进入读取队列；不再等同层8块Attention全部结束才开始路由。后续Attention与UFS读取重叠。Formal Router stage接收已保存的结果，避免重复计算。
+2. 512–1024个输入位置时，将同层各AR128块中属于同一专家的token归并，HMX仍每次最多计算32行。1K Native调用320→40次，路由项仍为327680，没有减少专家或Top8。短于512的输入继续使用AR128 Native及VTCM分路结果。
+3. 实际计算可以归并，LRU仍按原AR128顺序回放。最终物理槽、逐块seed/stamp和decode交接保持一致。大组的Native IO、DSP分路工作区在初始化时一次配置，token循环没有创建context或RPC buffer。
+
+| 输入，三轮交替均值 | 上一版，本轮复测 | 新版 | 耗时下降 |
+| --- | ---: | ---: | ---: |
+| 256-token 图文 | 1.981 秒 / 129.24 token/s | **1.822 秒 / 140.49 token/s** | **8.00%** |
+| 1024-token 文本 | 3.670 秒 / 279.06 token/s | **2.387 秒 / 428.99 token/s** | **34.95%** |
+
+| 环节，ms / 1024 token | 上一版 | 新版 |
+| --- | ---: | ---: |
+| RPC 外读取处理 | 34.26 | 67.90 |
+| Native MoE，含剩余读取等待 | 1840.46 | 508.31 |
+| Attention | 1300.96 | 1334.54 |
+| Router/shared，含交接复制 | 185.26 | 244.01 |
+| State/KV 反馈、head 及其它 | 308.57 | 232.27 |
+| 总耗时 | 3669.52 | 2387.03 |
+
+1K新版本范围 **2.384–2.390秒**，三轮均超过320 token/s，吞吐提高 **53.73%**。实际读取/复制与Attention重叠约 **1065.72ms**。计时已排除队列开启但无活跃读任务的空闲区间；这些重叠子项不能再次加入主阶段合计。
+
+图文与1K各85份hidden/logits/state/KV/路由/历史信息逐字节一致；额外512与1K检查各88份产物，覆盖逐块seed/stamp和最终路由，也完全一致。完整79个图文输出token和16个文本输出token一致。AR128单块、chunk-major与图文追问均通过。完整78步图文decode为11.62→11.64 token/s，本轮主要优化prefill。
+
+每层仍只常驻32个专家；1K归并增加约95MiB DDR工作缓冲（按分配尺寸推算，非实测整机峰值），Native VTCM申请由12MiB改为8MiB。256-token图文只增加约2MiB Router交接暂存，保持AR128专家计算。两种输入的专家O_DIRECT读取量仍为5.741/6.319GB。
+
+上表prefill包含embedding、全部40层、state/KV反馈与head，不含模型初始化、图片预处理和视觉编码。512/1K配置新增的RPC接口要求host与prefill skel配套部署，`build.sh`一起构建；读取线程参数可在设备runner使用`--prefill-io-workers`设置，默认仍为8。12/16读取线程、8 HVX线程试验没有稳定收益，均未作为默认加速配置。
+
+完整分析、对照CSV、错误探针与源码指纹见[1K prefill 320 token/s目标验证](../../../../../llama-output/qwen35-moe-from-safetensors-gptq-20261024/prefill-320-20261025/REPORT.md)。
 
 ## 代码位置
 

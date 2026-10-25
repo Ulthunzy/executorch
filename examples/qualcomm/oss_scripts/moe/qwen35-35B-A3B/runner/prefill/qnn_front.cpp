@@ -133,9 +133,9 @@ Runtime::~Runtime() {
     q.logFree(log);
 }
 
-Buffer::Buffer(Runtime& r, size_t n, bool initialize)
+Buffer::Buffer(Runtime& r, size_t n, bool initialize, bool cached)
     : runtime(&r), size((n + 4095) & ~size_t(4095)) {
-  data = r.allocate(25, 1, size);
+  data = r.allocate(25, cached ? 1 : 0, size);
   if (!data)
     throw std::runtime_error("rpcmem_alloc " + std::to_string(size));
   fd = r.get_fd(data);
@@ -271,8 +271,11 @@ Graph::Graph(Runtime& r, const std::string& path, bool metadata_only)
 }
 
 void Graph::activate() {
-  if (context)
+  // Borrowed graphs already have a context but still need run configuration.
+  if (context) {
+    configure_threads();
     return;
+  }
   check(
       runtime.q.contextCreateFromBinary(
           runtime.backend,
@@ -290,6 +293,12 @@ void Graph::activate() {
   check(
       runtime.q.graphRetrieve(context, graph_name.c_str(), &graph),
       "graphRetrieve");
+  configure_threads();
+  if (!runtime.defer_bindings)
+    register_io();
+}
+
+void Graph::configure_threads() {
   if (const char* threads = getenv("QNN_HVX_THREADS")) {
     QnnHtpGraph_CustomConfig_t custom{};
     custom.option = QNN_HTP_GRAPH_CONFIG_OPTION_NUM_HVX_THREADS;
@@ -301,8 +310,6 @@ void Graph::activate() {
     check(
         runtime.q.graphSetConfig(graph, config), "graphSetConfig HVX threads");
   }
-  if (!runtime.defer_bindings)
-    register_io();
 }
 
 void Graph::deactivate() {
@@ -556,9 +563,11 @@ void ContextRestore::load(Runtime& runtime, const std::vector<Graph*>& graphs) {
           std::max(runtime.peak_contexts, runtime.live_contexts);
     }
   check(error, "context initialization callback");
-  for (auto* graph : graphs)
+  for (auto* graph : graphs) {
     check(
         runtime.q.graphRetrieve(
             graph->context, graph->graph_name.c_str(), &graph->graph),
         "graphRetrieve initialized context");
+    graph->configure_threads();
+  }
 }

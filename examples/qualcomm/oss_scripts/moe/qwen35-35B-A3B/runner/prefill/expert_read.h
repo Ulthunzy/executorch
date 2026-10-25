@@ -11,4 +11,5 @@ struct ExpertRead {
   uint8_t* cache_destination = nullptr;
   double pread_ms = 0, copy_ms = 0;
   uint8_t* raw_staging = nullptr;
+  uint32_t* completion = nullptr;
 };

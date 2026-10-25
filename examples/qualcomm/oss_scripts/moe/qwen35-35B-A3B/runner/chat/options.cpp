@@ -29,6 +29,7 @@ Options parse_options(int argc, char** argv) {
           "  [--max-new-tokens 128] [--temperature 0] [--enable-thinking]\n"
           "  [--max-seq-len 1152] [--cache-experts 32] [--shared-model DIR]\n"
           "  [--prefill-order layer_major|chunk_major]\n"
+          "  [--prefill-io-workers 8]\n"
           "  [--log-path FILE] [--tokenize-only]\n"
           "Interactive commands: /image PATH QUESTION, /reset, /exit.\n");
       std::exit(0);
@@ -67,6 +68,8 @@ Options parse_options(int argc, char** argv) {
         options.capacity = integer_option(value);
       else if (flag == "--cache-experts")
         options.cache_experts = integer_option(value);
+      else if (flag == "--prefill-io-workers")
+        options.prefill_io_workers = integer_option(value);
       else if (flag == "--temperature") {
         size_t used = 0;
         options.temperature = std::stof(value, &used);
@@ -101,6 +104,7 @@ Options parse_options(int argc, char** argv) {
       (options.capacity != 1152 && options.capacity != 2048) ||
       (options.cache_experts != 16 && options.cache_experts != 32 &&
        options.cache_experts != 64) ||
+      options.prefill_io_workers < 1 || options.prefill_io_workers > 16 ||
       !std::isfinite(options.temperature) || options.temperature < 0)
     throw std::runtime_error(
         "Invalid generation, context or expert cache setting");
@@ -157,7 +161,7 @@ void configure_environment(const Options& o, int prefix_tokens) {
            {"INHERIT_EXPERT_CACHE", "1"},
            {"ASYNC_EXPERT_IO", "1"},
            {"ASYNC_DECODE_IO", "0"},
-           {"EXPERT_IO_WORKERS", "8"},
+           {"EXPERT_IO_WORKERS", std::to_string(o.prefill_io_workers)},
            {"DECODE_EXPERT_IO_WORKERS", "8"},
            {"STARTUP_EXPERT_PREFETCH", "overlap"},
            {"STARTUP_IO_WORKERS", "4"},

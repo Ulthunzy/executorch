@@ -3,7 +3,6 @@
 #include "expert_read.h"
 #include "../runtime_utils.h"
 #include <vector>
-#include <atomic>
 #include <cerrno>
 #include <condition_variable>
 #include <mutex>
@@ -18,11 +17,14 @@ class ExpertReaders {
   std::vector<void*> staging;
   std::mutex mutex;
   std::condition_variable changed;
-  std::atomic<int> next{0};
+  int next = 0;
   ExpertRead* requests = nullptr;
   int count = 0, epoch = 0, finished = 0;
-  bool stopping = false, pending = false;
+  int active = 0;
+  bool stopping = false, pending = false, sealed = true;
   Clock::time_point started{}, completed{};
+  Clock::time_point active_started{};
+  std::vector<std::pair<Clock::time_point, Clock::time_point>> active_spans;
 
   static void perform(ExpertRead& request, void* buffer);
 
@@ -35,7 +37,13 @@ class ExpertReaders {
 
   ~ExpertReaders();
 
-  void start(ExpertRead* jobs, int size);
+  void start(ExpertRead* jobs, int size, bool growable = false);
+
+  // Appended records must be initialized in the original, stable allocation
+  // before extend publishes the new count to workers.
+  void extend(int size);
+
+  void seal();
 
   void finish();
 

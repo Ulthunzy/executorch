@@ -1,6 +1,7 @@
 #include "expert_cache.h"
 
 #include <algorithm>
+#include <array>
 #include <stdexcept>
 
 ExpertCache::ExpertCache(int capacity) : entries(capacity) {}
@@ -15,6 +16,45 @@ int ExpertCache::find(int expert) const {
     if (entries[slot].expert == expert)
       return slot;
   return -1;
+}
+
+void ExpertCache::advance(const int32_t* ids, int tokens, int first_token) {
+  std::array<uint64_t, 256> stamps{};
+  std::array<bool, 256> present{};
+  for (const auto& entry : entries)
+    if (entry.expert >= 0) {
+      present[entry.expert] = true;
+      stamps[entry.expert] = entry.stamp;
+    }
+  for (int i = 0; i < tokens * 8; i++) {
+    const int expert = ids[i];
+    if (expert < 0 || expert >= 256)
+      throw std::runtime_error("LRU route ID");
+    present[expert] = true;
+    stamps[expert] = uint64_t(first_token) * 8 + i + 1;
+  }
+  std::vector<int> recent;
+  for (int e = 0; e < 256; e++)
+    if (present[e])
+      recent.push_back(e);
+  std::sort(recent.begin(), recent.end(), [&](int a, int b) {
+    return stamps[a] > stamps[b];
+  });
+  recent.resize(std::min(recent.size(), entries.size()));
+  std::vector<int> retained(entries.size(), -1);
+  for (int expert : recent) {
+    const int slot = find(expert);
+    if (slot >= 0)
+      retained[slot] = expert;
+  }
+  for (int expert : recent)
+    if (std::find(retained.begin(), retained.end(), expert) == retained.end())
+      *std::find(retained.begin(), retained.end(), -1) = expert;
+  for (size_t slot = 0; slot < entries.size(); slot++) {
+    const int expert = retained[slot];
+    entries[slot] = {expert, expert < 0 ? 0 : stamps[expert], false};
+  }
+  clock = uint64_t(first_token + tokens) * 8;
 }
 
 std::vector<ExpertCache::Binding> ExpertCache::prepare(

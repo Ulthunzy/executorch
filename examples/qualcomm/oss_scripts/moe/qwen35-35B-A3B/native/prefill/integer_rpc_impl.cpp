@@ -1,5 +1,6 @@
-// AR128 的 FastRPC 入口；同一 handle 内复用 DSP worker、线程栈和 IO 映射。
+// Prefill FastRPC 入口；同层专家可归并 token，复用 worker、线程栈和 IO 映射。
 #include "integer_moe.h"
+#include "expert_stream.h"
 #include "../worker_start.h"
 #include "HAP_mem.h"
 #include "qurt_memory.h"
@@ -96,6 +97,7 @@ struct State {
   const float* residual = nullptr;
   int pending = -1, assigned = 0;
   uint8_t* route = nullptr;
+  int capacity = 128;
   void* stacks[kWorkers + 1]{};
   qurt_mutex_t token_locks[128];
   PoolEntry entries[kWorkers + 1];
@@ -215,6 +217,22 @@ extern "C" AEEResult integer_rpc_close(remote_handle64 handle) {
   return release_banks();
 }
 
+extern "C" AEEResult integer_rpc_configure(remote_handle64 handle, int tokens) {
+  auto* state = reinterpret_cast<State*>(uintptr_t(handle));
+  if (tokens < 128 || tokens > 1024 || tokens % 128 || state->pending != -1)
+    return 14;
+  if (tokens == state->capacity)
+    return 0;
+  auto* route =
+      static_cast<uint8_t*>(memalign(128, size_t(tokens) * 8 * 2048 * 4));
+  if (!route)
+    return 12;
+  free(state->route);
+  state->route = route;
+  state->capacity = tokens;
+  return 0;
+}
+
 extern "C" AEEResult
 integer_rpc_counts(remote_handle64, int* output, int count) {
   if (count != 4)
@@ -270,29 +288,33 @@ extern "C" AEEResult integer_rpc_run(
   const auto start = tick();
   auto stamp = start;
   memset(metrics, 0, sizeof(metrics));
-  if (hidden_len != 128 * 2048 || ids_len != 128 * 8 || scores_len != 128 * 8 ||
-      shared_len != 128 * 2048 || descriptor_len != 8 ||
-      result_len != 128 * 2048)
+  if (descriptor_len != 8)
     return 14;
-  const int phase = descriptor[4];
+  const int tokens = expert_stream::token_count(descriptor[3]);
+  if (tokens < 128 || tokens > state->capacity || tokens % 128 ||
+      hidden_len != tokens * 2048 || ids_len != tokens * 8 ||
+      scores_len != tokens * 8 || shared_len != tokens * 2048 ||
+      result_len != tokens * 2048)
+    return 14;
+  const int phase = descriptor[4] == expert_stream::kPhase ? 0 : descriptor[4];
   if (phase < 0 || phase > 3 || descriptor[5] < 1 || descriptor[5] > 256 ||
-      descriptor[6] < 1 || descriptor[6] > 1024)
+      descriptor[6] < 1 || descriptor[6] > tokens * 8)
     return 54;
   if ((phase == 0 || phase == 1) && state->pending != -1)
     return 56;
   if ((phase == 2 || phase == 3) && state->pending != descriptor[7])
     return 56;
-  if ((phase == 0 && descriptor[6] != 1024) ||
-      (phase == 3 && state->assigned + descriptor[6] != 1024))
+  if ((phase == 0 && descriptor[6] != tokens * 8) ||
+      (phase == 3 && state->assigned + descriptor[6] != tokens * 8))
     return 56;
 #if SM_MOE_ACCUMULATE
-  if (phase)
+  if (phase || tokens != 128)
     return 57;
 #endif
   compute_res_attr_t attributes;
   HAP_compute_res_attr_init(&attributes);
   HAP_compute_res_attr_set_vtcm_param(
-      &attributes, phase ? 5242880 : 12582912, 1);
+      &attributes, tokens > 128 ? 8388608 : (phase ? 5242880 : 12582912), 1);
   HAP_compute_res_attr_set_hmx_param(&attributes, 1);
   const uint32_t context = HAP_compute_res_acquire(&attributes, 1000000);
   if (!context)
@@ -318,7 +340,7 @@ extern "C" AEEResult integer_rpc_run(
 #else
   void* route = state->route;
 #endif
-  if (phase)
+  if (phase || tokens > 128)
     route = state->route;
   QHPI_Tensor output[3] = {{result}, {vtcm}, {route}};
   QHPI_Tensor* out[] = {output, output + 1, output + 2};
@@ -372,14 +394,17 @@ extern "C" AEEResult integer_rpc_run_mapped(
   if (count != 14)
     return 40;
   auto* state = reinterpret_cast<State*>(uintptr_t(handle));
+  const int tokens = expert_stream::token_count(descriptors[9]);
+  if (tokens < 128 || tokens > state->capacity || tokens % 128)
+    return 14;
   void* buffers[6]{};
   const unsigned int sizes[] = {
-      128 * 2048 * 4,
-      128 * 8 * 4,
-      128 * 8 * 4,
-      128 * 2048 * 4,
-      128 * 2048 * 4,
-      128 * 2048 * 4};
+      unsigned(tokens * 2048 * 4),
+      unsigned(tokens * 8 * 4),
+      unsigned(tokens * 8 * 4),
+      unsigned(tokens * 2048 * 4),
+      unsigned(tokens * 2048 * 4),
+      unsigned(tokens * 2048 * 4)};
   for (int i = 0; i < 6; i++) {
     if (i == 5 && descriptors[i] < 0)
       continue;
@@ -432,17 +457,17 @@ extern "C" AEEResult integer_rpc_run_mapped(
   int error = integer_rpc_run(
       handle,
       static_cast<const float*>(buffers[0]),
-      128 * 2048,
+      tokens * 2048,
       static_cast<const int*>(buffers[1]),
-      128 * 8,
+      tokens * 8,
       static_cast<const float*>(buffers[2]),
-      128 * 8,
+      tokens * 8,
       static_cast<const float*>(buffers[3]),
-      128 * 2048,
+      tokens * 2048,
       descriptors + 6,
       8,
       static_cast<float*>(buffers[4]),
-      128 * 2048);
+      tokens * 2048);
   state->residual = nullptr;
   if (error)
     return error;

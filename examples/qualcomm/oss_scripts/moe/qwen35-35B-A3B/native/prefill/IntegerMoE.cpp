@@ -1,11 +1,12 @@
 #include "integer_moe.h"
+#include "expert_stream.h"
 #include "HTP/core/qhpi.h"
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
 
-// AR128 专家计算：先按专家聚合 token，每个专家最多处理 32 行一组的 HMX tile。
+// 同层 token 按专家归并，HMX 始终以最多 32 行的 tile 计算。
 // HVX 准备输入和后处理，HMX 集中执行矩阵乘；权重读取量由专家去重结果决定。
 #ifdef __hexagon__
 #include "hexagon_protos.h"
@@ -277,7 +278,9 @@ uint32_t execute_integer_moe(
   auto* route_output = static_cast<float*>(qhpi_tensor_raw_data(outputs[2]));
   const auto* descriptor =
       static_cast<const int32_t*>(qhpi_tensor_raw_data(inputs[4]));
-  const int phase = descriptor[4];
+  const bool streaming = descriptor[4] == expert_stream::kPhase;
+  const int phase = streaming ? 0 : descriptor[4];
+  const int tokens_count = expert_stream::token_count(descriptor[3]);
   const auto* x = static_cast<const float*>(qhpi_tensor_raw_data(inputs[0]));
   const auto* ids_ddr =
       static_cast<const int32_t*>(qhpi_tensor_raw_data(inputs[1]));
@@ -359,7 +362,9 @@ uint32_t execute_integer_moe(
     metrics[9][1] = tick() - started;
     write(&sync->go, 1);
     // HMX 消费 HVX 发布的 tile 请求；每个 worker 只有一个未完成请求。
-    while (read(&sync->done) != workers)
+    bool io_blocked = false;
+    uint64_t blocked_since = 0;
+    while (read(&sync->done) != workers) {
       for (unsigned i = 0; i < workers; i++) {
         Request* r = &sync->requests[i];
         if (read(&r->ready) != 1)
@@ -376,6 +381,25 @@ uint32_t execute_integer_moe(
         metrics[9][0] += tick() - stamp;
         write(&r->ready, 2);
       }
+#if SM_MOE_PROFILE
+      const bool blocked = (read(&sync->waiting) | read(&sync->done_mask)) ==
+          (1u << workers) - 1;
+      if (blocked != io_blocked) {
+        const auto now = tick();
+        if (io_blocked)
+          metrics[9][6] += now - blocked_since;
+        else
+          blocked_since = now;
+        io_blocked = blocked;
+      }
+#endif
+    }
+#if SM_MOE_PROFILE
+    if (io_blocked)
+      metrics[9][6] += tick() - blocked_since;
+    for (unsigned i = 0; i < workers; i++)
+      metrics[9][7] += sync->ready_wait[i];
+#endif
     metrics[9][2] = tick() - started;
     write(&sync->go, 2);
     await(&sync->combined, workers);
@@ -388,7 +412,7 @@ uint32_t execute_integer_moe(
     execution_counts[0]++;
     execution_counts[1] += sync->executed;
     execution_counts[2] += sync->assignments;
-    execution_counts[3] += (phase == 0 || phase == 3);
+    execution_counts[3] += (phase == 0 || phase == 3) ? tokens_count / 128 : 0;
     const auto error = sync->error;
     memset(sync, 0, sizeof(*sync));
     return error;
@@ -419,58 +443,79 @@ uint32_t execute_integer_moe(
   await(&sync->go, 1);
   auto* ids = reinterpret_cast<int32_t*>(base + 389248);
   auto* scores = reinterpret_cast<float*>(base + 393344);
-  dma_copy(ids, ids_ddr, 4096);
-  dma_copy(scores, scores_ddr, 4096);
+  // AR128 uses worker-local routing copies; larger groups use the mapped
+  // read-only tables. Each worker retains the same fixed tile workspace.
+  if (tokens_count == 128) {
+    dma_copy(ids, ids_ddr, 4096);
+    dma_copy(scores, scores_ddr, 4096);
+  }
+  if (tokens_count > 128)
+    qurt_mem_cache_clean(
+        uintptr_t(scores_ddr),
+        tokens_count * 8 * 4,
+        QURT_MEM_CACHE_INVALIDATE,
+        QURT_MEM_DCACHE);
+  const float* all_scores = tokens_count == 128 ? scores : scores_ddr;
   const uint8_t* bank = sync->bank;
   const auto* offsets = reinterpret_cast<const uint64_t*>(bank + 32);
   auto* input_codes = workspace + 3670016;
   auto* input_scales = reinterpret_cast<float*>(workspace + 447488);
-  const int first_token = worker * 16;
+  const int first_token = worker * (tokens_count / count);
   int local[32];
   for (int i = 0; i < 32; i++)
     local[i] = i;
-  // Worker 0 padding holds a stable expert-to-token CSR table for all eight
-  // workers.
+  // Worker 0 padding holds the shared CSR (up to 8192 assignments). Its end
+  // at 414976 precedes the per-worker stream scratch at 415104.
   auto* route_offsets = reinterpret_cast<uint32_t*>(workspace + 397440);
   auto* assignments = reinterpret_cast<uint16_t*>(workspace + 398592);
   auto prepared_at = tick();
   if (worker == 0) {
     unsigned counts[256]{}, cursor[256];
-    for (int i = 0; i < 1024; i++) {
-      if (unsigned(ids[i]) >= 256)
+    if (tokens_count > 128)
+      qurt_mem_cache_clean(
+          uintptr_t(ids_ddr),
+          tokens_count * 8 * 4,
+          QURT_MEM_CACHE_INVALIDATE,
+          QURT_MEM_DCACHE);
+    const auto* all_ids = tokens_count == 128 ? ids : ids_ddr;
+    for (int i = 0; i < tokens_count * 8; i++) {
+      if (unsigned(all_ids[i]) >= 256)
         write(&sync->error, 31);
       else
-        counts[ids[i]]++;
+        counts[all_ids[i]]++;
     }
     route_offsets[0] = 0;
     for (int e = 0; e < 256; e++) {
       route_offsets[e + 1] = route_offsets[e] + counts[e];
       cursor[e] = route_offsets[e];
-      if (counts[e] > 128)
+      if (counts[e] > unsigned(tokens_count))
         write(&sync->error, 31);
     }
-    for (int i = 0; i < 1024; i++)
-      if (unsigned(ids[i]) < 256)
-        assignments[cursor[ids[i]]++] = i;
+    for (int i = 0; i < tokens_count * 8; i++)
+      if (unsigned(all_ids[i]) < 256)
+        assignments[cursor[all_ids[i]]++] = i;
   }
-  dma_copy(packed, x + first_token * 2048, 16 * 2048 * 4);
-  prepare_activations(
-      packed,
-      input_scales + first_token * 2,
-      reinterpret_cast<float*>(packed),
-      2048,
-      local,
-      16,
-      2048,
-      1024,
-      true);
-  for (int m = 0; m < 16; m++)
-    for (int k = 0; k < 2048; k += 64) {
-      const auto first = vmem(packed + (m * 2048 + k) * 4),
-                 second = vmem(packed + (m * 2048 + k + 32) * 4);
-      vmem(input_codes + ((first_token + m) * 2048 + k) * 2) =
-          Q6_Vh_vpacke_VwVw(second, first);
-    }
+  for (int first = first_token; first < first_token + int(tokens_count / count);
+       first += 16) {
+    dma_copy(packed, x + first * 2048, 16 * 2048 * 4);
+    prepare_activations(
+        packed,
+        input_scales + first * 2,
+        reinterpret_cast<float*>(packed),
+        2048,
+        local,
+        16,
+        2048,
+        1024,
+        true);
+    for (int m = 0; m < 16; m++)
+      for (int k = 0; k < 2048; k += 64) {
+        const auto first_code = vmem(packed + (m * 2048 + k) * 4),
+                   second_code = vmem(packed + (m * 2048 + k + 32) * 4);
+        vmem(input_codes + ((first + m) * 2048 + k) * 2) =
+            Q6_Vh_vpacke_VwVw(second_code, first_code);
+      }
+  }
 #if SM_MOE_ACCUMULATE
   for (int t = first_token; t < first_token + 16; t++)
     for (int j = 0; j < 2048; j += 32)
@@ -479,12 +524,55 @@ uint32_t execute_integer_moe(
   increment(&sync->prepared);
   await(&sync->prepared, count);
   metrics[worker][0] += tick() - prepared_at;
-  const auto error = read(&sync->error);
-  while (!error) {
-    const unsigned expert = increment(&sync->next);
-    if (expert >= 256)
+  auto error = read(&sync->error);
+  auto* expert_order = reinterpret_cast<uint16_t*>(base + 415104);
+  auto* ready = reinterpret_cast<uint32_t*>(base + 415616);
+  if (streaming && !error) {
+    dma_copy(expert_order, bank + expert_stream::kOrderOffset, 512);
+    dma_copy(ready, bank + expert_stream::kReadyOffset, 1024);
+  }
+  while (!error && !read(&sync->error)) {
+    const unsigned index = increment(&sync->next);
+    if (index >= (streaming ? unsigned(descriptor[5]) : 256u))
       break;
-    int tokens[128], slots[128];
+    const unsigned expert = streaming ? expert_order[index] : index;
+    if (expert >= 256) {
+      error = 58;
+      write(&sync->error, error);
+      break;
+    }
+    if (streaming) {
+      // Each reader publishes only its own payload. Ready experts come first;
+      // a slow miss holds neither the other HVX workers nor completed results.
+      const auto deadline = HAP_perf_get_qtimer_count() + 5 * 19200000ull;
+#if SM_MOE_PROFILE
+      const auto waiting_at = tick();
+      if (!ready[expert])
+        __atomic_fetch_or(&sync->waiting, 1u << worker, __ATOMIC_ACQ_REL);
+#endif
+      while (!ready[expert] && !read(&sync->error)) {
+        const unsigned line = expert & ~31u;
+        dma_copy(
+            ready + line,
+            bank + expert_stream::kReadyOffset + line * sizeof(uint32_t),
+            128);
+        if (HAP_perf_get_qtimer_count() > deadline) {
+          error = 59;
+          break;
+        }
+        asm volatile("pause(#32)");
+      }
+#if SM_MOE_PROFILE
+      __atomic_fetch_and(&sync->waiting, ~(1u << worker), __ATOMIC_ACQ_REL);
+      sync->ready_wait[worker] += tick() - waiting_at;
+#endif
+      if (error || ready[expert] != expert_stream::kReady) {
+        error = error ? error : 60;
+        write(&sync->error, error);
+        break;
+      }
+    }
+    int tokens[1024], slots[1024];
     // 同一个专家的 token 连续处理，复用同一权重；offset 为 0 表示不属于当前批。
     const int total = route_offsets[expert + 1] - route_offsets[expert];
     if (!total || !offsets[expert])
@@ -579,7 +667,7 @@ uint32_t execute_integer_moe(
           true,
           tokens + begin,
           slots + begin,
-          scores);
+          all_scores);
 #if SM_MOE_ACCUMULATE
       stamp = tick();
       for (int m = 0; m < rows; m++) {
@@ -596,13 +684,17 @@ uint32_t execute_integer_moe(
     }
   }
   metrics[worker][7] = tick() - started;
+#if SM_MOE_PROFILE
+  __atomic_fetch_or(&sync->done_mask, 1u << worker, __ATOMIC_ACQ_REL);
+#endif
   increment(&sync->done);
   await(&sync->go, 2);
+  error = read(&sync->error);
   const auto combine_start = tick();
   // 首/中间批保留分路结果，仅单批或末批按 Top8 rank 合并，并加一次
   // shared/residual。
   if (!error && (phase == 0 || phase == 3))
-    for (unsigned t = worker; t < 128; t += count)
+    for (unsigned t = worker; t < unsigned(tokens_count); t += count)
       for (int j = 0; j < 2048; j += 32) {
 #if SM_MOE_ACCUMULATE
         auto sum = vmem(route_output + t * 2048 + j);

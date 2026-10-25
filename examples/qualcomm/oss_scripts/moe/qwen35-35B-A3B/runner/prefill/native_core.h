@@ -20,7 +20,7 @@ struct NativeCore {
   std::vector<int> owned_mappings;
   std::vector<std::shared_ptr<Buffer>> inbuf, outbuf;
 
-  NativeCore(Runtime& r, const std::string&);
+  NativeCore(Runtime& r, const std::string&, int tokens = 128);
 
   int named(bool input, const char* name);
 

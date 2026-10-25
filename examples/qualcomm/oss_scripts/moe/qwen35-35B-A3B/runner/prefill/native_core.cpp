@@ -1,6 +1,8 @@
 #include "native_core.h"
+#include "../../native/prefill/expert_stream.h"
 
-NativeCore::NativeCore(Runtime& r, const std::string&) : runtime(r) {
+NativeCore::NativeCore(Runtime& r, const std::string&, int tokens)
+    : runtime(r) {
   remote_rpc_control_unsigned_module request{CDSP_DOMAIN_ID, 1};
   check(
       remote_session_control(
@@ -10,15 +12,25 @@ NativeCore::NativeCore(Runtime& r, const std::string&) : runtime(r) {
       integer_rpc_open(
           (std::string(integer_rpc_URI) + "&_dom=cdsp").c_str(), &handle),
       "integer_rpc_open");
+  const int configured = integer_rpc_configure(handle, tokens);
+  if (configured) {
+    integer_rpc_close(handle);
+    handle = 0;
+    check(configured, "integer_rpc_configure");
+  }
   remote_rpc_control_latency latency{RPC_POLL_QOS, 9999};
   check(
       remote_handle64_control(
           handle, DSPRPC_CONTROL_LATENCY, &latency, sizeof(latency)),
       "native RPC polling");
   for (size_t n :
-       {128 * 2048 * 4, 128 * 8 * 4, 128 * 8 * 4, 128 * 2048 * 4, 32})
+       {tokens * 2048 * 4,
+        tokens * 8 * 4,
+        tokens * 8 * 4,
+        tokens * 2048 * 4,
+        32})
     inbuf.push_back(std::make_shared<Buffer>(r, n));
-  outbuf.push_back(std::make_shared<Buffer>(r, 128 * 2048 * 4));
+  outbuf.push_back(std::make_shared<Buffer>(r, tokens * 2048 * 4));
   if (mapped)
     sync_buffer(outbuf[0], DMA_BUF_SYNC_END | DMA_BUF_SYNC_WRITE);
 }
@@ -73,6 +85,8 @@ void NativeCore::end_output_read() {
 }
 
 void NativeCore::execute(bool read_output) {
+  const int tokens =
+      expert_stream::token_count(static_cast<const int*>(input(4))[3]);
   if (mapped) {
     if (output_read) {
       sync_buffer(outbuf[0], DMA_BUF_SYNC_END | DMA_BUF_SYNC_READ);
@@ -104,17 +118,17 @@ void NativeCore::execute(bool read_output) {
         integer_rpc_run(
             handle,
             (float*)input(0),
-            128 * 2048,
+            tokens * 2048,
             (int*)input(1),
-            128 * 8,
+            tokens * 8,
             (float*)input(2),
-            128 * 8,
+            tokens * 8,
             (float*)input(3),
-            128 * 2048,
+            tokens * 2048,
             (int*)input(4),
             8,
             (float*)output(0),
-            128 * 2048),
+            tokens * 2048),
         "integer_rpc_run");
   if (getenv("MOE_PROFILE")) {
     float p[80];

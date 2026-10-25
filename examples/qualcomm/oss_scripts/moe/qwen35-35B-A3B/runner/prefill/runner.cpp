@@ -118,6 +118,19 @@ class PrefillBackend final : public BackendInterface {
       const int chunks = session->sequence_tokens / 128;
       // PTE 的 workspace 覆盖整段输入，QNN/Native 每次仍处理 128 个 token。
       // Attention 的 state 在每块之后立即反馈，MoE 权重则复用到本层结束。
+      if (stage.kind == 3 && session->layer_memo && chunks >= 4) {
+        session->chunk_start = 0;
+        session->experts(
+            stage.layer,
+            input(0),
+            args[1]->toTensor().const_data_ptr<int32_t>(),
+            input(2),
+            input(3),
+            input(4),
+            output(5),
+            session->sequence_tokens);
+        return Error::Ok;
+      }
       for (int chunk = 0; chunk < chunks; chunk++) {
         if (chunks > 1)
           session->chunk_start = chunk * 128;
@@ -347,6 +360,31 @@ static int prefill_main(int argc, char** argv) try {
         (unsigned long long)m.layer_reuse_bytes,
         m.layer_seed_copy,
         m.staged_copy);
+    printf(
+        "PREFILL_PROFILE batch_setup_ms=%.6f batch_wait_ms=%.6f io_wall_ms=%.6f io_overlap_ms=%.6f seed_copy_ms=%.6f retained_copy_ms=%.6f input_copy_sync_ms=%.6f pread_worker_ms=%.6f payload_copy_worker_ms=%.6f ready_native_ms=%.6f missing_native_ms=%.6f ready_calls=%d missing_calls=%d\n",
+        m.batch_setup,
+        m.io_wait,
+        m.io_wall,
+        m.io_overlap,
+        m.layer_seed_copy,
+        m.staged_copy,
+        m.input_copy_sync,
+        m.pread_worker,
+        m.payload_copy_worker,
+        m.ready_native,
+        m.missing_native,
+        m.ready_calls,
+        m.missing_calls);
+    printf(
+        "PREFILL_COPY seed_wait_ms=%.6f seed_overlap_ms=%.6f retained_wait_ms=%.6f retained_overlap_ms=%.6f retained_prepare_ms=%.6f input_io_overlap_ms=%.6f router_io_overlap_ms=%.6f attention_io_overlap_ms=%.6f\n",
+        m.seed_wait,
+        m.seed_overlap,
+        m.retained_wait,
+        m.retained_overlap,
+        m.retained_prepare,
+        m.input_io_overlap,
+        m.router_io_overlap,
+        m.attention_io_overlap);
     if (chunk + chunks_per_plan == prompt_tokens / 128) {
       if (session->image_cursor != session->image_features.size())
         throw std::runtime_error(
