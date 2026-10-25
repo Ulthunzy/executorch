@@ -186,6 +186,13 @@ struct Store {
   }
 
   Store() {
+    // Limit heap growth slack while keeping every context resident.
+    QnnHtpPerfInfrastructure_MemoryConfig_t memory{};
+    memory.option = QNN_HTP_PERF_INFRASTRUCTURE_MEMORY_CONFIGOPTION_GROW_SIZE;
+    memory.memGrowSizeConfig = 4 * 1048576;
+    const QnnHtpPerfInfrastructure_MemoryConfig_t* configs[] = {
+        &memory, nullptr};
+    check(runtime.perf.setMemoryConfig(0, 0, configs), "shared heap grow size");
     const char* package = getenv("SHARED_OP_PACKAGE");
     if (!package)
       throw std::runtime_error("SHARED_OP_PACKAGE is required");

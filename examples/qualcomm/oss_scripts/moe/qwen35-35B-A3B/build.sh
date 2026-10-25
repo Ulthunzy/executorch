@@ -25,7 +25,7 @@ native_flags=(-O3 -fPIC -mhmx -mhvx -mhvx-length=128B -mv85
   -I"$HEXAGON_SDK_ROOT/incs" -I"$HEXAGON_SDK_ROOT/incs/stddef"
   -I"$HEXAGON_SDK_ROOT/rtos/qurt/computev85/include/qurt"
   -I"$HEXAGON_SDK_ROOT/rtos/qurt/computev85/include/posix"
-  -Drestrict=__restrict -DSM_EXPERT_BITS=2 -DSM_MOE_PROFILE=0
+  -Drestrict=__restrict -DSM_EXPERT_BITS=2 -DSM_MOE_PROFILE=${MOE_NATIVE_PROFILE:-0}
   -DSM_MOE_STAGE_READY=0 -DSM_MOE_ACCUMULATE=0 -DSM_MOE_ROUTE_VTCM=1
   -DSM_MOE_HMX_BATCH=8 -DPREPARE_DISABLED -DUSE_OS_QURT -DNATIVE_RPC)
 

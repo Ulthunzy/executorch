@@ -1,4 +1,5 @@
 #include "decode_session.h"
+#include <filesystem>
 
 DecodeSession::DecodeSession(const std::string& path, size_t cache_mib)
     : root(path), core(runtime, path), embedding(path) {
@@ -432,7 +433,6 @@ void DecodeSession::experts(
     metrics.logical += length;
   }
   const auto hit = cache->prepare(layer, ids, requests.data());
-
   metrics.hits += hit.hot + hit.cold;
   cache->use_direct(layer, ids, requests.data(), offsets);
   for (int i = 0; i < 8; i++)
@@ -449,7 +449,7 @@ void DecodeSession::experts(
   unsigned hit_mask = 0;
 
   for (int i = 0; i < 8; i++)
-    if (requests[i].cached)
+    if (requests[i].cached && !requests[i].cache_destination)
       hit_mask |= 1U << i;
   // ready 模式一次 RPC 内先消费命中，再消费陆续就绪的缺失专家。
   // split 是兼容路径：分别提交命中与缺失，最终仍按原 Top8 rank 求和。
@@ -569,6 +569,7 @@ void DecodeSession::experts(
   for (const auto& r : requests) {
     io.pread_worker += r.pread_ms;
     io.copy_worker += r.copy_ms;
+    io.publish_worker += r.publish_ms;
   }
   io_started = Clock::now();
   if (!ready) {

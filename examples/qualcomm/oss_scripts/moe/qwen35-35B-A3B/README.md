@@ -2,7 +2,7 @@
 
 本目录维护已验证的 40 层 MoE 推理、融合图导出及专家重构代码。独立于 `llama.py`。默认使用融合后的 Attention＋Router/shared、AR128 prefill、AR1 decode、每层 32 槽 LRU（可用 `--cache-experts 64` 切换）、命中专家先计算与缺失专家异步读取。
 
-当前默认使用 P/D 共享常量、外部权重文件与公共 head；11 个 context 在整个会话中常驻。Router/shared 为 GPTQ W8A16，embedding 为 group-32 INT4，专家缓存跨阶段交接复用。历史独立权重版本的测试记录仍保留在下文。
+当前默认使用 P/D 共享常量、外部权重文件与公共 head；11 个共享 context 在整个会话中常驻，图片或交互会话另保留 1 个视觉 context。Router/shared 为 GPTQ W8A16，embedding 为 group-32 INT4，专家缓存跨阶段交接复用。历史独立权重版本的测试记录仍保留在下文。
 
 导出、量化和推理各自保留入口，共用 [configs/model.json](configs/model.json) 中的量化、KV/state、上下文、thinking 和调度配置；[configs/sm8975.json](configs/sm8975.json) 只管理本机和设备路径。**完整命令、参数生效位置及支持范围见 [CONFIGURATION.md](CONFIGURATION.md)。**
 
@@ -42,7 +42,7 @@ cd /data/local/tmp/qwen35-raw-gptq-20261024/runtime/w2a8-fused-c1152-p128-cache3
 
 换图使用 `/image /data/local/tmp/another.png 请描述这张图。`；有空格的路径加双引号。每轮支持一张图片，旧图的 state/KV 保留以供追问。`/reset` 同时清除图文历史并恢复文本 RoPE。JPG/PNG 由 Android ImageDecoder 解码，再按校准路径做抗混叠 BICUBIC、RGB 归一化和 patch 排列；形状与 MRoPE 配置来自部署的 `VISION.json` 和 `model-config.json`。当前静态图为 448×448、196 个图像 token，源图最多 32 百万像素。
 
-部署还包括模型根目录的 `base-cos.f32`、`base-sin.f32` 和 `prefill/vision.bin`。`run_chat.py` 在视觉产物存在时一并部署这些文件。视觉 context 和 IO buffer 随完整模型初始化，所有图文轮次复用，结束会话时统一释放。首轮图文用 AR128；后续换图仍按 AR1 追加，当前约 221 个输入 token 需 24 秒，尚未接入多轮 AR128 批量追加。
+部署还包括模型根目录的 `base-cos.f32`、`base-sin.f32` 和 `prefill/vision.bin`。`run_chat.py` 在视觉产物存在时一并部署这些文件。图片输入或 `--interactive` 会话的视觉 context 和 IO buffer 随完整模型初始化，所有图文轮次复用，结束会话时统一释放；普通非交互纯文本 `--prompt` 不加载视觉模块。首轮图文用 AR128；后续换图仍按 AR1 追加，当前约 221 个输入 token 需 24 秒，尚未接入多轮 AR128 批量追加。
 
 SM8975 的 JPG、PNG 预处理、256-token 图文模板和 MRoPE 与 Python 路径逐字节一致；看图描述、跨轮追问、新图片、坏路径恢复和 reset 后再次看图均已验证。整个会话保留 11 个共享 context 和 1 个视觉 context，视觉重复执行不创建或释放 context/buffer。详见[设备图片会话记录](../../../../../llama-output/qwen35-moe-from-safetensors-gptq-20261024/device-image-chat-tests/REPORT.md)。
 
@@ -230,6 +230,23 @@ O_DIRECT 直接读 rpcmem 在该设备返回 EFAULT，因此保留一次 staging
 
 完整分析、对照CSV、错误探针与源码指纹见[1K prefill 320 token/s目标验证](../../../../../llama-output/qwen35-moe-from-safetensors-gptq-20261024/prefill-320-20261025/REPORT.md)。
 
+### Decode 阶段拆分与调度复测
+
+2026-10-25，prefill 优化提交为 `d6d877e938`。继续使用真实40层、专家N2存储/N4×A8计算、每层32槽LRU、UINT16 state/KV、静态容量1152，交替测试原调度与“提前读取＋DSP就绪轮询退避”。文本各3轮，图文各2轮；输出至EOS，首token来自prefill，decode速度仅统计后续AR1步进。
+
+| 输入 | 原调度 | 调度试验 | 结论 |
+| --- | ---: | ---: | --- |
+| 1024文本，57步AR1 | 97.51 ms/token / 10.25 token/s | 97.97 ms/token / 10.21 token/s | 没有稳定收益 |
+| 256图文，78步AR1 | 85.97 ms/token / 11.63 token/s | 84.18 ms/token / 11.88 token/s | 仅约2%延迟下降 |
+
+两个调度试验均已回退。默认分块仍为256KiB，缓存容量和读取策略保持原样；仅保留`CHAT_DECODE_STEP`中的读取线程累计`pread/copy/publish`计时，以及关闭会话时的可选Native汇总。`MOE_NATIVE_PROFILE=1 bash build.sh`编译细分计时版本，运行时`MOE_PROFILE_TOTAL=1`在关闭decode会话时输出汇总；普通构建默认不启用DSP细分计时。
+
+1K原调度主要开销为：RPC外处理3.01ms、Native含缺失等待48.93ms、Attention融合图38.31ms、Router输出交接0.06ms、state/head/采样等7.21ms。**Router/shared计算已包含在Attention融合图中，不能重复相加。**直接读取99.83MB/token、命中率63.56%；图文为65.28MB/token、76.17%。输入内容和输出序列不同，两行速度差异不能直接归因于上下文长度。
+
+Native单独profile的图文结果为39.09ms/token，其中最慢worker的专家就绪等待累计33.35ms，HMX执行累计0.45ms；这些是不同并行区间，不能直接相加。读取线程累计时间也不能加进端到端时间。cached/uncached rpcmem的O_DIRECT直读均返回EFAULT，暂存复制仍需保留。
+
+10轮有效对照的输出token、逐token缓存命中及读取字节数一致；未更改量化或专家路由。另有两次prefill初始化映射错误25，包含原版decode对照；失败记录未计入均值，补跑后通过。该映射问题的复现和修复见下一节。完整decode记录见[Decode调度复测报告](../../../../../llama-output/qwen35-moe-from-safetensors-gptq-20261024/decode-optimization-20261025/REPORT.md)。
+
 ### Prefill 初始化映射错误 25
 
 2026-10-25，在连续完整1K prefill＋decode会话的第6次启动复现。25是Native自定义错误：约210MiB的当前层专家memo在QNN恢复完成后才通过`HAP_mmap2`建立DSP映射，返回`0xffffffff`。fd有效、注册长度一致，底层日志为`0x80000608 / QuRT Error 12`。SDK把12定义为映射失败，不能直接解释为手机DRAM耗尽。旧代码还缓存失败指针与fd，导致同一handle后续调用持续返回25，并在关闭时尝试解除无效映射。
@@ -238,7 +255,94 @@ O_DIRECT 直接读 rpcmem 在该设备返回 EFAULT，因此保留一次 staging
 
 12轮1K文本与3轮图文完整会话未再出现25、15或清理错误，每轮85份prefill产物和完整生成token均与原版一致。1K prefill为413.56–429.42 token/s，图文为139.05–140.70 token/s，维持原性能范围。AR128/AR1024失败注入确认：旧版同handle重试仍报25，新版能重新映射并正常释放。本轮未改量化、Top8或计算结果，无需重新导出PTE；host runner与prefill skel需配套更新。系统日志尚不能进一步区分VA碎片、页表或底层映射器限制，有限次数通过也不等于任意系统负载下的保证。完整证据、回归、源码指纹与二进制见[错误25定位报告](../../../../../llama-output/qwen35-moe-from-safetensors-gptq-20261024/prefill-map25-20261025/REPORT.md)。
 
-最终排版重建后另补三对原版/修复版回归，覆盖128单块、512归并与chunk-major图文两轮对话，产物和token仍逐字节一致。修复版共18次整模初始化通过，最终配套二进制已留在SM8975测试目录。
+最终排版重建后另补三对原版/修复版回归，覆盖128单块、512归并与chunk-major图文两轮对话，产物和token仍逐字节一致。修复版共18次整模初始化通过，最终配套二进制已留在SM8975测试目录；这些初始化修复已提交为 `858046804b`。
+
+### Decode 提前预测专家 IO（历史试验，CPU 路径已撤回）
+
+2026-10-26，按用户要求模型计算只使用 NPU/DSP，已撤回 CPU INT8 近似路由的运行、准备及部署入口。以下是当时的试验记录；包含 CPU 预测的吞吐不作为当前纯 NPU/DSP 版本的性能基线。异步专家读取、命中先算与 LRU 继续保留。
+
+2026-10-25，初始化错误25修复提交后，继续拆分真实40层AR1。保持每层32槽LRU、原全矩阵GPTQ、Top8、UINT16 state/KV、容量1152与同一QNN图。使用每层Attention输入的CPU INT8近似路由，在Attention之前读取最多两个预测缺失专家到独立scratch；真实路由出来后只复用匹配的读取future，最终复制到实际LRU槽并发布ready。命中专家立即计算，预测错误不驱逐LRU，也不改变实际Router/shared计算与求和。
+
+| 输入 | 关闭提前预取 | 启用提前预取 |
+| --- | ---: | ---: |
+| 1K文本后57步decode，4轮中位数 | 101.18 ms/token / 9.88 token/s | **87.65 ms/token / 11.41 token/s** |
+| 256-token图文后78步decode，3轮中位数 | 87.27 ms/token / 11.46 token/s | **77.97 ms/token / 12.83 token/s** |
+
+文本主阶段为：RPC外处理含预测 **2.62→5.57ms**、Native含剩余等待 **54.05→37.28ms**、Attention融合段含Router/shared **37.97→37.60ms**、路由交接 **0.05→0.06ms**、state/head/采样等 **6.48→7.14ms**。偶数轮采用整轮耗时排序的中间两轮平均，分项取同两轮，保持可加；第三轮基线发生201.92ms/token读盘停顿，原始数据完整保留，未删除异常值。
+
+独立Native profile中，最慢worker专家就绪等待累计 **43.73→30.49ms/token**，HMX活跃计算约0.45ms。真实LRU命中率不变；文本总请求读取量 **99.83→112.23MB/token**，约增加12.43%，以额外预测读取换取计算/IO重叠。辅助矩阵20.039MiB，新增scratch/staging分配约4.922MiB；该数字不是整机内存峰值实测。
+
+14轮普通回归的完整生成ID与逐token实际LRU统计一致，另有1K输入的最终hidden、logits和40×2 state/KV共 **82份文件逐字节一致**。最终保留提前预测读取；集中轮询、Linux AIO和线程数调优没有稳定收益，均恢复原默认。GDN融合图约30.24ms、full-attention融合图约7.27ms仍是后续分析重点，Router/shared已包含其中，不能重复加历史独立图时间。
+
+该试验当时由 `quantization/prepare_early_router.py` 生成辅助矩阵。当前生成、部署和运行入口均已撤回；残留的 `early-router.bin` 不会被新版读取。旧二进制仍可用空变量 `EARLY_ROUTER_WEIGHTS=` 关闭CPU预测做历史对照。完整历史记录见[Decode拆分与提前预取报告](../../../../../llama-output/qwen35-moe-from-safetensors-gptq-20261024/decode-latency-20261025/REPORT.md)。
+
+### Decode 读盘长停顿待查
+
+历史对照中出现过连续 token 的 Native 500–760 ms 长停顿；六轮诊断和一轮普通复测未再次出现，尚未确认根因，也未标记修复。2026-10-25 按用户要求先保留现场，后续再查，本轮转到计算侧优化。[记录与后续安排](../../../../../llama-output/qwen35-moe-from-safetensors-gptq-20261024/decode-io-stall-20261025/REPORT.md)。
+
+
+### 关闭 CPU 预测后的完整性能与内存验证
+
+2026-10-26，按用户要求撤掉 CPU INT8 近似路由点积，Attention/真实 Router/shared 仍由 QNN 执行，Native MoE 矩阵计算在 DSP/HMX。保留每层32槽、Top8、异步读盘、命中先算、持久 context/state；量化和 PTE 不变，静态容量1152、prefill AR128。上一轮含 CPU 辅助的约11.41 token/s属于历史方案，不作为本轮基准。
+
+下表两列都禁用CPU预测；性能各两轮交替测试，内存另跑一次200ms采样。Prefill计时包含专家IO，排除初始化、图片预处理和encoder；decode不计prefill产生的首token。两个输入都使用视觉context常驻的图文部署。
+
+| 输入 | 指标 | 优化前 | 优化后 |
+| --- | --- | ---: | ---: |
+| 1024文本 | Prefill | 2.412秒 / 424.61 token/s | 2.415秒 / 424.05 token/s |
+| 1024文本 | Decode | 98.048 ms/token / 10.199 token/s | 98.090 ms/token / 10.195 token/s |
+| 1024文本 | 全流程峰值 | 4.994724 GiB | 4.994785 GiB |
+| 256图文 | Prefill | 1.818秒 / 140.81 token/s | 1.825秒 / 140.25 token/s |
+| 256图文 | Decode | 86.267 ms/token / 11.592 token/s | 84.434 ms/token / 11.844 token/s |
+| 256图文 | 全流程峰值 | 4.886219 GiB | 4.886658 GiB |
+
+文本性能基本持平，图文decode本轮降低2.12%；两轮不足以认定小幅收益稳定。30个GDN融合图合计由30.671降至29.906ms/token，但Native含剩余IO等待仍约50.6ms，整轮没有同等幅度下降。GDN保留全部量化位，V85启用Karatsuba精确cross重构、双V块系数复用及O3。另修正了构建配置过早展开导致增量编译漏记V85追加参数的问题，标准构建已重新核验。
+
+内存峰值均出现在prefill，DMA分配量完全相同；峰值CPU页差异仅0.0625/0.4492MiB。新版decode文本保持约4.860GiB，图文约4.816GiB，首尾仅增加0.039/0.305MiB，没有持续累积；SwapPSS均为0。退出时所有context/权重回调正常释放。200ms采样是观察峰值，不是任意瞬时分配的严格上界。
+
+**该轮图文部署未满足4GiB预算。** 当时纯文本输入也加载视觉模块：峰值约459.84MiB的`vision.bin` CPU文件页，加约432MiB视觉权重DMA，尚不含视觉工作区及IO；encoder计算仍在NPU。初始化→prefill上升到约5GiB，交接后decode约4.8GiB。原始[内存时间曲线](../../../../../llama-output/qwen35-moe-from-safetensors-gptq-20261024/performance-memory-no-cpu-20261026/MEMORY_TIMELINE.png)保留；与历史纯文本3.867GiB的对账及修复见下一节。
+
+8轮普通性能运行、4轮内存运行全部通过，生成ID和逐token真实LRU/IO相同；最终hidden、logits与40×2 state/KV共82文件逐字节一致。标准构建库另有一次完整1K回归，82文件仍一致。本轮未重新评估FP32 PPL。全部轮次、阶段明细、峰值fdinfo/smaps、配置与二进制SHA见[完整报告](../../../../../llama-output/qwen35-moe-from-safetensors-gptq-20261024/performance-memory-no-cpu-20261026/REPORT.md)。
+
+### 32槽内存回归对账与修复
+
+2026-10-26，历史3.867GiB使用无视觉的纯文本runner，近期约4.995GiB则在纯文本输入时也创建了视觉context；两者比较口径未对齐。缓存仍为40×32槽、1,101,168,640字节，两阶段复用同一批专家fd，没有变成64槽。
+
+已修复两处：非交互纯文本不再因目录中存在`vision.bin`而加载视觉模块；prefill每构建一层就绑定公共激活IO，避免40层临时私有IO在初始化同时存在。state/KV仍逐层私有，图片及可换图的交互会话仍将视觉context与整场会话一起创建、一起释放。
+
+| 输入/部署 | 历史32槽峰值 | 近期修复前 | 修复后 |
+| --- | ---: | ---: | ---: |
+| 128非交互纯文本 | 3.901541 GiB | — | **3.830641 GiB** |
+| 1024非交互纯文本 | 3.867239 GiB | 4.994785 GiB，误加载视觉 | **3.984724 GiB** |
+| 256图文 | — | 4.886658 GiB | 4.886780 GiB |
+
+1K修复前后减少**1034.303MiB / 1.010061GiB**：CPU PSS减少460.010MiB，去重DMA减少574.293MiB，后者包含视觉权重、工作区和IO。仅移除视觉的先导运行还捕获4.153GiB初始化峰值；逐层绑定共享IO后，完整峰值降至上述3.985GiB。
+
+1K仍比历史多**120.305MiB**，没有完全回到3.867GiB。DMA净增255.625MiB，包含映射到DMA的210MiB memo、1K Native归并的66MiB DSP分配及32MiB IO，减去取消的52.508MiB pipeline bank等；CPU PSS净减135.320MiB。历史由主机准备输入，当前终端还含分词等工作内存，不能只比较权重或`rpc_buffer_bytes`。
+
+普通性能复测：1K prefill **430.01 token/s**、decode **9.956 token/s**；图文prefill **139.71 token/s**、decode **11.551 token/s**。本轮各一次，上一轮均值分别为424.05/10.195及140.25/11.844，差异包含I/O波动，不据此认定稳定提速或回退。生成ID、真实LRU/IO及82份hidden/logits/state文件与修复前完全一致；纯文本开始的交互会话后续换图也已通过，视觉执行中无context/buffer重建。
+
+统计仍为CPU PSS＋去重DMA－PSS内DMA，200ms采样，SwapPSS为0。1K纯文本距4GiB预算仅约15.64MiB，不能保证其它输入也不超限；**图片或支持后续换图的交互会话仍超4GiB，不能引用非交互纯文本峰值。** 明细、曲线、现场和复跑脚本见[内存回归报告](../../../../../llama-output/qwen35-moe-from-safetensors-gptq-20261024/memory-regression-20261026/REPORT.md)。
+
+### 继续压缩常驻图文内存
+
+2026-10-26，保持全部40层、每层32槽、现有量化与视觉context常驻，完成三项优化：视觉权重通过QNN回调直接读入DMA，回收不再需要的CPU binary驻留页；GDN交换state句柄时不再申请无用的CPU中转数组；SDK堆增长粒度设为4MiB。
+
+| 场景 | 优化前峰值 | 优化后峰值 | 减少 |
+| --- | ---: | ---: | ---: |
+| 256-token图文 | 4.886780 GiB | **4.382659 GiB** | 516.220 MiB |
+| 1K文本＋视觉常驻 | 4.994785 GiB | **4.476583 GiB** | 530.639 MiB |
+| 1K纯文本 | 3.984724 GiB | **3.893999 GiB** | 92.902 MiB |
+
+1K视觉常驻使用交互会话初始化，输入为1024个文本token，视觉塔可供后续换图；不是1K图文性能样本。CPU PSS＋去重DMA的统计公式保持一致，SwapPSS均为0。完整含视觉仍超过4GiB预算，没有把纯文本峰值作为图文结果。
+
+原视觉binary的CPU PSS约459.844MiB，优化后28.098MiB，431.750MiB视觉权重DMA继续保留。SDK权重回调现在使用本模块Buffer，`rpc_buffer_bytes`会把原先SDK内部申请的视觉DMA计入，因此该局部计数会增加；完整峰值反而下降。GDN去掉约60MiB无用中转载荷，网格不一致的conv/state转换仍保留。调整堆增长粒度实测只省18MiB，未将全部32MiB块当成空闲。
+
+1K含视觉的最终峰值可对账为：层组/head权重1255.703MiB、专家缓存1050.156MiB、视觉权重431.750MiB、专家memo210.004MiB、其它DMA1373.871MiB、CPU PSS262.537MiB。其它DMA包含state/KV、IO、SDK/DSP堆和中间工作区；SDK编译元数据中各层DDR张量合计430.986MiB，视觉另10.442MiB，算子运行数据合计148.674MiB。这些是已有分配的说明，不能再加到峰值上。
+
+同轮图文无采样性能：prefill **138.96→140.91 token/s**，decode **11.629→11.507 token/s**；encoder **120.71→118.68ms**。各一轮，不能认定百分之一左右的差异是稳定收益或回退。最终1K纯文本为430.91 token/s prefill、10.074 token/s decode。
+
+文本及图文各82份hidden/logits/state文件与优化前逐字节相同，生成ID、真实LRU/IO相同。连续两次图片编码121.22/121.21ms，整场视觉权重只provide一次、退出release一次，执行中context/Buffer不重建。当前设备库拒绝VA优化配合权重回调，以及异步恢复配合deferred graph；持久binary提示和同优先级资源模式没有减少DMA，均未保留。完整分解、SDK元数据、试验记录及源码指纹见[常驻图文内存优化报告](../../../../../llama-output/qwen35-moe-from-safetensors-gptq-20261024/memory-optimization-20261026/REPORT.md)。
 
 ## 代码位置
 

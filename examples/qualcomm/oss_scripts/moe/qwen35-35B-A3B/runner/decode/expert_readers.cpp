@@ -1,4 +1,5 @@
 #include "expert_readers.h"
+#include "prefetch_queue.h"
 
 #include <sys/ioctl.h>
 #include <linux/dma-buf.h>
@@ -10,6 +11,16 @@
 #include <unistd.h>
 
 void ExpertReaders::perform(ExpertRead& request, void* buffer) {
+  if (request.source) {
+    try {
+      request.source_queue->wait(request.source);
+    } catch (const std::exception&) {
+      request.error = request.source->request.error;
+      if (!request.error)
+        request.error = EIO;
+      return;
+    }
+  }
   auto begin = Clock::now();
   const uint8_t* payload = request.cached;
   if (!payload) {
@@ -77,8 +88,12 @@ void ExpertReaders::worker(int index) {
               if ((done & mask) == mask &&
                   !gu_published[owner].exchange(1, std::memory_order_acq_rel)) {
                 dma_buf_sync sync{DMA_BUF_SYNC_END | DMA_BUF_SYNC_WRITE};
-                if (ioctl(cache_fd, DMA_BUF_IOCTL_SYNC, &sync)) {
-                  request.error = errno;
+                auto publish_started = Clock::now();
+                const int status = ioctl(cache_fd, DMA_BUF_IOCTL_SYNC, &sync);
+                const int error = status ? errno : 0;
+                request.publish_ms += elapsed(publish_started);
+                if (status) {
+                  request.error = error;
                   __atomic_store_n(
                       ready_words + 1,
                       uint32_t(request.error),
@@ -96,8 +111,12 @@ void ExpertReaders::worker(int index) {
           // The final chunk observes all payload stores before publishing
           // this expert's ready flag.
           dma_buf_sync sync{DMA_BUF_SYNC_END | DMA_BUF_SYNC_WRITE};
-          if (ioctl(cache_fd, DMA_BUF_IOCTL_SYNC, &sync)) {
-            request.error = errno;
+          auto publish_started = Clock::now();
+          const int status = ioctl(cache_fd, DMA_BUF_IOCTL_SYNC, &sync);
+          const int error = status ? errno : 0;
+          request.publish_ms += elapsed(publish_started);
+          if (status) {
+            request.error = error;
             __atomic_store_n(
                 ready_words + 1, uint32_t(request.error), __ATOMIC_RELEASE);
           } else if (stage_ready)
@@ -262,10 +281,12 @@ void ExpertReaders::finish() {
     for (int i = 0; i < original_count; i++) {
       original[i].pread_ms = 0;
       original[i].copy_ms = 0;
+      original[i].publish_ms = 0;
     }
     for (int i = 0; i < count; i++) {
       original[owners[i]].pread_ms += requests[i].pread_ms;
       original[owners[i]].copy_ms += requests[i].copy_ms;
+      original[owners[i]].publish_ms += requests[i].publish_ms;
     }
   }
   for (int i = 0; i < count; i++)

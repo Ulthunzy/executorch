@@ -30,6 +30,24 @@ extern "C" const char* qwen35_decode_error() {
 }
 
 extern "C" void qwen35_decode_close() {
+  try {
+    if (const char* directory = getenv("DECODE_VERIFY_ROOT");
+        directory && session && session->metrics.calls[4]) {
+      const auto root = std::string(directory);
+      const int input = session->head->index(true, 0);
+      const int output = session->head->index(false, 0);
+      save(root + "/hidden.f32", session->head->input(input), 2048 * 4);
+      save(root + "/logits.f32", session->head->output(output), 248320 * 4);
+      for (int layer = 0; layer < 40; ++layer)
+        for (int cache = 0; cache < 2; ++cache)
+          session->attention[layer]->save_cache(
+              root + "/layer" + std::to_string(layer) + "-cache" +
+                  std::to_string(cache) + ".u16",
+              cache);
+    }
+  } catch (const std::exception& error) {
+    fprintf(stderr, "decode verification snapshot failed: %s\n", error.what());
+  }
   session.reset();
   module.reset();
   embedded_binaries.clear();
@@ -133,16 +151,22 @@ qwen35_decode_step(int64_t token, float* logits, size_t count) try {
       throw std::runtime_error("nonfinite logits");
   std::copy(values, values + count, logits);
   double gdn = 0, full_attention = 0;
+  double pread_worker = 0, copy_worker = 0, publish_worker = 0;
+  int read_calls = 0;
   for (int layer = 0; layer < 40; ++layer) {
     if (session->attention[layer]->linear)
       gdn += metrics.execution[layer][0];
     else
       full_attention += metrics.execution[layer][0];
+    pread_worker += metrics.io[layer].pread_worker;
+    copy_worker += metrics.io[layer].copy_worker;
+    publish_worker += metrics.io[layer].publish_worker;
+    read_calls += metrics.io[layer].read_calls;
   }
   // The fused graph's Router/shared compute belongs to attention_ms;
   // router_ms measures only output handoff when fused_router_layers=40.
   printf(
-      "CHAT_DECODE_STEP position=%lld input_id=%lld total_ms=%.6f attention_ms=%.6f gdn_graph_ms=%.6f full_attention_graph_ms=%.6f router_ms=%.6f read_ms=%.6f native_ms=%.6f feedback_ms=%.6f head_ms=%.6f embedding_ms=%.6f direct_bytes=%llu cache_hits=%llu cache_requests=%llu\n",
+      "CHAT_DECODE_STEP position=%lld input_id=%lld total_ms=%.6f attention_ms=%.6f gdn_graph_ms=%.6f full_attention_graph_ms=%.6f router_ms=%.6f read_ms=%.6f native_ms=%.6f feedback_ms=%.6f head_ms=%.6f embedding_ms=%.6f direct_bytes=%llu cache_hits=%llu cache_requests=%llu pread_worker_ms=%.6f copy_worker_ms=%.6f publish_worker_ms=%.6f read_calls=%d\n",
       (long long)position,
       (long long)token,
       elapsed(started),
@@ -157,7 +181,11 @@ qwen35_decode_step(int64_t token, float* logits, size_t count) try {
       metrics.embedding,
       (unsigned long long)metrics.direct,
       (unsigned long long)metrics.hits,
-      (unsigned long long)metrics.requests);
+      (unsigned long long)metrics.requests,
+      pread_worker,
+      copy_worker,
+      publish_worker,
+      read_calls);
   return 0;
 } catch (const std::exception& error) {
   failed = true;

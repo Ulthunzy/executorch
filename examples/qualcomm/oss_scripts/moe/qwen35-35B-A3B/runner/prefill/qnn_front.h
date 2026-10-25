@@ -102,8 +102,12 @@ struct MappedBinary {
     return length;
   }
 
+  void discard_pages();
+
   ~MappedBinary();
 };
+
+class BinaryWeights;
 
 // System context 持有 tensor 元数据，不能在 inputs/outputs 使用期间释放。
 // QNN 内存句柄属于各自的 context，即使多张图绑定的是同一个 Buffer。
@@ -115,6 +119,7 @@ struct Graph {
   QnnSystemContext_Handle_t system = nullptr;
 
   MappedBinary binary;
+  std::unique_ptr<BinaryWeights> weights;
   std::vector<Qnn_Tensor_t> inputs, outputs;
   std::vector<std::shared_ptr<Buffer>> inbuf, outbuf;
 

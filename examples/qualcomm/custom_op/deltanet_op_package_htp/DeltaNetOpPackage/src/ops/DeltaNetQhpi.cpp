@@ -479,8 +479,9 @@ static inline void deltanetQhpiHvxReduceStateU16(
     // For K<=128, each int32 accumulator fits even at U16 endpoints:
     // |A|<=128*4095*4096 < INT32_MAX. No state/coeff low bits are lost.
     if (key_dim <= 128) {
-      // Three dot-product terms need twelve vector registers per V block.
-      constexpr size_t kSplitVectors = 1;
+      // Karatsuba removes two MACs per K, leaving room to process two V
+      // blocks together and reuse Q/K coefficients. Keep other builds at one.
+      constexpr size_t kSplitVectors = kQUint16KaratsubaReduction ? Vectors : 1;
       constexpr int kSplitShift = 4;
       constexpr int kSplitMask = (1 << kSplitShift) - 1;
       const HVX_Vector v_zero_hi = Q6_Vh_vsplat_R(prev_zero_offset >> kSplitShift);

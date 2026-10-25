@@ -1,5 +1,7 @@
 #include "../shared/graph_binding.h"
 #include "qnn_front.h"
+#include "binary_weights.h"
+#include <cerrno>
 
 std::map<std::string, EmbeddedBinary> embedded_binaries;
 
@@ -187,6 +189,13 @@ MappedBinary::~MappedBinary() {
     munmap(pointer, length);
 }
 
+void MappedBinary::discard_pages() {
+  // Keep the mapping and metadata addresses valid; clean file pages can fault
+  // back in if the SDK needs them. Embedded PTE memory is never discarded.
+  if (owned && pointer && madvise(pointer, length, MADV_DONTNEED))
+    fprintf(stderr, "binary page advice failed: %d\n", errno);
+}
+
 size_t Graph::elements(const Qnn_Tensor_t& t) {
   size_t n = 1;
   for (unsigned i = 0; i < FIELD(t, rank); i++)
@@ -225,6 +234,12 @@ Graph::Graph(Runtime& r, const std::string& path, bool metadata_only)
   graph_name = gi.graphName;
   inputs.assign(gi.graphInputs, gi.graphInputs + gi.numGraphInputs);
   outputs.assign(gi.graphOutputs, gi.graphOutputs + gi.numGraphOutputs);
+  if (!borrowed_context &&
+      path.substr(path.find_last_of('/') + 1) == "vision.bin") {
+    weights = std::make_unique<BinaryWeights>(r, path);
+    binary.discard_pages();
+    weights->discard_file_cache();
+  }
 
   for (auto& t : inputs) {
     auto b = std::make_shared<Buffer>(r, size(t));
@@ -276,16 +291,32 @@ void Graph::activate() {
     configure_threads();
     return;
   }
-  check(
-      runtime.q.contextCreateFromBinary(
-          runtime.backend,
-          runtime.device,
-          nullptr,
-          binary.data(),
-          binary.size(),
-          &context,
-          nullptr),
-      "contextCreateFromBinary");
+  if (weights) {
+    check(
+        runtime.q.contextCreateFromBinaryWithCallback(
+            runtime.backend,
+            runtime.device,
+            nullptr,
+            weights->callback(),
+            binary.data(),
+            binary.size(),
+            &context,
+            nullptr,
+            nullptr),
+        "contextCreateFromBinaryWithCallback");
+    binary.discard_pages();
+    weights->discard_file_cache();
+  } else
+    check(
+        runtime.q.contextCreateFromBinary(
+            runtime.backend,
+            runtime.device,
+            nullptr,
+            binary.data(),
+            binary.size(),
+            &context,
+            nullptr),
+        "contextCreateFromBinary");
   ++runtime.context_creates;
   ++runtime.live_contexts;
   runtime.peak_contexts =

@@ -127,18 +127,20 @@ PrefillSession::PrefillSession(const std::string& path, int plan_tokens)
   }
   const auto context_started = Clock::now();
 
-  for (int layer = 0; layer < 40; layer++) {
-    attention.emplace_back(
-        new Attention(runtime, root, layer, layer % 4 != 3, false));
-    router.emplace_back(new Graph(
-        runtime, root + "/layer" + std::to_string(layer) + "/moe-front.bin"));
-  }
   // Grouped Native output is sequence-sized; QNN registers an AR128 tensor.
   // Give QNN its own chain so one fd is never registered at both lengths.
   const auto chain = sequence_tokens >= 512
       ? std::make_shared<Buffer>(runtime, 128 * 2048 * 4)
       : core.outbuf[0];
-  shared_io = std::make_unique<SharedIo>(runtime, attention, router, chain);
+  shared_io = std::make_unique<SharedIo>(runtime);
+  for (int layer = 0; layer < 40; layer++) {
+    attention.emplace_back(
+        new Attention(runtime, root, layer, layer % 4 != 3, false));
+    router.emplace_back(new Graph(
+        runtime, root + "/layer" + std::to_string(layer) + "/moe-front.bin"));
+    // Release each layer's provisional activation IO before building the next.
+    shared_io->bind_layer(*attention.back(), *router.back(), chain);
+  }
   // QNN IO remains AR128; grouped Native calls need separate sequence-sized IO.
   if (sequence_tokens < 512) {
     core.inbuf[0] = shared_io->hidden;

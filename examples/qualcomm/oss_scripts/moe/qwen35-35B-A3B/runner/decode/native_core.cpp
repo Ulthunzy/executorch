@@ -282,6 +282,18 @@ void NativeCore::close() {
   if (!handle)
     return;
   const int service_error = stop_service();
+  int profile_error = 0;
+  if (getenv("MOE_PROFILE_TOTAL")) {
+    float values[96];
+    profile_error = integer_rpc_profile(handle, values, 96);
+    if (!profile_error)
+      for (int row = 0; row < 12; ++row) {
+        printf("CHAT_MOE_PROFILE_TOTAL row=%d", row);
+        for (int column = 0; column < 8; ++column)
+          printf(" %.6f", values[row * 8 + column]);
+        printf("\n");
+      }
+  }
   if (service.joinable()) {
     {
       std::lock_guard<std::mutex> lock(service_mutex);
@@ -302,6 +314,7 @@ void NativeCore::close() {
   owned_mappings.clear();
   io_mappings.clear();
   check(service_error, "native service");
+  check(profile_error, "integer_rpc_profile");
 }
 
 NativeCore::~NativeCore() {

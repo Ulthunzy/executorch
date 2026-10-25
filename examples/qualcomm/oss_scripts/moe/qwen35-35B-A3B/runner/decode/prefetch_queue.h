@@ -19,8 +19,8 @@ struct PrefetchTask {
   bool required = false;
 };
 
-// 可选的预测预取线程池；required 任务优先，pause 暂停尚未取走的预测任务。
-// 默认入口关闭预测路径，普通缺失读取由 ExpertReaders 承担。
+// required 任务优先；pause 只暂停尚未取走的预测任务。
+// 预测填独立暂存区，实际缺失槽的复制与发布仍由 ExpertReaders 完成。
 class PrefetchQueue {
   std::mutex mutex;
   std::condition_variable changed;

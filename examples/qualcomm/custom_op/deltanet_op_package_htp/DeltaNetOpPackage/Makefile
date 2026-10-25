@@ -119,7 +119,8 @@ flags=$(ARM_CLANG_OPTS) $(AARCH64_CXX_FLAGS)
 link_flags=$(AARCH64_LDFLAGS)
 endef
 
-define HEXAGON_BUILD_CONFIG :=
+# Architecture makefiles can append flags after including this file.
+define HEXAGON_BUILD_CONFIG
 $(COMMON_BUILD_CONFIG)
 compiler=$(HEXAGON_CXX)
 version=$(shell $(HEXAGON_CXX) --version 2>/dev/null)

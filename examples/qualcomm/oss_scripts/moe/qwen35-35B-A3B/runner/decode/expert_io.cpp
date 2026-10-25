@@ -125,8 +125,9 @@ void ExpertCache::use_direct(
     return;
   auto* base = static_cast<uint8_t*>(buffers[layer]->data);
   for (int i = 0; i < 8; i++) {
-    const uint8_t* pointer =
-        requests[i].cached ? requests[i].cached : requests[i].cache_destination;
+    const uint8_t* pointer = requests[i].cache_destination
+        ? requests[i].cache_destination
+        : requests[i].cached;
     if (pointer) {
       offsets[ids[i]] = (1ULL << 63) | uint64_t(pointer - base);
       requests[i].destination = nullptr;

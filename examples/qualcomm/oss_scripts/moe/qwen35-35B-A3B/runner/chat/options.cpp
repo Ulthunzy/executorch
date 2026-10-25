@@ -133,12 +133,16 @@ void configure_environment(const Options& o, int prefix_tokens) {
       prefill + "/plans/prefill-" + std::to_string(plan_tokens) + ".pte";
   if (!o.tokenize_only && !std::filesystem::is_regular_file(plan))
     throw std::runtime_error("Missing prefill plan: " + plan);
+  // Interactive sessions keep vision resident for later /image turns.
+  const bool vision_enabled = (!o.image_path.empty() || o.interactive) &&
+      std::filesystem::is_regular_file(prefill + "/vision.bin");
   printf(
-      "CHAT_PREFILL_PLAN order=%s prompt_tokens=%d plan_tokens=%d path=%s\n",
+      "CHAT_PREFILL_PLAN order=%s prompt_tokens=%d plan_tokens=%d path=%s vision_enabled=%d\n",
       o.prefill_order.c_str(),
       prefix_tokens,
       plan_tokens,
-      plan.c_str());
+      plan.c_str(),
+      vision_enabled);
   for (const auto& item : std::vector<std::pair<std::string, std::string>>{
            {"CHAT_PREFILL_PLAN", plan},
            {"LD_LIBRARY_PATH", prefill},
@@ -181,9 +185,7 @@ void configure_environment(const Options& o, int prefix_tokens) {
            {"SAVE_ALL_LOGITS", "0"},
            {"DEVICE_CHAT", "1"},
            {"CHAT_ROPE_ROOT", o.model_root},
-           {"VISION_INPUT",
-            std::filesystem::is_regular_file(prefill + "/vision.bin") ? "1"
-                                                                      : "0"}})
+           {"VISION_INPUT", vision_enabled ? "1" : "0"}})
     if (setenv(item.first.c_str(), item.second.c_str(), 1))
       throw std::runtime_error("Cannot set " + item.first);
   for (const char* flag :

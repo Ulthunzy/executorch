@@ -14,9 +14,10 @@ struct SharedIo {
       int index,
       const std::shared_ptr<Buffer>& buffer);
 
-  SharedIo(
-      Runtime& runtime,
-      std::vector<std::unique_ptr<Attention>>& attention,
-      std::vector<std::unique_ptr<Graph>>& router,
+  explicit SharedIo(Runtime& runtime);
+
+  void bind_layer(
+      Attention& attention,
+      Graph& router,
       const std::shared_ptr<Buffer>& chain);
 };

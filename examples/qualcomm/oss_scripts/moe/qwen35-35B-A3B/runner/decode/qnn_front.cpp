@@ -313,17 +313,7 @@ void Graph::activate() {
   check(
       runtime.q.graphRetrieve(context, graph_name.c_str(), &graph),
       "graphRetrieve");
-  if (const char* threads = getenv("QNN_HVX_THREADS")) {
-    QnnHtpGraph_CustomConfig_t custom{};
-    custom.option = QNN_HTP_GRAPH_CONFIG_OPTION_NUM_HVX_THREADS;
-    custom.numHvxThreads = atoi(threads);
-    QnnGraph_Config_t option = QNN_GRAPH_CONFIG_INIT;
-    option.option = QNN_GRAPH_CONFIG_OPTION_CUSTOM;
-    option.customConfig = &custom;
-    const QnnGraph_Config_t* config[] = {&option, nullptr};
-    check(
-        runtime.q.graphSetConfig(graph, config), "graphSetConfig HVX threads");
-  }
+
   if (!runtime.defer_bindings)
     register_io();
 }
@@ -355,6 +345,17 @@ void Graph::bind(Qnn_Tensor_t& t, const std::shared_ptr<Buffer>& buffer) {
 void Graph::register_io() {
   if (!context)
     throw std::runtime_error("register IO without context");
+  if (const char* threads = getenv("QNN_HVX_THREADS")) {
+    QnnHtpGraph_CustomConfig_t custom{};
+    custom.option = QNN_HTP_GRAPH_CONFIG_OPTION_NUM_HVX_THREADS;
+    custom.numHvxThreads = atoi(threads);
+    QnnGraph_Config_t option = QNN_GRAPH_CONFIG_INIT;
+    option.option = QNN_GRAPH_CONFIG_OPTION_CUSTOM;
+    option.customConfig = &custom;
+    const QnnGraph_Config_t* config[] = {&option, nullptr};
+    check(
+        runtime.q.graphSetConfig(graph, config), "graphSetConfig HVX threads");
+  }
   for (auto& t : inputs)
     register_tensor(t, bindings.at(FIELD(t, id)));
   for (auto& t : outputs)

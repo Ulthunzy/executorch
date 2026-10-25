@@ -61,8 +61,12 @@ Attention::Attention(
                    FIELD(out, dimensions));
     if (!linear)
       handoff_cache[i].resize(512 * 1024);
-    cache_host[i].resize(Graph::elements(cache_owner().inputs[cache_input[i]]));
-    cache_temporary[i].resize(Graph::elements(graph.outputs[output[i + 2]]));
+    // Matching GDN state grids swap DMA handles and never use CPU staging.
+    if (!swap_state[i]) {
+      cache_host[i].resize(
+          Graph::elements(cache_owner().inputs[cache_input[i]]));
+      cache_temporary[i].resize(Graph::elements(graph.outputs[output[i + 2]]));
+    }
   }
 }
 

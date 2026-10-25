@@ -20,7 +20,8 @@ struct Metrics {
     int hot = 0, cold = 0, read_calls = 0;
     uint64_t bytes = 0;
     double wait = 0, sync = 0, pread_worker = 0, copy_worker = 0,
-           feedback_overlap = 0, hit_native = 0, hit_overlap = 0, tail_wait = 0;
+           publish_worker = 0, feedback_overlap = 0, hit_native = 0,
+           hit_overlap = 0, tail_wait = 0;
     int hit_mask = 0, split = 0;
   };
 
