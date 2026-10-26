@@ -46,9 +46,26 @@ SM8975/V85、SDK 2.48.1、1152总上下文、AR128、每层32槽；1K文本或25
 | 1024文本 | 257.63→260.40 | 10.94→11.03 | 4.0704→4.0733 |
 | 256图文 | 127.31→127.19 | 10.96→11.65 | 4.5398→4.4714 |
 
-本次未观察到大幅性能回退或内存增长。文本峰值增加约3MiB，图文峰值降低约70MiB。新旧输出均能完成文本摘要和白牛、橙衣男子的图片描述，但措辞和token序列不同，图文decode的提升不能全部视为代码优化收益。Embedding和前7层专家文件逐字节一致，后续层专家及冷启动列表有差异；未据此声称PPL或正式benchmark精度等价。强制忽略EOS后的角色片段不属于正常遇EOS即停止的回答。
+上表仅对比两套同样存在FA布局回退的产物，未对齐更早约420 token/s的基线；后续冻结旧图交叉复测及修复见下一节。文本峰值增加约3MiB，图文峰值降低约70MiB。新旧输出均能完成文本摘要和白牛、橙衣男子的图片描述，但措辞和token序列不同，图文decode的提升不能全部视为代码优化收益。Embedding和前7层专家文件逐字节一致，后续层专家及冷启动列表有差异；未据此声称PPL或正式benchmark精度等价。强制忽略EOS后的角色片段不属于正常遇EOS即停止的回答。
 
 新产物和原始记录保留于 `llama-output/qwen35-moe-fresh-gptq-20261026-190729`；QNN原始context在 `export/qnn-shared/`，共享graph/weights在 `export/shared-model/`，无权重调度PTE在 `export/plans/`。逐阶段耗时、测试口径和汇总数字见[源码内回归记录](docs/fresh-gptq-regression-20261026.json)，完整原始日志及decode拆分见该产物目录的 `REPORT.md`、`measurements/`。
+
+### 2026-10-26：单 prefill PTE 与 FA 布局回退修复
+
+之前按输入长度生成的8份host调度PTE已合并为一个 `plans/prefill.pte`，只含一个 `prefill_forward` 方法。host工作区采用有界动态长度，C++重复调用AR128的QNN/Native kernel；不按文本长度生成文件或方法，保留同层多块的专家复用和有效token的state/KV更新。完整导出只有 `plans/prefill.pte`、`plans/decode.pte`、`vision/vision.pte` 三个计算PTE，embedding保留一份INT4数据，共享QNN图/权重和专家银行仍由模型目录统一定位。正常推理只传 `--weights-path`，无需逐个传PTE。32K是目标缓存容量，需按该容量编译一次cache/mask，不代表32份prefill PTE。
+
+历史冻结图配最新runner复测达到426.26 token/s，确认回退主要来自新版FA图。QNN profiling定位到GQA的K/V展开后的两处view复制周期数暴增；按head做MatMul跳过展开链后，真实第3层单独测量18.756→4.413ms。原量化参数和全部GPTQ权重保留，复用同一校准目录及未改动的head/视觉编码器，重新编译10组共享QNN context。
+
+SM8975、SDK2.48.1、1152总上下文、AR128、32槽/层，输出固定128 token（127步AR1），两轮无监控性能均值；内存另外采样，全部6轮thermal status为0。Prefill不含初始化、图像预处理和encoder。
+
+| 输入 | Prefill 修复前→后 token/s | Decode 前→后 token/s | 峰值内存 前→后 GiB |
+| --- | ---: | ---: | ---: |
+| 1024文本 | 260.46→422.12 | 11.03→11.08 | 4.0733→3.9474 |
+| 256图文 | 127.19→140.49 | 11.65→11.68 | 4.4714→4.4514 |
+
+文本prefill两轮409.32/434.92 token/s，已回到较早约420的区间，内存未增加。CPU参考在28/128有效token下四个输出逐元素一致；NPU真实单层的非零输入测试也四个输出逐元素一致。整模固定长度生成分别在第57/42个token发生措辞分歧，不能据此声称正式PPL完全等价。57项Python回归、C++主机检查、Android构建、单PTE的短文本/1K/图文实测及4K边界编译通过；4K边界保留原整数core，避免序列分段引入无量化参数的部分MatMul。
+
+模型目录：`llama-output/qwen35-moe-regression-package-20261026/export`；完整测试记录见[单PTE及FA修复](docs/single-prefill-fa-layout-20261026.json)，原始日志和profiling保留在该目录的上一级。
 
 ### 2026-10-26：代码复核与新入口设备回归
 
@@ -130,7 +147,7 @@ cd /data/local/tmp/qwen35-raw-gptq-20261024/runtime/w2a8-fused-c1152-p128-cache3
 
 输入 `/reset` 清空对话，输入 `/exit` 退出。也可用 `--prompt "第一问" --prompt "第二问"` 连续执行多轮；增加 `--interactive` 可继续从终端读取。`--temperature 0` 为 greedy，`--enable-thinking` 开启思考模板，默认关闭。运行日志及逐 token 时间记录在模型目录的 `chat.log`，可用 `--log-path` 修改。
 
-首轮 Attention/Router 使用 AR128，普通请求仅在序列末尾加入无效 padding；显式 `--prompt-tokens` 的定长 benchmark 才向 system-message 填充真实空格。512–1024位置的同层专家 token 在 Native 内归并，HMX tile 仍最多32行；较短输入的 Native 维持 AR128。终端按实际补齐长度选择无权重的 host PTE，默认按 `layer_major` 让同一层完成全部 AR128 块并复用专家，再进入下一层。顺序来自部署的 `prefill/plans/PLANS.json`，可用 `--prefill-order chunk_major` 显式对照。后续轮将尚未反馈的最后一个生成 token、轮次分隔符及新问题按 AR128 分块追加，仅有效位置更新 state/KV，不重新计算历史；AR1只用于生成。Context、buffer、每层 LRU 和原生服务在会话内常驻；`/reset` 只清空 state/KV 和位置，不重新装载权重或丢弃专家缓存。达到静态上下文容量时拒绝追加，用户可显式 `/reset`。
+首轮 Attention/Router 使用 AR128，普通请求仅在序列末尾加入无效 padding；显式 `--prompt-tokens` 的定长 benchmark 才向 system-message 填充真实空格。512–1024位置的同层专家 token 在 Native 内归并，HMX tile 仍最多32行；较短输入的 Native 维持 AR128。终端只加载一个 `prefill.pte`，由 C++ 按 AR128 分块，默认按 `layer_major` 让同一层完成全部 AR128 块并复用专家，再进入下一层。顺序来自部署的 `prefill/plans/PLANS.json`，可用 `--prefill-order chunk_major` 显式对照。后续轮将尚未反馈的最后一个生成 token、轮次分隔符及新问题按 AR128 分块追加，仅有效位置更新 state/KV，不重新计算历史；AR1只用于生成。Context、buffer、每层 LRU 和原生服务在会话内常驻；`/reset` 只清空 state/KV 和位置，不重新装载权重或丢弃专家缓存。达到静态上下文容量时拒绝追加，用户可显式 `/reset`。
 
 设备端使用与 `qnn_llama_runner.cpp` 相同的 HFTokenizer/BPE 和 ExecuTorch sampler。Qwen3.5 的 NFC 使用 Android 公共 ICU API（Android 31+），避免现有内置 NFC 丢失重音字符；原 tokenizer 文件保持不变。
 

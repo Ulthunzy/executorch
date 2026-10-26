@@ -1,0 +1,156 @@
+{
+  "target": "SM8975/V85",
+  "sdk": "2.48.1.260715",
+  "context": 1152,
+  "ar_len": 128,
+  "expert_slots_per_layer": 32,
+  "generated_tokens": 128,
+  "actual_ar1_steps": 127,
+  "ignore_eos": true,
+  "quantization_unchanged": true,
+  "calibration": "/hunter/cpp_code/ET/npu/executorch/llama-output/qwen35-moe-fresh-gptq-20261026-190729/calibration",
+  "rebuilt_qnn_groups": 10,
+  "unchanged_reused_components": [
+    "head",
+    "vision"
+  ],
+  "ptes": [
+    "plans/decode.pte",
+    "plans/prefill.pte",
+    "vision/vision.pte"
+  ],
+  "prefill_method": "prefill_forward",
+  "prefill_methods": 1,
+  "host_workspace_bound": 1024,
+  "bounded_dynamic_host_tensors": true,
+  "qnn_and_native_ar_len": 128,
+  "model_directory": "/hunter/cpp_code/ET/npu/executorch/llama-output/qwen35-moe-regression-package-20261026/export",
+  "memory_method": "Separate 200ms CPU PSS + inode-deduplicated DMA-BUF - DMA mappings already in PSS",
+  "thermal_statuses": [
+    0,
+    0,
+    0,
+    0,
+    0,
+    0
+  ],
+  "operator_profile_source": "/hunter/cpp_code/ET/npu/executorch/llama-output/qwen35-moe-regression-package-20261026/profile-new-events.json",
+  "fa_single_layer": {
+    "before_ms": 18.756411,
+    "after_ms": 4.412607
+  },
+  "fa_cpu_reference_exact": [
+    {
+      "valid": 28,
+      "all_outputs_equal": true
+    },
+    {
+      "valid": 128,
+      "all_outputs_equal": true
+    }
+  ],
+  "fa_npu_nonzero_inputs_exact": true,
+  "before": {
+    "text1k": {
+      "prefill_tps": 260.457521,
+      "prefill_tps_rounds": [
+        256.746692,
+        264.16835
+      ],
+      "decode_tps": 11.028847892324132,
+      "peak_gib": 4.073347091674805,
+      "prefill_stages_ms": {
+        "embedding_ms": 63.097370500000004,
+        "attention_ms": 2522.350807,
+        "router_ms": 335.507166,
+        "moe_ms": 727.0896379999999,
+        "feedback_ms": 173.87609550000002,
+        "head_ms": 5.035391000000001
+      }
+    },
+    "image256": {
+      "prefill_tps": 127.19364350000001,
+      "prefill_tps_rounds": [
+        126.475769,
+        127.911518
+      ],
+      "decode_tps": 11.654617129557035,
+      "peak_gib": 4.471443176269531,
+      "prefill_stages_ms": {
+        "embedding_ms": 7.3480995,
+        "attention_ms": 657.4729675000001,
+        "router_ms": 109.249998,
+        "moe_ms": 1101.5920875,
+        "feedback_ms": 52.9109075,
+        "head_ms": 6.0915365
+      }
+    }
+  },
+  "after": {
+    "text1k": {
+      "prefill_tps": 422.1213775,
+      "prefill_tps_rounds": [
+        409.318406,
+        434.924349
+      ],
+      "decode_tps": 11.076879292385671,
+      "peak_gib": 3.9473915100097656,
+      "prefill_stages_ms": {
+        "embedding_ms": 66.863646,
+        "attention_ms": 1340.664185,
+        "router_ms": 243.94520899999998,
+        "moe_ms": 626.3993224999999,
+        "feedback_ms": 65.396309,
+        "head_ms": 4.5663540000000005
+      }
+    },
+    "image256": {
+      "prefill_tps": 140.4915145,
+      "prefill_tps_rounds": [
+        139.646381,
+        141.336648
+      ],
+      "decode_tps": 11.683325006651245,
+      "peak_gib": 4.451442718505859,
+      "prefill_stages_ms": {
+        "embedding_ms": 4.5899475,
+        "attention_ms": 360.47568,
+        "router_ms": 82.50669500000001,
+        "moe_ms": 1264.492474,
+        "feedback_ms": 34.999664499999994,
+        "head_ms": 4.952135500000001
+      }
+    }
+  },
+  "output_comparison": {
+    "text1k": {
+      "first_different_token": 57
+    },
+    "image256": {
+      "first_different_token": 42
+    }
+  },
+  "checks": {
+    "python_tests": 57,
+    "host_padding_tests": 10,
+    "android_build": true,
+    "single_pte_device_lengths": [
+      128,
+      256,
+      1024
+    ],
+    "context_4096_compile": true
+  },
+  "limitations": [
+    "Fixed-length ignore-EOS generations differ at token 57 (text) and 42 (image); no formal PPL equivalence is claimed.",
+    "Integer head splitting is only enabled when the physical prefill width is <=4096; the 4K boundary retains its existing core."
+  ],
+  "review_checks": {
+    "python_tests_passed": 63,
+    "host_checks": "context_store, cache_transfer, runtime_settings; padding tests passed",
+    "android_build": "passed",
+    "device_smoke": "SM8975, single prefill PTE, 8 generated tokens, exit 0",
+    "bundle_validation": "Reject legacy static plans, invalid dynamic bounds, mismatched schedule workspace and old bundle format",
+    "four_k_context_compile": "passed; expanded integer sequence tiling remains disabled"
+  }
+}

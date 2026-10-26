@@ -23,6 +23,11 @@ def padded_prefill_front(module, inputs, capacity):
             from .fp16_attention_core import fp16_attention_core
 
             fp16_attention_core(module, inputs)
+        elif capacity + 128 <= 4096:
+            # Sequence tiling would introduce unquantized partial MatMuls.
+            from .split_attention_core import split_attention_core
+
+            split_attention_core(module, inputs)
         return module, inputs
     if len(inputs) != 3 or inputs[0].shape[1] != 128:
         raise ValueError("Expected an AR128 GDN or full-attention front")
