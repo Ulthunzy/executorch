@@ -2,6 +2,8 @@
 
 #include <cstddef>
 #include <cstdint>
+#include "cache_transfer.h"
+#include "session_state.h"
 
 extern "C" __attribute__((visibility("default"))) int qwen35_decode_run(
     int argc,
@@ -25,6 +27,10 @@ __attribute__((visibility("default"))) int qwen35_decode_set_inputs(
     size_t table_count);
 __attribute__((visibility("default"))) int qwen35_decode_reset();
 __attribute__((visibility("default"))) int qwen35_decode_position();
+__attribute__((visibility("default"))) int qwen35_decode_export_state(
+    Qwen35SessionState* state);
+__attribute__((visibility("default"))) int qwen35_decode_import_state(
+    const Qwen35SessionState* state);
 __attribute__((visibility("default"))) void qwen35_decode_close();
 __attribute__((visibility("default"))) const char* qwen35_decode_error();
 }

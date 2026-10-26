@@ -121,10 +121,12 @@ def prepare_image(args, ids, metadata, run_dir, np):
         cursor += grid_h * grid_w
         position += max(grid_h, grid_w)
     delta = position - len(ids)
-    base_cos = np.fromfile(args.artifacts / "assets/cos.f32", dtype="<f4").reshape(
+    from workflow.runtime_assets import runtime_assets
+
+    base_cos = np.fromfile(runtime_assets(args) / "cos.f32", dtype="<f4").reshape(
         -1, 32
     )
-    base_sin = np.fromfile(args.artifacts / "assets/sin.f32", dtype="<f4").reshape(
+    base_sin = np.fromfile(runtime_assets(args) / "sin.f32", dtype="<f4").reshape(
         -1, 32
     )
     if base_cos.shape != base_sin.shape or len(base_cos) < max(

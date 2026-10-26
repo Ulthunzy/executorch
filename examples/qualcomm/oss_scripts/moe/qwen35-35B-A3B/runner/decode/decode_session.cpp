@@ -48,8 +48,8 @@ DecodeSession::DecodeSession(const std::string& path, size_t cache_mib)
   const auto* prior = reinterpret_cast<const int32_t*>(history.data());
   for (int layer = 0; layer < 40; layer++)
     std::copy(
-        prior + layer * 128 * 8 + 127 * 8,
-        prior + layer * 128 * 8 + 128 * 8,
+        prior + layer * 128 * 8 + ((prefix_tokens - 1) % 128) * 8,
+        prior + layer * 128 * 8 + (((prefix_tokens - 1) % 128) + 1) * 8,
         previous_routes[layer].begin());
   if (async_io) {
     const auto profile = bytes(root + "/prediction-profile.f32");
@@ -100,8 +100,7 @@ DecodeSession::DecodeSession(const std::string& path, size_t cache_mib)
   cos = bytes(rope_root + "/cos.f32");
 
   sin = bytes(rope_root + "/sin.f32");
-  if (cos.size() < 2048 * 32 * 4 || sin.size() < 2048 * 32 * 4)
-    throw std::runtime_error("embedding/RoPE dimensions");
+  validate_rope_tables(cos.size(), sin.size(), context_capacity);
   if (ready_queue) {
     ready_buffer =
         std::make_shared<Buffer>(runtime, 4096, Buffer::CachePolicy::Uncached);

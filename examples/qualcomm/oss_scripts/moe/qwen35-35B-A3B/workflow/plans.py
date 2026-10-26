@@ -2,6 +2,7 @@ import json
 import hashlib
 
 from model_config import shared_model_signature
+from .runtime_assets import runtime_assets
 
 
 def check_plan(path, args, phase):
@@ -27,7 +28,7 @@ def check_plan(path, args, phase):
         phase == "decode"
         and metadata.get("cache_encoding_sha256")
         != hashlib.sha256(
-            (args.artifacts / "assets/cache-encoding.bin").read_bytes()
+            (runtime_assets(args) / "cache-encoding.bin").read_bytes()
         ).hexdigest()
     ):
         raise ValueError(
@@ -81,7 +82,7 @@ def prepare_plans(args, run_dir):
             if phase == "decode":
                 command += [
                     "--cache-encoding",
-                    str(args.artifacts / "assets/cache-encoding.bin"),
+                    str(runtime_assets(args) / "cache-encoding.bin"),
                 ]
             pack_plan(command)
             if phase == "prefill":
@@ -109,7 +110,11 @@ def prepare_chat_plans(args, run_dir):
     from pack_pte import main as pack_plan
 
     directory = run_dir / "chat-plans"
-    lengths = range(128, args.model_settings.context.max_prefill_tokens + 1, 128)
+    lengths = (
+        range(128, args.model_settings.context.max_prefill_tokens + 1, 128)
+        if args.prefill_order == "layer_major"
+        else (128,)
+    )
     for length in lengths:
         pack_plan(
             [
@@ -129,7 +134,7 @@ def prepare_chat_plans(args, run_dir):
                 "--max-seq-len",
                 str(args.decode_capacity),
                 "--prefill-order",
-                "layer_major",
+                args.prefill_order,
                 "--prefill-tokens",
                 str(length),
             ]
@@ -140,8 +145,10 @@ def prepare_chat_plans(args, run_dir):
                 version=1,
                 ar_len=128,
                 capacity=args.decode_capacity,
+                max_prefill_tokens=args.model_settings.context.max_prefill_tokens,
                 prefill_order=args.prefill_order,
                 lengths=list(lengths),
+                model_configuration=args.model_settings.to_dict(),
             ),
             indent=2,
         )

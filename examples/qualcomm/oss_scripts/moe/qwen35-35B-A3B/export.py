@@ -205,7 +205,7 @@ def main():
         description="Export optimized AR1 attention/router/shared graphs from calibrated per-layer QDQ programs"
     )
     add_model_config_argument(parser)
-    parser.add_argument("--max-seq-len", type=int, choices=[1152, 2048])
+    parser.add_argument("--max-seq-len", type=int)
     parser.add_argument(
         "--source-dir",
         type=Path,
@@ -222,7 +222,6 @@ def main():
     parser.add_argument(
         "--capacities",
         type=int,
-        choices=[1152, 2048],
         nargs="+",
     )
     parser.add_argument(
@@ -244,6 +243,13 @@ def main():
     args.capacities = args.capacities or [
         args.max_seq_len or settings.context.max_seq_len
     ]
+    try:
+        for capacity in args.capacities:
+            replace(
+                settings, context=replace(settings.context, max_seq_len=capacity)
+            ).validate()
+    except ValueError as error:
+        parser.error(str(error))
     if bool(args.router_qdq) != (settings.quantization.router_shared == "w8a16_gptq"):
         parser.error(
             "w8a16_gptq needs --router-qdq; fp16 uses checkpoint constants without --router-qdq"

@@ -3,6 +3,7 @@
 #include "qnn_front.h"
 #include "cache_utils.h"
 #include "../runtime_utils.h"
+#include "../cache_transfer.h"
 #include <array>
 #include <cmath>
 
@@ -23,6 +24,8 @@ struct Attention {
   int history = 0;
   std::vector<int> input, output;
   std::vector<uint16_t> initial[2], maps[2];
+  size_t state_elements[2]{};
+  int initial_tokens = 0;
   bool identity[2];
   bool swap_state =
       getenv("GDN_STATE_SWAP") && std::string(getenv("GDN_STATE_SWAP")) == "1";
@@ -40,6 +43,8 @@ struct Attention {
   void reset();
 
   void clear();
+
+  QuantizedCacheView cache_view(int c);
 
   void execute(
       const float* hidden,

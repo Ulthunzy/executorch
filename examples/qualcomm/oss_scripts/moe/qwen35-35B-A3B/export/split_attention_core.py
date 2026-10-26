@@ -44,7 +44,46 @@ def split_attention_core(module, inputs):
         outputs = []
         with graph.inserting_before(matmul):
 
-            def slice_dequant(node, index):
+            def slice_dequant(node, index, sequence=None):
+                if sequence is not None:
+                    start, end, dimension = sequence
+                    source = node.args[0].args[0] if node.args[0].target == Q else None
+                    if (
+                        source is not None
+                        and source.target == torch.ops.aten.cat.default
+                        and source.args[1] % node.meta["val"].ndim == dimension
+                    ):
+                        parts, offset = [], 0
+                        for part in source.args[0]:
+                            width = part.meta["val"].shape[dimension]
+                            first, last = max(start - offset, 0), min(
+                                end - offset, width
+                            )
+                            if first < last:
+                                assert part.target == DQ
+                                piece = graph.call_function(
+                                    torch.ops.aten.slice.Tensor,
+                                    (part, dimension, first, last),
+                                )
+                                codes = graph.call_function(Q, (piece, *part.args[1:]))
+                                parts.append(
+                                    graph.call_function(DQ, (codes, *part.args[1:]))
+                                )
+                            offset += width
+                        assert parts
+                        sliced = (
+                            parts[0]
+                            if len(parts) == 1
+                            else graph.call_function(
+                                torch.ops.aten.cat.default, (parts, dimension)
+                            )
+                        )
+                    else:
+                        sliced = graph.call_function(
+                            torch.ops.aten.slice.Tensor, (node, dimension, start, end)
+                        )
+                    integer = graph.call_function(Q, (sliced, *node.args[1:]))
+                    node = graph.call_function(DQ, (integer, *node.args[1:]))
                 sliced = graph.call_function(
                     torch.ops.aten.slice.Tensor, (node, 1, index, index + 1)
                 )
@@ -54,24 +93,56 @@ def split_attention_core(module, inputs):
                 )
 
             # Preserve every calibrated grid while skipping the GQA repeat/reshape chain.
-            def kv_value(node, index):
+            def kv_value(node, index, sequence=None):
                 if node is boundary:
-                    return slice_dequant(node, index)
+                    return slice_dequant(node, index, sequence)
                 if node.target in SHAPES:
-                    return kv_value(node.args[0], index)
+                    return kv_value(node.args[0], index, sequence)
                 assert node.target in {Q, DQ}
                 return graph.call_function(
                     node.target,
-                    (kv_value(node.args[0], index), *node.args[1:]),
+                    (kv_value(node.args[0], index, sequence), *node.args[1:]),
                     dict(node.kwargs),
                 )
 
             for head in range(heads):
-                query = slice_dequant(left, head)
-                key_value = kv_value(right, head // (heads // kv_heads))
-                value = graph.call_function(
-                    torch.ops.aten.matmul.default, (query, key_value)
+                reduction = left.meta["val"].shape[-1] > 4096
+                length = (
+                    left.meta["val"].shape[-1]
+                    if reduction
+                    else right.meta["val"].shape[-1]
                 )
+                step = 2048 if length > 4096 else length
+                pieces = []
+                for start in range(0, length, step):
+                    end = min(start + step, length)
+                    # Slice sequence before heads: no full-context KV head
+                    # temporary needs to fit in VTCM. Softmax stays global.
+                    query = slice_dequant(
+                        left,
+                        head,
+                        (start, end, 3) if reduction and length > 4096 else None,
+                    )
+                    key_value = kv_value(
+                        right,
+                        head // (heads // kv_heads),
+                        (start, end, 2 if reduction else 3) if length > 4096 else None,
+                    )
+                    pieces.append(
+                        graph.call_function(
+                            torch.ops.aten.matmul.default, (query, key_value)
+                        )
+                    )
+                value = pieces[0]
+                if reduction:
+                    for piece in pieces[1:]:
+                        value = graph.call_function(
+                            torch.ops.aten.add.Tensor, (value, piece)
+                        )
+                elif len(pieces) > 1:
+                    value = graph.call_function(torch.ops.aten.cat.default, (pieces, 3))
+                if len(pieces) > 1:
+                    value.meta["fp16_attention_join"] = True
                 integer = graph.call_function(
                     Q, (value, *output_q.args[1:]), dict(output_q.kwargs)
                 )

@@ -11,6 +11,7 @@ namespace {
 std::unique_ptr<executorch::extension::Module> module;
 std::string last_error;
 bool failed = false;
+bool prefill_interrupted = false;
 std::array<uint64_t, 6> lifetime{};
 
 std::array<uint64_t, 6> resources() {
@@ -52,6 +53,7 @@ extern "C" void qwen35_decode_close() {
   module.reset();
   embedded_binaries.clear();
   failed = false;
+  prefill_interrupted = false;
 }
 
 extern "C" int qwen35_decode_open(const char* root, int cache_mib) try {
@@ -74,6 +76,10 @@ extern "C" int qwen35_decode_open(const char* root, int cache_mib) try {
     if (!attention->linear &&
         attention->history + 1 != session->context_capacity)
       throw std::runtime_error("decode capacity differs from compiled graph");
+  // Chat reset starts an empty conversation; it never restores this prefix.
+  for (auto& attention : session->attention)
+    for (auto& snapshot : attention->initial)
+      std::vector<uint16_t>().swap(snapshot);
   lifetime = resources();
   int fused_routers = 0;
   for (const auto& attention : session->attention)
@@ -92,6 +98,64 @@ extern "C" int qwen35_decode_position() {
   return session ? session->position : -1;
 }
 
+extern "C" int qwen35_decode_export_state(Qwen35SessionState* state) try {
+  if (!session || failed || prefill_interrupted || session->in_step || !state)
+    throw std::runtime_error("decode state is not available for prefill");
+  for (const auto& pending : session->pending)
+    if (!pending.empty())
+      throw std::runtime_error("unfinished decode expert prefetch");
+  check(session->core.stop_service(), "pause decode mailbox");
+  session->core.end_output_read();
+  state->position = session->position;
+  state->capacity = session->context_capacity;
+  state->append_only = session->attention[3]->append_kv;
+  session->cache->export_state(*state);
+  for (int layer = 0; layer < 40; ++layer) {
+    for (int c = 0; c < 2; ++c)
+      state->layer[layer].cache[c] = session->attention[layer]->cache_view(c);
+    std::copy(
+        session->previous_routes[layer].begin(),
+        session->previous_routes[layer].end(),
+        state->layer[layer].routes);
+  }
+  return 0;
+} catch (const std::exception& error) {
+  last_error = error.what();
+  return 1;
+}
+
+extern "C" int qwen35_decode_import_state(const Qwen35SessionState* state) try {
+  if (!session || failed || session->in_step || !state ||
+      state->capacity != session->context_capacity ||
+      (!state->aborted &&
+       (state->position < 1 || state->position >= state->capacity)))
+    throw std::runtime_error("invalid prefill state handoff");
+  session->cache->import_state(*state);
+  if (state->aborted) {
+    prefill_interrupted = true;
+    return 0;
+  }
+  for (int layer = 0; layer < 40; ++layer) {
+    std::copy(
+        state->layer[layer].routes,
+        state->layer[layer].routes + 8,
+        session->previous_routes[layer].begin());
+    session->attention[layer]->last_position = state->position - 1;
+  }
+  session->position = state->position;
+  session->prefix_tokens = state->position;
+  session->next_layer = 0;
+  session->metrics = {};
+  session->image_cursor = session->image_features.size();
+  if (resources() != lifetime)
+    throw std::runtime_error("prefill changed decode model resources");
+  return 0;
+} catch (const std::exception& error) {
+  failed = true;
+  last_error = error.what();
+  return 1;
+}
+
 extern "C" int qwen35_decode_set_inputs(
     const float* features,
     size_t feature_count,
@@ -99,7 +163,7 @@ extern "C" int qwen35_decode_set_inputs(
     const float* sin,
     size_t table_count) try {
   if (!session || failed || session->in_step || !cos || !sin ||
-      table_count * sizeof(float) != session->cos.size() ||
+      table_count != session->cos.size() / sizeof(float) ||
       session->cos.size() != session->sin.size() || feature_count % 2048 ||
       (feature_count && !features) ||
       session->image_cursor != session->image_features.size())
@@ -126,7 +190,8 @@ extern "C" int qwen35_decode_set_inputs(
 
 extern "C" int
 qwen35_decode_step(int64_t token, float* logits, size_t count) try {
-  if (!session || !module || failed || !logits || count != 248320)
+  if (!session || !module || failed || prefill_interrupted || !logits ||
+      count != 248320)
     throw std::runtime_error("invalid decode step or failed session");
   const auto started = Clock::now();
   int64_t position = session->position;
@@ -208,6 +273,7 @@ extern "C" int qwen35_decode_reset() try {
   session->metrics = {};
   session->image_features.clear();
   session->image_cursor = 0;
+  prefill_interrupted = false;
   if (resources() != lifetime)
     throw std::runtime_error("reset changed model resources");
   return 0;

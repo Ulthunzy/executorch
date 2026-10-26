@@ -326,21 +326,22 @@ extern "C" AEEResult integer_rpc_run(
   if (descriptor_len != 8)
     return 14;
   const int tokens = expert_stream::token_count(descriptor[3]);
-  if (tokens < 128 || tokens > state->capacity || tokens % 128 ||
-      hidden_len != tokens * 2048 || ids_len != tokens * 8 ||
+  const int valid = expert_stream::valid_token_count(descriptor[3]);
+  if (tokens < 128 || tokens > state->capacity || tokens % 128 || valid < 1 ||
+      valid > tokens || hidden_len != tokens * 2048 || ids_len != tokens * 8 ||
       scores_len != tokens * 8 || shared_len != tokens * 2048 ||
       result_len != tokens * 2048)
     return 14;
   const int phase = descriptor[4] == expert_stream::kPhase ? 0 : descriptor[4];
   if (phase < 0 || phase > 3 || descriptor[5] < 1 || descriptor[5] > 256 ||
-      descriptor[6] < 1 || descriptor[6] > tokens * 8)
+      descriptor[6] < 1 || descriptor[6] > valid * 8)
     return 54;
   if ((phase == 0 || phase == 1) && state->pending != -1)
     return 56;
   if ((phase == 2 || phase == 3) && state->pending != descriptor[7])
     return 56;
-  if ((phase == 0 && descriptor[6] != tokens * 8) ||
-      (phase == 3 && state->assigned + descriptor[6] != tokens * 8))
+  if ((phase == 0 && descriptor[6] != valid * 8) ||
+      (phase == 3 && state->assigned + descriptor[6] != valid * 8))
     return 56;
 #if SM_MOE_ACCUMULATE
   if (phase || tokens != 128)
@@ -522,5 +523,5 @@ extern "C" AEEResult integer_rpc_release_io(remote_handle64 handle) {
         return 51;
       entry = IoMapping{};
     }
-  return 0;
+  return release_banks();
 }

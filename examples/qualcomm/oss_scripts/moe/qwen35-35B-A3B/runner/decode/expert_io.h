@@ -9,6 +9,7 @@
 #include <cerrno>
 #include <thread>
 #include "../resident_handoff.h"
+#include "../session_state.h"
 
 // 一个专家的对齐磁盘范围和有效 payload；cached 与 cache_destination
 // 区分命中/缺失。
@@ -91,4 +92,7 @@ class ExpertCache {
   void reset();
 
   Hits prepare(int layer, const int* ids, ExpertRead* requests);
+
+  void export_state(Qwen35SessionState& state) const;
+  void import_state(const Qwen35SessionState& state);
 };

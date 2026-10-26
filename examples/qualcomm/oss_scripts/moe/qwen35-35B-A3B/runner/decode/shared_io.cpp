@@ -30,7 +30,13 @@ SharedIo::SharedIo(
   shared = allocate(2048 * 4);
   cos = allocate(32 * 4);
   sin = allocate(32 * 4);
-  mask = allocate(2048 * 4);
+  size_t mask_bytes = 0;
+  for (const auto& a : attention)
+    if (!a->linear)
+      mask_bytes =
+          std::max(mask_bytes, Graph::size(a->graph.inputs[a->input[3]]));
+  if (mask_bytes)
+    mask = allocate(mask_bytes);
   for (size_t i = 0; i < attention.size(); i++) {
     auto& a = *attention[i];
     bind(a.graph, true, a.input[0], chain);

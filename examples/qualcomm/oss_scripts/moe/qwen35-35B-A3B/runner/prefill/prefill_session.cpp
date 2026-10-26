@@ -16,6 +16,9 @@ PrefillSession::PrefillSession(const std::string& path, int plan_tokens)
   if (plan_tokens < 128 || plan_tokens > 1024 || plan_tokens % 128)
     throw std::runtime_error("invalid prefill plan length");
   sequence_tokens = plan_tokens;
+  sequence_valid_tokens = getenv("PREFILL_VALID_TOKENS")
+      ? atoi(getenv("PREFILL_VALID_TOKENS"))
+      : plan_tokens;
   if (sequence_tokens > 128) {
     // DSP consumes this layer's memo directly. Uncached memory avoids a
     // full-bank CPU cache flush each time the selected expert table changes.
@@ -136,11 +139,23 @@ PrefillSession::PrefillSession(const std::string& path, int plan_tokens)
   for (int layer = 0; layer < 40; layer++) {
     attention.emplace_back(
         new Attention(runtime, root, layer, layer % 4 != 3, false));
+    if (!attention.back()->linear) {
+      const int window = attention.back()->history + 128;
+      if (prefill_window && prefill_window != window)
+        throw std::runtime_error("inconsistent prefill KV windows");
+      prefill_window = window;
+    }
     router.emplace_back(new Graph(
         runtime, root + "/layer" + std::to_string(layer) + "/moe-front.bin"));
     // Release each layer's provisional activation IO before building the next.
     shared_io->bind_layer(*attention.back(), *router.back(), chain);
   }
+  logical_capacity = getenv("DECODE_CONTEXT_CAPACITY")
+      ? atoi(getenv("DECODE_CONTEXT_CAPACITY"))
+      : attention[0]->input.size() == 4 ? prefill_window - 128
+                                        : prefill_window;
+  if (logical_capacity < 1 || sequence_tokens > prefill_window)
+    throw std::runtime_error("prefill plan exceeds compiled KV window");
   // QNN IO remains AR128; grouped Native calls need separate sequence-sized IO.
   if (sequence_tokens < 512) {
     core.inbuf[0] = shared_io->hidden;
@@ -176,6 +191,7 @@ PrefillSession::PrefillSession(const std::string& path, int plan_tokens)
       getenv("CHAT_ROPE_ROOT") ? getenv("CHAT_ROPE_ROOT") : root;
   cos = bytes(rope_root + "/cos.f32");
   sin = bytes(rope_root + "/sin.f32");
+  validate_rope_tables(cos.size(), sin.size(), logical_capacity);
   const auto context_finished = Clock::now();
 
   if (startup_policy != "none") {
@@ -235,10 +251,11 @@ void PrefillSession::embed(const int64_t* tokens, float* out) {
     metrics = {};
   active_group = -1;
   next_layer = 0;
-  if (chunk_start < 0 || chunk_start > 896)
+  if (chunk_start < 0 || chunk_start + valid_tokens > logical_capacity)
     throw std::runtime_error("prefill chunk position");
   auto t = Clock::now();
-  for (int token = 0; token < 128; token++) {
+  std::fill(out + valid_tokens * 2048, out + 128 * 2048, 0.f);
+  for (int token = 0; token < valid_tokens; token++) {
     if (tokens[token] < 0 || tokens[token] >= 248320)
       throw std::runtime_error("token ID");
     if (tokens[token] == 248056) {
@@ -332,7 +349,8 @@ void PrefillSession::attend(
       x,
       chunk_start,
       reinterpret_cast<const float*>(cos.data()),
-      reinterpret_cast<const float*>(sin.data()));
+      reinterpret_cast<const float*>(sin.data()),
+      valid_tokens);
   memcpy(norm, a.hidden(), 128 * 2048 * 4);
   memcpy(residual, a.residual(), 128 * 2048 * 4);
   const auto done = Clock::now();
@@ -420,7 +438,7 @@ void PrefillSession::prefetch_route(int layer, const int32_t* ids) {
     attention_io_spans.clear();
   }
   auto& bank = *banks[layer];
-  for (int token = 0; token < 128; token++) {
+  for (int token = 0; token < valid_tokens; token++) {
     std::array<bool, 256> seen{};
     for (int rank = 0; rank < 8; rank++) {
       const int expert = ids[token * 8 + rank];
@@ -531,6 +549,10 @@ void PrefillSession::experts(
       (tokens > 128 &&
        (!layer_memo || tokens != sequence_tokens || chunk_start)))
     throw std::runtime_error("MoE token group");
+  const int active_tokens =
+      tokens == 128 ? valid_tokens : sequence_valid_tokens;
+  if (active_tokens < 1 || active_tokens > tokens)
+    throw std::runtime_error("invalid MoE valid length");
   auto t = Clock::now();
   prepare_layer_memo(layer);
   finish_memo_copy();
@@ -567,7 +589,7 @@ void PrefillSession::experts(
   std::array<int, 256> histogram{}, last_use{};
   std::copy(
       ids + (tokens - 128) * 8, ids + tokens * 8, route_history[layer].begin());
-  for (int token = 0; token < tokens; token++) {
+  for (int token = 0; token < active_tokens; token++) {
     std::array<bool, 256> seen{};
     for (int k = 0; k < 8; k++) {
       int e = ids[token * 8 + k];
@@ -589,7 +611,7 @@ void PrefillSession::experts(
   }
   auto stamp_of = [&](int e) -> uint64_t {
     if (histogram[e])
-      return uint64_t(chunk_start) * 8 + last_use[e] + 1;
+      return stamp_offsets[layer] + uint64_t(chunk_start) * 8 + last_use[e] + 1;
     auto found = std::find(original_ids.begin(), original_ids.end(), e);
     return found == original_ids.end()
         ? 0
@@ -721,10 +743,10 @@ void PrefillSession::experts(
         layer_memo->fd,
         int(layer_memo->size),
         ++generations[0],
-        tokens == 128 ? 0 : tokens << expert_stream::kTokenShift,
+        expert_stream::mapping_control(0, tokens, active_tokens),
         expert_stream::kPhase,
         int(selected.size()),
-        tokens * 8,
+        active_tokens * 8,
         layer};
     memcpy(core.input(4), descriptor, sizeof(descriptor));
     Clock::time_point native_end;
@@ -749,7 +771,7 @@ void PrefillSession::experts(
     metrics.native += native_ms;
     metrics.native_calls++;
     metrics.requests += selected.size();
-    metrics.assignments += tokens * 8;
+    metrics.assignments += active_tokens * 8;
     if (missing.empty()) {
       metrics.ready_native += native_ms;
       metrics.ready_calls++;
@@ -889,7 +911,7 @@ void PrefillSession::experts(
           current->fd,
           int(current->size),
           ++generations[mapping_index],
-          mapping_index,
+          expert_stream::mapping_control(mapping_index, tokens, active_tokens),
           phase,
           int(selected.size()),
           assignments,
@@ -956,7 +978,8 @@ void PrefillSession::experts(
     chunk_start = tokens - 128;
     histogram.fill(0);
     last_use.fill(0);
-    for (int i = 0; i < 128 * 8; i++) {
+    valid_tokens = active_tokens - chunk_start;
+    for (int i = 0; i < valid_tokens * 8; i++) {
       const int expert = ids[chunk_start * 8 + i];
       ++histogram[expert];
       last_use[expert] = i;
@@ -1047,7 +1070,7 @@ void PrefillSession::experts(
     if (entry.expert >= 0 && histogram[entry.expert])
       entry.stamp = stamp_of(entry.expert);
 
-  cache.clock = uint64_t(chunk_start + 128) * 8;
+  cache.clock = stamp_offsets[layer] + uint64_t(chunk_start + valid_tokens) * 8;
   printf(
       "PREFILL_PIPE layer=%d chunk=%d group_tokens=%d ready_experts=%zu missing_experts=%zu async=%d io_wall_ms=%.6f overlap_ms=%.6f wait_ms=%.6f native_ms=%.6f\n",
       layer,
@@ -1101,7 +1124,15 @@ void PrefillSession::project(const float* x, float* logits) {
   const size_t count = Graph::elements(head->inputs[in]);
   if (count != 2048 && count != 128 * 2048)
     throw std::runtime_error("prefill head shape");
-  memcpy(head->input(in), x + 128 * 2048 - count, count * 4);
+  if (count == 2048)
+    memcpy(head->input(in), x + (valid_tokens - 1) * 2048, count * 4);
+  else {
+    memcpy(head->input(in), x, count * 4);
+    memcpy(
+        static_cast<float*>(head->input(in)) + 127 * 2048,
+        x + (valid_tokens - 1) * 2048,
+        2048 * 4);
+  }
   head->execute();
   memcpy(logits, head->output(out), 248320 * 4);
   metrics.head += elapsed(t);
@@ -1109,7 +1140,7 @@ void PrefillSession::project(const float* x, float* logits) {
   if (memo_copy != MemoCopy::None)
     copy_compute_spans.emplace_back(t, Clock::now());
   finish_memo_copy();
-  chunk_start += 128;
+  chunk_start += valid_tokens;
 }
 
 void PrefillSession::finish_prefill_native() {

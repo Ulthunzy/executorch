@@ -196,8 +196,10 @@ static int decode_main(int argc, const char** argv) try {
         "stream_runner ROOT MAX_NEW_TOKENS CACHE_MIB EOS_IDS");
   model_root = argv[1];
   const int max_tokens = std::stoi(argv[2]), cache_mib = std::stoi(argv[3]);
-  const int prefix_tokens =
-      getenv("PREFILL_TOKENS") ? atoi(getenv("PREFILL_TOKENS")) : 128;
+  const int prefix_tokens = getenv("PREFILL_VALID_TOKENS")
+      ? atoi(getenv("PREFILL_VALID_TOKENS"))
+      : getenv("PREFILL_TOKENS") ? atoi(getenv("PREFILL_TOKENS"))
+                                 : 128;
   if (max_tokens < 1 ||
       max_tokens > (getenv("DECODE_CONTEXT_CAPACITY")
                         ? atoi(getenv("DECODE_CONTEXT_CAPACITY"))

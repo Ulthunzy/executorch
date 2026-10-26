@@ -46,6 +46,8 @@ def group_commands(args):
             command += ["--qnn-binding", str(args.qnn_binding)]
         if args.independent:
             command += ["--independent"]
+        if args.model:
+            command += ["--model", str(args.model)]
         commands.append(command)
     return commands
 
@@ -57,6 +59,9 @@ def main():
     add_model_config_argument(parser)
     parser.add_argument("--prefill-source", type=Path, required=True)
     parser.add_argument("--decode-source", type=Path, required=True)
+    parser.add_argument(
+        "--model", type=Path, help="Checkpoint config used for rotary tables"
+    )
     parser.add_argument("--router-qdq", type=Path)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--layers", type=int, nargs="+")
@@ -70,9 +75,7 @@ def main():
         action="store_true",
         help="Print subprocess commands without loading QNN or weights",
     )
-    parser.add_argument(
-        "--max-seq-len", "--capacity", dest="capacity", type=int, choices=[1152, 2048]
-    )
+    parser.add_argument("--max-seq-len", "--capacity", dest="capacity", type=int)
     parser.add_argument("--qnn-binding", type=Path)
     parser.add_argument("--op-package-host", type=Path, required=True)
     parser.add_argument("--op-package-device", required=True)
@@ -104,8 +107,12 @@ def main():
         )
         return
     if args.all_layers:
+        from export.runtime_assets import build_runtime_assets, checkpoint_path
+
+        checkpoint = checkpoint_path(args.prefill_source, args.model)
         for command in commands:
             subprocess.run(command, check=True)
+        build_runtime_assets(args.output, checkpoint, args.capacity)
         (args.output / "EXPORT.json").write_text(
             json.dumps(
                 dict(model_configuration=settings.to_dict(), commands=commands),
@@ -142,12 +149,9 @@ def main():
         to_edge_transform_and_lower_to_qnn,
     )
     from executorch.exir._serialize._program import deserialize_pte_binary
-    from executorch.examples.qualcomm.oss_scripts.llama.quantize.generation import (
-        remove_export_checks,
-        replace_prefill_cores,
-    )
     from export.fp16_attention_core import fp16_attention_core
     from export.graph_utils import resize_attention
+    from export.prefill import padded_prefill_front
     from export.model import FusedFront, MoeFront, QuantizedFusedFront
     from export.quantization import validate_router_graph, validate_router_source
 
@@ -174,12 +178,9 @@ def main():
             for node in prefill.graph.nodes
             if node.op == "placeholder"
         )
-        if layer % 4 != 3:
-            replace_prefill_cores(prefill)
-            prefill = torch.export.export(
-                prefill, prefill_inputs, strict=False
-            ).module()
-            remove_export_checks(prefill)
+        prefill, prefill_inputs = padded_prefill_front(
+            prefill, prefill_inputs, args.capacity
+        )
         decode = torch.export.load(
             args.decode_source / f"layer{layer}/decode-qdq.pt2"
         ).module()
@@ -257,7 +258,7 @@ def main():
         QnnExecuTorchBackendType.kHtpBackend
     ).get_capture_program_passes()
     state_shapes = {(1, 8192, 4), (1, 32, 128, 128)}
-    for length in (1, 128, 896, args.capacity - 1):
+    for length in (1, 128, args.capacity, args.capacity - 1):
         state_shapes.update({(1, 2, 256, length), (1, 2, length, 256)})
 
     def tag(node):
@@ -327,6 +328,8 @@ def main():
         router_calibration=router_calibration,
         weight_sharing=not args.independent,
         prefill_core="chunked_mixed_fp16",
+        prefill_valid_length=True,
+        prefill_history=args.capacity,
         io_order="QNN input_N_/output_N_ name IDs; resolve against runtime tensor metadata",
         graphs=graphs,
         contexts={v: k for k, v in contexts.items()},

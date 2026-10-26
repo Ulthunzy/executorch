@@ -95,18 +95,13 @@ def resize_attention(module, capacity):
     full_attention = len(placeholders) == 6
     assert len(placeholders) in (3, 6)
     old_capacity = placeholders[3].meta["val"].shape[-1] if full_attention else None
+    ar_len = placeholders[0].meta["val"].shape[1]
     inputs = []
     for index, node in enumerate(placeholders):
         shape = list(node.meta["val"].shape)
-        if full_attention:
-            shape = [
-                (
-                    capacity
-                    if x == old_capacity
-                    else capacity - 1 if x == old_capacity - 1 else x
-                )
-                for x in shape
-            ]
+        if full_attention and index >= 3:
+            axis = -1 if index in (3, 4) else -2
+            shape[axis] = capacity if index == 3 else capacity - ar_len
         inputs.append(
             torch.ones(shape) if full_attention and index == 1 else torch.zeros(shape)
         )
@@ -135,7 +130,11 @@ def resize_attention(module, capacity):
                             (
                                 capacity
                                 if x == old_capacity
-                                else (capacity - 1 if x == old_capacity - 1 else x)
+                                else (
+                                    capacity - ar_len
+                                    if x == old_capacity - ar_len
+                                    else x
+                                )
                             )
                             for x in arguments[1]
                         ]

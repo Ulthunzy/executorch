@@ -9,10 +9,12 @@
 #include "../handoff.h"
 #include "../resident_handoff.h"
 #include "../embedding.h"
+#include "../session_state.h"
 #include <array>
 #include <chrono>
 #include <cstdlib>
 #include <set>
+#include <functional>
 
 #include "attention.h"
 #include "shared_io.h"
@@ -63,10 +65,12 @@ struct PrefillSession {
   size_t stride = 0;
   bool reuse =
       getenv("REUSE_EXPERTS") && std::string(getenv("REUSE_EXPERTS")) == "1";
-  int capacity = 0, pool_count = 0, chunk_start = 0;
+  int capacity = 0, pool_count = 0, chunk_start = 0, prefill_window = 0,
+      logical_capacity = 0;
   Metrics metrics;
   std::array<std::array<InheritedExperts::Entry, 64>, 40> layer_history{};
   std::array<uint64_t, 40> layer_clocks{};
+  std::array<uint64_t, 40> stamp_offsets{};
   std::array<std::array<int32_t, 128 * 8>, 40> route_history{};
   bool async_io = getenv("ASYNC_EXPERT_IO") &&
       std::string(getenv("ASYNC_EXPERT_IO")) == "1";
@@ -75,7 +79,8 @@ struct PrefillSession {
       ? getenv("STARTUP_EXPERT_PREFETCH")
       : "none";
   bool startup_seed_pending = false;
-  int sequence_tokens = 128, memo_layer = -1;
+  int sequence_tokens = 128, valid_tokens = 128, sequence_valid_tokens = 128,
+      memo_layer = -1;
   std::shared_ptr<Buffer> layer_memo;
   std::array<bool, 256> memo_valid{};
   std::array<int, 64> memo_slot_ids{};
@@ -108,6 +113,20 @@ struct PrefillSession {
   void prefetch_route(int layer, const int32_t* ids);
 
   void finish_prefill_native();
+
+  void prepare_decode();
+
+  void append(
+      const int64_t* tokens,
+      size_t count,
+      const float* features,
+      size_t feature_count,
+      const float* cos,
+      const float* sin,
+      size_t table_count,
+      Qwen35SessionState& state,
+      float* logits,
+      const std::function<bool()>& stopped);
 
   void reset();
 

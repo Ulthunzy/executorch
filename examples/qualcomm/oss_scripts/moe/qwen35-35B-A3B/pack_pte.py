@@ -30,7 +30,6 @@ def main(argv=None):
     parser.add_argument(
         "--prefill-tokens",
         type=int,
-        choices=range(128, 1025, 128),
         default=128,
         help="Host plan sequence length; QNN and Native kernels remain AR128",
     )
@@ -50,6 +49,16 @@ def main(argv=None):
             prefill_order=args.prefill_order or settings.schedule.prefill_order,
         ),
     ).validate()
+    if (
+        args.prefill_tokens < 128
+        or args.prefill_tokens > settings.context.max_prefill_tokens
+        or args.prefill_tokens % 128
+        or (
+            settings.schedule.prefill_order == "layer_major"
+            and args.prefill_tokens > 1024
+        )
+    ):
+        parser.error("Invalid prefill length for the selected context and schedule")
     if args.phase == "decode" and args.cache_encoding is None:
         parser.error("Decode packing requires --cache-encoding")
     if args.shared_model:

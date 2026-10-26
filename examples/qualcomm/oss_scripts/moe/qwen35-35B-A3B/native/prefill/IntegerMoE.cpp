@@ -281,6 +281,7 @@ uint32_t execute_integer_moe(
   const bool streaming = descriptor[4] == expert_stream::kPhase;
   const int phase = streaming ? 0 : descriptor[4];
   const int tokens_count = expert_stream::token_count(descriptor[3]);
+  const int valid_tokens = expert_stream::valid_token_count(descriptor[3]);
   const auto* x = static_cast<const float*>(qhpi_tensor_raw_data(inputs[0]));
   const auto* ids_ddr =
       static_cast<const int32_t*>(qhpi_tensor_raw_data(inputs[1]));
@@ -478,7 +479,7 @@ uint32_t execute_integer_moe(
           QURT_MEM_CACHE_INVALIDATE,
           QURT_MEM_DCACHE);
     const auto* all_ids = tokens_count == 128 ? ids : ids_ddr;
-    for (int i = 0; i < tokens_count * 8; i++) {
+    for (int i = 0; i < valid_tokens * 8; i++) {
       if (unsigned(all_ids[i]) >= 256)
         write(&sync->error, 31);
       else
@@ -488,10 +489,10 @@ uint32_t execute_integer_moe(
     for (int e = 0; e < 256; e++) {
       route_offsets[e + 1] = route_offsets[e] + counts[e];
       cursor[e] = route_offsets[e];
-      if (counts[e] > unsigned(tokens_count))
+      if (counts[e] > unsigned(valid_tokens))
         write(&sync->error, 31);
     }
-    for (int i = 0; i < tokens_count * 8; i++)
+    for (int i = 0; i < valid_tokens * 8; i++)
       if (unsigned(all_ids[i]) < 256)
         assignments[cursor[all_ids[i]]++] = i;
   }
@@ -696,6 +697,10 @@ uint32_t execute_integer_moe(
   if (!error && (phase == 0 || phase == 3))
     for (unsigned t = worker; t < unsigned(tokens_count); t += count)
       for (int j = 0; j < 2048; j += 32) {
+        if (t >= unsigned(valid_tokens)) {
+          vmem(output + t * 2048 + j) = Q6_V_vzero();
+          continue;
+        }
 #if SM_MOE_ACCUMULATE
         auto sum = vmem(route_output + t * 2048 + j);
 #else

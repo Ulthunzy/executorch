@@ -19,17 +19,21 @@ int integer_option(const std::string& value) {
 
 Options parse_options(int argc, char** argv) {
   Options options;
+  std::set<std::string> overrides;
   for (int i = 1; i < argc; ++i) {
     const std::string flag = argv[i];
+    overrides.insert(flag);
     if (flag == "--help") {
       printf(
           "qwen35_moe_runner --model-root DIR --tokenizer-path tokenizer.json\n"
           "  [--prompt TEXT ...] [--interactive] [--system-prompt TEXT]\n"
           "  [--image-path JPG_OR_PNG] (image files are decoded on device)\n"
           "  [--max-new-tokens 128] [--temperature 0] [--enable-thinking]\n"
+          "  [--prompt-tokens N] [--ignore-eos] (fixed-length performance runs)\n"
           "  [--max-seq-len 1152] [--cache-experts 32] [--shared-model DIR]\n"
           "  [--prefill-order layer_major|chunk_major]\n"
           "  [--prefill-io-workers 8]\n"
+          "  [--model-config FILE] (defaults to the deployed plan settings)\n"
           "  [--log-path FILE] [--tokenize-only]\n"
           "Interactive commands: /image PATH QUESTION, /reset, /exit.\n");
       std::exit(0);
@@ -42,6 +46,8 @@ Options parse_options(int argc, char** argv) {
       options.thinking = false;
     else if (flag == "--tokenize-only")
       options.tokenize_only = true;
+    else if (flag == "--ignore-eos")
+      options.ignore_eos = true;
     else {
       if (i + 1 == argc)
         throw std::runtime_error("Missing value for " + flag);
@@ -52,6 +58,8 @@ Options parse_options(int argc, char** argv) {
         options.tokenizer_path = value;
       else if (flag == "--shared-model")
         options.shared_model = value;
+      else if (flag == "--model-config")
+        options.model_config = value;
       else if (flag == "--prompt")
         options.prompts.push_back(value);
       else if (flag == "--image-path")
@@ -64,6 +72,8 @@ Options parse_options(int argc, char** argv) {
         options.log_path = value;
       else if (flag == "--max-new-tokens")
         options.max_new_tokens = integer_option(value);
+      else if (flag == "--prompt-tokens")
+        options.prompt_tokens = integer_option(value);
       else if (flag == "--max-seq-len")
         options.capacity = integer_option(value);
       else if (flag == "--cache-experts")
@@ -88,12 +98,32 @@ Options parse_options(int argc, char** argv) {
     throw std::runtime_error(
         "Missing prefill plan bundle; redeploy with run_chat.py");
   manifest >> plans;
+  nlohmann::json configuration =
+      plans.value("model_configuration", nlohmann::json::object());
+  if (!options.model_config.empty()) {
+    std::ifstream settings(options.model_config);
+    if (!settings)
+      throw std::runtime_error("Cannot open model configuration");
+    settings >> configuration;
+  }
+  if (!configuration.empty())
+    apply_model_settings(options, configuration, overrides);
+  else if (
+      !std::filesystem::is_regular_file(
+          options.model_root + "/prefill/embedding.int4") &&
+      std::filesystem::is_regular_file(
+          options.model_root + "/prefill/embedding.bf16"))
+    options.runtime.embedding_bits = 16;
   if (plans.at("version") != 1 || plans.at("ar_len") != 128 ||
       plans.at("capacity") != options.capacity)
     throw std::runtime_error(
         "Prefill plan bundle does not match the compiled context");
   if (options.prefill_order.empty())
     options.prefill_order = plans.at("prefill_order");
+  options.max_prefill_tokens = plans.value("max_prefill_tokens", 1024);
+  if (options.runtime.context_load_mode == "serial")
+    throw std::runtime_error(
+        "Shared contexts require batched initialization; serial loading is unsupported");
   if (options.prefill_order != "layer_major" &&
       options.prefill_order != "chunk_major")
     throw std::runtime_error("Invalid prefill order");
@@ -101,7 +131,14 @@ Options parse_options(int argc, char** argv) {
                                .lexically_normal()
                                .string();
   if (options.max_new_tokens < 1 || options.max_new_tokens > options.capacity ||
-      (options.capacity != 1152 && options.capacity != 2048) ||
+      options.capacity < 1024 || options.capacity > 32768 ||
+      options.capacity % 128 || options.max_prefill_tokens < 128 ||
+      options.max_prefill_tokens >= options.capacity ||
+      options.max_prefill_tokens % 128 || options.prompt_tokens < 0 ||
+      options.prompt_tokens > options.max_prefill_tokens ||
+      options.prompt_tokens % 128 ||
+      (options.prefill_order == "layer_major" &&
+       options.max_prefill_tokens > 1024) ||
       (options.cache_experts != 16 && options.cache_experts != 32 &&
        options.cache_experts != 64) ||
       options.prefill_io_workers < 1 || options.prefill_io_workers > 16 ||
@@ -124,7 +161,12 @@ Options parse_options(int argc, char** argv) {
   return options;
 }
 
-void configure_environment(const Options& o, int prefix_tokens) {
+void configure_environment(
+    const Options& o,
+    int prefix_tokens,
+    int valid_tokens) {
+  if (valid_tokens < 0)
+    valid_tokens = prefix_tokens;
   const std::string prefill = o.model_root + "/prefill",
                     decode = o.model_root + "/decode";
   const int plan_tokens =
@@ -155,28 +197,30 @@ void configure_environment(const Options& o, int prefix_tokens) {
            {"HANDOFF_MAX_TOKENS", std::to_string(o.max_new_tokens)},
            {"HANDOFF_EOS_IDS", "248046,248044"},
            {"PREFILL_TOKENS", std::to_string(prefix_tokens)},
+           {"PREFILL_VALID_TOKENS", std::to_string(valid_tokens)},
            {"DECODE_CONTEXT_CAPACITY", std::to_string(o.capacity)},
            {"EXPERT_CACHE_SLOTS", std::to_string(o.cache_experts)},
-           {"EMBEDDING_BITS", "4"},
-           {"EXPERT_BITS", "2"},
+           {"EMBEDDING_BITS", std::to_string(o.runtime.embedding_bits)},
+           {"EXPERT_BITS", std::to_string(o.runtime.expert_bits)},
            {"NATIVE_MAPPED_IO", "1"},
            {"NATIVE_RESIDUAL", "1"},
            {"REUSE_EXPERTS", "1"},
            {"INHERIT_EXPERT_CACHE", "1"},
-           {"ASYNC_EXPERT_IO", "1"},
+           {"ASYNC_EXPERT_IO", o.runtime.prefill_async_io ? "1" : "0"},
            {"ASYNC_DECODE_IO", "0"},
            {"EXPERT_IO_WORKERS", std::to_string(o.prefill_io_workers)},
-           {"DECODE_EXPERT_IO_WORKERS", "8"},
-           {"STARTUP_EXPERT_PREFETCH", "overlap"},
-           {"STARTUP_IO_WORKERS", "4"},
+           {"DECODE_EXPERT_IO_WORKERS",
+            std::to_string(o.runtime.decode_io_workers)},
+           {"STARTUP_EXPERT_PREFETCH", o.runtime.startup_prefetch},
+           {"STARTUP_IO_WORKERS", std::to_string(o.runtime.startup_io_workers)},
            {"SKIP_EXPERT_ZERO", "1"},
-           {"EXPERT_READ_CHUNK_KIB", "256"},
-           {"KV_APPEND_ONLY", "1"},
-           {"GDN_STATE_SWAP", "1"},
+           {"EXPERT_READ_CHUNK_KIB", std::to_string(o.runtime.read_chunk_kib)},
+           {"KV_APPEND_ONLY", o.runtime.kv_append_only ? "1" : "0"},
+           {"GDN_STATE_SWAP", o.runtime.state_swap ? "1" : "0"},
            {"NATIVE_MAILBOX", "1"},
-           {"HIT_FIRST_EXPERTS", "1"},
-           {"EXPERT_READY_IO", "1"},
-           {"OVERLAP_STATE_FEEDBACK", "1"},
+           {"HIT_FIRST_EXPERTS", o.runtime.hit_first ? "1" : "0"},
+           {"EXPERT_READY_IO", o.runtime.ready_io ? "1" : "0"},
+           {"OVERLAP_STATE_FEEDBACK", o.runtime.overlap_feedback ? "1" : "0"},
            {"MAILBOX_BACKOFF_US", "0"},
            {"MAILBOX_POLL_DELAY_NS", "0"},
            {"SEED_PREFILL_LRU", "0"},

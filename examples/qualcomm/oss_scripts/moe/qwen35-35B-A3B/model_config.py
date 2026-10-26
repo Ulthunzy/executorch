@@ -147,12 +147,17 @@ class ModelConfig:
             raise ValueError(
                 "This MoE runner has UINT16 KV/GDN/conv interfaces; UINT8 requires new calibration and runner support"
             )
-        if x.max_seq_len not in {1152, 2048} or (
-            x.prefill_ar_len,
-            x.max_prefill_tokens,
-        ) != (128, 1024):
+        if (
+            not 1024 <= x.max_seq_len <= 32768
+            or x.max_seq_len % 128
+            or x.prefill_ar_len != 128
+            or not 128 <= x.max_prefill_tokens < x.max_seq_len
+            or x.max_prefill_tokens % 128
+            or (s.prefill_order == "layer_major" and x.max_prefill_tokens > 1024)
+        ):
             raise ValueError(
-                "Supported graphs use context 1152/2048, AR128 and at most 1024 prefill tokens"
+                "Use AR128, aligned context up to 32768 and a smaller aligned prefill limit; "
+                "layer_major Native batches support at most 1024 tokens"
             )
         if (
             not isinstance(g.system_prompt, str)

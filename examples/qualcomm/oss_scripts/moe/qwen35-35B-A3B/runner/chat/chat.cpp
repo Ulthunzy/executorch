@@ -19,6 +19,22 @@ std::vector<float> initial_image(VisionEncoder* encoder) {
   return conversation->initial_image(encoder);
 }
 
+int run_client(Options options, Client& client, PrefillMain prefill) try {
+  tokenizer_tls_alignment = 1;
+  conversation = std::make_unique<Conversation>(std::move(options), &client);
+  conversation->prepare();
+  std::string root = conversation->options.model_root + "/prefill";
+  char name[] = "qwen35_moe_jni", one[] = "1", zero[] = "0";
+  char* arguments[] = {name, root.data(), one, zero};
+  const int result = prefill(4, arguments);
+  conversation.reset();
+  return result;
+} catch (const std::exception& error) {
+  client.fail(error.what());
+  conversation.reset();
+  return 1;
+}
+
 int main(int argc, char** argv, PrefillMain prefill) try {
   tokenizer_tls_alignment = argc;
   conversation = std::make_unique<Conversation>(parse_options(argc, argv));

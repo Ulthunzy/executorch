@@ -58,8 +58,10 @@ struct DecodeSession {
   int context_capacity = getenv("DECODE_CONTEXT_CAPACITY")
       ? atoi(getenv("DECODE_CONTEXT_CAPACITY"))
       : 1152;
-  int prefix_tokens =
-      getenv("PREFILL_TOKENS") ? atoi(getenv("PREFILL_TOKENS")) : 128;
+  int prefix_tokens = getenv("PREFILL_VALID_TOKENS")
+      ? atoi(getenv("PREFILL_VALID_TOKENS"))
+      : getenv("PREFILL_TOKENS") ? atoi(getenv("PREFILL_TOKENS"))
+                                 : 128;
   int generations[2]{}, position = 128, next_layer = 0;
   bool in_step = false;
   Metrics metrics;

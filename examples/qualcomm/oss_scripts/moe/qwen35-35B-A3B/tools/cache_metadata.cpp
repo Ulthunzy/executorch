@@ -26,8 +26,12 @@ static std::vector<char> read(const std::string& path) {
 }
 
 int main(int argc, char** argv) try {
-  if (argc != 4)
-    throw std::runtime_error("cache_metadata SDK SHARED_EXPORT OUTPUT");
+  if (argc != 4 && argc != 5)
+    throw std::runtime_error(
+        "cache_metadata SDK SHARED_EXPORT OUTPUT [GROUPS]");
+  const int groups = argc == 5 ? std::stoi(argv[4]) : 10;
+  if (groups < 1 || groups > 10)
+    throw std::runtime_error("cache metadata needs 1 through 10 groups");
   void* library = dlopen(
       (std::string(argv[1]) + "/lib/x86_64-linux-clang/libQnnSystem.so")
           .c_str(),
@@ -47,9 +51,9 @@ int main(int argc, char** argv) try {
   auto system = providers[0]->QNN_SYSTEM_INTERFACE_VER_NAME;
   std::ofstream output(argv[3], std::ios::binary);
   output.write("Q36CACHE", 8);
-  const uint32_t header[] = {1, 40};
+  const uint32_t header[] = {1, uint32_t(groups * 4)};
   output.write(reinterpret_cast<const char*>(header), sizeof(header));
-  for (int group = 0; group < 10; group++) {
+  for (int group = 0; group < groups; group++) {
     const auto root = std::string(argv[2]) + "/group" + std::to_string(group);
     const auto binary = read(root + "/context0.bin");
     QnnSystemContext_Handle_t context = nullptr;
@@ -123,7 +127,8 @@ int main(int argc, char** argv) try {
   }
   if (!output)
     throw std::runtime_error("write cache metadata");
-  printf("CACHE_ENCODINGS_READY layers=40 tensors=80\n");
+  printf(
+      "CACHE_ENCODINGS_READY layers=%d tensors=%d\n", groups * 4, groups * 8);
   return 0;
 } catch (const std::exception& error) {
   fprintf(stderr, "%s\n", error.what());

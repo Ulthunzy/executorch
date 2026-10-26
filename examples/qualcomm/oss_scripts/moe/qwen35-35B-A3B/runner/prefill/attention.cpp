@@ -23,6 +23,8 @@ Attention::Attention(
                                : std::vector<int>{0, 1, 2, 5, 4, 3};
   std::vector<int> om =
       linear ? std::vector<int>{3, 2, 0, 1} : std::vector<int>{3, 2, 1, 0};
+  if (linear && graph.inputs.size() == 4)
+    im.push_back(3);
   if (graph.borrowed_context) {
     const auto mapping = bytes(
         std::string(getenv("SHARED_MODEL_ROOT")) + "/group" +
@@ -59,8 +61,16 @@ Attention::Attention(
         std::equal(FIELD(in, dimensions),
                    FIELD(in, dimensions) + FIELD(in, rank),
                    FIELD(out, dimensions));
-    if (!linear)
-      handoff_cache[i].resize(512 * 1024);
+    if (!linear) {
+      const auto elements = Graph::elements(in);
+      if (elements % 512 || !elements)
+        throw std::runtime_error("prefill KV history layout");
+      const int current = elements / 512;
+      if (i && current != history)
+        throw std::runtime_error("prefill K/V history mismatch");
+      history = current;
+      handoff_cache[i].resize(512 * (history + 128));
+    }
     // Matching GDN state grids swap DMA handles and never use CPU staging.
     if (!swap_state[i]) {
       cache_host[i].resize(
@@ -91,19 +101,35 @@ void Attention::prefill(
     int start,
     const float* cos,
     const float* sin,
+    int valid,
     bool reuse) {
+  if (valid < 1 || valid > 128 || start < 0)
+    throw std::runtime_error("invalid AR128 valid length");
+  valid_tokens = valid;
+  if (linear) {
+    if (input.size() == 4)
+      *static_cast<int32_t*>(graph.input(input[3])) = valid - 1;
+    else if (valid != 128)
+      throw std::runtime_error("Re-export GDN with AR128 padding support");
+  }
   if (!reuse)
     memcpy(
         hidden_alias ? hidden_alias->data : graph.input(input[0]),
         hidden,
         128 * 2048 * 4);
   if (!linear) {
-    memcpy(graph.input(input[1]), cos + start * 32, 128 * 32 * 4);
-    memcpy(graph.input(input[2]), sin + start * 32, 128 * 32 * 4);
-    const int history = cold ? 0 : 896, columns = history + 128;
+    auto* cos_input = static_cast<float*>(graph.input(input[1]));
+    auto* sin_input = static_cast<float*>(graph.input(input[2]));
+    std::copy(cos + start * 32, cos + (start + valid) * 32, cos_input);
+    std::copy(sin + start * 32, sin + (start + valid) * 32, sin_input);
+    std::fill(cos_input + valid * 32, cos_input + 128 * 32, 1.f);
+    std::fill(sin_input + valid * 32, sin_input + 128 * 32, 0.f);
+    const int history = cold ? 0 : this->history, columns = history + 128;
+    if (start < 0 || start > history)
+      throw std::runtime_error("prefill position exceeds KV history");
     float* mask = (float*)graph.input(input[3]);
     std::fill(mask, mask + 128 * columns, -255.f);
-    for (int t = 0; t < 128; t++) {
+    for (int t = 0; t < valid; t++) {
       std::fill(
           mask + t * columns + history - start,
           mask + t * columns + history,
@@ -113,14 +139,16 @@ void Attention::prefill(
           mask + t * columns + history + t + 1,
           0.f);
     }
+    // Padding rows still need a finite softmax, but never enter saved KV.
+    for (int t = valid; t < 128; ++t)
+      mask[t * columns + history] = 0.f;
   }
   graph.execute();
 }
 
 void Attention::feedback() {
   // 输出与下一次输入可能使用不同的量化网格，必须先查表重映射。
-  // handoff_cache 保留完整 1024 窗口供 decode 导入，graph 输入则仅保留历史
-  // 896。
+  // Handoff includes the current block; the next graph input retains history.
   for (int c = 0; c < 2; c++) {
     if (swap_state[c]) {
       const int in = cache_input[c], out = output[c + 2];
@@ -146,22 +174,17 @@ void Attention::feedback() {
     if (linear) {
       for (size_t i = 0; i < count; i++)
         to[i] = lut[from[i]];
-    } else if (c == 0)
-      for (int row = 0; row < 512; row++) {
-        auto* full = handoff_cache[c].data() + row * 1024;
-        memcpy(full, to + row * 896, 896 * 2);
-        for (int t = 0; t < 128; t++)
-          full[896 + t] = lut[from[row * 128 + t]];
-        memcpy(to + row * 896, full + 128, 896 * 2);
-      }
-    else
-      for (int h = 0; h < 2; h++) {
-        auto* full = handoff_cache[c].data() + h * 1024 * 256;
-        memcpy(full, to + h * 896 * 256, 896 * 256 * 2);
-        for (int i = 0; i < 128 * 256; i++)
-          full[896 * 256 + i] = lut[from[h * 128 * 256 + i]];
-        memcpy(to + h * 896 * 256, full + 128 * 256, 896 * 256 * 2);
-      }
+    } else {
+      const auto q = FIELD(cache_owner().inputs[cache_input[c]], quantizeParams)
+                         .scaleOffsetEncoding;
+      append_prefill_kv(
+          {to, cache_host[c].size(), q.scale, q.offset},
+          from,
+          lut.data(),
+          handoff_cache[c].data(),
+          c ? CacheLayout::Value : CacheLayout::Key,
+          valid_tokens);
+    }
     memcpy(device_input, to, cache_host[c].size() * 2);
   }
 }

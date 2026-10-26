@@ -80,7 +80,9 @@ def parse_args(argv=None):
     )
     parser.add_argument("--prompt", default="什么是注意力机制,你用python来实现一下")
     parser.add_argument(
-        "--prompt-tokens", type=int, choices=list(range(128, 1025, 128))
+        "--prompt-tokens",
+        type=int,
+        choices=range(128, settings.context.max_prefill_tokens + 1, 128),
     )
     parser.add_argument("--image-path", type=Path)
     parser.add_argument(
@@ -94,7 +96,6 @@ def parse_args(argv=None):
         "--decode-capacity",
         dest="decode_capacity",
         type=int,
-        choices=[1152, 2048],
         default=settings.context.max_seq_len,
     )
     parser.add_argument(

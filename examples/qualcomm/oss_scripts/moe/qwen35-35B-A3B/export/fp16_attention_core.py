@@ -9,6 +9,22 @@ def fp16_attention_core(module, inputs):
     split_attention_core(module, inputs)
     graph = module.graph
     for node in list(graph.nodes):
+        if node.meta.get("fp16_attention_join"):
+            with graph.inserting_after(node):
+                half = graph.call_function(
+                    torch.ops.aten._to_copy.default,
+                    (node,),
+                    {"dtype": torch.float16},
+                )
+            with graph.inserting_after(half):
+                converted = graph.call_function(
+                    torch.ops.aten._to_copy.default,
+                    (half,),
+                    {"dtype": torch.float32},
+                )
+            node.replace_all_uses_with(converted)
+            half.replace_input_with(converted, node)
+            continue
         if node.target != torch.ops.aten.matmul.default:
             continue
         with graph.inserting_before(node):

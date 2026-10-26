@@ -11,7 +11,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from model_config import add_model_config_argument, load_model_config
 
 
-def prepare_data(args):
+def prepare_data(args, settings):
     import torch
     from transformers import AutoTokenizer
     from quantization.checkpoint import Checkpoint, rope_tables
@@ -63,7 +63,7 @@ def prepare_data(args):
         ),
         args.output / "INPUTS.pt",
     )
-    cos, sin = rope_tables(checkpoint.config)
+    cos, sin = rope_tables(checkpoint.config, max(2048, settings.context.max_seq_len))
     (args.output / "assets").mkdir(exist_ok=True)
     cos.numpy().tofile(args.output / "assets/cos.f32")
     sin.numpy().tofile(args.output / "assets/sin.f32")
@@ -382,7 +382,7 @@ def main():
     torch.backends.cuda.matmul.allow_tf32 = False
     torch.backends.cudnn.allow_tf32 = False
     if args.stage == "data":
-        prepare_data(args)
+        prepare_data(args, settings)
     elif args.stage == "embedding-inputs":
         quantized_embedding_inputs(args)
     elif args.stage == "attention":

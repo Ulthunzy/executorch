@@ -3,6 +3,7 @@ import shlex
 
 from .artifacts import decode_layer_dir
 from .plans import prepare_chat_plans
+from .runtime_assets import runtime_assets
 
 
 def deploy_artifacts(args, device, paths, run_dir, vision):
@@ -68,7 +69,7 @@ def deploy_artifacts(args, device, paths, run_dir, vision):
     for name in ("cos", "sin"):
         adb(
             "push",
-            args.artifacts / f"assets/{name}.f32",
+            runtime_assets(args) / f"{name}.f32",
             f"{profile_root}/base-{name}.f32",
         )
     adb("push", args.model / "config.json", profile_root + "/model-config.json")
@@ -119,9 +120,7 @@ def deploy_artifacts(args, device, paths, run_dir, vision):
         for name in ["cos.f32", "sin.f32"]:
             adb("shell", "rm " + target + "/" + name)
             local = (
-                run_dir / name
-                if vision is not None
-                else args.artifacts / "assets" / name
+                run_dir / name if vision is not None else runtime_assets(args) / name
             )
             adb("push", local, target + "/" + name)
     if args.teacher_tokens:
@@ -134,7 +133,7 @@ def deploy_artifacts(args, device, paths, run_dir, vision):
     )
     adb(
         "push",
-        args.artifacts / "assets/cache-encoding.bin",
+        runtime_assets(args) / "cache-encoding.bin",
         decode_root + "/cache-encoding.bin",
     )
     for layer in range(40):

@@ -3,5 +3,6 @@
           qwen35_decode_reset; qwen35_decode_position; qwen35_decode_close;
           qwen35_decode_error;
           qwen35_decode_set_inputs;
+          qwen35_decode_export_state; qwen35_decode_import_state;
   local: *;
 };

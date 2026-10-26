@@ -33,59 +33,38 @@ Attention::Attention(
     if (old.size() != source.elements * 2 || !std::isfinite(source.scale) ||
         source.scale <= 0)
       throw std::runtime_error("prefill cache metadata");
-    // 使用两端图的实际 scale/offset 转换，不能把 UINT16 code 直接当实数复制。
     const auto q =
         FIELD(graph.inputs[target], quantizeParams).scaleOffsetEncoding;
-    std::vector<uint16_t> table(65536);
-    for (int i = 0; i < 65536; i++)
-      table[i] = std::clamp(
-          long(lround(
-              (i + source.offset) * double(source.scale) / q.scale - q.offset)),
-          0L,
-          65535L);
-    initial[c].resize(Graph::elements(graph.inputs[target]));
-    std::fill(initial[c].begin(), initial[c].end(), uint16_t(-q.offset));
-    if (!linear &&
-        (source.elements != 2 * 256 * 1024 ||
-         initial[c].size() != 2 * 256 * history))
-      throw std::runtime_error("KV cache layout");
-    auto* from = reinterpret_cast<const uint16_t*>(old.data());
-    auto* to = initial[c].data();
+    state_elements[c] = Graph::elements(graph.inputs[target]);
+    const int source_window = linear ? 0 : source.elements / 512;
+    initial_tokens = getenv("PREFILL_VALID_TOKENS")
+        ? atoi(getenv("PREFILL_VALID_TOKENS"))
+        : getenv("PREFILL_TOKENS") ? atoi(getenv("PREFILL_TOKENS"))
+                                   : 128;
     if (linear) {
-      if (initial[c].size() != source.elements)
+      if (state_elements[c] != source.elements)
         throw std::runtime_error("GDN state layout");
-      for (size_t i = 0; i < source.elements; i++)
-        to[i] = table[from[i]];
-    } else if (append_kv) {
-      const int past =
-          getenv("PREFILL_TOKENS") ? atoi(getenv("PREFILL_TOKENS")) : 128;
-      if (past < 0 || past > 1024 || past > history)
-        throw std::runtime_error("append KV prefix");
-      if (c == 0)
-        for (int row = 0; row < 512; row++)
-          for (int t = 0; t < past; t++)
-            to[row * history + t] = table[from[row * 1024 + 1024 - past + t]];
-      else
-        for (int h = 0; h < 2; h++)
-          for (int i = 0; i < past * 256; i++)
-            to[h * history * 256 + i] =
-                table[from[h * 1024 * 256 + (1024 - past) * 256 + i]];
-    } else if (c == 0) {
-      if (source.elements != 2 * 256 * 1024 ||
-          initial[c].size() != 2 * 256 * history)
-        throw std::runtime_error("K layout");
-      for (int row = 0; row < 512; row++)
-        for (int t = 0; t < 1024; t++)
-          to[row * history + history - 1024 + t] = table[from[row * 1024 + t]];
+      initial[c].resize(source.elements);
     } else {
-      if (source.elements != 2 * 1024 * 256 ||
-          initial[c].size() != 2 * history * 256)
-        throw std::runtime_error("V layout");
-      for (int h = 0; h < 2; h++)
-        for (int i = 0; i < 1024 * 256; i++)
-          to[h * history * 256 + (history - 1024) * 256 + i] =
-              table[from[h * 1024 * 256 + i]];
+      if (!source_window || source.elements % 512 ||
+          state_elements[c] != 512 * size_t(history) || initial_tokens < 1 ||
+          initial_tokens > source_window || initial_tokens > history)
+        throw std::runtime_error("KV cache layout or prefix length");
+      // Store only real prefix tokens; unused decode capacity is quantized
+      // zero.
+      initial[c].resize(512 * size_t(initial_tokens));
     }
+    copy_cache_range(
+        {reinterpret_cast<uint16_t*>(old.data()),
+         source.elements,
+         source.scale,
+         source.offset},
+        {initial[c].data(), initial[c].size(), q.scale, q.offset},
+        linear ? CacheLayout::State
+               : (c ? CacheLayout::Value : CacheLayout::Key),
+        linear ? 0 : source_window - initial_tokens,
+        0,
+        linear ? source.elements : initial_tokens);
     maps[c] = grid_map(graph.outputs[output[c + 2]], graph.inputs[target]);
     identity[c] = true;
     for (int i = 0; i < 65536; i++)
@@ -96,22 +75,42 @@ Attention::Attention(
   }
 }
 
+QuantizedCacheView Attention::cache_view(int c) {
+  if (c < 0 || c >= 2)
+    throw std::runtime_error("Invalid cache index");
+  const auto encoding =
+      FIELD(graph.inputs[input[c + (linear ? 1 : 4)]], quantizeParams)
+          .scaleOffsetEncoding;
+  return {
+      static_cast<uint16_t*>(state[c]->data),
+      state_elements[c],
+      encoding.scale,
+      encoding.offset};
+}
+
 void Attention::reset() {
-  last_position =
-      (getenv("PREFILL_TOKENS") ? atoi(getenv("PREFILL_TOKENS")) : 128) - 1;
-  for (int c = 0; c < 2; c++)
-    memcpy(state[c]->data, initial[c].data(), initial[c].size() * 2);
+  last_position = initial_tokens - 1;
+  for (int c = 0; c < 2; ++c) {
+    auto destination = cache_view(c);
+    clear_cache(destination);
+    copy_cache_range(
+        {initial[c].data(),
+         initial[c].size(),
+         destination.scale,
+         destination.offset},
+        destination,
+        linear ? CacheLayout::State
+               : (c ? CacheLayout::Value : CacheLayout::Key),
+        0,
+        linear || append_kv ? 0 : history - initial_tokens,
+        linear ? initial[c].size() : initial_tokens);
+  }
 }
 
 void Attention::clear() {
   last_position = -1;
-  for (int c = 0; c < 2; ++c) {
-    const auto encoding =
-        FIELD(graph.inputs[input[c + (linear ? 1 : 4)]], quantizeParams)
-            .scaleOffsetEncoding;
-    auto* values = static_cast<uint16_t*>(state[c]->data);
-    std::fill(values, values + initial[c].size(), uint16_t(-encoding.offset));
-  }
+  for (int c = 0; c < 2; ++c)
+    clear_cache(cache_view(c));
 }
 
 void Attention::execute(
@@ -122,11 +121,11 @@ void Attention::execute(
   last_position = position;
   memcpy(alias->data, hidden, 2048 * 4);
   if (!linear) {
+    if (position < 0 || position > history)
+      throw std::runtime_error("FA position");
     memcpy(graph.input(input[1]), cos + position * 32, 32 * 4);
     memcpy(graph.input(input[2]), sin + position * 32, 32 * 4);
     auto* mask = static_cast<float*>(graph.input(input[3]));
-    if (position < 0 || position > history)
-      throw std::runtime_error("FA position");
     std::fill(mask, mask + history + 1, -255.f);
     if (append_kv) {
       std::fill(mask, mask + position, 0.f);
@@ -147,7 +146,9 @@ void Attention::execute(
   }
   if (const char* directory = getenv("GDN_CAPTURE"); directory && linear &&
       position ==
-          (getenv("PREFILL_TOKENS") ? atoi(getenv("PREFILL_TOKENS")) : 128) &&
+          (getenv("PREFILL_VALID_TOKENS") ? atoi(getenv("PREFILL_VALID_TOKENS"))
+               : getenv("PREFILL_TOKENS") ? atoi(getenv("PREFILL_TOKENS"))
+                                          : 128) &&
       graph.name.find("/layer0/attention.bin") != std::string::npos) {
     for (size_t i = 0; i < graph.inputs.size(); i++)
       save(
@@ -188,9 +189,9 @@ void Attention::feedback() {
       graph.bindings[FIELD(graph.outputs[out], id)] = graph.outbuf[out];
     } else if (linear) {
       if (identity[c])
-        memcpy(to, from, initial[c].size() * 2);
+        memcpy(to, from, state_elements[c] * 2);
       else
-        for (size_t i = 0; i < initial[c].size(); i++)
+        for (size_t i = 0; i < state_elements[c]; i++)
           to[i] = maps[c][from[i]];
     } else if (append_kv && last_position < history) {
       if (c == 0)
@@ -230,13 +231,13 @@ void Attention::feedback() {
 void Attention::save_cache(const std::string& path, int c) {
   // 文件交接口径统一为有效历史靠右，屏蔽内部 append 布局与窗口布局的差异。
   if (linear || !append_kv) {
-    save(path, state[c]->data, initial[c].size() * 2);
+    save(path, state[c]->data, state_elements[c] * 2);
     return;
   }
   const int valid = std::min(history, last_position + 1);
   const auto q =
       FIELD(graph.inputs[input[c + 4]], quantizeParams).scaleOffsetEncoding;
-  std::vector<uint16_t> ordered(initial[c].size(), uint16_t(-q.offset));
+  std::vector<uint16_t> ordered(state_elements[c], uint16_t(-q.offset));
   const auto* from = static_cast<const uint16_t*>(state[c]->data);
   if (c == 0)
     for (int row = 0; row < 512; row++)

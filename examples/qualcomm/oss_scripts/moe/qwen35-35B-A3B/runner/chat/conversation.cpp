@@ -1,4 +1,5 @@
 #include "conversation.h"
+#include "../prefill_api.h"
 #include "../runtime_utils.h"
 
 #include <executorch/extension/llm/sampler/sampler.h>
@@ -11,8 +12,10 @@
 #include <unistd.h>
 
 namespace moe_chat {
-Conversation::Conversation(Options settings)
-    : options(std::move(settings)), logits(248320) {
+Conversation::Conversation(Options settings, Client* transport)
+    : options(std::move(settings)), logits(248320), client(transport) {
+  if (client)
+    return;
   console = fdopen(dup(STDOUT_FILENO), "w");
   if (!console)
     throw std::runtime_error("Cannot open chat output");
@@ -26,6 +29,10 @@ Conversation::~Conversation() {
 }
 
 void Conversation::report_error(const std::string& message) {
+  if (client) {
+    client->fail(message);
+    return;
+  }
   fprintf(
       console,
       "推理失败：%s；运行日志：%s\n",
@@ -89,13 +96,15 @@ Conversation::prompt_tokens(const std::string& text, bool first, bool image) {
 }
 
 void Conversation::prepare() {
-  fflush(stdout);
-  fflush(stderr);
-  FILE* log = fopen(options.log_path.c_str(), "w");
-  if (!log || dup2(fileno(log), STDOUT_FILENO) < 0 ||
-      dup2(fileno(log), STDERR_FILENO) < 0)
-    throw std::runtime_error("Cannot redirect runtime diagnostics");
-  fclose(log);
+  if (!client) {
+    fflush(stdout);
+    fflush(stderr);
+    FILE* log = fopen(options.log_path.c_str(), "w");
+    if (!log || dup2(fileno(log), STDOUT_FILENO) < 0 ||
+        dup2(fileno(log), STDERR_FILENO) < 0)
+      throw std::runtime_error("Cannot redirect runtime diagnostics");
+    fclose(log);
+  }
   if (tokenizer.load(options.tokenizer_path) != tokenizers::Error::Ok)
     throw std::runtime_error(
         "Cannot load tokenizer: " + options.tokenizer_path);
@@ -108,6 +117,10 @@ void Conversation::prepare() {
       throw std::runtime_error("Tokenizer does not match the exported model");
   }
   rotary = std::make_unique<RotaryPositions>(options.model_root);
+  validate_rope_tables(
+      rotary->cos.size() * sizeof(float),
+      rotary->sin.size() * sizeof(float),
+      options.capacity);
   if (std::ifstream(options.model_root + "/prefill/vision.bin"))
     image_layout = std::make_unique<ImageLayout>(options.model_root);
   if (!options.image_path.empty() && !image_layout)
@@ -125,19 +138,26 @@ void Conversation::prepare() {
   }
   first_tokens =
       prompt_tokens(options.prompts.front(), true, !options.image_path.empty());
-  const size_t target = (first_tokens.size() + 127) / 128 * 128;
-  if (target > 1024 ||
-      target + options.max_new_tokens > size_t(options.capacity) + 1)
+  const size_t target = options.prompt_tokens
+      ? size_t(options.prompt_tokens)
+      : (first_tokens.size() + 127) / 128 * 128;
+  const size_t valid = options.prompt_tokens ? target : first_tokens.size();
+  if (target < first_tokens.size() ||
+      target > size_t(options.max_prefill_tokens) ||
+      valid + options.max_new_tokens > size_t(options.capacity))
     throw std::runtime_error(
         "Initial prompt and requested output exceed the compiled context");
-  // Match the calibrated host path: whitespace lives inside the system message,
-  // leaving the final cache/logits at the actual assistant generation boundary.
-  auto end = std::find(first_tokens.begin(), first_tokens.end(), 248046);
-  const auto space = encode(" ");
-  if (end == first_tokens.end() || space.size() != 1)
-    throw std::runtime_error("Invalid ChatML system padding");
-  first_tokens.insert(end, target - first_tokens.size(), space[0]);
+  // Explicit benchmark lengths add real whitespace. Ordinary prompts retain
+  // their original tokenization and use inactive AR128 padding instead.
+  if (options.prompt_tokens) {
+    auto end = std::find(first_tokens.begin(), first_tokens.end(), 248046);
+    const auto space = encode(" ");
+    if (end == first_tokens.end() || space.size() != 1)
+      throw std::runtime_error("Invalid ChatML system padding");
+    first_tokens.insert(end, target - first_tokens.size(), space[0]);
+  }
   rotary->append(first_tokens, 0, image_layout.get());
+  last_input_token = first_tokens.back();
   rotary->save(options.model_root);
   if (!options.image_path.empty()) {
     first_pixels = image_patches(options.image_path, *image_layout);
@@ -153,19 +173,21 @@ void Conversation::prepare() {
   }
   std::ofstream file(
       options.model_root + "/prefill/tokens.i64", std::ios::binary);
-  file.write(
-      reinterpret_cast<const char*>(first_tokens.data()),
-      first_tokens.size() * 8);
+  auto padded = first_tokens;
+  padded.resize(target, 248044);
+  file.write(reinterpret_cast<const char*>(padded.data()), padded.size() * 8);
   if (!file)
     throw std::runtime_error("Cannot write prefill tokens");
   file.close();
-  configure_environment(options, first_tokens.size());
+  configure_environment(options, padded.size(), first_tokens.size());
   if (options.tokenize_only) {
     fprintf(console, "Encoded %zu tokens\n", first_tokens.size());
     return;
   }
-  fprintf(console, "正在加载模型…\n");
-  fflush(console);
+  if (!client) {
+    fprintf(console, "正在加载模型…\n");
+    fflush(console);
+  }
 }
 
 std::vector<float> Conversation::initial_image(VisionEncoder* encoder) {
@@ -185,19 +207,74 @@ void Conversation::consume(int64_t token) {
     throw std::runtime_error(error());
 }
 
+bool Conversation::prefill(
+    const std::vector<uint64_t>& ids,
+    const std::vector<float>& features) {
+  if (client && client->stopped()) {
+    needs_reset = true;
+    return false;
+  }
+  Qwen35SessionState state;
+  if (export_state(&state))
+    throw std::runtime_error(error());
+  std::vector<int64_t> tokens;
+  if (pending >= 0)
+    tokens.push_back(pending);
+  tokens.insert(tokens.end(), ids.begin(), ids.end());
+  needs_reset = true;
+  try {
+    qwen35_prefill_append(
+        tokens.data(),
+        tokens.size(),
+        features.data(),
+        features.size(),
+        rotary->cos.data(),
+        rotary->sin.data(),
+        rotary->cos.size(),
+        state,
+        logits.data(),
+        [this] {
+          return client && client->stopped();
+        });
+  } catch (...) {
+    // A partially filled slot may no longer contain its former expert. Mark
+    // all slots cold before reset; never publish stale payload identities.
+    state.aborted = true;
+    for (auto& layer : state.layer) {
+      std::fill(std::begin(layer.experts), std::end(layer.experts), -1);
+      std::fill(std::begin(layer.stamps), std::end(layer.stamps), 0);
+    }
+    if (import_state(&state))
+      throw std::runtime_error(error());
+    if (client && client->stopped())
+      return false;
+    throw;
+  }
+  if (import_state(&state))
+    throw std::runtime_error(error());
+  pending = -1;
+  needs_reset = false;
+  last_input_token = ids.back();
+  return true;
+}
+
 void Conversation::generate() {
   const int begin_position = position();
   const int limit =
-      std::min(options.max_new_tokens, options.capacity + 1 - begin_position);
+      std::min(options.max_new_tokens, options.capacity - begin_position);
   executorch::extension::llm::Sampler sampler(
       248320, options.temperature, 0.9f, 42);
-  uint64_t previous = first_tokens.back();
+  uint64_t previous = last_input_token;
   generated.clear();
   const auto started = Clock::now();
-  fprintf(console, "助手> ");
-  fflush(console);
+  if (!client) {
+    fprintf(console, "助手> ");
+    fflush(console);
+  }
   ended = false;
   for (int i = 0; i < limit; ++i) {
+    if (client && client->stopped())
+      break;
     pending = sampler.sample(logits.data());
     generated.push_back(pending);
     ended = pending == 248046 || pending == 248044;
@@ -208,20 +285,28 @@ void Conversation::generate() {
         pending,
         position(),
         elapsed(started));
-    if (ended)
+    if (ended && !options.ignore_eos)
       break;
     auto piece = tokenizer.decode(previous, pending, true);
     if (!piece.ok())
       throw std::runtime_error("Output detokenization failed");
     const auto& text = piece.get();
-    fwrite(text.data(), 1, text.size(), console);
-    fflush(console);
+    if (client)
+      client->token(text);
+    else {
+      fwrite(text.data(), 1, text.size(), console);
+      fflush(console);
+    }
     previous = pending;
-    if (i + 1 < limit)
+    if (i + 1 < limit && !(client && client->stopped())) {
       consume(pending);
+      pending = -1;
+    }
   }
-  fprintf(console, "\n");
-  fflush(console);
+  if (!client) {
+    fprintf(console, "\n");
+    fflush(console);
+  }
   ++turns;
   empty = false;
   printf(
@@ -232,25 +317,78 @@ void Conversation::generate() {
       generated.size(),
       ended,
       elapsed(started));
+  if (client)
+    client->complete(nlohmann::json{
+        {"generated_tokens", generated.size()},
+        {"position", position()},
+        {"generation_ms", elapsed(started)},
+        {"eos", ended},
+        {"stopped", client->stopped()},
+        {"requires_reset",
+         false}}.dump());
+}
+
+void Conversation::reset_context() {
+  if (reset())
+    throw std::runtime_error(error());
+  pending = -1;
+  ended = false;
+  empty = true;
+  needs_reset = false;
+  rotary->reset();
+  if (set_inputs(
+          nullptr,
+          0,
+          rotary->cos.data(),
+          rotary->sin.data(),
+          rotary->cos.size()))
+    throw std::runtime_error(error());
+}
+
+void Conversation::client_turn(const Request& request) {
+  if (request.kind == Request::Kind::Reset) {
+    reset_context();
+    client->complete("{\"reset\":true}");
+    return;
+  }
+  if (needs_reset)
+    throw std::runtime_error("Reset the conversation after interrupted input");
+  const bool image = !request.image_path.empty();
+  const auto ids = prompt_tokens(request.prompt, empty, image);
+  if (position() + int(ids.size()) + (pending >= 0) >= options.capacity)
+    throw std::runtime_error("Context is full; reset the conversation");
+  std::vector<float> features;
+  if (image) {
+    if (!vision || !image_layout)
+      throw std::runtime_error(
+          "Vision was not enabled when creating this module");
+    features =
+        encode_image(vision, image_patches(request.image_path, *image_layout));
+    if (features.size() != size_t(image_layout->tokens()) * 2048)
+      throw std::runtime_error("Vision output differs from image token count");
+  }
+  rotary->append(ids, position() + (pending >= 0), image_layout.get());
+  if (set_inputs(
+          features.data(),
+          features.size(),
+          rotary->cos.data(),
+          rotary->sin.data(),
+          rotary->cos.size()))
+    throw std::runtime_error(error());
+  if (!prefill(ids, features)) {
+    client->complete("{\"stopped\":true,\"requires_reset\":true}");
+    return;
+  }
+  options.max_new_tokens = request.max_new_tokens;
+  options.temperature = request.temperature;
+  generate();
 }
 
 bool Conversation::turn(const std::string& text) {
   if (text == "/exit")
     return false;
   if (text == "/reset") {
-    if (reset())
-      throw std::runtime_error(error());
-    pending = -1;
-    ended = false;
-    empty = true;
-    rotary->reset();
-    if (set_inputs(
-            nullptr,
-            0,
-            rotary->cos.data(),
-            rotary->sin.data(),
-            rotary->cos.size()))
-      throw std::runtime_error(error());
+    reset_context();
     fprintf(console, "对话已清空。\n");
     fflush(console);
     printf("CHAT_RESET position=%d resources_retained=1\n", position());
@@ -300,11 +438,7 @@ bool Conversation::turn(const std::string& text) {
     throw std::runtime_error(error());
   // The final sampled token (including EOS) has not been fed back yet. Commit
   // it before appending the next user turn; never reset or repad existing KV.
-  if (pending >= 0)
-    consume(pending);
-  for (const auto id : ids)
-    consume(id);
-  pending = -1;
+  prefill(ids, features);
   printf(
       "CHAT_APPEND turn=%d tokens=%zu position=%d elapsed_ms=%.6f state_reset=0\n",
       turns + 1,
@@ -328,7 +462,12 @@ int Conversation::run(void* library) {
       reinterpret_cast<decltype(error)>(dlsym(library, "qwen35_decode_error"));
   set_inputs = reinterpret_cast<decltype(set_inputs)>(
       dlsym(library, "qwen35_decode_set_inputs"));
-  if (!open || !step || !reset || !position || !close || !error || !set_inputs)
+  export_state = reinterpret_cast<decltype(export_state)>(
+      dlsym(library, "qwen35_decode_export_state"));
+  import_state = reinterpret_cast<decltype(import_state)>(
+      dlsym(library, "qwen35_decode_import_state"));
+  if (!open || !step || !reset || !position || !close || !error ||
+      !set_inputs || !export_state || !import_state)
     throw std::runtime_error("Decode library does not support persistent chat");
 
   struct DecoderLifetime {
@@ -343,6 +482,8 @@ int Conversation::run(void* library) {
 
   if (open((options.model_root + "/decode").c_str(), 4096))
     throw std::runtime_error(error());
+  if (client)
+    client->ready();
   {
     std::ifstream file(
         options.model_root + "/prefill/pte-0-logits.f32", std::ios::binary);
@@ -352,6 +493,22 @@ int Conversation::run(void* library) {
       throw std::runtime_error("Cannot read first prefill logits");
   }
   generate();
+  if (client) {
+    while (true) {
+      const auto request = client->next();
+      if (request.kind == Request::Kind::Close)
+        break;
+      options.thinking = request.thinking;
+      try {
+        client_turn(request);
+      } catch (const std::exception& e) {
+        client->fail(e.what());
+      }
+    }
+    close();
+    close = nullptr;
+    return 0;
+  }
   bool quit = false;
   for (size_t i = 1; i < options.prompts.size(); ++i)
     if (!turn(options.prompts[i])) {

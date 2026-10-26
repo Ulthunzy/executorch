@@ -7,14 +7,44 @@
 #include "vision_encoder.h"
 #include "../handoff.h"
 #include "../decode_api.h"
+#include "../prefill_api.h"
 #include "../shared/graph_binding.h"
 #ifdef MOE_CHAT_RUNNER
 #include "../chat/chat.h"
+#ifdef MOE_JNI_RUNNER
+#include "../chat/conversation.h"
+#endif
 #endif
 
 using namespace executorch::runtime;
 static std::string model_root;
 static std::unique_ptr<PrefillSession> session;
+
+void qwen35_prefill_append(
+    const int64_t* tokens,
+    size_t count,
+    const float* features,
+    size_t feature_count,
+    const float* cos,
+    const float* sin,
+    size_t table_count,
+    Qwen35SessionState& state,
+    float* logits,
+    const std::function<bool()>& stopped) {
+  if (!session)
+    throw std::runtime_error("prefill session is not resident");
+  session->append(
+      tokens,
+      count,
+      features,
+      feature_count,
+      cos,
+      sin,
+      table_count,
+      state,
+      logits,
+      stopped);
+}
 
 struct Stage {
   uint32_t kind, layer, plan_tokens;
@@ -134,6 +164,8 @@ class PrefillBackend final : public BackendInterface {
       for (int chunk = 0; chunk < chunks; chunk++) {
         if (chunks > 1)
           session->chunk_start = chunk * 128;
+        session->valid_tokens = std::min(
+            128, session->sequence_valid_tokens - session->chunk_start);
         const size_t hidden_offset = size_t(chunk) * 128 * 2048;
         const size_t route_offset = size_t(chunk) * 128 * 8;
         switch (stage.kind) {
@@ -195,7 +227,9 @@ static Backend backend{"Qwen36PrefillStage", &backend_instance};
 static auto registered = register_backend(backend);
 
 static int prefill_main(int argc, char** argv) try {
+#ifndef MOE_JNI_RUNNER
   setvbuf(stdout, nullptr, _IONBF, 0);
+#endif
   runtime_init();
   if (argc != 4)
     throw std::runtime_error("usage: pte_runner ROOT SAMPLES WARMUPS");
@@ -234,11 +268,18 @@ static int prefill_main(int argc, char** argv) try {
 
   const int prompt_tokens =
       getenv("PREFILL_TOKENS") ? atoi(getenv("PREFILL_TOKENS")) : 128;
-  if (samples != 1 || warmups || prompt_tokens < 128 || prompt_tokens > 1024 ||
-      prompt_tokens % 128 ||
+  const int valid_tokens = getenv("PREFILL_VALID_TOKENS")
+      ? atoi(getenv("PREFILL_VALID_TOKENS"))
+      : prompt_tokens;
+  if (valid_tokens < 1 || valid_tokens > session->logical_capacity ||
+      valid_tokens > prompt_tokens || prompt_tokens - valid_tokens >= 128)
+    throw std::runtime_error("invalid prefill padding length");
+  const int max_prefill_tokens = session->attention[3]->history + 128;
+  if (samples != 1 || warmups || prompt_tokens < 128 ||
+      prompt_tokens > max_prefill_tokens || prompt_tokens % 128 ||
       (plan_tokens != 128 && plan_tokens != prompt_tokens))
     throw std::runtime_error(
-        "prefill supports one sequence of 128 through1024 tokens");
+        "prefill sequence exceeds the compiled KV history or plan alignment");
   auto data = bytes(model_root + "/tokens.i64");
   if (data.size() != size_t(prompt_tokens) * 8)
     throw std::runtime_error("token input size");
@@ -269,6 +310,9 @@ static int prefill_main(int argc, char** argv) try {
   const auto sequence_begin = Clock::now();
   const int chunks_per_plan = plan_tokens / 128;
   for (int chunk = 0; chunk < prompt_tokens / 128; chunk += chunks_per_plan) {
+    const int active_tokens = std::min(plan_tokens, valid_tokens - chunk * 128);
+    session->sequence_valid_tokens =
+        active_tokens + (plan_tokens == 128 ? chunk * 128 : 0);
     for (const auto& cache : session->caches)
       for (const auto& entry : cache.entries) {
         seeds.push_back(entry.expert);
@@ -300,11 +344,11 @@ static int prefill_main(int argc, char** argv) try {
     if (m.calls[0] != chunks_per_plan || m.calls[1] != 40 * chunks_per_plan ||
         m.calls[2] != 40 * chunks_per_plan ||
         m.calls[3] != 40 * chunks_per_plan || m.calls[4] != 1 ||
-        m.assignments != 40960 * chunks_per_plan ||
+        m.assignments != active_tokens * 8 * 40 ||
         counts[0] != m.native_calls || counts[1] != int(m.requests) ||
-        counts[2] != 40960 * chunks_per_plan ||
+        counts[2] != active_tokens * 8 * 40 ||
         counts[3] != 40 * chunks_per_plan ||
-        session->chunk_start != (chunk + chunks_per_plan) * 128)
+        session->chunk_start != chunk * 128 + active_tokens)
       throw std::runtime_error("chunk task coverage");
     if (rt.context_creates != creates || rt.context_frees != frees ||
         rt.memory_registers != regs || rt.memory_deregisters != deregs ||
@@ -333,7 +377,7 @@ static int prefill_main(int argc, char** argv) try {
         chunk * 128,
         plan_tokens,
         total_ms,
-        plan_tokens * 1000. / total_ms,
+        active_tokens * 1000. / total_ms,
         m.embedding,
         m.attention,
         m.router,
@@ -391,14 +435,15 @@ static int prefill_main(int argc, char** argv) try {
             "encoded image features were not fully consumed");
       const double loop_ms = elapsed(sequence_begin);
       printf(
-          "PREFILL_TOTAL tokens=%d chunks=%d graph_ms=%.6f loop_ms=%.6f tokens_per_second=%.6f direct_bytes=%llu native_calls=%d\n",
-          prompt_tokens,
+          "PREFILL_TOTAL tokens=%d chunks=%d graph_ms=%.6f loop_ms=%.6f tokens_per_second=%.6f direct_bytes=%llu native_calls=%d padded_tokens=%d\n",
+          valid_tokens,
           prompt_tokens / 128,
           graph_total,
           loop_ms,
-          1000 * prompt_tokens / loop_ms,
+          1000 * valid_tokens / loop_ms,
           (unsigned long long)direct_total,
-          native_total);
+          native_total,
+          prompt_tokens);
       auto* scores = result->at(0).toTensor().const_data_ptr<float>();
       const int64_t first = std::max_element(scores, scores + 248320) - scores;
       printf(
@@ -540,7 +585,7 @@ static int prefill_main(int argc, char** argv) try {
     const char* decode_async = getenv("ASYNC_DECODE_IO");
     if (decode_async)
       setenv("ASYNC_EXPERT_IO", decode_async, 1);
-    session->finish_prefill_native();
+    session->prepare_decode();
     const auto creates = session->runtime.context_creates;
     const auto frees = session->runtime.context_frees;
     const auto registrations = session->runtime.memory_registers;
@@ -587,6 +632,11 @@ static int prefill_main(int argc, char** argv) try {
   return 1;
 }
 
+#ifdef MOE_JNI_RUNNER
+int qwen35_moe_run_client(moe_chat::Options options, moe_chat::Client& client) {
+  return moe_chat::run_client(std::move(options), client, prefill_main);
+}
+#else
 int main(int argc, char** argv) {
 #ifdef MOE_CHAT_RUNNER
   return moe_chat::main(argc, argv, prefill_main);
@@ -594,3 +644,5 @@ int main(int argc, char** argv) {
   return prefill_main(argc, argv);
 #endif
 }
+
+#endif

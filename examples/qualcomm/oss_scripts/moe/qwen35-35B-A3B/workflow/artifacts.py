@@ -3,6 +3,7 @@ import struct
 import hashlib
 
 from .plans import check_plan
+from .runtime_assets import runtime_assets, validate_rope
 
 
 def decode_layer_dir(args, layer):
@@ -50,6 +51,10 @@ def check_artifacts(args):
         )
     if args.decode_context_load_mode not in ("async", "serial"):
         raise ValueError("Unsupported decode context loading mode in ASSETS.json")
+    if args.shared_model and args.decode_context_load_mode == "serial":
+        raise ValueError(
+            "Shared contexts require batched initialization; serial loading is unsupported"
+        )
     required = [
         args.build_dir / "qwen35_moe_runner",
         args.build_dir / "prefill_handoff_runner",
@@ -62,7 +67,7 @@ def check_artifacts(args):
         args.model / "tokenizer.json",
         args.artifacts / "cold-experts.i32",
         *[
-            args.artifacts / "assets" / name
+            runtime_assets(args) / name
             for name in ["cache-encoding.bin", "cos.f32", "sin.f32"]
         ],
     ]
@@ -102,6 +107,7 @@ def check_artifacts(args):
         raise FileNotFoundError(
             "Missing artifacts/build outputs:\n" + "\n".join(missing)
         )
+    validate_rope(runtime_assets(args), args.decode_capacity)
     if args.shared_model:
         covered = set()
         for group in range(10):
@@ -129,7 +135,17 @@ def check_artifacts(args):
             for layer in expected:
                 inputs = 6 if layer % 4 == 3 else 3
                 for method, counts in (
-                    ("prefill_attention", (inputs, 4)),
+                    (
+                        "prefill_attention",
+                        (
+                            inputs
+                            + (
+                                manifest.get("prefill_valid_length", False)
+                                and layer % 4 != 3
+                            ),
+                            4,
+                        ),
+                    ),
                     ("prefill_router", (1, 3)),
                     ("decode", (inputs, 7)),
                 ):

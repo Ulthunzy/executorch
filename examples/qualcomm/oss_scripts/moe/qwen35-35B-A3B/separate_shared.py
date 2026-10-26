@@ -5,6 +5,7 @@ import re
 import shlex
 import subprocess
 import sys
+import shutil
 from dataclasses import replace
 
 from model_config import add_model_config_argument, load_model_config
@@ -16,7 +17,7 @@ def main():
         description="Capture SDK weight ranges and separate shared contexts, one group at a time"
     )
     add_model_config_argument(parser)
-    parser.add_argument("--max-seq-len", type=int, choices=[1152, 2048])
+    parser.add_argument("--max-seq-len", type=int)
     parser.add_argument("--source-dir", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--head-context", type=Path)
@@ -94,6 +95,14 @@ def main():
             check=True,
         )
         print("SEPARATED", name, flush=True)
+        if name != "head":
+            directory = source.parent
+            for metadata in [directory / "GRAPHS.json", *directory.glob("*.io")]:
+                shutil.copy2(metadata, destination / metadata.name)
+    for name in ("cache-encoding.bin", "cos.f32", "sin.f32", "RUNTIME.json"):
+        source = args.source_dir / name
+        if source.is_file():
+            shutil.copy2(source, args.output / name)
 
 
 if __name__ == "__main__":
