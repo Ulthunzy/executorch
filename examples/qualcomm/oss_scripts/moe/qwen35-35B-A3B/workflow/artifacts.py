@@ -102,6 +102,8 @@ def check_artifacts(args):
                 )
     if args.embedding_table:
         required.append(args.embedding_table)
+    else:
+        required.append(args.artifacts / "embedding.bf16")
     for layer in range(40):
         required.extend(
             [
@@ -109,6 +111,8 @@ def check_artifacts(args):
                 args.artifacts / f"indices/layer{layer}/bank-index.bin",
             ]
         )
+        if args.deploy_weights:
+            required.append(args.artifacts / f"banks/layer{layer}/experts.n2")
         if not args.shared_model:
             directory = decode_layer_dir(args, layer)
             required.extend([directory / "attention.bin", directory / "io.bin"])

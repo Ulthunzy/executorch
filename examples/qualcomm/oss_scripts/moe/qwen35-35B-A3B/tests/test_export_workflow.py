@@ -1,3 +1,4 @@
+import hashlib
 import json
 from pathlib import Path
 import struct
@@ -42,6 +43,17 @@ def make_config(tmp_path, **changes):
     write(model_config, json.dumps(numerical).encode())
     source = tmp_path / "calibrated"
     write(source / "MODEL_CONFIG.json", json.dumps(numerical).encode())
+    write(
+        source / "DATA.json",
+        json.dumps(
+            dict(
+                index_sha256=hashlib.sha256(
+                    (model / "model.safetensors.index.json").read_bytes()
+                ).hexdigest(),
+                safetensors={},
+            )
+        ).encode(),
+    )
     for name in (
         "QUANTIZATION_COMPLETE.json",
         "cold-experts.i32",
@@ -285,6 +297,35 @@ def test_resume_rejects_changed_inputs(tmp_path, monkeypatch):
     with pytest.raises(ValueError, match="changed"):
         pipeline.run()
     assert len(calls) == count
+
+
+def test_calibrated_export_rejects_another_checkpoint(tmp_path):
+    pipeline = ExportPipeline(load_export_config(make_config(tmp_path)))
+    provenance = pipeline.config.calibration_dir / "DATA.json"
+    data = json.loads(provenance.read_text())
+    data["index_sha256"] = "different checkpoint"
+    provenance.write_text(json.dumps(data))
+    with pytest.raises(ValueError, match="Checkpoint index changed"):
+        pipeline.check()
+
+
+def test_checkpoint_provenance_rejects_modified_or_unrecorded_shards(tmp_path):
+    from quantization.provenance import validate_checkpoint_source
+
+    shard = tmp_path / "weights.safetensors"
+    write(shard)
+    index = json.dumps(dict(weight_map={"weight": shard.name})).encode()
+    write(tmp_path / "model.safetensors.index.json", index)
+    metadata = dict(index_sha256=hashlib.sha256(index).hexdigest(), safetensors={})
+    with pytest.raises(ValueError, match="provenance is incomplete"):
+        validate_checkpoint_source(tmp_path, metadata)
+    metadata["safetensors"][shard.name] = dict(
+        bytes=shard.stat().st_size, mtime_ns=shard.stat().st_mtime_ns
+    )
+    validate_checkpoint_source(tmp_path, metadata)
+    write(shard, b"changed checkpoint weights")
+    with pytest.raises(ValueError, match="Checkpoint shard changed"):
+        validate_checkpoint_source(tmp_path, metadata)
 
 
 def test_pte_plans_really_serialize_both_phases(tmp_path, monkeypatch):

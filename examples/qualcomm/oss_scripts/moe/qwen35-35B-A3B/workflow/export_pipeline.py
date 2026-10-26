@@ -376,6 +376,7 @@ class ExportPipeline:
                 required += [
                     c.calibration_dir / name
                     for name in (
+                        "DATA.json",
                         "QUANTIZATION_COMPLETE.json",
                         "MODEL_CONFIG.json",
                         "cold-experts.i32",
@@ -431,6 +432,11 @@ class ExportPipeline:
                 "Export requires the 40-layer, hidden-2048, Top8/256 MoE checkpoint"
             )
         if "text" in c.components and c.source == "calibrated":
+            from quantization.provenance import validate_checkpoint_source
+
+            validate_checkpoint_source(
+                c.model, json.loads((c.calibration_dir / "DATA.json").read_text())
+            )
             prepared = json.loads((c.calibration_dir / "MODEL_CONFIG.json").read_text())
             if prepared["quantization"] != self.settings.to_dict()[
                 "quantization"

@@ -11,6 +11,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 import run_chat  # noqa: E402
+from workflow.artifacts import check_artifacts  # noqa: E402
 from workflow.target import TargetConfig  # noqa: E402
 from executorch.backends.qualcomm.serialization.qc_schema import (  # noqa: E402
     _soc_info_table,
@@ -100,6 +101,18 @@ def test_deployment_commands_cannot_consume_chat_input(monkeypatch):
     monkeypatch.setattr("workflow.device.subprocess.run", run)
     AndroidDevice("phone").adb("shell", "mkdir -p /data/local/tmp/chat")
     assert calls[0]["stdin"] == subprocess.DEVNULL
+
+
+def test_missing_expert_payload_is_rejected_before_deployment(monkeypatch):
+    args = parse_args(["--runner", "diagnostic"])
+    assert args.deploy_weights
+    monkeypatch.setattr(
+        Path,
+        "is_file",
+        lambda path: path.name not in {"TARGET.json", "ASSETS.json", "experts.n2"},
+    )
+    with pytest.raises(FileNotFoundError, match="banks/layer0/experts.n2"):
+        check_artifacts(args)
 
 
 @pytest.mark.parametrize(

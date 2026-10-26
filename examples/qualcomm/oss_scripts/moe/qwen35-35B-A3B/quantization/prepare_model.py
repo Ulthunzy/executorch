@@ -12,6 +12,7 @@ import time
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 from workflow.model_config import add_model_config_argument, load_model_config
+from quantization.provenance import validate_checkpoint_source
 
 
 def main():
@@ -106,22 +107,9 @@ def main():
         args.output / "DATA.json",
     )
     data = json.loads((args.output / "DATA.json").read_text())
-    if (
-        data["index_sha256"]
-        != hashlib.sha256(
-            (args.model / "model.safetensors.index.json").read_bytes()
-        ).hexdigest()
-    ):
-        raise ValueError("Checkpoint index changed")
+    validate_checkpoint_source(args.model, data)
     if data["corpus_sha256"] != hashlib.sha256(args.corpus.read_bytes()).hexdigest():
         raise ValueError("Calibration corpus changed")
-    for name, metadata in data["safetensors"].items():
-        stat = (args.model / name).stat()
-        if (stat.st_size, stat.st_mtime_ns) != (
-            metadata["bytes"],
-            metadata["mtime_ns"],
-        ):
-            raise ValueError(f"Checkpoint shard changed: {name}")
     run(
         "embedding",
         prefix
