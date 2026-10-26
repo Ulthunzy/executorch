@@ -1,5 +1,6 @@
 #include "../shared/graph_binding.h"
 #include "qnn_front.h"
+#include <exception>
 
 std::map<std::string, EmbeddedBinary> embedded_binaries;
 
@@ -7,28 +8,6 @@ void check(Qnn_ErrorHandle_t status, const char* action) {
   if (status)
     throw std::runtime_error(
         std::string(action) + ": " + std::to_string(status));
-}
-
-std::vector<uint8_t> bytes(const std::string& name) {
-  std::ifstream f(name, std::ios::binary | std::ios::ate);
-  if (!f)
-    throw std::runtime_error("open " + name);
-  size_t n = f.tellg();
-  std::vector<uint8_t> b(n);
-  f.seekg(0);
-  f.read((char*)b.data(), n);
-  return b;
-}
-
-void save(const std::string& name, const void* p, size_t n) {
-  FILE* f = fopen(name.c_str(), "wb");
-  if (!f)
-    throw std::runtime_error("save " + name);
-  if (fwrite(p, 1, n, f) != n)
-    throw std::runtime_error("write " + name);
-  fflush(f);
-  fsync(fileno(f));
-  fclose(f);
 }
 
 void Runtime::logger(
@@ -43,76 +22,86 @@ void Runtime::logger(
 }
 
 Runtime::Runtime() {
-  void* h = dlopen("libQnnHtp.so", RTLD_NOW | RTLD_GLOBAL);
-  if (!h)
-    throw std::runtime_error(dlerror());
-  const QnnInterface_t** providers = nullptr;
-  uint32_t n = 0;
-  auto get = (Qnn_ErrorHandle_t(*)(const QnnInterface_t***, uint32_t*))dlsym(
-      h, "QnnInterface_getProviders");
-  check(get(&providers, &n), "getProviders");
-  q = providers[0]->QNN_INTERFACE_VER_NAME;
+  try {
+    htp_library.reset(dlopen("libQnnHtp.so", RTLD_NOW | RTLD_GLOBAL));
+    void* h = htp_library.get();
+    if (!h)
+      throw std::runtime_error(dlerror());
+    const QnnInterface_t** providers = nullptr;
+    uint32_t n = 0;
+    auto get = (Qnn_ErrorHandle_t(*)(const QnnInterface_t***, uint32_t*))dlsym(
+        h, "QnnInterface_getProviders");
+    check(get(&providers, &n), "getProviders");
+    q = providers[0]->QNN_INTERFACE_VER_NAME;
 
-  void* sys = dlopen("libQnnSystem.so", RTLD_NOW | RTLD_GLOBAL);
-  if (!sys)
-    throw std::runtime_error(dlerror());
-  const QnnSystemInterface_t** sp = nullptr;
-  auto sg =
-      (Qnn_ErrorHandle_t(*)(const QnnSystemInterface_t***, uint32_t*))dlsym(
-          sys, "QnnSystemInterface_getProviders");
-  check(sg(&sp, &n), "systemProviders");
-  s = sp[0]->QNN_SYSTEM_INTERFACE_VER_NAME;
+    system_library.reset(dlopen("libQnnSystem.so", RTLD_NOW | RTLD_GLOBAL));
+    void* sys = system_library.get();
+    if (!sys)
+      throw std::runtime_error(dlerror());
+    const QnnSystemInterface_t** sp = nullptr;
+    auto sg =
+        (Qnn_ErrorHandle_t(*)(const QnnSystemInterface_t***, uint32_t*))dlsym(
+            sys, "QnnSystemInterface_getProviders");
+    check(sg(&sp, &n), "systemProviders");
+    s = sp[0]->QNN_SYSTEM_INTERFACE_VER_NAME;
 
-  void* rpc = dlopen("libcdsprpc.so", RTLD_NOW | RTLD_GLOBAL);
-  if (!rpc)
-    rpc = dlopen("libadsprpc.so", RTLD_NOW | RTLD_GLOBAL);
-  if (!rpc)
-    throw std::runtime_error(dlerror());
-  allocate = (decltype(allocate))dlsym(rpc, "rpcmem_alloc");
-  release = (decltype(release))dlsym(rpc, "rpcmem_free");
-  get_fd = (decltype(get_fd))dlsym(rpc, "rpcmem_to_fd");
-  if (!allocate || !release || !get_fd)
-    throw std::runtime_error("rpcmem symbols");
+    rpc_library.reset(dlopen("libcdsprpc.so", RTLD_NOW | RTLD_GLOBAL));
+    if (!rpc_library)
+      rpc_library.reset(dlopen("libadsprpc.so", RTLD_NOW | RTLD_GLOBAL));
+    void* rpc = rpc_library.get();
+    if (!rpc)
+      throw std::runtime_error(dlerror());
+    allocate = (decltype(allocate))dlsym(rpc, "rpcmem_alloc");
+    release = (decltype(release))dlsym(rpc, "rpcmem_free");
+    get_fd = (decltype(get_fd))dlsym(rpc, "rpcmem_to_fd");
+    if (!allocate || !release || !get_fd)
+      throw std::runtime_error("rpcmem symbols");
 
-  check(
-      q.logCreate(
-          logger,
-          getenv("QNN_DEBUG") ? QNN_LOG_LEVEL_DEBUG : QNN_LOG_LEVEL_WARN,
-          &log),
-      "logCreate");
-  check(q.backendCreate(log, nullptr, &backend), "backendCreate");
-  check(q.deviceCreate(log, nullptr, &device), "deviceCreate");
+    check(
+        q.logCreate(
+            logger,
+            getenv("QNN_DEBUG") ? QNN_LOG_LEVEL_DEBUG : QNN_LOG_LEVEL_WARN,
+            &log),
+        "logCreate");
+    check(q.backendCreate(log, nullptr, &backend), "backendCreate");
+    check(q.deviceCreate(log, nullptr, &device), "deviceCreate");
 
-  QnnDevice_Infrastructure_t infrastructure = nullptr;
-  check(q.deviceGetInfrastructure(&infrastructure), "deviceGetInfrastructure");
-  perf = ((QnnHtpDevice_Infrastructure_t*)infrastructure)->perfInfra;
-  check(perf.createPowerConfigId(0, 0, &power_id), "createPowerConfigId");
+    QnnDevice_Infrastructure_t infrastructure = nullptr;
+    check(
+        q.deviceGetInfrastructure(&infrastructure), "deviceGetInfrastructure");
+    perf = ((QnnHtpDevice_Infrastructure_t*)infrastructure)->perfInfra;
+    check(perf.createPowerConfigId(0, 0, &power_id), "createPowerConfigId");
 
-  QnnHtpPerfInfrastructure_PowerConfig_t dcvs{}, latency{}, poll{};
-  dcvs.option = QNN_HTP_PERF_INFRASTRUCTURE_POWER_CONFIGOPTION_DCVS_V3;
-  auto& d = dcvs.dcvsV3Config;
-  d.contextId = power_id;
-  d.setDcvsEnable = 1;
-  d.dcvsEnable = 0;
-  d.powerMode = QNN_HTP_PERF_INFRASTRUCTURE_POWERMODE_PERFORMANCE_MODE;
-  d.setSleepLatency = 1;
-  d.sleepLatency = 40;
-  d.setSleepDisable = 1;
-  d.sleepDisable = 1;
-  d.setBusParams = 1;
-  d.setCoreParams = 1;
-  d.busVoltageCornerMin = d.busVoltageCornerTarget = d.busVoltageCornerMax =
-      DCVS_VOLTAGE_VCORNER_MAX_VOLTAGE_CORNER;
-  d.coreVoltageCornerMin = d.coreVoltageCornerTarget = d.coreVoltageCornerMax =
-      DCVS_VOLTAGE_VCORNER_MAX_VOLTAGE_CORNER;
-  latency.option =
-      QNN_HTP_PERF_INFRASTRUCTURE_POWER_CONFIGOPTION_RPC_CONTROL_LATENCY;
-  latency.rpcControlLatencyConfig = 100;
-  poll.option = QNN_HTP_PERF_INFRASTRUCTURE_POWER_CONFIGOPTION_RPC_POLLING_TIME;
-  poll.rpcPollingTimeConfig = 9999;
-  const QnnHtpPerfInfrastructure_PowerConfig_t* config[] = {
-      &dcvs, &latency, &poll, nullptr};
-  check(perf.setPowerConfig(power_id, config), "setPowerConfig");
+    QnnHtpPerfInfrastructure_PowerConfig_t dcvs{}, latency{}, poll{};
+    dcvs.option = QNN_HTP_PERF_INFRASTRUCTURE_POWER_CONFIGOPTION_DCVS_V3;
+    auto& d = dcvs.dcvsV3Config;
+    d.contextId = power_id;
+    d.setDcvsEnable = 1;
+    d.dcvsEnable = 0;
+    d.powerMode = QNN_HTP_PERF_INFRASTRUCTURE_POWERMODE_PERFORMANCE_MODE;
+    d.setSleepLatency = 1;
+    d.sleepLatency = 40;
+    d.setSleepDisable = 1;
+    d.sleepDisable = 1;
+    d.setBusParams = 1;
+    d.setCoreParams = 1;
+    d.busVoltageCornerMin = d.busVoltageCornerTarget = d.busVoltageCornerMax =
+        DCVS_VOLTAGE_VCORNER_MAX_VOLTAGE_CORNER;
+    d.coreVoltageCornerMin = d.coreVoltageCornerTarget =
+        d.coreVoltageCornerMax = DCVS_VOLTAGE_VCORNER_MAX_VOLTAGE_CORNER;
+    latency.option =
+        QNN_HTP_PERF_INFRASTRUCTURE_POWER_CONFIGOPTION_RPC_CONTROL_LATENCY;
+    latency.rpcControlLatencyConfig = 100;
+    poll.option =
+        QNN_HTP_PERF_INFRASTRUCTURE_POWER_CONFIGOPTION_RPC_POLLING_TIME;
+    poll.rpcPollingTimeConfig = 9999;
+    const QnnHtpPerfInfrastructure_PowerConfig_t* config[] = {
+        &dcvs, &latency, &poll, nullptr};
+    check(perf.setPowerConfig(power_id, config), "setPowerConfig");
+  } catch (...) {
+    release_handles();
+    throw;
+  }
 }
 
 void Runtime::package(const char* path) {
@@ -123,6 +112,10 @@ void Runtime::package(const char* path) {
 }
 
 Runtime::~Runtime() {
+  release_handles();
+}
+
+void Runtime::release_handles() {
   if (power_id)
     perf.destroyPowerConfigId(power_id);
   if (device)
@@ -131,6 +124,10 @@ Runtime::~Runtime() {
     q.backendFree(backend);
   if (log)
     q.logFree(log);
+  power_id = 0;
+  device = nullptr;
+  backend = nullptr;
+  log = nullptr;
 }
 
 Buffer::Buffer(Runtime& r, size_t n, CachePolicy policy)
@@ -139,8 +136,11 @@ Buffer::Buffer(Runtime& r, size_t n, CachePolicy policy)
   if (!data)
     throw std::runtime_error("rpcmem_alloc " + std::to_string(size));
   fd = r.get_fd(data);
-  if (fd < 0)
+  if (fd < 0) {
+    r.release(data);
+    data = nullptr;
     throw std::runtime_error("rpcmem_to_fd");
+  }
   memset(data, 0, size);
   ++r.buffer_allocations;
   r.buffer_bytes += size;
@@ -152,8 +152,11 @@ Buffer::Buffer(Runtime& r, int imported_fd, size_t n)
   if (fcntl(fd, F_GETFD) < 0)
     throw std::runtime_error("inherited fd closed");
   data = mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
-  if (data == MAP_FAILED)
-    throw std::runtime_error("mmap resident fd errno=" + std::to_string(errno));
+  if (data == MAP_FAILED) {
+    const int error = errno;
+    close(fd);
+    throw std::runtime_error("mmap resident fd errno=" + std::to_string(error));
+  }
   ++r.buffer_allocations;
   r.buffer_bytes += size;
   r.peak_buffer_bytes = std::max(r.peak_buffer_bytes, r.buffer_bytes);
@@ -216,72 +219,83 @@ size_t Graph::size(const Qnn_Tensor_t& t) {
 
 Graph::Graph(Runtime& r, const std::string& path, bool metadata_only)
     : runtime(r), binary(shared_graph_enabled(path) ? "" : path), name(path) {
-  borrowed_context = shared_graph_enabled(path);
-  const QnnSystemContext_GraphInfoV1_t* selected = nullptr;
-  if (borrowed_context) {
-    selected = borrow_shared_graph(path, &context, &graph);
-  } else {
-    check(r.s.systemContextCreate(&system), "systemContextCreate");
-    const QnnSystemContext_BinaryInfo_t* info = nullptr;
-    Qnn_ContextBinarySize_t n = 0;
-    check(
-        r.s.systemContextGetBinaryInfo(
-            system, binary.data(), binary.size(), &info, &n),
-        "getBinaryInfo");
-    QnnSystemContext_GraphInfo_t* g =
-        info->version == QNN_SYSTEM_CONTEXT_BINARY_INFO_VERSION_1
-        ? info->contextBinaryInfoV1.graphs
-        : info->version == QNN_SYSTEM_CONTEXT_BINARY_INFO_VERSION_2
-        ? info->contextBinaryInfoV2.graphs
-        : info->contextBinaryInfoV3.graphs;
-    selected = &g[0].graphInfoV1;
-  }
-  const auto& gi = *selected;
-  graph_name = gi.graphName;
-  inputs.assign(gi.graphInputs, gi.graphInputs + gi.numGraphInputs);
-  outputs.assign(gi.graphOutputs, gi.graphOutputs + gi.numGraphOutputs);
-
-  for (auto& t : inputs) {
-    auto b = std::make_shared<Buffer>(r, size(t));
-    inbuf.push_back(b);
-    if (!metadata_only)
-      bindings[FIELD(t, id)] = b;
-  }
-  for (auto& t : outputs) {
-    if (metadata_only) {
-      outbuf.push_back(nullptr);
-      continue;
+  try {
+    borrowed_context = shared_graph_enabled(path);
+    const QnnSystemContext_GraphInfoV1_t* selected = nullptr;
+    if (borrowed_context) {
+      selected = borrow_shared_graph(path, &context, &graph);
+    } else {
+      check(r.s.systemContextCreate(&system), "systemContextCreate");
+      const QnnSystemContext_BinaryInfo_t* info = nullptr;
+      Qnn_ContextBinarySize_t n = 0;
+      check(
+          r.s.systemContextGetBinaryInfo(
+              system, binary.data(), binary.size(), &info, &n),
+          "getBinaryInfo");
+      QnnSystemContext_GraphInfo_t* g =
+          info->version == QNN_SYSTEM_CONTEXT_BINARY_INFO_VERSION_1
+          ? info->contextBinaryInfoV1.graphs
+          : info->version == QNN_SYSTEM_CONTEXT_BINARY_INFO_VERSION_2
+          ? info->contextBinaryInfoV2.graphs
+          : info->contextBinaryInfoV3.graphs;
+      selected = &g[0].graphInfoV1;
     }
-    auto b = std::make_shared<Buffer>(r, size(t));
-    outbuf.push_back(b);
-    bindings[FIELD(t, id)] = b;
-  }
-  if (!metadata_only && !r.defer_contexts)
-    activate();
+    const auto& gi = *selected;
+    graph_name = gi.graphName;
+    inputs.assign(gi.graphInputs, gi.graphInputs + gi.numGraphInputs);
+    outputs.assign(gi.graphOutputs, gi.graphOutputs + gi.numGraphOutputs);
 
-  for (int direction = 0; direction < 2; direction++) {
-    auto& tensors = direction ? outputs : inputs;
-    for (size_t i = 0; i < tensors.size(); i++) {
-      auto& t = tensors[i];
-      fprintf(
-          stderr,
-          "IO %s %s %zu %s dt=%x dims=",
-          path.c_str(),
-          direction ? "out" : "in",
-          i,
-          FIELD(t, name),
-          FIELD(t, dataType));
-      for (unsigned j = 0; j < FIELD(t, rank); j++)
-        fprintf(stderr, "%u,", FIELD(t, dimensions)[j]);
-      auto qp = FIELD(t, quantizeParams);
-      if (qp.quantizationEncoding == QNN_QUANTIZATION_ENCODING_SCALE_OFFSET)
+    for (auto& t : inputs) {
+      auto b = std::make_shared<Buffer>(r, size(t));
+      inbuf.push_back(b);
+      if (!metadata_only)
+        bindings[FIELD(t, id)] = b;
+    }
+    for (auto& t : outputs) {
+      if (metadata_only) {
+        outbuf.push_back(nullptr);
+        continue;
+      }
+      auto b = std::make_shared<Buffer>(r, size(t));
+      outbuf.push_back(b);
+      bindings[FIELD(t, id)] = b;
+    }
+    if (!metadata_only && !r.defer_contexts)
+      activate();
+
+    for (int direction = 0; direction < 2; direction++) {
+      auto& tensors = direction ? outputs : inputs;
+      for (size_t i = 0; i < tensors.size(); i++) {
+        auto& t = tensors[i];
         fprintf(
             stderr,
-            " scale=%g offset=%d",
-            qp.scaleOffsetEncoding.scale,
-            qp.scaleOffsetEncoding.offset);
-      fprintf(stderr, "\n");
+            "IO %s %s %zu %s dt=%x dims=",
+            path.c_str(),
+            direction ? "out" : "in",
+            i,
+            FIELD(t, name),
+            FIELD(t, dataType));
+        for (unsigned j = 0; j < FIELD(t, rank); j++)
+          fprintf(stderr, "%u,", FIELD(t, dimensions)[j]);
+        auto qp = FIELD(t, quantizeParams);
+        if (qp.quantizationEncoding == QNN_QUANTIZATION_ENCODING_SCALE_OFFSET)
+          fprintf(
+              stderr,
+              " scale=%g offset=%d",
+              qp.scaleOffsetEncoding.scale,
+              qp.scaleOffsetEncoding.offset);
+        fprintf(stderr, "\n");
+      }
     }
+  } catch (...) {
+    try {
+      deactivate();
+    } catch (const std::exception& error) {
+      fprintf(stderr, "graph construction cleanup failed: %s\n", error.what());
+    }
+    if (system)
+      runtime.s.systemContextFree(system);
+    throw;
   }
 }
 
@@ -321,11 +335,18 @@ void Graph::activate() {
 void Graph::deactivate() {
   if (!context)
     return;
-  unregister_io();
+  std::exception_ptr unregister_error;
+  try {
+    unregister_io();
+  } catch (...) {
+    unregister_error = std::current_exception();
+  }
   if (borrowed_context) {
     release_shared_graph(context);
     context = nullptr;
     graph = nullptr;
+    if (unregister_error)
+      std::rethrow_exception(unregister_error);
     return;
   }
   check(runtime.q.contextFree(context, nullptr), "contextFree");
@@ -333,6 +354,8 @@ void Graph::deactivate() {
   --runtime.live_contexts;
   context = nullptr;
   graph = nullptr;
+  if (unregister_error)
+    std::rethrow_exception(unregister_error);
 }
 
 void Graph::bind(Qnn_Tensor_t& t, const std::shared_ptr<Buffer>& buffer) {

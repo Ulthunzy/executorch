@@ -33,6 +33,11 @@ void save(const std::string& name, const void* data, size_t size);
 
 // 一次 session 共享 backend/device，计数器用于检查逐 token 路径是否重建资源。
 struct Runtime {
+  // Unload the provider before FastRPC; a closed model must not leave an old
+  // DSP transport alive when another JNI instance is opened in this process.
+  std::unique_ptr<void, int (*)(void*)> rpc_library{nullptr, dlclose};
+  std::unique_ptr<void, int (*)(void*)> system_library{nullptr, dlclose};
+  std::unique_ptr<void, int (*)(void*)> htp_library{nullptr, dlclose};
   bool defer_contexts = false, defer_bindings = true;
   uint64_t context_creates = 0, context_frees = 0, live_contexts = 0,
            peak_contexts = 0, memory_registers = 0, memory_deregisters = 0;
@@ -60,6 +65,9 @@ struct Runtime {
   void package(const char* path);
 
   ~Runtime();
+
+ private:
+  void release_handles();
 };
 
 // 支持新分配 rpcmem，以及接管同进程 prefill 传来的 DMA fd。

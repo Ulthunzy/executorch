@@ -2,6 +2,8 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <string>
+#include <vector>
 
 using Clock = std::chrono::steady_clock;
 
@@ -15,3 +17,7 @@ inline size_t align4096(size_t size) {
 }
 
 uint64_t physical_reads();
+void validate_rope_tables(size_t cos_bytes, size_t sin_bytes, size_t positions);
+
+std::vector<uint8_t> bytes(const std::string& name);
+void save(const std::string& name, const void* data, size_t size);

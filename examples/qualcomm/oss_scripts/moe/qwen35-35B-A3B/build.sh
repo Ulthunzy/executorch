@@ -97,9 +97,11 @@ done
   -fvisibility-inlines-hidden -Wl,-Bsymbolic -Wl,--exclude-libs,ALL \
   -I"$QNN_SDK_ROOT/include/QNN" "$moe_root/runner/shared/context_store.cpp" \
   "$moe_root/runner/shared/weight_source.cpp" "$moe_root/runner/shared/graph_binding.cpp" \
-  "$moe_root/runner/decode/qnn_front.cpp" -ldl -o "$task_build/libqwen35_shared.so"
+  "$moe_root/runner/decode/qnn_front.cpp" "$moe_root/runner/runtime_utils.cpp" \
+  -ldl -o "$task_build/libqwen35_shared.so"
 "$compiler" -O2 -std=c++17 -static-libstdc++ -I"$QNN_SDK_ROOT/include/QNN" \
   "$moe_root/tools/capture_weights.cpp" "$moe_root/runner/decode/qnn_front.cpp" \
+  "$moe_root/runner/runtime_utils.cpp" \
   "$moe_root/runner/shared/graph_binding.cpp" -ldl -o "$task_build/capture_weights"
 if [[ "${MOE_BUILD_NATIVE:-1}" == 1 ]]; then
   "$moe_root/build_op_package.sh"

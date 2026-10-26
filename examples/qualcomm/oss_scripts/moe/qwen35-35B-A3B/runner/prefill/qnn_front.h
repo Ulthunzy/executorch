@@ -34,6 +34,11 @@ void save(const std::string& name, const void* data, size_t size);
 
 // 一次 session 共享 backend/device，context 和 IO 注册次数用于检查循环内重建。
 struct Runtime {
+  // Unload the provider before FastRPC; a closed model must not leave an old
+  // DSP transport alive when another JNI instance is opened in this process.
+  std::unique_ptr<void, int (*)(void*)> rpc_library{nullptr, dlclose};
+  std::unique_ptr<void, int (*)(void*)> system_library{nullptr, dlclose};
+  std::unique_ptr<void, int (*)(void*)> htp_library{nullptr, dlclose};
   bool defer_contexts = false, defer_bindings = true;
   uint64_t context_creates = 0, context_frees = 0, live_contexts = 0,
            peak_contexts = 0, memory_registers = 0, memory_deregisters = 0;
@@ -61,6 +66,9 @@ struct Runtime {
   void package(const char* path);
 
   ~Runtime();
+
+ private:
+  void release_handles();
 };
 
 // 4 KiB 对齐的 rpcmem 分配；fd 用于 QNN 注册和 FastRPC 映射。

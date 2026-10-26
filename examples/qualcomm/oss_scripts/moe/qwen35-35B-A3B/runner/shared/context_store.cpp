@@ -72,7 +72,15 @@ struct Context {
 
 struct Store {
   Runtime runtime;
+  std::mutex init_mutex;
+  std::condition_variable init_changed;
   std::map<std::string, std::unique_ptr<Context>> contexts;
+
+  bool has_references() const {
+    return std::any_of(contexts.begin(), contexts.end(), [](const auto& entry) {
+      return entry.second->references != 0;
+    });
+  }
 
   static void notify(
       Qnn_ContextHandle_t handle,
@@ -93,15 +101,13 @@ struct Store {
   }
 
   void load(const std::string& root) {
-    std::mutex mutex;
-    std::condition_variable changed;
     std::vector<Context*> entries;
     for (int group = 0; group <= 10; ++group) {
       const std::string path =
           root + (group == 10 ? "/head" : "/group" + std::to_string(group));
       auto entry = std::make_unique<Context>(runtime, path);
-      entry->init_mutex = &mutex;
-      entry->init_changed = &changed;
+      entry->init_mutex = &init_mutex;
+      entry->init_changed = &init_changed;
       entries.push_back(entry.get());
       contexts.emplace(path, std::move(entry));
     }
@@ -163,8 +169,8 @@ struct Store {
         runtime.q.contextCreateFromBinaryListAsync(
             runtime.backend, runtime.device, list.data(), configs, nullptr),
         "shared asynchronous contexts");
-    std::unique_lock<std::mutex> lock(mutex);
-    changed.wait(lock, [&] {
+    std::unique_lock<std::mutex> lock(init_mutex);
+    init_changed.wait(lock, [&] {
       return std::all_of(entries.begin(), entries.end(), [](const auto* e) {
         return e->initialized;
       });
@@ -206,9 +212,12 @@ struct Store {
   }
 };
 
+std::unique_ptr<Store> active_store;
+
 Store& store() {
-  static Store value;
-  return value;
+  if (!active_store)
+    active_store = std::make_unique<Store>();
+  return *active_store;
 }
 } // namespace
 
@@ -218,8 +227,8 @@ extern "C" __attribute__((visibility("default"))) int qwen35_shared_acquire(
     Qnn_ContextHandle_t* context,
     Qnn_GraphHandle_t* graph,
     const QnnSystemContext_GraphInfoV1_t** metadata) {
+  std::lock_guard<std::mutex> guard(registry_mutex);
   try {
-    std::lock_guard<std::mutex> guard(registry_mutex);
     auto& owner = store();
     if (owner.contexts.empty()) {
       const auto root = std::string(directory).substr(
@@ -245,6 +254,8 @@ extern "C" __attribute__((visibility("default"))) int qwen35_shared_acquire(
         "shared graph not found: " + std::string(graph_name));
   } catch (const std::exception& error) {
     fprintf(stderr, "SHARED_ACQUIRE_FAILED %s\n", error.what());
+    if (active_store && !active_store->has_references())
+      active_store.reset();
     return 1;
   }
 }
@@ -252,11 +263,15 @@ extern "C" __attribute__((visibility("default"))) int qwen35_shared_acquire(
 extern "C" __attribute__((visibility("default"))) void qwen35_shared_release(
     Qnn_ContextHandle_t context) {
   std::lock_guard<std::mutex> guard(registry_mutex);
-  auto& entries = store().contexts;
-  for (auto it = entries.begin(); it != entries.end(); ++it)
-    if (it->second && it->second->handle == context) {
-      if (!--it->second->references)
-        entries.erase(it);
+  if (!active_store)
+    return;
+  for (auto& entry : active_store->contexts)
+    if (entry.second->handle == context && entry.second->references) {
+      --entry.second->references;
+      // Batch loading also creates contexts that a failed constructor may
+      // never borrow. Release the complete batch after its final live lease.
+      if (!active_store->has_references())
+        active_store.reset();
       return;
     }
 }
@@ -300,19 +315,22 @@ extern "C" __attribute__((visibility("default"))) int qwen35_shared_unregister(
     Qnn_ContextHandle_t context,
     Qnn_MemHandle_t handle) {
   std::lock_guard<std::mutex> guard(registry_mutex);
-  auto& owner = store();
+  if (!active_store)
+    return 1;
+  auto& owner = *active_store;
   for (auto& pair : owner.contexts) {
     auto& entry = *pair.second;
     if (entry.handle != context)
       continue;
     for (auto it = entry.memory.begin(); it != entry.memory.end(); ++it)
       if (it->second.handle == handle) {
-        if (!--it->second.references) {
+        if (it->second.references == 1) {
           const auto status = owner.runtime.q.memDeRegister(&handle, 1);
           if (status)
             return int(status);
           entry.memory.erase(it);
-        }
+        } else
+          --it->second.references;
         return 0;
       }
   }
@@ -322,5 +340,5 @@ extern "C" __attribute__((visibility("default"))) int qwen35_shared_unregister(
 extern "C" __attribute__((visibility("default"))) uint64_t
 qwen35_shared_context_count() {
   std::lock_guard<std::mutex> guard(registry_mutex);
-  return store().contexts.size();
+  return active_store ? active_store->contexts.size() : 0;
 }
