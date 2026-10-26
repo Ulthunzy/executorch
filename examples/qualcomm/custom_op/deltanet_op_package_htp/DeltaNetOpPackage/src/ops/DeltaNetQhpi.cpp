@@ -71,6 +71,25 @@ static constexpr int kQUint16StateUpdateShift = 20;
 static constexpr bool kEnableQUint16HvxStateUpdate = true;
 static constexpr bool kEnableQUint16HvxStateUpdateF32 = true;
 
+static inline void deltanetQhpiCopyStateU16(
+    uint16_t* destination,
+    const uint16_t* source,
+    size_t elements) {
+#if defined(__hexagon__) && __HVX_ARCH__ == 81
+  const uintptr_t addresses = reinterpret_cast<uintptr_t>(destination) |
+      reinterpret_cast<uintptr_t>(source);
+  if (addresses % 128 == 0 && elements % kQUint16HvxValuesPerVec == 0) {
+    for (size_t offset = 0; offset < elements;
+         offset += kQUint16HvxValuesPerVec) {
+      *reinterpret_cast<HVX_Vector*>(destination + offset) =
+          *reinterpret_cast<const HVX_Vector*>(source + offset);
+    }
+    return;
+  }
+#endif
+  std::memcpy(destination, source, elements * sizeof(uint16_t));
+}
+
 // 决定一个 head 的 V 维是否再拆给多个 worker。
 // 当前仅在 B*H=1、V>=256 且 worker 有余量时分块；常见 H=16,V=128
 // 只按 head 并行，分块数受最小 SIMD tile 大小和 worker 数限制。
@@ -2008,10 +2027,10 @@ static inline void deltanetCoreQhpiRunQUint16Tile(
   // H=16,K=V=128 时整个 state 占 512 KiB，每 head 32 KiB。
   if constexpr (StateResident) {
     if (tile_size == value_dim) {
-      std::memcpy(
+      deltanetQhpiCopyStateU16(
           state_data + state_base,
           recurrent_state_data + state_base,
-          key_dim * value_dim * sizeof(uint16_t));
+          key_dim * value_dim);
     } else {
       for (size_t k = 0; k < key_dim; ++k) {
         const size_t row_base = state_base + k * value_dim + v_begin;
