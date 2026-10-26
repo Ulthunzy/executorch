@@ -1,19 +1,20 @@
 import json
 import hashlib
 
-from model_config import shared_model_signature
+from workflow.model_config import shared_model_signature
 from .runtime_assets import runtime_assets
 
 
-def check_plan(path, args, phase):
+def check_plan(path, args, phase, expected_tokens=None):
     if not path.is_file():
-        raise FileNotFoundError(path)
+        raise FileNotFoundError(f"{path}: missing exported PTE; run export.py first")
     metadata = json.loads(path.with_suffix(".json").read_text())
+    args.model_settings.target.check_manifest(metadata)
     if metadata["phase"] != phase or metadata["layers"] != 40:
         raise ValueError(f"{path}: wrong phase or layer count")
     if metadata.get("compile_settings") != args.model_settings.compile_settings():
         raise ValueError(
-            f"{path}: model/quantization/KV/context configuration differs; repack with the selected --model-config"
+            f"{path}: model/quantization/KV/context configuration differs; run export.py with the selected --model-config"
         )
     shared = metadata["weight_mode"] == "external_shared"
     if shared != bool(args.shared_model):
@@ -22,7 +23,7 @@ def check_plan(path, args, phase):
         args.shared_model
     ):
         raise ValueError(
-            f"{path}: shared context/IO metadata differs; repack for the selected model"
+            f"{path}: shared context/IO metadata differs; run export.py for the selected model"
         )
     if (
         phase == "decode"
@@ -32,12 +33,16 @@ def check_plan(path, args, phase):
         ).hexdigest()
     ):
         raise ValueError(
-            f"{path}: prefill cache encodings differ; repack the decode plan"
+            f"{path}: prefill cache encodings differ; run export.py for matching decode PTEs"
         )
     if phase == "prefill":
         if metadata.get("prefill_order") != args.prefill_order:
-            raise ValueError(f"{path}: prefill order differs; repack the plan")
-        expected = args.prompt_tokens if args.prefill_order == "layer_major" else 128
+            raise ValueError(
+                f"{path}: prefill order differs; run export.py for the selected schedule"
+            )
+        expected = expected_tokens or (
+            args.prompt_tokens if args.prefill_order == "layer_major" else 128
+        )
         if expected is not None and metadata["plan_tokens"] != expected:
             raise ValueError(
                 f"{path}: plan length does not match the prompt and prefill order"
@@ -45,113 +50,56 @@ def check_plan(path, args, phase):
     return metadata
 
 
-def prepare_plans(args, run_dir):
-    # Shared plans contain stage metadata; creating one does not compile QNN
-    # or duplicate weights and lets the requested prefill order select the loop.
-    if args.shared_model:
-        from pack_pte import main as pack_plan
-
-        for phase, current in (
-            ("prefill", args.local_prefill_pte),
-            ("decode", args.local_decode_pte),
-        ):
-            if current is not None:
-                continue
-            path = run_dir / "plans" / f"{phase}.pte"
-            command = [
-                "--quiet",
-                "--model-config",
-                str(args.model_config),
-                "--phase",
-                phase,
-                "--source-dir",
-                str(args.artifacts),
-                "--shared-model",
-                str(args.shared_model),
-                "--head",
-                str(args.shared_model / "head/graph.qnn"),
-                "--output",
-                str(path),
-                "--max-seq-len",
-                str(args.decode_capacity),
-                "--prefill-order",
-                args.prefill_order,
-                "--prefill-tokens",
-                str(args.prompt_tokens),
-            ]
-            if phase == "decode":
-                command += [
-                    "--cache-encoding",
-                    str(runtime_assets(args) / "cache-encoding.bin"),
-                ]
-            pack_plan(command)
-            if phase == "prefill":
-                args.local_prefill_pte = path
-            else:
-                args.local_decode_pte = path
+def select_plans(args):
+    """Select existing export artifacts; inference never serializes programs."""
+    phases = ("decode",) if args.runner == "chat" else ("prefill", "decode")
     plans = {}
-    for phase, path in (
-        ("prefill", args.local_prefill_pte),
-        ("decode", args.local_decode_pte),
-    ):
-        if path is not None:
-            plans[phase] = check_plan(path, args, phase)
-    if args.prompt_tokens > 128 and "prefill" not in plans:
-        raise ValueError(
-            "Multi-block prefill needs a local plan/JSON sidecar or shared model so the configured schedule can be verified"
-        )
+    for phase in phases:
+        current = args.local_decode_pte if phase == "decode" else args.local_prefill_pte
+        if current is None:
+            length = args.prompt_tokens if args.prefill_order == "layer_major" else 128
+            filename = (
+                "decode.pte" if phase == "decode" else f"prefill-{length or 128}.pte"
+            )
+            current = args.artifacts / "plans" / filename
+        plans[phase] = check_plan(current, args, phase)
+        if phase == "decode":
+            args.local_decode_pte = current
+        else:
+            args.local_prefill_pte = current
     return plans
 
 
-def prepare_chat_plans(args, run_dir):
-    """Package host schedules for standalone chat; QNN kernels stay AR128."""
-    if not args.shared_model:
+def load_prefill_bundle(args):
+    if args.runner != "chat":
         return None
-    from pack_pte import main as pack_plan
-
-    directory = run_dir / "chat-plans"
-    lengths = (
-        range(128, args.model_settings.context.max_prefill_tokens + 1, 128)
+    directory = args.artifacts / "plans"
+    manifest = directory / "PLANS.json"
+    if not manifest.is_file():
+        raise FileNotFoundError(
+            f"{manifest}: missing exported plan bundle; run export.py first"
+        )
+    metadata = json.loads(manifest.read_text())
+    expected = (
+        list(range(128, args.model_settings.context.max_prefill_tokens + 1, 128))
         if args.prefill_order == "layer_major"
-        else (128,)
+        else [128]
     )
-    for length in lengths:
-        pack_plan(
-            [
-                "--quiet",
-                "--model-config",
-                str(args.model_config),
-                "--phase",
-                "prefill",
-                "--source-dir",
-                str(args.artifacts),
-                "--shared-model",
-                str(args.shared_model),
-                "--head",
-                str(args.shared_model / "head/graph.qnn"),
-                "--output",
-                str(directory / f"prefill-{length}.pte"),
-                "--max-seq-len",
-                str(args.decode_capacity),
-                "--prefill-order",
-                args.prefill_order,
-                "--prefill-tokens",
-                str(length),
-            ]
+    if (
+        metadata.get("version") != 1
+        or metadata.get("ar_len") != 128
+        or metadata.get("capacity") != args.decode_capacity
+        or metadata.get("max_prefill_tokens")
+        != args.model_settings.context.max_prefill_tokens
+        or metadata.get("prefill_order") != args.prefill_order
+        or metadata.get("lengths") != expected
+    ):
+        raise ValueError(
+            f"{manifest}: context or schedule differs; export matching PTEs with export.py"
         )
-    (directory / "PLANS.json").write_text(
-        json.dumps(
-            dict(
-                version=1,
-                ar_len=128,
-                capacity=args.decode_capacity,
-                max_prefill_tokens=args.model_settings.context.max_prefill_tokens,
-                prefill_order=args.prefill_order,
-                lengths=list(lengths),
-                model_configuration=args.model_settings.to_dict(),
-            ),
-            indent=2,
+    args.model_settings.target.check_manifest(metadata["model_configuration"])
+    for length in expected:
+        check_plan(
+            directory / f"prefill-{length}.pte", args, "prefill", expected_tokens=length
         )
-        + "\n"
-    )
     return directory

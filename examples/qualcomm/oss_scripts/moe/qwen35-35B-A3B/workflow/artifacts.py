@@ -55,13 +55,23 @@ def check_artifacts(args):
         raise ValueError(
             "Shared contexts require batched initialization; serial loading is unsupported"
         )
+    target_file = args.build_dir / "TARGET.json"
+    build_metadata = (
+        json.loads(target_file.read_text()) if target_file.is_file() else {}
+    )
+    args.model_settings.target.check_manifest(build_metadata)
+    if args.runner == "chat" and build_metadata.get("chat_controls") != 1:
+        raise ValueError(
+            "Rebuild the native chat runner with this version of build.sh (the unified export builds it automatically)"
+        )
     required = [
         args.build_dir / "qwen35_moe_runner",
         args.build_dir / "prefill_handoff_runner",
         args.build_dir / "libmoe_decode.so",
         args.build_dir / "native-prefill/libinteger_rpc_skel.so",
         args.build_dir / "native-decode/libinteger_rpc_skel.so",
-        args.build_dir / "op-package/hexagon-v85/libQnnDeltaNetOpPackage_HTP.so",
+        args.build_dir
+        / f"op-package/hexagon-{args.dsp_arch}/libQnnDeltaNetOpPackage_HTP.so",
         args.model / "config.json",
         args.model / "generation_config.json",
         args.model / "tokenizer.json",
@@ -114,6 +124,11 @@ def check_artifacts(args):
             manifest = json.loads(
                 (args.shared_model / f"group{group}/GRAPHS.json").read_text()
             )
+            args.model_settings.target.check_manifest(manifest)
+            if args.runner == "chat" and not manifest.get("prefill_valid_length"):
+                raise ValueError(
+                    "Re-export the shared graphs for native chat: AR128 valid-length input is required"
+                )
             expected = list(range(group * 4, group * 4 + 4))
             if (
                 manifest["layers"] != expected
@@ -156,6 +171,7 @@ def check_artifacts(args):
             raise ValueError("Shared model must contain all 40 layers")
         if args.model_settings.quantization.head == "w4a16_gptq":
             head = json.loads((args.artifacts / "head/HEAD.json").read_text())
+            args.model_settings.target.check_manifest(head)
             provenance = json.loads(
                 (args.shared_model / "head/WEIGHTS.json").read_text()
             )

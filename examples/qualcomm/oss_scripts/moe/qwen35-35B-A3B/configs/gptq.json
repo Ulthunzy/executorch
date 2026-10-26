@@ -16,7 +16,28 @@
     "router_gptq_damping": 0.01,
     "embedding": "int4_g32"
   },
-  "cache": {"kv_dtype": "uint16", "gdn_state_dtype": "uint16", "conv_state_dtype": "uint16"},
-  "context": {"max_seq_len": 1152, "prefill_ar_len": 128, "max_prefill_tokens": 1024},
-  "schedule": {"cache_experts": 32, "prefill_order": "layer_major"}
+  "cache": {
+    "kv_dtype": "uint16",
+    "gdn_state_dtype": "uint16",
+    "conv_state_dtype": "uint16"
+  },
+  "context": {
+    "max_seq_len": 1152,
+    "prefill_ar_len": 128,
+    "max_prefill_tokens": 1024
+  },
+  "schedule": {
+    "cache_experts": 32,
+    "prefill_order": "layer_major"
+  },
+  "target": {
+    "soc_model": "SM8975",
+    "dsp_arch": "v85"
+  },
+  "generation": {
+    "temperature": 0,
+    "ignore_eos": false,
+    "interactive": false,
+    "stream": true
+  }
 }

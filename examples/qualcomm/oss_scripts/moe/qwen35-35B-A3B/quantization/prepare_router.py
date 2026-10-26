@@ -8,7 +8,7 @@ import sys
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from model_config import add_model_config_argument, load_model_config
+from workflow.model_config import add_model_config_argument, load_model_config
 
 
 def attention_inputs(args, layer):
@@ -78,6 +78,7 @@ def attention_inputs(args, layer):
 
 
 def prepare_layer(args, layer):
+    settings = load_model_config(args.model_config)
     from export.binding import load_binding
 
     load_binding(args.qnn_binding)
@@ -136,7 +137,7 @@ def prepare_layer(args, layer):
         act_observer=MinMaxObserver,
         granularity=QuantGranularity.PER_CHANNEL,
     )
-    quantizer = QnnQuantizer(soc_model=QcomChipset.SM8975)
+    quantizer = QnnQuantizer(soc_model=QcomChipset[settings.target.soc_model])
     quantizer.set_recipe(recipe)
     prepared = prepare_pt2e(
         torch.export.export(model, (fit[:, :128].contiguous(),)).module(), quantizer

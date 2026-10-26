@@ -21,9 +21,15 @@ int main() {
         {"startup_prefetch", "none"},
         {"read_chunk_kib", 64},
         {"prefill_order", "chunk_major"}}},
-      {"generation", {{"enable_thinking", true}, {"max_new_tokens", 64}}}};
+      {"generation",
+       {{"enable_thinking", true},
+        {"max_new_tokens", 64},
+        {"temperature", 0.75},
+        {"ignore_eos", true},
+        {"stream", false}}}};
   apply_model_settings(options, config, {});
   assert(options.capacity == 2048 && options.thinking);
+  assert(options.temperature == 0.75f && options.ignore_eos && !options.stream);
   assert(options.runtime.embedding_bits == 16 && !options.runtime.state_swap);
   assert(
       !options.runtime.kv_append_only &&
@@ -85,6 +91,23 @@ int main() {
   assert(std::string(getenv("DECODE_EXPERT_IO_WORKERS")) == "16");
   assert(std::string(getenv("PREFILL_TOKENS")) == "128");
   assert(std::string(getenv("PREFILL_VALID_TOKENS")) == "37");
+  const char* sampling[] = {
+      "runner",
+      "--model-root",
+      directory.c_str(),
+      "--tokenizer-path",
+      "/tmp/tokenizer.json",
+      "--temperature",
+      "0.25",
+      "--stream",
+      "--no-ignore-eos",
+      "--no-interactive",
+      "--no-vision",
+      "--prompt",
+      "test"};
+  options = parse_options(13, const_cast<char**>(sampling));
+  assert(options.temperature == 0.25f && options.stream && !options.ignore_eos);
+  assert(!options.interactive && !options.vision_enabled);
   std::filesystem::remove_all(root);
   std::cout << "runtime configuration and RoPE bounds tests passed\n";
 }

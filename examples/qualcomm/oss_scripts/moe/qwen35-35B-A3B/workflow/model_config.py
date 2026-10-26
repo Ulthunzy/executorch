@@ -4,7 +4,9 @@ import json
 import math
 from pathlib import Path
 
-DEFAULT_MODEL_CONFIG = Path(__file__).resolve().parent / "configs/model.json"
+from workflow.target import TargetConfig
+
+DEFAULT_MODEL_CONFIG = Path(__file__).resolve().parents[1] / "configs/model.json"
 
 
 @dataclass(frozen=True)
@@ -46,6 +48,10 @@ class GenerationConfig:
     enable_thinking: bool = False
     system_prompt: str = "你是一个有帮助的人工智能助手。"
     max_new_tokens: int = 128
+    temperature: float = 0
+    ignore_eos: bool = False
+    interactive: bool = False
+    stream: bool = True
 
 
 @dataclass(frozen=True)
@@ -65,6 +71,7 @@ class ScheduleConfig:
 
 @dataclass(frozen=True)
 class ModelConfig:
+    target: TargetConfig = field(default_factory=TargetConfig)
     quantization: QuantizationConfig = field(default_factory=QuantizationConfig)
     cache: CacheConfig = field(default_factory=CacheConfig)
     context: ContextConfig = field(default_factory=ContextConfig)
@@ -72,6 +79,7 @@ class ModelConfig:
     schedule: ScheduleConfig = field(default_factory=ScheduleConfig)
 
     def validate(self):
+        self.target.validate()
         q, c, x, g, s = (
             self.quantization,
             self.cache,
@@ -167,6 +175,12 @@ class ModelConfig:
             raise ValueError(
                 "Generation needs a nonempty system prompt and valid output length"
             )
+        if (
+            type(g.temperature) not in (int, float)
+            or not math.isfinite(g.temperature)
+            or g.temperature < 0
+        ):
+            raise ValueError("temperature must be finite and nonnegative")
         if s.prefill_order not in {
             "layer_major",
             "chunk_major",
@@ -195,6 +209,9 @@ class ModelConfig:
             c.append_only,
             c.state_swap,
             g.enable_thinking,
+            g.ignore_eos,
+            g.interactive,
+            g.stream,
             s.prefill_async_io,
             s.decode_hit_first,
             s.decode_ready_io,
@@ -207,7 +224,9 @@ class ModelConfig:
         return self
 
     def to_dict(self):
-        return dict(version=1, **asdict(self))
+        data = dict(version=1, **asdict(self))
+        data["target"] = self.target.to_dict()
+        return data
 
     def compile_settings(self):
         return dict(
@@ -230,6 +249,7 @@ def load_model_config(path=DEFAULT_MODEL_CONFIG):
         raise ValueError("Expected a version 1 model configuration object")
     unknown = set(data) - {
         "version",
+        "target",
         "quantization",
         "cache",
         "context",
@@ -240,6 +260,7 @@ def load_model_config(path=DEFAULT_MODEL_CONFIG):
         raise ValueError(f"Unknown model configuration sections: {sorted(unknown)}")
     try:
         return ModelConfig(
+            target=TargetConfig.resolve(**data.get("target", {})),
             quantization=QuantizationConfig(**data.get("quantization", {})),
             cache=CacheConfig(**data.get("cache", {})),
             context=ContextConfig(**data.get("context", {})),

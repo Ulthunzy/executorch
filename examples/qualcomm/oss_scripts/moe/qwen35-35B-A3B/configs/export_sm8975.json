@@ -1,0 +1,39 @@
+{
+  "version": 1,
+  "model_config": "model.json",
+  "model": "/hunter/model/Qwen/Qwen3.6-35B-A3B",
+  "source": "calibrated",
+  "calibration_dir": "llama-output/qwen35-moe-from-safetensors-gptq-20261024",
+  "output": "llama-output/qwen35-35B-A3B-export",
+  "components": [
+    "text",
+    "vision"
+  ],
+  "phases": [
+    "prefill",
+    "decode"
+  ],
+  "format": "pte",
+  "build": true,
+  "build_dir": "build/moe/qwen35-35B-A3B-export",
+  "qnn_binding": "llama-output/qwen35-moe-from-safetensors-gptq-20261024/tools/PyQnnManagerAdaptor.cpython-311-x86_64-linux-gnu.so",
+  "qnn_sdk_root": "/hunter/qnn_sdk/src/backends/qnn/2.48.1.260715",
+  "hexagon_sdk_root": "/hunter/qnn_sdk/hexagon/6.7.0.0",
+  "hexagon_tools_root": "/hunter/qnn_sdk/hexagon/6.7.0.0/tools/HEXAGON_Tools/21.0.04/Tools",
+  "android_ndk_root": "/hunter/android-ndk/android-ndk-r28c",
+  "op_package_device": "/data/local/tmp/qwen35-35B-A3B/libQnnDeltaNetOpPackage_HTP.so",
+  "device": "A7SR026915000282",
+  "runtime_device_dir": "/data/local/tmp/qwen35-sharing-corrected-model/prefill",
+  "remote_root": "/data/local/tmp/qwen35-config-export",
+  "corpus": "llama-output/qwen35-moe-from-safetensors-gptq-20261024/calibration/wikitext-2-raw-v1-train.jsonl",
+  "images": [
+    "llama-output/qwen35-moe-from-safetensors-gptq-20261024/calibration/images/000000039769.jpg",
+    "llama-output/qwen35-moe-from-safetensors-gptq-20261024/calibration/images/Statue-of-Liberty-Island-New-York-Bay.jpg"
+  ],
+  "calibration_device": "cuda",
+  "expert_batch": 8,
+  "image_height": 448,
+  "image_width": 448,
+  "soc_model": "SM8975",
+  "dsp_arch": "v85"
+}

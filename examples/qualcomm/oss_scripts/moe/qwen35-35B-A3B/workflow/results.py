@@ -2,7 +2,7 @@ import json
 import time
 
 
-def stream_tokens(device, command, run_dir, tokenizer, text_only):
+def stream_tokens(device, command, run_dir, tokenizer, text_only, stream=True):
     generated, timings = [], []
     displayed, previous = "", None
     started = time.perf_counter()
@@ -37,6 +37,8 @@ def stream_tokens(device, command, run_dir, tokenizer, text_only):
                     if not text.startswith(displayed):
                         raise RuntimeError("Decoded stream prefix changed")
                     delta, displayed = text[len(displayed) :], text
+                    if not stream:
+                        continue
                     if text_only:
                         print(delta, end="", flush=True)
                     else:
@@ -68,6 +70,8 @@ def stream_tokens(device, command, run_dir, tokenizer, text_only):
                 ):
                     print(line.rstrip(), flush=True)
             exit_code = process.wait()
+    if not stream:
+        print(displayed, flush=True)
     return exit_code, generated, timings
 
 

@@ -2,23 +2,35 @@ from pathlib import PurePosixPath
 import shlex
 
 from .artifacts import decode_layer_dir
-from .plans import prepare_chat_plans
+from .plans import load_prefill_bundle
 from .runtime_assets import runtime_assets
 
 
 def deploy_artifacts(args, device, paths, run_dir, vision):
-    chat_plans = prepare_chat_plans(args, run_dir)
+    chat_plans = load_prefill_bundle(args)
+    if args.deploy_weights:
+        device.adb(
+            "shell",
+            "mkdir -p "
+            + args.remote_weights
+            + "/banks "
+            + args.remote_weights
+            + "/indices",
+        )
+        for name in ("banks", "indices"):
+            device.adb(
+                "push",
+                "--sync",
+                str(args.artifacts / name) + "/.",
+                args.remote_weights + "/" + name + "/",
+            )
     adb = device.adb
     prefill_root, decode_root = paths.prefill, paths.decode
     common = [
-        "embedding.bf16",
-        "indices",
-        "cos.f32",
-        "sin.f32",
         "libQnnHtp.so",
         "libQnnSystem.so",
-        "libQnnHtpV85Stub.so",
-        "libQnnHtpV85Skel.so",
+        f"libQnnHtp{args.dsp_arch.upper()}Stub.so",
+        f"libQnnHtp{args.dsp_arch.upper()}Skel.so",
         "libQnnHtpPrepare.so",
     ]
     commands = [
@@ -34,10 +46,11 @@ def deploy_artifacts(args, device, paths, run_dir, vision):
             args.local_prefill_pte if target == prefill_root else args.local_decode_pte
         )
         filename = "prefill.pte" if target == prefill_root else "decode.pte"
-        if local is None:
-            commands.append(f"ln -sfn {program} {target}/{filename}")
-        else:
-            commands.append(f"rm -f {target}/{filename}")
+        if target == decode_root or args.runner == "diagnostic":
+            if local is None:
+                commands.append(f"ln -sfn {program} {target}/{filename}")
+            else:
+                commands.append(f"rm -f {target}/{filename}")
         for name in common:
             commands.append(f"ln -sfn {source}/{name} {target}/{name}")
         commands.append(f"ln -sfn {args.remote_weights}/indices {target}/indices")
@@ -60,7 +73,8 @@ def deploy_artifacts(args, device, paths, run_dir, vision):
     ]:
         commands.append(f"ln -sfn {prefill_root}/{name} {decode_root}/{name}")
     adb("shell", "\n".join(commands))
-    adb("push", args.build_dir / "qwen35_moe_runner", prefill_root + "/")
+    if args.runner == "chat":
+        adb("push", "--sync", args.build_dir / "qwen35_moe_runner", prefill_root + "/")
     if chat_plans is not None:
         adb("shell", "mkdir -p " + prefill_root + "/plans")
         adb("push", str(chat_plans) + "/.", prefill_root + "/plans/")
@@ -73,23 +87,35 @@ def deploy_artifacts(args, device, paths, run_dir, vision):
             f"{profile_root}/base-{name}.f32",
         )
     adb("push", args.model / "config.json", profile_root + "/model-config.json")
-    if args.vision_artifacts and (args.vision_artifacts / "vision.bin").is_file():
+    if (
+        args.with_vision
+        and args.vision_artifacts
+        and (args.vision_artifacts / "vision.bin").is_file()
+    ):
         adb(
             "push", args.vision_artifacts / "VISION.json", profile_root + "/VISION.json"
         )
         adb("push", args.vision_artifacts / "vision.bin", prefill_root + "/vision.bin")
+    else:
+        adb("shell", "rm -f " + prefill_root + "/vision.bin")
     for local, target in (
         (args.local_prefill_pte, prefill_root + "/prefill.pte"),
         (args.local_decode_pte, decode_root + "/decode.pte"),
     ):
         if local is not None:
             adb("push", local, target)
-    if args.embedding_table:
-        embedding_remote = args.remote_root + "/embedding.int4"
-        adb("push", args.embedding_table, embedding_remote)
-        for target in (prefill_root, decode_root):
-            adb("shell", f"ln -sfn {embedding_remote} {target}/embedding.int4")
-    adb("push", run_dir / "tokens.i64", prefill_root + "/tokens.i64")
+    embedding = "embedding.int4" if args.embedding_table else "embedding.bf16"
+    embedding_remote = args.remote_root + "/" + embedding
+    adb(
+        "push",
+        "--sync",
+        args.embedding_table or args.artifacts / embedding,
+        embedding_remote,
+    )
+    for target in (prefill_root, decode_root):
+        adb("shell", f"ln -sfn {embedding_remote} {target}/{embedding}")
+    if (run_dir / "tokens.i64").is_file():
+        adb("push", run_dir / "tokens.i64", prefill_root + "/tokens.i64")
     if vision is not None:
         adb("push", run_dir / "pixels.f32", prefill_root + "/pixels.f32")
     adb(
@@ -118,7 +144,6 @@ def deploy_artifacts(args, device, paths, run_dir, vision):
             ),
         )
         for name in ["cos.f32", "sin.f32"]:
-            adb("shell", "rm " + target + "/" + name)
             local = (
                 run_dir / name if vision is not None else runtime_assets(args) / name
             )
@@ -128,7 +153,8 @@ def deploy_artifacts(args, device, paths, run_dir, vision):
     adb("shell", "rm -f " + decode_root + "/libQnnDeltaNetOpPackage_HTP.so")
     adb(
         "push",
-        args.build_dir / "op-package/hexagon-v85/libQnnDeltaNetOpPackage_HTP.so",
+        args.build_dir
+        / f"op-package/hexagon-{args.dsp_arch}/libQnnDeltaNetOpPackage_HTP.so",
         decode_root + "/libQnnDeltaNetOpPackage_HTP.so",
     )
     adb(
@@ -150,10 +176,13 @@ def deploy_artifacts(args, device, paths, run_dir, vision):
     if args.shared_model:
         shared_remote = paths.shared_model
         adb("shell", "mkdir -p " + shared_remote)
-        adb("push", args.build_dir / "libqwen35_shared.so", prefill_root + "/")
+        adb(
+            "push", "--sync", args.build_dir / "libqwen35_shared.so", prefill_root + "/"
+        )
         adb("shell", "mkdir -p " + shared_remote + "/head")
         adb(
             "push",
+            "--sync",
             args.shared_model / "head/graph.qnn",
             args.shared_model / "head/weights.bin",
             shared_remote + "/head/",
@@ -164,6 +193,7 @@ def deploy_artifacts(args, device, paths, run_dir, vision):
             adb("shell", "mkdir -p " + target)
             adb(
                 "push",
+                "--sync",
                 local / "graph.qnn",
                 local / "weights.bin",
                 local / "GRAPHS.json",

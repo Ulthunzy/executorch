@@ -3,13 +3,15 @@ import json
 from pathlib import Path, PurePosixPath
 import re
 import shlex
-import subprocess
 import sys
 import shutil
 from dataclasses import replace
 
-from model_config import add_model_config_argument, load_model_config
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from workflow.model_config import add_model_config_argument, load_model_config
 from workflow.device import AndroidDevice
+from export.weights import separate_context
 
 
 def main():
@@ -65,7 +67,11 @@ def main():
     remote = args.remote_root
     device.adb("shell", f"mkdir -p {remote}")
     device.adb("push", args.build_dir / "capture_weights", remote + "/capture_weights")
-    package = args.build_dir / "op-package/hexagon-v85/libQnnDeltaNetOpPackage_HTP.so"
+    device.check_target(settings.target)
+    package = (
+        args.build_dir
+        / f"op-package/hexagon-{settings.target.dsp_arch}/libQnnDeltaNetOpPackage_HTP.so"
+    )
     device.adb("push", package, remote + "/libQnnDeltaNetOpPackage_HTP.so")
     for name, source in sources:
         destination = args.output / name
@@ -81,24 +87,8 @@ def main():
         (destination / "capture.log").write_text(device.adb("shell", command))
         requests = destination / "requests.txt"
         device.adb("pull", remote + "/requests.txt", requests)
-        subprocess.run(
-            [
-                sys.executable,
-                str(Path(__file__).with_name("pack_shared_weights.py")),
-                "--context",
-                str(source),
-                "--requests",
-                str(requests),
-                "--output",
-                str(destination),
-            ],
-            check=True,
-        )
+        separate_context(source, requests, destination)
         print("SEPARATED", name, flush=True)
-        if name != "head":
-            directory = source.parent
-            for metadata in [directory / "GRAPHS.json", *directory.glob("*.io")]:
-                shutil.copy2(metadata, destination / metadata.name)
     for name in ("cache-encoding.bin", "cos.f32", "sin.f32", "RUNTIME.json"):
         source = args.source_dir / name
         if source.is_file():

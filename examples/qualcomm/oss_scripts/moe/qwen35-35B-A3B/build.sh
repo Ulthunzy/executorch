@@ -11,6 +11,14 @@ runtime_build=${EXECUTORCH_ANDROID_BUILD:-"$task_repo/build-android"}
 : "${HEXAGON_SDK_ROOT:?Set HEXAGON_SDK_ROOT}"
 : "${HEXAGON_TOOLS_ROOT:?Set HEXAGON_TOOLS_ROOT}"
 : "${ANDROID_NDK_ROOT:?Set ANDROID_NDK_ROOT}"
+task_soc=${MOE_SOC_MODEL:-SM8975}
+target_args=(--soc-model "$task_soc")
+if [[ -n "${MOE_DSP_ARCH:-}" ]]; then
+  target_args+=(--dsp-arch "v${MOE_DSP_ARCH#v}")
+fi
+task_arch=$(PYTHONPATH="$task_repo/..${PYTHONPATH:+:$PYTHONPATH}" \
+  "${MOE_PYTHON:-python}" "$moe_root/workflow/target.py" "${target_args[@]}")
+export MOE_SOC_MODEL="$task_soc" MOE_DSP_ARCH="$task_arch"
 ggml_root=${LLAMA_CPP_ROOT:-"$task_repo/../llama.cpp"}
 ggml_htp="$ggml_root/ggml/src/ggml-hexagon/htp"
 if [[ ! -f "$ggml_htp/hvx-sigmoid.h" ]]; then
@@ -20,11 +28,11 @@ fi
 
 qaic="$HEXAGON_SDK_ROOT/ipc/fastrpc/qaic/Ubuntu/qaic"
 compiler="$ANDROID_NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android28-clang++"
-native_flags=(-O3 -fPIC -mhmx -mhvx -mhvx-length=128B -mv85
+native_flags=(-O3 -fPIC -mhmx -mhvx -mhvx-length=128B -mv"$task_arch"
   -I"$QNN_SDK_ROOT/include/QNN" -I"$ggml_htp" -I"$ggml_htp/.."
   -I"$HEXAGON_SDK_ROOT/incs" -I"$HEXAGON_SDK_ROOT/incs/stddef"
-  -I"$HEXAGON_SDK_ROOT/rtos/qurt/computev85/include/qurt"
-  -I"$HEXAGON_SDK_ROOT/rtos/qurt/computev85/include/posix"
+  -I"$HEXAGON_SDK_ROOT/rtos/qurt/computev$task_arch/include/qurt"
+  -I"$HEXAGON_SDK_ROOT/rtos/qurt/computev$task_arch/include/posix"
   -Drestrict=__restrict -DSM_EXPERT_BITS=2 -DSM_MOE_PROFILE=${MOE_NATIVE_PROFILE:-0}
   -DSM_MOE_STAGE_READY=0 -DSM_MOE_ACCUMULATE=0 -DSM_MOE_ROUTE_VTCM=1
   -DSM_MOE_HMX_BATCH=8 -DPREPARE_DISABLED -DUSE_OS_QURT -DNATIVE_RPC)
@@ -104,6 +112,9 @@ done
   "$moe_root/runner/runtime_utils.cpp" \
   "$moe_root/runner/shared/graph_binding.cpp" -ldl -o "$task_build/capture_weights"
 if [[ "${MOE_BUILD_NATIVE:-1}" == 1 ]]; then
-  "$moe_root/build_op_package.sh"
+  "$moe_root/native/build_op_package.sh"
 fi
-echo "Built runners and V85 Native MoE libraries in $task_build"
+echo "Built runners and Native MoE libraries in $task_build"
+cat > "$task_build/TARGET.json" <<EOF
+{"target":{"soc_model":"$task_soc","dsp_arch":"v$task_arch"},"chat_controls":1}
+EOF

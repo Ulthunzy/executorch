@@ -3,7 +3,12 @@ import hashlib
 import json
 from pathlib import Path
 
-from model_config import add_model_config_argument, load_model_config
+import sys
+
+# Internal stage scripts also support direct execution for diagnostics.
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from workflow.model_config import add_model_config_argument, load_model_config
 
 
 def main():
@@ -123,7 +128,7 @@ def main():
         from quantization.matrix import original_weights
 
         gptq_weights = original_weights(model)
-    quantizer = QnnQuantizer(soc_model=QcomChipset.SM8975)
+    quantizer = QnnQuantizer(soc_model=QcomChipset[settings.target.soc_model])
     recipes = {
         "w8a16": Qwen35VLEncoderQuantRecipe,
         "w8a16_gptq": Qwen35VLEncoderQuantRecipe,
@@ -172,7 +177,7 @@ def main():
     )
     print(f"VISION_QDQ sqnr_db={sqnr:.4f}", flush=True)
     specs = generate_qnn_executorch_compiler_spec(
-        QcomChipset.SM8975,
+        QcomChipset[settings.target.soc_model],
         generate_htp_compiler_spec(use_fp16=False),
         shared_buffer=False,
     )
@@ -198,6 +203,7 @@ def main():
     blob = program.backend_delegate_data[plan.delegates[0].processed.index].data
     (args.output / "vision.bin").write_bytes(qnn.StripProtocol(blob))
     metadata = dict(
+        target=settings.target.to_dict(),
         version=1,
         model_config_sha256=hashlib.sha256(
             (args.model / "config.json").read_bytes()

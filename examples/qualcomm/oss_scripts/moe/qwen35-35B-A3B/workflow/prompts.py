@@ -1,4 +1,4 @@
-from multimodal import image_prompt, pad_prompt
+from workflow.vision import image_prompt, pad_prompt
 
 
 def prepare_prompt(args, tokenizer, np, vision=None):

@@ -29,6 +29,7 @@ Options parse_options(int argc, char** argv) {
           "  [--prompt TEXT ...] [--interactive] [--system-prompt TEXT]\n"
           "  [--image-path JPG_OR_PNG] (image files are decoded on device)\n"
           "  [--max-new-tokens 128] [--temperature 0] [--enable-thinking]\n"
+          "  [--stream|--no-stream] [--vision|--no-vision]\n"
           "  [--prompt-tokens N] [--ignore-eos] (fixed-length performance runs)\n"
           "  [--max-seq-len 1152] [--cache-experts 32] [--shared-model DIR]\n"
           "  [--prefill-order layer_major|chunk_major]\n"
@@ -40,6 +41,8 @@ Options parse_options(int argc, char** argv) {
     }
     if (flag == "--interactive")
       options.interactive = true;
+    else if (flag == "--no-interactive")
+      options.interactive = false;
     else if (flag == "--enable-thinking")
       options.thinking = true;
     else if (flag == "--no-enable-thinking")
@@ -48,6 +51,12 @@ Options parse_options(int argc, char** argv) {
       options.tokenize_only = true;
     else if (flag == "--ignore-eos")
       options.ignore_eos = true;
+    else if (flag == "--no-ignore-eos")
+      options.ignore_eos = false;
+    else if (flag == "--stream" || flag == "--no-stream")
+      options.stream = flag == "--stream";
+    else if (flag == "--vision" || flag == "--no-vision")
+      options.vision_enabled = flag == "--vision";
     else {
       if (i + 1 == argc)
         throw std::runtime_error("Missing value for " + flag);
@@ -91,6 +100,8 @@ Options parse_options(int argc, char** argv) {
   }
   if (options.model_root.empty() || options.tokenizer_path.empty())
     throw std::runtime_error("--model-root and --tokenizer-path are required");
+  if (!options.vision_enabled && !options.image_path.empty())
+    throw std::runtime_error("--image-path requires vision");
   options.model_root = std::filesystem::canonical(options.model_root).string();
   nlohmann::json plans;
   std::ifstream manifest(options.model_root + "/prefill/plans/PLANS.json");
@@ -176,7 +187,8 @@ void configure_environment(
   if (!o.tokenize_only && !std::filesystem::is_regular_file(plan))
     throw std::runtime_error("Missing prefill plan: " + plan);
   // Interactive sessions keep vision resident for later /image turns.
-  const bool vision_enabled = (!o.image_path.empty() || o.interactive) &&
+  const bool vision_enabled = o.vision_enabled &&
+      (!o.image_path.empty() || o.interactive) &&
       std::filesystem::is_regular_file(prefill + "/vision.bin");
   printf(
       "CHAT_PREFILL_PLAN order=%s prompt_tokens=%d plan_tokens=%d path=%s vision_enabled=%d\n",

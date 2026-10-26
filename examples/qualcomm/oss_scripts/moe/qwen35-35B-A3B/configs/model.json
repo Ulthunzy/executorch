@@ -31,7 +31,11 @@
   "generation": {
     "enable_thinking": false,
     "system_prompt": "你是一个有帮助的人工智能助手。",
-    "max_new_tokens": 128
+    "max_new_tokens": 128,
+    "temperature": 0,
+    "ignore_eos": false,
+    "interactive": false,
+    "stream": true
   },
   "schedule": {
     "prefill_order": "layer_major",
@@ -45,5 +49,9 @@
     "decode_ready_io": true,
     "overlap_feedback": true,
     "context_load_mode": "auto"
+  },
+  "target": {
+    "soc_model": "SM8975",
+    "dsp_arch": "v85"
   }
 }

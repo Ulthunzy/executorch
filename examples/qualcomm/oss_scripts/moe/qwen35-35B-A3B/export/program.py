@@ -1,11 +1,17 @@
+"""Serialize the external-weight MoE execution plan as part of export."""
+
 import argparse
 import hashlib
 import json
 from pathlib import Path
+import sys
 import struct
 
 from dataclasses import replace
-from model_config import (
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from workflow.model_config import (
     add_model_config_argument,
     load_model_config,
     shared_model_signature,
@@ -23,8 +29,6 @@ def main(argv=None):
     parser.add_argument("--max-seq-len", type=int)
     parser.add_argument("--prefill-order", choices=["layer_major", "chunk_major"])
     parser.add_argument("--phase", choices=["prefill", "decode"], required=True)
-    parser.add_argument("--source-dir", type=Path, required=True)
-    parser.add_argument("--head", type=Path, required=True)
     parser.add_argument("--cache-encoding", type=Path, help="Required for decode")
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument(
@@ -34,7 +38,10 @@ def main(argv=None):
         help="Host plan sequence length; QNN and Native kernels remain AR128",
     )
     parser.add_argument(
-        "--shared-model", type=Path, help="Separated four-layer context groups"
+        "--shared-model",
+        type=Path,
+        required=True,
+        help="Shared four-layer context groups",
     )
     args = parser.parse_args(argv)
     settings = load_model_config(args.model_config)
@@ -61,25 +68,21 @@ def main(argv=None):
         parser.error("Invalid prefill length for the selected context and schedule")
     if args.phase == "decode" and args.cache_encoding is None:
         parser.error("Decode packing requires --cache-encoding")
-    if args.shared_model:
-        for group in range(10):
-            manifest = json.loads(
-                (args.shared_model / f"group{group}/GRAPHS.json").read_text()
+    for group in range(10):
+        manifest = json.loads(
+            (args.shared_model / f"group{group}/GRAPHS.json").read_text()
+        )
+        settings.target.check_manifest(manifest)
+        if (
+            manifest["capacity"] != settings.context.max_seq_len
+            or manifest["router"] != settings.quantization.router_shared
+            or not manifest["weight_sharing"]
+        ):
+            parser.error(f"Shared group {group} does not match the selected model")
+        if manifest.get("compile_settings") != settings.compile_settings():
+            parser.error(
+                f"Shared group {group}: compiled quantization/KV/context mismatch"
             )
-            if (
-                manifest["capacity"] != settings.context.max_seq_len
-                or manifest["router"] != settings.quantization.router_shared
-            ):
-                parser.error(
-                    f"Shared group {group} does not match --model-config/--max-seq-len"
-                )
-            if (
-                "compile_settings" in manifest
-                or settings.quantization.attention == "gptq"
-            ) and manifest.get("compile_settings") != settings.compile_settings():
-                parser.error(
-                    f"Shared group {group}: compiled quantization/KV/context mismatch"
-                )
     from executorch.exir._serialize._program import (
         PTEFile,
         serialize_pte_binary,
@@ -143,14 +146,13 @@ def main(argv=None):
         values.append(EValue(value))
         return len(values) - 1
 
-    def stage(kind, layer, arguments, primary=None, auxiliary=None):
-        if args.shared_model:
-            primary = args.cache_encoding if decode and kind == 0 else None
-            auxiliary = (
-                (args.shared_model / f"group{layer // 4}" / f"layer{layer}_decode.io")
-                if decode and kind == 1
-                else None
-            )
+    def stage(kind, layer, arguments):
+        primary = args.cache_encoding if decode and kind == 0 else None
+        auxiliary = (
+            args.shared_model / f"group{layer // 4}" / f"layer{layer}_decode.io"
+            if decode and kind == 1
+            else None
+        )
         data = primary.read_bytes() if primary else b""
         aux = auxiliary.read_bytes() if auxiliary else b""
         offset = (128 + len(data) + 127) & ~127
@@ -158,10 +160,10 @@ def main(argv=None):
         header = struct.pack(
             "<8sIIIIQQQ",
             magic,
-            3 if args.shared_model else (2 if ar_len > 128 else 1),
+            3,
             kind,
             layer,
-            ar_len if args.shared_model or ar_len > 128 else 0,
+            ar_len,
             len(data),
             offset,
             len(aux),
@@ -198,34 +200,22 @@ def main(argv=None):
         0,
         0,
         [tokens, position, hidden] if decode else [tokens, hidden],
-        args.cache_encoding if decode else None,
     )
     for layer in range(40):
         norm, residual = tensor([1, ar_len, 2048], "norm"), tensor(
             [1, ar_len, 2048], "residual"
         )
-        directory = args.source_dir / f"layer{layer}"
-        if decode:
-            attention, metadata = (
-                directory / "attention.bin",
-                directory / "io.bin",
-            )
-        else:
-            attention = (
-                args.source_dir / f"cold/layer{layer}" if layer % 4 == 3 else directory
-            ) / "forward_0.bin"
-            metadata = directory / "forward_0.bin" if layer % 4 == 3 else None
-        stage(1, layer, [hidden, norm, residual], attention, metadata)
+        stage(1, layer, [hidden, norm, residual])
         ids = tensor([1, ar_len, 8], "ids", ScalarType.INT)
         scores, shared = tensor([1, ar_len, 8], "scores"), tensor(
             [1, ar_len, 2048], "shared"
         )
-        stage(2, layer, [norm, ids, scores, shared], directory / "moe-front.bin")
+        stage(2, layer, [norm, ids, scores, shared])
         next_hidden = tensor([1, ar_len, 2048], "chain")
         stage(3, layer, [norm, ids, scores, shared, residual, next_hidden])
         hidden = next_hidden
     logits = tensor([1, 1, 248320], "logits")
-    stage(4, 0, [hidden, logits], args.head)
+    stage(4, 0, [hidden, logits])
     assert len(instructions) == 122
     plan = ExecutionPlan(
         "decode_forward" if decode else "prefill_forward",
@@ -250,26 +240,21 @@ def main(argv=None):
         json.dumps(
             dict(
                 phase=args.phase,
+                target=settings.target.to_dict(),
                 ar_len=1 if decode else 128,
                 plan_tokens=ar_len,
                 requested_prefill_tokens=args.prefill_tokens,
                 prefill_order=settings.schedule.prefill_order,
                 compile_settings=settings.compile_settings(),
-                shared_signature=(
-                    shared_model_signature(args.shared_model)
-                    if args.shared_model
-                    else None
-                ),
+                shared_signature=shared_model_signature(args.shared_model),
                 cache_encoding_sha256=(
                     hashlib.sha256(args.cache_encoding.read_bytes()).hexdigest()
                     if decode
                     else None
                 ),
                 layers=40,
-                weight_mode=(
-                    "external_shared" if args.shared_model else "embedded_independent"
-                ),
-                shared_model=str(args.shared_model) if args.shared_model else None,
+                weight_mode="external_shared",
+                shared_model=str(args.shared_model),
                 stages=records,
             ),
             indent=2,

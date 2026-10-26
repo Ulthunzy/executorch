@@ -2,15 +2,71 @@
 
 本目录维护已验证的 40 层 MoE 推理、融合图导出及专家重构代码。独立于 `llama.py`。默认使用融合后的 Attention＋Router/shared、AR128 prefill、AR1 decode、每层 32 槽 LRU（可用 `--cache-experts 64` 切换）、命中专家先计算与缺失专家异步读取。
 
-当前默认使用 P/D 共享常量、外部权重文件与公共 head；11 个共享 context 在整个会话中常驻，图片或交互会话另保留 1 个视觉 context。Router/shared 为 GPTQ W8A16，embedding 为 group-32 INT4，专家缓存跨阶段交接复用。历史独立权重版本的测试记录仍保留在下文。
+当前默认使用 P/D 共享常量、外部权重文件与公共 head；11 个共享 context 在整个会话中常驻，图片输入或显式 `--with-vision` 另保留 1 个视觉 context。Router/shared 为 GPTQ W8A16，embedding 为 group-32 INT4，专家缓存跨阶段交接复用。历史独立权重版本的测试记录仍保留在下文。
 
 导出、量化和推理各自保留入口，共用 [configs/model.json](configs/model.json) 中的量化、KV/state、上下文、thinking 和调度配置；[configs/sm8975.json](configs/sm8975.json) 只管理本机和设备路径。**完整命令、参数生效位置及支持范围见 [CONFIGURATION.md](CONFIGURATION.md)。**
 
-当前保留的完整导出位于 `llama-output/qwen35-moe-from-safetensors-gptq-20261024`，默认模型配方与设备配置均已对齐这套全矩阵 GPTQ 产物。编译 binding、WikiText 校准语料、两张校准图片及设备运行库已迁入该目录；历史导出的权重、PTE 和中间文件清理，报告归档到其中的 `history-reports/`。下文历史命令用于说明当时测试口径，当前运行请使用上面的默认配置及 `CONFIGURATION.md` 中的命令。
+校准源保留在 `llama-output/qwen35-moe-from-safetensors-gptq-20261024`，包含全矩阵 GPTQ 权重、binding、WikiText 语料、两张校准图片及运行库。统一入口的新完整导出位于 `llama-output/qwen35-35B-A3B-export`；2026-10-26 已在 SM8975 验证有效长度 AR128、文本/图片及多轮推理。下文历史命令说明当时测试口径，当前运行使用统一导出及 `CONFIGURATION.md` 中的命令。
 
 分词器继续使用原有 `meta-pytorch/tokenizers` 子模块，锁定上游正式提交 `32af6c1b623639515a08ab9b2b4580ffe570c42a`（上游 PR #198，支持 `ByteLevel use_regex=false`），无需额外的自定义分词器仓库。拉取源码后执行 `git submodule update --init --recursive`。更新版本后应重建对应 Android 分词器静态库，再重新链接 runner/JNI，保证头文件与静态库匹配。
 
 该上游版本的32项 pre-tokenizer 测试及1项 HF ByteLevel 回归通过，主机和 Android C++17 编译兼容性检查通过；对冻结评测的12724条 NFC 输入，token ID 与保存的原设备结果逐项一致。[分词验证记录](docs/tokenizer-upstream-20261026.json)保留版本与输出哈希；本次未重跑模型推理，原129题评测结果继续保留。
+
+## 配置驱动的统一导出
+
+正常导出只需一条命令：
+
+```bash
+python examples/qualcomm/oss_scripts/moe/qwen35-35B-A3B/export.py \
+  --config examples/qualcomm/oss_scripts/moe/qwen35-35B-A3B/configs/export_sm8975.json
+```
+
+导出配置选择文本/视觉组件、PTE/QNN 格式、复用校准产物或从 safetensors 开始，以及输出与工具链路径；引用的 `model.json` 统一管理量化、KV、上下文和调度。`--soc-model` / `--soc_model` 选择 SM8750/V79、SM8850/V81 或 SM8975/V85，`--device` 选择采集设备。内部串行执行构建、量化、分组 QNN 编译、共享权重分离与 PTE 打包，保存检查点以便续跑。`--print-plan` 查看计划，`--check` 检查本地依赖。原分步脚本已移入 `export/`，作为内部实现保留；详细字段、产物格式和推理命令见 [配置说明](CONFIGURATION.md#一条命令导出)。
+
+正常推理统一由 `run_chat.py` / `run_inference(...)` 进入设备端常驻会话：
+
+```bash
+python examples/qualcomm/oss_scripts/moe/qwen35-35B-A3B/run_chat.py \
+  --weights-path llama-output/qwen35-35B-A3B-export \
+  --device A7SR026915000282 --soc-model SM8975 \
+  --temperature 0.7 --max-new-tokens 256 \
+  --interactive --stream --prompt "请介绍一下自己。"
+```
+
+图片使用 `--image-path /path/to/image.jpg`，在设备内解码；后续图片使用 `--with-vision` 保留视觉塔。`--ignore-eos` 控制停止条件，`--no-stream` 改为每轮生成完再显示。旧 teacher-forcing / 张量dump仍进入诊断链路。新会话要求配套的新runner和支持有效长度的AR128图，统一导出会同时生成；旧产物不会被自动覆盖。三种架构的专家内核与GDN包已通过交叉编译，V79/V81整模设备验证尚未执行。
+
+### 2026-10-26：代码复核与新入口设备回归
+
+后续目录精简已移除顶层 `multimodal.py`、`pack_pte.py`、`pack_shared_weights.py`、`separate_shared.py`，配置及构建辅助也下移。顶层只保留 `export.py`、`run_chat.py`、`build.sh` 三个入口。共享在QNN编译时启用，PTE打包和权重文件分离均由导出阶段自动完成；推理只读取 `plans/` 中的现成产物，缺失或配置不匹配时要求重新导出，不再临时打包。具体职责见[代码位置](#代码位置)及[导出格式说明](CONFIGURATION.md#导出共享图权重与-pte)。
+
+目录整理后的54项回归通过；AR128/AR256调度PTE、decode PTE，以及一组真实共享context分离得到的 `graph.qnn`、`weights.bin` 均与已有产物逐字节相同。SM8975用现成PTE完成文本和图片两项整模推理，分别回答“2”和“图中男子穿的上衣是橙色。”，运行日志没有PTE生成记录。此轮没有重跑GPU校准或40层QNN编译。详情见[产物一致性](../../../../../llama-output/qwen35-export-layout-review-20261026/ARTIFACT_EQUIVALENCE.json)及[设备记录](../../../../../llama-output/qwen35-export-layout-review-20261026/DEVICE_RESULTS.json)。
+
+删除无调用方的独立 decode/router 导出器、重复的分组导出调度、未使用的 `--model` 参数和 checkpoint 路径 helper；合并计划打包、视觉校验及重复上传逻辑。部署失败也保存 `RUN.json`。SoC 与架构直接取自 `qc_schema.py` 的 `QcomChipset`、`HtpArch`、`_soc_info_table`；本目录只限制 Native 的 V79/V81/V85 支持范围，构建和导出不再各维护一份映射。
+
+分词探针中的27与226是独立请求，后者已经包含文本。同一请求先合并模板、文本和图片 token，再统一按 AR128 分块；只有尾部的无效位置补齐。设备 token IDs 与 Transformers 完全一致，图片解码、缩放、归一化及 patch 数据与 PIL 参考逐字节一致。
+
+| 分词探针 | 文本及模板 | 图片 token | 有效总数 | AR128 块数 | 无效尾部 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 纯文本 | 27 | 0 | 27 | 1 | 101 |
+| 图文 | 30 | 196 | 226 | 2 | 30 |
+| 增加27个文本 token 的图文 | 57 | 196 | 253 | 2 | 3 |
+
+整模设备为 SM8975/V85、SDK 2.48.1、40层、1152总上下文、每层32槽，复用冻结文本 GPTQ 校准结果，视觉重新执行 W8A16 GPTQ 校准，视觉 QDQ SQNR 为28.25 dB。新图和新runner串行运行以下六项，均通过；不同文本提示的 token 数与上面的分词探针不同。
+
+| 功能 | 首轮有效输入/AR128块数 | 生成 token 数 | 结果 |
+| --- | --- | --- | --- |
+| 文本 greedy | 28 / 1 | 62，遇 EOS | 中文介绍正常 |
+| 图片 greedy | 226 / 2 | 80，达到上限 | 识别白牛、橙衣男子、草地和帐篷 |
+| 温度0.7、非流式 | 30 / 1 | 48，达到上限 | 生成 Python 学习建议 |
+| 忽略 EOS | 28 / 1 | 固定12 | 输出长度控制正确 |
+| 文本多轮 | 35 / 1 | 2＋12 | 追问正确恢复“蓝鲸42” |
+| 253-token 图文及追问 | 253 / 2 | 48＋9 | 追问上衣颜色回答“橙色” |
+
+两组多轮输入的追加日志均为 `ar1_calls=0`，会话为 `model_reloads=0`。253-token 图文的日志为 `CHAT_INPUT valid_tokens=253 text_and_template_tokens=57 image_tokens=196 padded_tokens=256 ar128_blocks=2`，没有将文本和图片分别补齐。
+
+设备回归还定位并修复了两项问题：共享 context 的 IO 预算只统计了 UINT16 state/KV，漏算 FP32 激活及跨 context 注册，原192MiB预算不足。本轮记录的注册量约223.9MiB；改为按全部图IO及页对齐计算安全上界，新产物预算为400MiB，原错误25及8003在后续六项测试中未再出现。非交互 ADB 部署命令改用空stdin，避免抢先读取聊天进程的下一轮输入。另补齐 `quantization/__init__.py`，修复内部阶段脚本的同名模块遮蔽问题。
+
+52项Python回归及C++ context回滚、FP32 IO预算、cache交接和运行参数测试通过；`git diff --check` 通过。原始失败记录、分词探针、六组运行及源码/二进制指纹保留在[设备回归目录](../../../../../llama-output/qwen35-reviewed-device-tests-20261026/DEVICE_RESULTS.json)和新导出的 `RUNTIME_REVIEW.json`。导出检查点保留编译时的原始来源标识，没有因运行时修复而伪造重编译记录。本次为功能回归，未重测峰值内存或完整benchmark，已停止评测的129题记录不变。
 
 ## 2026-10-26：2048 上下文图文连续负载测试
 
@@ -59,7 +115,7 @@ cd /data/local/tmp/qwen35-raw-gptq-20261024/runtime/w2a8-fused-c1152-p128-cache3
 
 输入 `/reset` 清空对话，输入 `/exit` 退出。也可用 `--prompt "第一问" --prompt "第二问"` 连续执行多轮；增加 `--interactive` 可继续从终端读取。`--temperature 0` 为 greedy，`--enable-thinking` 开启思考模板，默认关闭。运行日志及逐 token 时间记录在模型目录的 `chat.log`，可用 `--log-path` 修改。
 
-首轮 Attention/Router 使用 AR128，与原主机入口采用相同的 system-message 空格填充。512–1024位置的同层专家 token 在 Native 内归并，HMX tile 仍最多32行；较短输入的 Native 维持 AR128。终端按实际输入长度选择无权重的 host PTE，默认按 `layer_major` 让同一层完成全部 AR128 块并复用专家，再进入下一层。顺序来自部署的 `prefill/plans/PLANS.json`，可用 `--prefill-order chunk_major` 显式对照。后续轮将尚未反馈的最后一个生成 token、轮次分隔符及新问题按 AR1 追加到当前 state/KV，不重新计算历史。后续输入很长时，其处理速度受 AR1 吞吐限制。Context、buffer、每层 LRU 和原生服务在会话内常驻；`/reset` 只清空 state/KV 和位置，不重新装载权重或丢弃专家缓存。达到静态上下文容量时拒绝追加，用户可显式 `/reset`。
+首轮 Attention/Router 使用 AR128，普通请求仅在序列末尾加入无效 padding；显式 `--prompt-tokens` 的定长 benchmark 才向 system-message 填充真实空格。512–1024位置的同层专家 token 在 Native 内归并，HMX tile 仍最多32行；较短输入的 Native 维持 AR128。终端按实际补齐长度选择无权重的 host PTE，默认按 `layer_major` 让同一层完成全部 AR128 块并复用专家，再进入下一层。顺序来自部署的 `prefill/plans/PLANS.json`，可用 `--prefill-order chunk_major` 显式对照。后续轮将尚未反馈的最后一个生成 token、轮次分隔符及新问题按 AR128 分块追加，仅有效位置更新 state/KV，不重新计算历史；AR1只用于生成。Context、buffer、每层 LRU 和原生服务在会话内常驻；`/reset` 只清空 state/KV 和位置，不重新装载权重或丢弃专家缓存。达到静态上下文容量时拒绝追加，用户可显式 `/reset`。
 
 设备端使用与 `qnn_llama_runner.cpp` 相同的 HFTokenizer/BPE 和 ExecuTorch sampler。Qwen3.5 的 NFC 使用 Android 公共 ICU API（Android 31+），避免现有内置 NFC 丢失重音字符；原 tokenizer 文件保持不变。
 
@@ -77,7 +133,7 @@ cd /data/local/tmp/qwen35-raw-gptq-20261024/runtime/w2a8-fused-c1152-p128-cache3
 
 换图使用 `/image /data/local/tmp/another.png 请描述这张图。`；有空格的路径加双引号。每轮支持一张图片，旧图的 state/KV 保留以供追问。`/reset` 同时清除图文历史并恢复文本 RoPE。JPG/PNG 由 Android ImageDecoder 解码，再按校准路径做抗混叠 BICUBIC、RGB 归一化和 patch 排列；形状与 MRoPE 配置来自部署的 `VISION.json` 和 `model-config.json`。当前静态图为 448×448、196 个图像 token，源图最多 32 百万像素。
 
-部署还包括模型根目录的 `base-cos.f32`、`base-sin.f32` 和 `prefill/vision.bin`。`run_chat.py` 在视觉产物存在时一并部署这些文件。图片输入或 `--interactive` 会话的视觉 context 和 IO buffer 随完整模型初始化，所有图文轮次复用，结束会话时统一释放；普通非交互纯文本 `--prompt` 不加载视觉模块。首轮图文用 AR128；后续换图仍按 AR1 追加，当前约 221 个输入 token 需 24 秒，尚未接入多轮 AR128 批量追加。
+部署还包括模型根目录的 `base-cos.f32`、`base-sin.f32` 和 `prefill/vision.bin`。图片输入或显式 `--with-vision` 会话的视觉 context 和 IO buffer 随完整模型初始化，所有图文轮次复用，结束会话时统一释放；纯文本会话不加载视觉模块。首轮和后续图文输入均使用有效长度 AR128 分块，旧版 AR1 换图耗时仅保留在下方历史记录中。
 
 SM8975 的 JPG、PNG 预处理、256-token 图文模板和 MRoPE 与 Python 路径逐字节一致；看图描述、跨轮追问、新图片、坏路径恢复和 reset 后再次看图均已验证。整个会话保留 11 个共享 context 和 1 个视觉 context，视觉重复执行不创建或释放 context/buffer。详见[设备图片会话记录](../../../../../llama-output/qwen35-moe-from-safetensors-gptq-20261024/device-image-chat-tests/REPORT.md)。
 
@@ -117,7 +173,7 @@ Decode 的 40 层都已融合 Attention 与 Router/shared；约 0.047 ms 只是�
 
 ### 首轮 prefill 调度修复
 
-上述阶段测试后确认：旧终端入口固定加载 `[1,128]` 的 `prefill.pte`，没有使用配置中的 `layer_major`。256 个输入 token 的第二块和第一块有 77.25% 的逐层专家重合，但每层32槽 LRU 不能保留全部工作集，导致重复读取。现在按首轮实际 padding 长度自动选择128～1024的host计划，QNN与Native的AR仍为128；部署自动准备8份计划，含JSON共约0.61MB，不复制权重。
+上述阶段测试后确认：旧终端入口固定加载 `[1,128]` 的 `prefill.pte`，没有使用配置中的 `layer_major`。256 个输入 token 的第二块和第一块有 77.25% 的逐层专家重合，但每层32槽 LRU 不能保留全部工作集，导致重复读取。现在按首轮实际 padding 长度自动选择128～1024的host计划，QNN与Native的AR仍为128；导出阶段准备8份计划，部署只读取，含JSON共约0.61MB，不复制权重。
 
 SM8975、相同图文输入、同一目录与二进制：
 
@@ -383,68 +439,45 @@ Native单独profile的图文结果为39.09ms/token，其中最慢worker的专家
 
 ```text
 qwen35-35B-A3B/
-├── run_chat.py              # 参数解析→产物校验→推理
-├── model_config.py          # 模型配置、静态图契约及参数验证
-├── configs/model.json       # 量化、KV/state、上下文、thinking、调度
-├── workflow/
-│   ├── config.py            # CLI、配置文件和参数约束
-│   ├── artifacts.py         # 共享/独立产物校验、逐层路径与 IO 顺序
-│   ├── prompts.py           # 文本、图文和固定 token 输入
-│   ├── plans.py             # 按实际输入及调度生成/校验 PTE 计划
-│   ├── device.py            # ADB、设备路径、快照和流式子进程生命周期
-│   ├── deployment.py        # 部署及设备运行命令
-│   ├── inference.py         # 单次运行、输入记录、各阶段编排
-│   └── results.py           # 实时吐字、结果收集、EOS/反馈/teacher 校验
-├── export.py                # 从已校准逐层 QDQ 图导出融合 AR1 图
-├── export_shared.py         # 四层 AR128/AR1 联合编译与公共权重去重验证
-├── export_router.py         # 导出独立 W8A16 GPTQ Router/shared 图
-├── export_vision.py         # 只读取视觉权重，校准并导出 W8A16 编码器
-├── export_head.py           # 编译从本轮 safetensors/GPTQ 生成的新 head
-├── multimodal.py            # 图片预处理、image token 展开和三维 MRoPE
-├── pack_pte.py              # 将逐层 QNN binary 包装为完整 40 层 PTE 调度计划
-├── pack_shared_weights.py   # 按 SDK 回调范围分离图元数据与权重文件
-├── separate_shared.py       # 逐组采集真实 SDK 权重范围并分离文件
-├── tools/capture_weights.cpp # 设备端 context 恢复与权重回调采集
-├── build.sh                 # Android model runner、decode 动态库、Native MoE
-├── build_op_package.sh      # 复用共享 GDN 源码构建 host/V85 包
-├── configs/sm8975.json      # 本机模型、外部产物和设备路径
+├── export.py                 # 配置驱动的唯一导出入口
+├── run_chat.py               # 推理入口和run_inference函数
+├── build.sh                  # Android runner及Native库构建
+├── configs/                  # 导出、量化、设备与调度JSON
 ├── export/
-│   ├── model.py             # Router/shared、融合层
-│   ├── graph_utils.py       # 静态上下文特化
-│   ├── split_attention_core.py
-│   └── fp16_attention_core.py
+│   ├── shared.py             # 编译时共享prefill/decode权重
+│   ├── capture.py            # 导出内部的SDK权重范围采集
+│   ├── weights.py            # 图/权重文件布局分离，无独立CLI
+│   ├── program.py            # 导出内部的完整PTE序列化
+│   ├── head.py、vision.py    # head及视觉编译
+│   ├── runtime_assets.py     # 实际cache编码及RoPE
+│   └── model.py、graph_utils.py、prefill.py等
+├── workflow/
+│   ├── model_config.py       # 模型配置及静态图契约
+│   ├── target.py             # 复用qc_schema，筛选V79/V81/V85
+│   ├── export_config.py、export_pipeline.py # 单命令串行导出与续跑
+│   ├── config.py、artifacts.py # 推理参数和产物校验
+│   ├── plans.py              # 读取现成PTE，不执行打包
+│   ├── vision.py、prompts.py  # 元数据校验及离线诊断输入
+│   └── device.py、deployment.py、inference.py、session.py、diagnostic.py等
 ├── runner/
-│   ├── chat/                # 设备 CLI、tokenizer、图片解码/切块、MRoPE、多轮状态
-│   ├── prefill/             # 图片编码、AR128、每层专家缓存、向 decode 交接
-│   ├── decode/              # 常驻 context/state、32/64 槽 LRU、异步 IO、SIMD 采样
-│   │   └── decoder_api.cpp  # 持久 open/step/reset/close C ABI，供设备会话调用
-│   ├── shared/              # 共享 context 的外部权重文件映射与 DMA 回调
-│   ├── embedding.h/.cpp     # 按行读取 BF16 或 packed INT4 embedding
-│   ├── handoff.h
-│   └── resident_handoff.h
+│   ├── chat/                 # 设备分词、图片解码、MRoPE、多轮和吐字
+│   ├── prefill/、decode/     # 模型计算、缓存与专家IO
+│   ├── shared/               # 常驻共享context和权重DMA回调
+│   └── tests/                # 主机回归
 ├── native/
-│   ├── prefill/             # AR128 的 N2 解包、A8、N4×A8 HMX
-│   ├── decode/              # AR1、mailbox、bank 映射与就绪队列
-│   ├── worker_start.h/.cpp   # 所有 worker 锁申请完成后统一进入或取消计算
-│   ├── tests/               # 主机并发测试及设备真实锁失败注入
-│   └── N2Utils.h/.cpp       # N2→N4 展开接口与实现
-└── quantization/
-    ├── prepare_model.py     # 从 safetensors 串行校准全部 40 层与 head
-    ├── prepare_safetensors.py # token/embedding、原始 Attention、FP32 参考链路
-    ├── checkpoint.py        # 按层读取真实 checkpoint，不加载整个 35B
-    ├── matrix.py            # Linear、depthwise、视觉位置表的 Hessian/GPTQ
-    ├── evaluate_device.py   # 同 token 的设备 PPL/hidden SQNR
-    ├── quantize.py          # Hessian/GPTQ、完整专家重构与 scale 拟合
-    ├── prepare_router.py    # 用已有逐层输入校准 W8A16 GPTQ Router/shared
-    ├── prepare_embedding.py # one-hot 对角 Hessian、group-32 INT4 表
-    └── prepare_experts.py   # 逐层顺序校准、生成 experts.n2 和 bank-index.bin
+│   ├── build_op_package.sh   # GDN包内部构建
+│   ├── prefill/、decode/     # HVX/HMX内核与FastRPC
+│   └── tests/                # 锁与映射错误注入回归
+├── tools/                    # 设备权重范围和cache元数据工具
+├── quantization/             # safetensors、GPTQ与专家重构
+└── tests/                    # 导出与推理流程回归
 ```
 
 GDN recurrence 复用[共享 DeltaNetQhpi.cpp](../../../custom_op/deltanet_op_package_htp/DeltaNetOpPackage/src/ops/DeltaNetQhpi.cpp)，本目录不复制该 op。decode 选择已有 DDR kernel；prefill 沿用已有 AR128 图。原 PTE 的 `Q36DECO1`/`Q36PREF1`、`Qwen36*Stage` 名称作为兼容 ABI 保留。
 
 ### Python 流程
 
-参考 `llama.py` 的参数解析、产物准备、设备推理与评估职责划分，`run_chat.py` 只串起 `parse_args → check_artifacts → inference`。导出由 `export.py`、`export_shared.py`、`export_router.py`、`export_vision.py` 负责；专家、Router 和 embedding 的校准分别保留独立命令。`--model-config` 在各步骤使用同一配方，修改 GPTQ 参数需要重新校准，修改静态接口或容量需要重新导出。运行入口消费已编译图，自动生成与实际 prefill 长度和调度顺序匹配的元数据 PTE。
+参考 `llama.py` 的参数解析、产物准备、设备推理与评估职责划分，`run_chat.py` 只串起 `parse_args → check_artifacts → inference`。导出使用 `export.py --config`，由 `workflow/export_pipeline.py` 串行编排校准、QNN 编译、权重分离和 PTE 打包；各内部阶段保留单独调试命令。`--model-config` 在各步骤使用同一配方，修改 GPTQ 参数需要重新校准，修改静态接口或容量需要重新导出。运行入口只消费导出阶段已经生成的PTE及共享权重，根据实际prefill长度选择计划。
 
 `workflow/inference.py` 显式编排输入准备、部署、执行和结果校验；`DevicePaths` 统一管理 prefill、decode 和共享模型路径。独立权重的逐层目录由 `decode_layer_dir` 统一解析，供校验和部署复用。共享权重模式直接校验十组共享产物及 120 份 IO 顺序文件，不要求旧的独立 Attention binary 留在本地。
 
@@ -535,7 +568,7 @@ PYTHONPATH="$(dirname "$PWD")" python -u \
   --prompt "什么是注意力机制？" --max-new-tokens 128
 ```
 
-可以用 `--config` 选择设备/产物路径，`--model-config` 选择模型设置，CLI 覆盖本次运行参数。共享模式按实际输入自动打包本地元数据 PTE；也可显式提供 `--local-prefill-pte`、`--local-decode-pte` 及其 JSON sidecar，运行前校验图、IO 顺序、KV 编码和静态配置。`--runtime-device-dir` 指向设备上已部署的 QNN runtime/skel 等依赖，bank 从 `--remote-weights` 读取。
+可以用 `--config` 选择设备/产物路径，`--model-config` 选择模型设置，CLI 覆盖本次运行参数。共享模式按实际输入选择导出目录里的现成PTE；也可显式提供 `--local-prefill-pte`、`--local-decode-pte` 及其 JSON sidecar，运行前校验图、IO 顺序、KV 编码和静态配置。`--runtime-device-dir` 指向设备上已部署的 QNN runtime/skel 等依赖，bank 从 `--remote-weights` 读取。
 
 运行会部署本目录构建的 runner、Native MoE 和 GDN 包，并加载 `--artifacts/assets` 的融合图。两个完整 PTE 保留兼容调度容器，decode 的逐层 Attention/Router 由融合 binary 覆盖。不能用普通 llama runner 直接运行这套 PTE。
 
@@ -543,7 +576,7 @@ PYTHONPATH="$(dirname "$PWD")" python -u \
 
 ### 图片编码与图文推理
 
-`--vision-artifacts` 指向 `export_vision.py` 生成的目录，默认由 `configs/sm8975.json` 的 `vision_artifacts` 指定。运行入口部署同一编码器的 `vision.bin`；`vision.pte` 同时保留用于检查和其他部署方式。
+`--vision-artifacts` 指向 `export/vision.py` 生成的目录，默认由 `configs/sm8975.json` 的 `vision_artifacts` 指定。运行入口部署同一编码器的 `vision.bin`；`vision.pte` 同时保留用于检查和其他部署方式。
 
 ```bash
 PYTHONPATH="$(dirname "$PWD")" python -u \
@@ -559,13 +592,13 @@ PYTHONPATH="$(dirname "$PWD")" python -u \
 
 日志 `PTE_READY.setup_ms` 包含模型及视觉图的初始化；`VISION_ENCODE` 统计常驻图执行、输出复制和有限值检查，附带 context/IO 创建次数，均应为 0。`MODEL_RESIDENT` 校验 decode 返回后视觉和 prefill context 仍然存活。`PREFILL_TOTAL` 与 `DECODE_LOOP` 分别统计语言模型两阶段，特征保存放在主循环后。结果目录额外保存 `pixels.f32`、`image-features.f32`、`mrope-positions.i32` 和本次使用的 cos/sin 表。
 
-### 导出视觉编码器
+### 单阶段调试：视觉编码器
 
 仅加载 checkpoint 中的 `model.visual.*`，不会把 35B 文本权重加载到主机内存。复用现有 Qwen3.5 静态视觉实现、W8A16 配方与 INT32 bias 保护；每通道 W8 Linear，使用真实图片在 GPU 校准。使用与导出融合图相同的 SDK 环境：
 
 ```bash
 PYTHONPATH="$(dirname "$PWD")" python -u \
-  examples/qualcomm/oss_scripts/moe/qwen35-35B-A3B/export_vision.py \
+  examples/qualcomm/oss_scripts/moe/qwen35-35B-A3B/export/vision.py \
   --model /hunter/model/Qwen/Qwen3.6-35B-A3B \
   --output llama-output/qwen35-moe-vision-sm8975-20261023 \
   --qnn-binding llama-output/qwen36-decode-optimization-sm8975-20261023/export/PyQnnManagerAdaptor.cpython-311-x86_64-linux-gnu.so \
@@ -574,41 +607,18 @@ PYTHONPATH="$(dirname "$PWD")" python -u \
 
 输出包含 `vision.pte`、`vision.bin`、`vision-qdq.pt2`、`VISION.json` 及 FP32/QDQ 参考数据。导出检查视觉图只有一个 QNN delegate，输入输出各一个；运行前检查模型配置指纹和分辨率。`--image-height`、`--image-width` 可选择其他 32 的整数倍分辨率，需要重新导出对应图。
 
-## 重新导出融合图
-
-输入是已完成校准的逐层数据目录，每层包含 `decode-qdq.pt2`、`moe-constants.npz`。保留原 Q/DQ 网格，按层串行编译，每图要求只有一个 QNN delegate。这个步骤不会重新训练或重新校准 35B 模型。
-
-```bash
-export LD_LIBRARY_PATH="$ANDROID_NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/lib/x86_64-unknown-linux-gnu:$QNN_SDK_ROOT/lib/x86_64-linux-clang:$LD_LIBRARY_PATH"
-
-PYTHONPATH="$(dirname "$PWD")" python -u \
-  examples/qualcomm/oss_scripts/moe/qwen35-35B-A3B/export.py \
-  --source-dir /path/to/calibrated-decoder-layers \
-  --output /path/to/artifacts/assets \
-  --router-qdq /path/to/router-qdq \
-  --capacities 1152 2048 \
-  --op-package-host build/moe/qwen35-35B-A3B/op-package/x86_64-linux-clang/libQnnDeltaNetOpPackage.so
-```
-
-可用 `--layers 0 3` 先导出一层 GDN 和一层 full attention。默认使用当前安装的 `PyQnnManagerAdaptor`；若需选择与 QNN SDK 一致的单独构建版本，可传 `--qnn-binding /path/to/PyQnnManagerAdaptor...so`。host op 包由本目录的构建脚本生成。
-
-输出目录为 `gdn-fused/layerN`、`context1152-fused/layerN` 和 `context2048-fused/layerN`，每层包含 `attention.pte`、`attention.bin`、`io.bin`、`IO.json`。
-
 ## 完整 PTE 容器与专家重构
 
-`pack_pte.py` 使用已有逐层 QNN binary 和 head 构建完整执行计划，每个计划 122 个阶段。输入目录格式：
+以下是历史独立图记录。当前完整执行计划由 `export/program.py` 在统一导出内部生成，每个计划122个阶段，运行时不再手动打包。历史输入目录格式：
 
 - decode：`layerN/attention.bin`、`io.bin`、`moe-front.bin`。
 - prefill：`layerN/forward_0.bin`、`moe-front.bin`；full-attention 另需 `cold/layerN/forward_0.bin`。
 
-```bash
-python examples/qualcomm/oss_scripts/moe/qwen35-35B-A3B/pack_pte.py \
-  --phase decode --source-dir /path/to/base-decoder-layers \
-  --head /path/to/decode-head.bin --cache-encoding /path/to/cache-encoding.bin \
-  --output /path/to/decode.pte
-```
 
-prefill 使用 `--phase prefill` 和对应 AR128 head，不传 `--cache-encoding`。`--prefill-tokens` 默认 128；设为完整输入长度可启用下文的按层复用，QNN/Native 内核仍为 AR128。逐层 QNN 编译和容器包装是两个步骤；本目录尚不提供从原始 Hugging Face 权重直接生成所有基础图的一条命令。
+此历史分步命令已移除；当前统一执行 `export.py --config configs/export_sm8975.json`。
+
+
+prefill 使用 `--phase prefill` 和对应 AR128 head，不传 `--cache-encoding`。`--prefill-tokens` 默认 128；设为完整输入长度可启用下文的按层复用，QNN/Native 内核仍为 AR128。逐层 QNN 编译和容器包装在内部是两个步骤；正常流程由 `export.py --config` 自动串联。本节的独立图命令用于旧产物调试。
 
 专家重构入口：
 
@@ -644,12 +654,10 @@ python examples/qualcomm/oss_scripts/moe/qwen35-35B-A3B/quantization/prepare_rou
   --inputs /path/to/INPUTS.pt --output /path/to/router-qdq \
   --qnn-binding /path/to/PyQnnManagerAdaptor.so
 
-python examples/qualcomm/oss_scripts/moe/qwen35-35B-A3B/export_router.py \
-  --source-dir /path/to/router-qdq --output /path/to/router-contexts \
-  --qnn-binding /path/to/PyQnnManagerAdaptor.so
+
 ```
 
-两步均按层串行处理。校准默认使用 CUDA；`export_router.py` 为旧独立模式产生 `prefill/layerN/moe-front.bin`、`decode/layerN/moe-front.bin`。当前默认共享流程使用 `export_shared.py --router-qdq ...`，随后用 `separate_shared.py` 分离权重。导出检查五个真实 INT8 投影网格及校准报告中的 GPTQ damping，防止配置修改后继续误用旧 QDQ。
+校准按层串行处理，默认使用 CUDA；共享编译使用 `export/shared.py --router-qdq ...`，统一入口随后自动分离图/权重文件。导出检查五个真实 INT8 投影网格及校准报告中的 GPTQ damping，防止配置修改后继续误用旧 QDQ。
 
 旧独立权重模式下，完整 W8 图整批恢复 decode 曾触发 DSP 装载错误，需要 `--decode-context-load-mode serial`。当前共享模式采用 SDK 回调批量恢复 11 个 context，两个阶段都复用这些实例，循环内不创建/销毁。装载方式与逐 token 的专家异步读取是不同设置。
 
@@ -751,26 +759,9 @@ SM8975，真实 40 层，最终同 DSP 库对照：
 
 启用方式：先构建当前 runner，再用原 AR128 图打包与实际输入长度匹配的计划。例如 256-token 图文：
 
-```bash
-python examples/qualcomm/oss_scripts/moe/qwen35-35B-A3B/pack_pte.py \
-  --phase prefill \
-  --source-dir llama-output/qwen36-full40-sm8975-20261021 \
-  --head llama-output/qwen36-full-prefill-pte-sm8975-20261021/forward_0.bin \
-  --prefill-tokens 256 \
-  --output llama-output/qwen35-moe-prefill-io-20261023/prefill-seq256.pte
 
-adb -s A7SR026915000282 push \
-  llama-output/qwen35-moe-prefill-io-20261023/prefill-seq256.pte \
-  /data/local/tmp/qwen36-full-prefill-pte-sm8975-20261021/
+此历史分步命令已移除；当前统一执行 `export.py --config configs/export_sm8975.json`。
 
-PYTHONPATH="$(dirname "$PWD")" python -u \
-  examples/qualcomm/oss_scripts/moe/qwen35-35B-A3B/run_chat.py \
-  --prefill-pte /data/local/tmp/qwen36-full-prefill-pte-sm8975-20261021/prefill-seq256.pte \
-  --prompt-tokens 256 \
-  --image-path /home/hunter/下载/test.jpg \
-  --prompt "请用中文描述这张图片，简短回答。" \
-  --max-new-tokens 128
-```
 
 1K 输入将打包长度设为 `--prefill-tokens 1024`，运行时选对应 PTE 并传 `--prompt-tokens 1024`。新计划使用 v2 header，需使用新 runner；原 AR128/v1 PTE 可继续运行。默认配置的 AR128 PTE 路径保持原值，选择新计划才会按层复用。
 
@@ -865,14 +856,11 @@ INT4 表从 970 MiB 降为 303.125 MiB，减少 666.875 MiB；这是外部查表
 
 真实四层串联的两轮无转储均值：关闭共享为 75.130 ms/AR128、7.711 ms/AR1；分离共享为 72.009 ms/AR128、7.967 ms/AR1。为隔离共享机制，该互操作验证预载四层各 256 个 N2 专家，两个阶段复用相同 bank；计时含 Native、state/KV 和桥接复制，排除初始化及 bank 预载。它不是原 64 槽 LRU/UFS 调度的性能基准，也不包含 embedding、head、采样或视觉塔。本轮证明内存下降和数值一致，尚未证明稳定的执行加速。
 
-联合编译入口是 `export_shared.py --layers 0 1 2 3`；传 `--router-qdq` 复用已验证 GPTQ 图，`--independent` 生成相同 12 图但关闭去重的控制组。打包入口如下，requests 文件来自设备加载时的公开 DMA 回调：
+联合编译入口是 `export/shared.py --layers 0 1 2 3`；传 `--router-qdq` 复用已验证 GPTQ 图，当时的独立常量控制组生成相同12图关闭去重（该对照入口已清理，历史记录保留）。打包入口如下，requests 文件来自设备加载时的公开 DMA 回调：
 
-```bash
-python examples/qualcomm/oss_scripts/moe/qwen35-35B-A3B/pack_shared_weights.py \
-  --context llama-output/qwen35-moe-sharing-four-layer-20261023/shared/context0.bin \
-  --requests llama-output/qwen35-moe-sharing-four-layer-20261023/four-requests.txt \
-  --output llama-output/qwen35-moe-sharing-four-layer-20261023/separated
-```
+
+此历史分步命令已移除；当前统一执行 `export.py --config configs/export_sm8975.json`。
+
 
 同一 context 最多共享 64 个图；本轮为 12 个。该先导实验之后已完成下节的 40 层扩展；当前默认入口已经切换到通过整模型回归的共享版本。具体限制以 SDK 版本为准，参见[高通 HTP 文档](https://docs.qualcomm.com/bundle/publicresource/topics/80-63442-10/htp_backend.html)。
 
@@ -982,7 +970,7 @@ GDN 图新增 INT32 `last_token_index`：padding 的 Q/K/V 与 beta 为零、dec
 
 本次同时修复：共享 context 批量初始化失败后清理未借用的 context，Graph 构造失败时回收已取得资源；按目标 context 生成并检查 RoPE；去掉普通 decode 导出入口的 1152/2048 限制；CLI/JNI 从部署计划的 `model_configuration` 读取 embedding、KV、state swap、IO 和调度设置；decode 初始 KV 快照只保存真实前缀，chat 导入后释放快照及 JNI memfd。原 `LlmModule` API 不受影响。
 
-新 shared 导出自动从编译后的图提取 `cache-encoding.bin`，按 checkpoint config 生成足够长度的 cos/sin；`separate_shared.py` 一起保留这些文件与 IO metadata。运行时优先使用这套配套资产，拒绝长度不足的 RoPE。旧 PTE、旧 cache metadata 与旧 Native skeleton 不能混用此版 padding ABI，需要重新导出和构建。
+新 shared 导出自动从编译后的图提取 `cache-encoding.bin`，按 checkpoint config 生成足够长度的 cos/sin；内部 `export/capture.py` 一起保留这些文件与 IO metadata。运行时优先使用这套配套资产，拒绝长度不足的 RoPE。旧 PTE、旧 cache metadata 与旧 Native skeleton 不能混用此版 padding ABI，需要重新导出和构建。
 
 本机验证记录：
 

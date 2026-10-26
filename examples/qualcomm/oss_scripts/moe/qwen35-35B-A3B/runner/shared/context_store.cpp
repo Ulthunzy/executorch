@@ -139,25 +139,21 @@ struct Store {
         QNN_HTP_CONTEXT_CONFIG_OPTION_SHARE_RESOURCES_OPTIMIZATION_TYPE;
     custom[1].shareResOptType = SEQUENTIAL_WITHOUT_VA_OPTIMIZATION;
     custom[2].option = QNN_HTP_CONTEXT_CONFIG_OPTION_REUSED_IO_LIMIT;
-    size_t cache_bytes = 0;
+    size_t io_bytes = 0;
     for (const auto* entry : entries) {
       const auto& info = entry->metadata->contextBinaryInfoV3;
       for (uint32_t i = 0; i < info.numGraphs; ++i) {
         const auto& graph = info.graphs[i].graphInfoV1;
         for (uint32_t j = 0; j < graph.numGraphInputs; ++j)
-          if (FIELD(graph.graphInputs[j], dataType) ==
-              QNN_DATATYPE_UFIXED_POINT_16)
-            cache_bytes += Graph::size(graph.graphInputs[j]);
+          io_bytes += (Graph::size(graph.graphInputs[j]) + 4095) & ~size_t(4095);
         for (uint32_t j = 0; j < graph.numGraphOutputs; ++j)
-          if (FIELD(graph.graphOutputs[j], dataType) ==
-              QNN_DATATYPE_UFIXED_POINT_16)
-            cache_bytes += Graph::size(graph.graphOutputs[j]);
+          io_bytes += (Graph::size(graph.graphOutputs[j]) + 4095) & ~size_t(4095);
       }
     }
-    // Cache IO is private to each layer/phase; activation IO is shared. Round
-    // its allowance to 16 MiB without reserving a second copy of every tensor.
+    // Registrations also consume IO VA for FP32 activations, including shared
+    // fds registered in different contexts. Bound all tensor IO, not only KV.
     custom[2].reusedIoLimitMb = std::max<size_t>(
-        192, ((cache_bytes + 31 * 1048576) / (16 * 1048576)) * 16);
+        192, ((io_bytes + 31 * 1048576) / (16 * 1048576)) * 16);
     QnnContext_Config_t config[3]{};
     const QnnContext_Config_t* configs[4]{};
     for (int i = 0; i < 3; ++i) {

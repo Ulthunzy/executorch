@@ -6,7 +6,7 @@ import struct
 import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from model_config import add_model_config_argument, load_model_config
+from workflow.model_config import add_model_config_argument, load_model_config
 
 import numpy as np
 import torch

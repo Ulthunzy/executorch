@@ -4,6 +4,7 @@
 
 #include <executorch/extension/llm/sampler/sampler.h>
 #include <algorithm>
+#include <cmath>
 #include <dlfcn.h>
 #include <fstream>
 #include <iostream>
@@ -121,7 +122,8 @@ void Conversation::prepare() {
       rotary->cos.size() * sizeof(float),
       rotary->sin.size() * sizeof(float),
       options.capacity);
-  if (std::ifstream(options.model_root + "/prefill/vision.bin"))
+  if (options.vision_enabled &&
+      std::ifstream(options.model_root + "/prefill/vision.bin"))
     image_layout = std::make_unique<ImageLayout>(options.model_root);
   if (!options.image_path.empty() && !image_layout)
     throw std::runtime_error(
@@ -180,6 +182,15 @@ void Conversation::prepare() {
     throw std::runtime_error("Cannot write prefill tokens");
   file.close();
   configure_environment(options, padded.size(), first_tokens.size());
+  const size_t image_tokens =
+      std::count(first_tokens.begin(), first_tokens.end(), 248056);
+  printf(
+      "CHAT_INPUT valid_tokens=%zu text_and_template_tokens=%zu image_tokens=%zu padded_tokens=%zu ar128_blocks=%zu\n",
+      first_tokens.size(),
+      first_tokens.size() - image_tokens,
+      image_tokens,
+      padded.size(),
+      padded.size() / 128);
   if (options.tokenize_only) {
     fprintf(console, "Encoded %zu tokens\n", first_tokens.size());
     return;
@@ -266,6 +277,7 @@ void Conversation::generate() {
       248320, options.temperature, 0.9f, 42);
   uint64_t previous = last_input_token;
   generated.clear();
+  std::string buffered;
   const auto started = Clock::now();
   if (!client) {
     fprintf(console, "助手> ");
@@ -293,10 +305,11 @@ void Conversation::generate() {
     const auto& text = piece.get();
     if (client)
       client->token(text);
-    else {
+    else if (options.stream) {
       fwrite(text.data(), 1, text.size(), console);
       fflush(console);
-    }
+    } else
+      buffered += text;
     previous = pending;
     if (i + 1 < limit && !(client && client->stopped())) {
       consume(pending);
@@ -304,6 +317,8 @@ void Conversation::generate() {
     }
   }
   if (!client) {
+    if (!options.stream)
+      fwrite(buffered.data(), 1, buffered.size(), console);
     fprintf(console, "\n");
     fflush(console);
   }
@@ -318,14 +333,15 @@ void Conversation::generate() {
       ended,
       elapsed(started));
   if (client)
-    client->complete(nlohmann::json{
-        {"generated_tokens", generated.size()},
-        {"position", position()},
-        {"generation_ms", elapsed(started)},
-        {"eos", ended},
-        {"stopped", client->stopped()},
-        {"requires_reset",
-         false}}.dump());
+    client->complete(
+        nlohmann::json{
+            {"generated_tokens", generated.size()},
+            {"position", position()},
+            {"generation_ms", elapsed(started)},
+            {"eos", ended},
+            {"stopped", client->stopped()},
+            {"requires_reset", false}}
+            .dump());
 }
 
 void Conversation::reset_context() {
@@ -353,6 +369,9 @@ void Conversation::client_turn(const Request& request) {
   }
   if (needs_reset)
     throw std::runtime_error("Reset the conversation after interrupted input");
+  if (request.max_new_tokens < 1 || request.max_new_tokens > options.capacity ||
+      !std::isfinite(request.temperature) || request.temperature < 0)
+    throw std::runtime_error("Invalid generation length or temperature");
   const bool image = !request.image_path.empty();
   const auto ids = prompt_tokens(request.prompt, empty, image);
   if (position() + int(ids.size()) + (pending >= 0) >= options.capacity)
@@ -408,7 +427,7 @@ bool Conversation::turn(const std::string& text) {
     }
   }
   const auto ids = prompt_tokens(message, empty, !path.empty());
-  if (position() + int(ids.size()) + (pending >= 0) > options.capacity) {
+  if (position() + int(ids.size()) + (pending >= 0) >= options.capacity) {
     fprintf(console, "上下文已满，请输入 /reset 开始新对话。\n");
     fflush(console);
     return true;

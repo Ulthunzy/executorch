@@ -3,53 +3,14 @@ import hashlib
 import json
 from pathlib import Path
 import struct
-import subprocess
 import sys
 from dataclasses import replace
 
-from model_config import add_model_config_argument, load_model_config
 
+# Internal stage scripts also support direct execution for diagnostics.
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-def group_commands(args):
-    groups = (
-        [list(range(i, i + 4)) for i in range(0, 40, 4)]
-        if args.all_layers
-        else [args.layers]
-    )
-    commands = []
-    for index, layers in enumerate(groups):
-        target = args.output / f"group{index}" if args.all_layers else args.output
-        command = [
-            sys.executable,
-            "-u",
-            __file__,
-            "--model-config",
-            str(args.model_config),
-            "--prefill-source",
-            str(args.prefill_source),
-            "--decode-source",
-            str(args.decode_source),
-            "--output",
-            str(target),
-            "--layers",
-            *map(str, layers),
-            "--max-seq-len",
-            str(args.capacity),
-            "--op-package-host",
-            str(args.op_package_host),
-            "--op-package-device",
-            args.op_package_device,
-        ]
-        if args.router_qdq:
-            command += ["--router-qdq", str(args.router_qdq)]
-        if args.qnn_binding:
-            command += ["--qnn-binding", str(args.qnn_binding)]
-        if args.independent:
-            command += ["--independent"]
-        if args.model:
-            command += ["--model", str(args.model)]
-        commands.append(command)
-    return commands
+from workflow.model_config import add_model_config_argument, load_model_config
 
 
 def main():
@@ -59,30 +20,14 @@ def main():
     add_model_config_argument(parser)
     parser.add_argument("--prefill-source", type=Path, required=True)
     parser.add_argument("--decode-source", type=Path, required=True)
-    parser.add_argument(
-        "--model", type=Path, help="Checkpoint config used for rotary tables"
-    )
     parser.add_argument("--router-qdq", type=Path)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--layers", type=int, nargs="+")
-    parser.add_argument(
-        "--all-layers",
-        action="store_true",
-        help="Compile ten four-layer groups sequentially",
-    )
-    parser.add_argument(
-        "--print-plan",
-        action="store_true",
-        help="Print subprocess commands without loading QNN or weights",
-    )
     parser.add_argument("--max-seq-len", "--capacity", dest="capacity", type=int)
     parser.add_argument("--qnn-binding", type=Path)
     parser.add_argument("--op-package-host", type=Path, required=True)
     parser.add_argument("--op-package-device", required=True)
-    parser.add_argument("--independent", action="store_true")
     args = parser.parse_args()
-    if args.all_layers and args.layers:
-        parser.error("Choose --all-layers or --layers")
     args.layers = args.layers or [0, 1, 2, 3]
     settings = load_model_config(args.model_config)
     args.capacity = args.capacity or settings.context.max_seq_len
@@ -97,31 +42,6 @@ def main():
         parser.error("Select one to four distinct layers")
     if any(layer not in range(40) for layer in args.layers):
         parser.error("Layer IDs must be 0..39")
-    commands = group_commands(args)
-    if args.print_plan:
-        print(
-            json.dumps(
-                dict(model_configuration=settings.to_dict(), commands=commands),
-                indent=2,
-            )
-        )
-        return
-    if args.all_layers:
-        from export.runtime_assets import build_runtime_assets, checkpoint_path
-
-        checkpoint = checkpoint_path(args.prefill_source, args.model)
-        for command in commands:
-            subprocess.run(command, check=True)
-        build_runtime_assets(args.output, checkpoint, args.capacity)
-        (args.output / "EXPORT.json").write_text(
-            json.dumps(
-                dict(model_configuration=settings.to_dict(), commands=commands),
-                indent=2,
-            )
-            + "\n"
-        )
-        return
-
     from export.binding import load_binding
 
     qnn = load_binding(args.qnn_binding)
@@ -247,10 +167,8 @@ def main():
         ]
     )
     specs = generate_qnn_executorch_compiler_spec(
-        QcomChipset.SM8975,
-        generate_htp_compiler_spec(
-            use_fp16=False, use_weight_sharing=not args.independent
-        ),
+        QcomChipset[settings.target.soc_model],
+        generate_htp_compiler_spec(use_fp16=False, use_weight_sharing=True),
         shared_buffer=False,
         op_package_options=package,
     )
@@ -317,16 +235,17 @@ def main():
         (args.output / f"{plan.name}.io").write_bytes(
             struct.pack("<" + "I" * len(values), *values)
         )
-    if not args.independent and len(contexts) != 1:
+    if len(contexts) != 1:
         raise ValueError("Shared methods must refer to one context")
     report = dict(
+        target=settings.target.to_dict(),
         compile_settings=settings.compile_settings(),
         model_configuration=settings.to_dict(),
         layers=args.layers,
         capacity=args.capacity,
         router="w8a16_gptq" if args.router_qdq else "fp16",
         router_calibration=router_calibration,
-        weight_sharing=not args.independent,
+        weight_sharing=True,
         prefill_core="chunked_mixed_fp16",
         prefill_valid_length=True,
         prefill_history=args.capacity,

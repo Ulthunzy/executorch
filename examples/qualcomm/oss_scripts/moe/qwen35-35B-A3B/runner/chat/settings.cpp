@@ -71,6 +71,14 @@ void apply_model_settings(
   if (!overrides.count("--max-new-tokens"))
     options.max_new_tokens =
         generation.value("max_new_tokens", options.max_new_tokens);
+  if (!overrides.count("--temperature"))
+    options.temperature = generation.value("temperature", options.temperature);
+  if (!overrides.count("--ignore-eos") && !overrides.count("--no-ignore-eos"))
+    options.ignore_eos = generation.value("ignore_eos", options.ignore_eos);
+  if (!overrides.count("--stream") && !overrides.count("--no-stream"))
+    options.stream = generation.value("stream", options.stream);
+  if (!overrides.count("--interactive") && !overrides.count("--no-interactive"))
+    options.interactive = generation.value("interactive", options.interactive);
   if (!overrides.count("--system-prompt"))
     options.system_prompt =
         generation.value("system_prompt", options.system_prompt);

@@ -8,7 +8,7 @@ from pathlib import Path
 import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from model_config import add_model_config_argument, load_model_config
+from workflow.model_config import add_model_config_argument, load_model_config
 
 
 def prepare_data(args, settings):
@@ -227,7 +227,8 @@ def prepare_attention(args, settings):
             )
         )
     quantizer = make_quantizer(
-        backend=QnnExecuTorchBackendType.kHtpBackend, soc_model="SM8975"
+        backend=QnnExecuTorchBackendType.kHtpBackend,
+        soc_model=settings.target.soc_model,
     )
     quantizer.set_recipe(recipe)
     prepared = prepare_pt2e(graph, quantizer)
@@ -313,7 +314,8 @@ def prepare_head(args, settings):
     gc.collect()
     weights = original_weights(graph)
     quantizer = make_quantizer(
-        backend=QnnExecuTorchBackendType.kHtpBackend, soc_model="SM8975"
+        backend=QnnExecuTorchBackendType.kHtpBackend,
+        soc_model=settings.target.soc_model,
     )
     quantizer.set_recipe(Qwen3_5QuantRecipe().recipe)
     prepared = prepare_pt2e(graph, quantizer)

@@ -6,15 +6,6 @@ from pathlib import Path
 import subprocess
 
 
-def checkpoint_path(source, requested=None):
-    if requested is not None:
-        return requested
-    metadata = source.parent / "DATA.json"
-    if not metadata.is_file():
-        raise ValueError("Pass --model or retain the source DATA.json for RoPE export")
-    return Path(json.loads(metadata.read_text())["model"])
-
-
 def build_runtime_assets(output, checkpoint, capacity):
     from quantization.checkpoint import rope_tables
 
@@ -61,3 +52,16 @@ def build_runtime_assets(output, checkpoint, capacity):
         )
         + "\n"
     )
+
+
+if __name__ == "__main__":
+    import argparse
+    import sys
+
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--model", type=Path, required=True)
+    parser.add_argument("--capacity", type=int, required=True)
+    args = parser.parse_args()
+    build_runtime_assets(args.output, args.model, args.capacity)

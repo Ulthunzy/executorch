@@ -3,7 +3,12 @@ import hashlib
 import json
 from pathlib import Path
 
-from model_config import add_model_config_argument, load_model_config
+import sys
+
+# Internal stage scripts also support direct execution for diagnostics.
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from workflow.model_config import add_model_config_argument, load_model_config
 
 
 def main():
@@ -21,7 +26,7 @@ def main():
         settings.quantization.head != "w4a16_gptq"
         or report["method"] != "all_projection_gptq"
         or len(report["projections"]) != 1
-        or report["projections"][0]["shape"] != [248320,2048]
+        or report["projections"][0]["shape"] != [248320, 2048]
         or report["projections"][0]["bits"] != 4
     ):
         parser.error("A freshly calibrated W4A16 GPTQ head is required")
@@ -42,7 +47,7 @@ def main():
     graph = torch.export.load(args.source).module()
     sample = (torch.zeros(1, 1, 2048),)
     specs = generate_qnn_executorch_compiler_spec(
-        QcomChipset.SM8975,
+        QcomChipset[settings.target.soc_model],
         generate_htp_compiler_spec(use_fp16=False),
         shared_buffer=False,
     )
@@ -61,6 +66,7 @@ def main():
     (args.output / "HEAD.json").write_text(
         json.dumps(
             dict(
+                target=settings.target.to_dict(),
                 source_sha256=hashlib.sha256(args.source.read_bytes()).hexdigest(),
                 quantization=report,
                 shape=[1, 1, 2048],
