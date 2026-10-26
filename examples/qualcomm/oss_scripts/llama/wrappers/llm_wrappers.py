@@ -28,7 +28,7 @@ from executorch.backends.qualcomm._passes.qnn_pass_manager import (
     get_qnn_pass_manager_cls,
 )
 from executorch.backends.qualcomm.builders.utils import is_graph_output
-from executorch.backends.qualcomm.export_utils import make_quantizer
+from executorch.backends.qualcomm.export_utils import get_backend_type, make_quantizer
 from executorch.backends.qualcomm.quantizer.quantizer import QuantDtype
 
 from executorch.backends.qualcomm.utils.constants import (
@@ -94,6 +94,10 @@ from executorch.examples.qualcomm.oss_scripts.llama.mix_precision_analyzer impor
 )
 from executorch.examples.qualcomm.oss_scripts.llama.model.embedding import (
     TokenEmbedding,
+)
+from executorch.examples.qualcomm.oss_scripts.llama.model.qwen35_output import (
+    split_qwen35_output,
+    use_split_qwen35_output,
 )
 from executorch.examples.qualcomm.oss_scripts.llama.model.static_llama import (
     LlamaModel,
@@ -2368,6 +2372,23 @@ class Qwen35TextDecoder(HybridTextDecoder):
         self.decode = None
         self.prefill = None
 
+    def _compile_models(self, request):
+        if use_split_qwen35_output(
+            self.control_args,
+            request.method_data[TEXT_DECODER],
+            self.config,
+            self.decode,
+            self.prefill,
+        ):
+            for decoder in (self.decode, self.prefill):
+                chunks = split_qwen35_output(decoder.decoder)
+                logging.info(
+                    "Qwen3.5 AR%d output projection: %d frozen W4 group32 chunks",
+                    decoder.meta["get_ar_len"],
+                    chunks,
+                )
+        super()._compile_models(request)
+
     def _clone_decoder(self, module, inputs, mode):
         from executorch.examples.qualcomm.oss_scripts.llama.quantize.generation import (
             position_input_index,
@@ -2893,6 +2914,8 @@ class MultiModalManager(Component):
                     compile_spec=compile_specs[m],
                     pte_filename=pte_filenames[m],
                     skip_quantize=skip_quantize[m] if m in skip_quantize else False,
+                    backend=get_backend_type(self.control_args.backend),
+                    soc_model=self.control_args.soc_model,
                 )
                 for m in self._modalities
             },
