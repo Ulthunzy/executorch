@@ -277,3 +277,9 @@ target_link_options(
 target_link_options_gc_sections(executorch_jni)
 
 target_link_libraries(executorch_jni ${link_libraries} log)
+
+# Independent MoE DSO; existing ExecuTorch/LlmModule JNI targets are unchanged.
+option(EXECUTORCH_BUILD_QWEN35_MOE_JNI "Build Qwen35 external-expert JNI" OFF)
+if(EXECUTORCH_BUILD_QWEN35_MOE_JNI)
+  add_subdirectory(jni/moe)
+endif()

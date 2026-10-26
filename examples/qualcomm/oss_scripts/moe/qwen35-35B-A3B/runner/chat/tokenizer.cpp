@@ -1,6 +1,7 @@
 #include "tokenizer.h"
 
 #include <dlfcn.h>
+#include <cstdlib>
 #include <fstream>
 #include <limits>
 #include <unicode/unorm2.h>
@@ -94,8 +95,12 @@ tokenizers::Error DeviceTokenizer::load(const std::string& path) {
     throw std::runtime_error(
         "Expected the Qwen3.5 NFC tokenizer configuration");
   config["normalizer"] = nullptr;
-  char temporary[] = "/data/local/tmp/qwen35-tokenizer-XXXXXX";
-  const int fd = mkstemp(temporary);
+  // Android apps cannot write /data/local/tmp. JNI supplies its private cache.
+  const char* cache = getenv("QWEN35_TOKENIZER_CACHE");
+  std::string name = std::string(cache ? cache : "/data/local/tmp") +
+      "/qwen35-tokenizer-XXXXXX";
+  const int fd = mkstemp(name.data());
+  const char* temporary = name.c_str();
   if (fd < 0)
     throw std::runtime_error("Cannot create tokenizer configuration");
   ::close(fd);

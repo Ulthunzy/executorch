@@ -41,3 +41,7 @@
 
 # Keep AsrCallback interface methods (invoked from native code).
 -keep interface org.pytorch.executorch.extension.asr.AsrCallback { *; }
+
+# Qwen35 MoE has a separate JNI DSO and a private streaming byte callback.
+-keep class org.pytorch.executorch.extension.llm.Qwen35MoeModule { *; }
+-keep class org.pytorch.executorch.extension.llm.Qwen35MoeModule$Stream { *; }
