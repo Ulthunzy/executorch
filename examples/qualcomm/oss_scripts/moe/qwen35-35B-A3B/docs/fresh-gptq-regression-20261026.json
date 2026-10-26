@@ -1,0 +1,264 @@
+{
+  "date": "2026-10-26",
+  "code_commit": "2de25ff00d63c996202c8d6115d8b9f0357ce136",
+  "checkpoint": "/hunter/model/Qwen/Qwen3.6-35B-A3B",
+  "model_configuration": {
+    "version": 1,
+    "quantization": {
+      "attention": "gptq",
+      "vision": "w8a16_gptq",
+      "head": "w4a16_gptq",
+      "matrix_gptq_damping": 0.01,
+      "expert_gptq_only": true,
+      "expert_bits": 2,
+      "expert_activation_bits": 8,
+      "expert_gu_group": 1024,
+      "expert_down_group": 512,
+      "expert_gptq_damping": 0.1,
+      "reconstruction_steps": 80,
+      "router_shared": "w8a16_gptq",
+      "router_gptq_damping": 0.01,
+      "embedding": "int4_g32"
+    },
+    "cache": {
+      "kv_dtype": "uint16",
+      "gdn_state_dtype": "uint16",
+      "conv_state_dtype": "uint16",
+      "append_only": true,
+      "state_swap": true
+    },
+    "context": {
+      "max_seq_len": 1152,
+      "prefill_ar_len": 128,
+      "max_prefill_tokens": 1024
+    },
+    "generation": {
+      "enable_thinking": false,
+      "system_prompt": "你是一个有帮助的人工智能助手。",
+      "max_new_tokens": 128,
+      "temperature": 0,
+      "ignore_eos": false,
+      "interactive": false,
+      "stream": true
+    },
+    "schedule": {
+      "prefill_order": "layer_major",
+      "cache_experts": 32,
+      "prefill_async_io": true,
+      "startup_prefetch": "overlap",
+      "io_workers": 8,
+      "startup_io_workers": 4,
+      "read_chunk_kib": 256,
+      "decode_hit_first": true,
+      "decode_ready_io": true,
+      "overlap_feedback": true,
+      "context_load_mode": "auto"
+    },
+    "target": {
+      "soc_model": "SM8975",
+      "dsp_arch": "v85"
+    }
+  },
+  "source": "safetensors",
+  "old_qdq_used": false,
+  "old_quantized_weights_used": false,
+  "layers": 40,
+  "experts": 10240,
+  "all_expert_gu_down_gptq": true,
+  "python_regressions_passed": 57,
+  "vision_qdq_sqnr_db": 28.25120036328161,
+  "artifact_root": "llama-output/qwen35-moe-fresh-gptq-20261026-190729",
+  "performance_runs": {
+    "baseline_before": 2,
+    "baseline_after": 2,
+    "fresh": 2
+  },
+  "memory_runs_per_variant": 1,
+  "memory_sampling_ms": 200,
+  "memory_accounting": "CPU PSS + inode-deduplicated DMA-BUF bytes - DMA mappings already included in PSS",
+  "timing_scope": "Language-model prefill excludes initialization, image preprocessing and vision encoding; decode measures 127 actual AR1 intervals for fixed 128 generated tokens",
+  "results": [
+    {
+      "case": "text1k",
+      "baseline": {
+        "prefill_ms": 3974.623618,
+        "decode_ms": 91.44313583464567,
+        "peak_gib": 4.070356369018555,
+        "vision_execute_ms": 0,
+        "prefill_range": [
+          253.720952,
+          264.699344
+        ],
+        "decode_range": [
+          10.864933213859095,
+          11.074308426773964
+        ],
+        "run_count": 4,
+        "stages": {
+          "total_ms": 90.87853639370078,
+          "attention_ms": 39.16663442913386,
+          "gdn_graph_ms": 31.266113517716537,
+          "full_attention_graph_ms": 7.814762616141732,
+          "router_ms": 0.04915658464566929,
+          "read_ms": 2.351430862204724,
+          "native_ms": 43.483363860236224,
+          "feedback_ms": 1.1215093287401574,
+          "head_ms": 4.133162529527559,
+          "embedding_ms": 0.01086061811023622,
+          "direct_bytes": 76196436.66141732,
+          "cache_hits": 230.99212598425197,
+          "cache_requests": 320
+        },
+        "prefill_tokens_s": 257.63445760312493,
+        "decode_tokens_s": 10.935757953536008
+      },
+      "fresh": {
+        "prefill_ms": 3932.341431,
+        "decode_ms": 90.67144414960632,
+        "peak_gib": 4.073347091674805,
+        "vision_execute_ms": 0,
+        "prefill_range": [
+          256.746692,
+          264.16835
+        ],
+        "decode_range": [
+          11.01504771870237,
+          11.042648065945894
+        ],
+        "run_count": 2,
+        "stages": {
+          "total_ms": 90.10924633464566,
+          "attention_ms": 39.311944086614176,
+          "gdn_graph_ms": 31.429276263779528,
+          "full_attention_graph_ms": 7.797483811023621,
+          "router_ms": 0.04655740157480315,
+          "read_ms": 2.2797889606299213,
+          "native_ms": 42.650488673228345,
+          "feedback_ms": 1.140609755905512,
+          "head_ms": 4.110367090551181,
+          "embedding_ms": 0.012834622047244096,
+          "direct_bytes": 75670665.07086614,
+          "cache_hits": 231.60629921259843,
+          "cache_requests": 320
+        },
+        "prefill_tokens_s": 260.40465152070874,
+        "decode_tokens_s": 11.028830624446847
+      },
+      "identical_output_tokens": false,
+      "changes_pct": {
+        "prefill_ms": -1.063803546290909,
+        "decode_ms": -0.8439033482346758,
+        "peak_gib": 0.07347569561755307
+      }
+    },
+    {
+      "case": "image256",
+      "baseline": {
+        "prefill_ms": 2010.83887925,
+        "decode_ms": 91.22491497244094,
+        "peak_gib": 4.539792060852051,
+        "vision_execute_ms": 120.49420574999999,
+        "prefill_range": [
+          126.387256,
+          129.678099
+        ],
+        "decode_range": [
+          10.797247714937594,
+          11.045040777817006
+        ],
+        "run_count": 4,
+        "stages": {
+          "total_ms": 90.66024416732283,
+          "attention_ms": 38.76010096653543,
+          "gdn_graph_ms": 30.971968948818898,
+          "full_attention_graph_ms": 7.703563978346457,
+          "router_ms": 0.04618353937007874,
+          "read_ms": 2.3294707992125985,
+          "native_ms": 43.52125484055118,
+          "feedback_ms": 1.1073625216535432,
+          "head_ms": 4.162700159448819,
+          "embedding_ms": 0.1809034409448819,
+          "direct_bytes": 75920069.54330708,
+          "cache_hits": 231.31496062992127,
+          "cache_requests": 320
+        },
+        "prefill_tokens_s": 127.31005086567778,
+        "decode_tokens_s": 10.961917589093945
+      },
+      "fresh": {
+        "prefill_ms": 2012.7433065,
+        "decode_ms": 85.80290986614173,
+        "peak_gib": 4.471443176269531,
+        "vision_execute_ms": 121.2839585,
+        "prefill_range": [
+          126.475769,
+          127.911518
+        ],
+        "decode_range": [
+          11.651689714069482,
+          11.65754454504459
+        ],
+        "run_count": 2,
+        "stages": {
+          "total_ms": 85.23530590551181,
+          "attention_ms": 39.05716218897638,
+          "gdn_graph_ms": 31.22618302362205,
+          "full_attention_graph_ms": 7.745065669291339,
+          "router_ms": 0.04464035039370079,
+          "read_ms": 2.130771334645669,
+          "native_ms": 38.02413577952756,
+          "feedback_ms": 1.1129376377952758,
+          "head_ms": 4.174537157480315,
+          "embedding_ms": 0.13852751181102363,
+          "direct_bytes": 62196082.89763779,
+          "cache_hits": 247.3464566929134,
+          "cache_requests": 320
+        },
+        "prefill_tokens_s": 127.18959202262288,
+        "decode_tokens_s": 11.654616394246615
+      },
+      "identical_output_tokens": false,
+      "changes_pct": {
+        "prefill_ms": 0.09470809768261645,
+        "decode_ms": -5.9435573142898495,
+        "peak_gib": -1.5055509958685542
+      }
+    }
+  ],
+  "export_seconds": {
+    "build": 50.42446718499923,
+    "quantize": 2073.733618244998,
+    "head": 22.601920929002517,
+    "qnn-group0": 146.57315491400004,
+    "qnn-group1": 147.51355504499952,
+    "qnn-group2": 146.716882075998,
+    "qnn-group3": 147.2020461539978,
+    "qnn-group4": 146.60683535299904,
+    "qnn-group5": 147.03675134500008,
+    "qnn-group6": 147.03816857599668,
+    "qnn-group7": 146.39349018999928,
+    "qnn-group8": 146.25780942200072,
+    "qnn-group9": 149.21199833300125,
+    "runtime-assets": 5.752586923001218,
+    "vision": 478.10718952000025,
+    "separate-group0": 3.4133833429987135,
+    "separate-group1": 3.332326877000014,
+    "separate-group2": 3.3096969519974664,
+    "separate-group3": 3.3067229180014692,
+    "separate-group4": 3.361106591997668,
+    "separate-group5": 3.2105574419983895,
+    "separate-group6": 3.2559286979994795,
+    "separate-group7": 3.2759167039985186,
+    "separate-group8": 3.2586196820011537,
+    "separate-group9": 10.101173485003528,
+    "prefill-128": 2.745938362000743,
+    "prefill-256": 2.7684197010021308,
+    "prefill-384": 2.735281189001398,
+    "prefill-512": 2.7282815739999933,
+    "prefill-640": 2.7412062030016386,
+    "prefill-768": 2.715139690997603,
+    "prefill-896": 2.727067736999743,
+    "prefill-1024": 2.710237003000657,
+    "decode": 2.7302457190016867
+  }
+}

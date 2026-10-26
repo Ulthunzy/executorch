@@ -35,6 +35,21 @@ python examples/qualcomm/oss_scripts/moe/qwen35-35B-A3B/run_chat.py \
 
 图片使用 `--image-path /path/to/image.jpg`，在设备内解码；后续图片使用 `--with-vision` 保留视觉塔。`--ignore-eos` 控制停止条件，`--no-stream` 改为每轮生成完再显示。旧 teacher-forcing / 张量dump仍进入诊断链路。新会话要求配套的新runner和支持有效长度的AR128图，统一导出会同时生成；旧产物不会被自动覆盖。三种架构的专家内核与GDN包已通过交叉编译，V79/V81整模设备验证尚未执行。
 
+### 2026-10-26：从 safetensors 完整重导出回归
+
+代码提交 `6352293f6c` 统一导出和推理入口，`2de25ff00d` 补齐专家载荷与 checkpoint 来源校验。57项Python回归通过。随后从空校准目录重新读取 `/hunter/model/Qwen/Qwen3.6-35B-A3B`，完成40层、10240个专家的GPTQ-only量化、112个视觉矩阵的W8A16 GPTQ、10组P/D共享QNN编译和自动打包，没有复用旧QDQ或量化权重。
+
+SM8975/V85、SDK 2.48.1、1152总上下文、AR128、每层32槽；1K文本或256图文输入，固定生成128 token并忽略EOS。新产物性能测两轮，旧产物在重导出前后各测两轮，下面比较各自均值；内存分别另测一轮，200ms采样CPU PSS＋去重DMA-BUF－已计入PSS的DMA映射。Prefill不含初始化、图片预处理及视觉编码。
+
+| 输入 | Prefill 旧→新 token/s | Decode 旧→新 token/s | 峰值内存 旧→新 GiB |
+| --- | ---: | ---: | ---: |
+| 1024文本 | 257.63→260.40 | 10.94→11.03 | 4.0704→4.0733 |
+| 256图文 | 127.31→127.19 | 10.96→11.65 | 4.5398→4.4714 |
+
+本次未观察到大幅性能回退或内存增长。文本峰值增加约3MiB，图文峰值降低约70MiB。新旧输出均能完成文本摘要和白牛、橙衣男子的图片描述，但措辞和token序列不同，图文decode的提升不能全部视为代码优化收益。Embedding和前7层专家文件逐字节一致，后续层专家及冷启动列表有差异；未据此声称PPL或正式benchmark精度等价。强制忽略EOS后的角色片段不属于正常遇EOS即停止的回答。
+
+新产物和原始记录保留于 `llama-output/qwen35-moe-fresh-gptq-20261026-190729`；QNN原始context在 `export/qnn-shared/`，共享graph/weights在 `export/shared-model/`，无权重调度PTE在 `export/plans/`。逐阶段耗时、测试口径和汇总数字见[源码内回归记录](docs/fresh-gptq-regression-20261026.json)，完整原始日志及decode拆分见该产物目录的 `REPORT.md`、`measurements/`。
+
 ### 2026-10-26：代码复核与新入口设备回归
 
 后续目录精简已移除顶层 `multimodal.py`、`pack_pte.py`、`pack_shared_weights.py`、`separate_shared.py`，配置及构建辅助也下移。顶层只保留 `export.py`、`run_chat.py`、`build.sh` 三个入口。共享在QNN编译时启用，PTE打包和权重文件分离均由导出阶段自动完成；推理只读取 `plans/` 中的现成产物，缺失或配置不匹配时要求重新导出，不再临时打包。具体职责见[代码位置](#代码位置)及[导出格式说明](CONFIGURATION.md#导出共享图权重与-pte)。
