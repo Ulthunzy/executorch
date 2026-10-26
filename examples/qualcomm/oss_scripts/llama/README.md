@@ -803,6 +803,20 @@ Disposable experiment scripts have been removed after verification. PTEs,
 measurements and calibration records are retained. See
 [integration review and test records](README_QWEN35_TEST_RECORDS.md#qwen35-cli-integration-20261017).
 
+##### GDN prefill implementation (2026-10-17)
+
+Full-attention K/V retains the existing KV8 annotation; GDN recurrent and conv
+state remain UINT16, and chunk MatMul remains FP16. INT4 embedding is unchanged.
+The GDN state8, normalized-byte cache IO and integer MatMul experiments have
+been removed from the implementation; their measurements remain historical
+[test records](README_QWEN35_TEST_RECORDS.md#qwen35-gdn-experiment-cleanup-20261017).
+
+The common AR128 prefill optimization is retained: Gather nodes become static
+slices, redundant mask/sign operations are folded, and stable 8×8 inverse
+leaves are embedded in 32×32 operands. Dense32 high-order powers are not used.
+The UINT16 standalone GDN measured 0.892334 ms on SM8750; this is not full-model
+throughput. Existing PTEs require re-export to use the updated chunk graph.
+
 Historical storage-only UINT8 verification (2026-10-16): eight recipe/embedding regressions
 passed. Actual Qwen full-attention AR128 and AR1 small PTEs ran on SM8750 with
 one QNN delegate and no CPU fallback. Against PyTorch Q/DQ, the small model's

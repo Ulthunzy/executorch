@@ -8,6 +8,37 @@
 
 当前保留的完整导出位于 `llama-output/qwen35-moe-from-safetensors-gptq-20261024`，默认模型配方与设备配置均已对齐这套全矩阵 GPTQ 产物。编译 binding、WikiText 校准语料、两张校准图片及设备运行库已迁入该目录；历史导出的权重、PTE 和中间文件清理，报告归档到其中的 `history-reports/`。下文历史命令用于说明当时测试口径，当前运行请使用上面的默认配置及 `CONFIGURATION.md` 中的命令。
 
+## 2026-10-26：2048 上下文图文连续负载测试
+
+设备终端 C++ runner 实测完整40层，统一总上下文2048、prefill AR128、`layer_major`；每层32/64槽LRU，真实Top8不变。Embedding INT4/group32、Router/shared GPTQ W8A16、专家W2/N4×A8、KV/GDN/conv UINT16。每组生成指定数量的输出；图文输入长度包含模板和196个视觉token。同一输入的32/64槽生成ID全部一致。
+
+下表各数字均按 **32槽 / 64槽** 排列，速度单位为token/s。LLM prefill包含专家IO，含视觉prefill另外计入Android内部图片解码、缩放、patch和resident encoder；均排除模型初始化。
+
+| 输入 | 输入/输出token | LLM prefill | 含视觉prefill | Decode | 模型峰值GiB |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 纯文本 | 256/256 | 159.66 / 175.40 | 159.66 / 175.40 | 10.84 / 12.86 | 3.801 / 4.787 |
+| 纯文本 | 512/512 | 272.56 / 301.47 | 272.56 / 301.47 | 10.91 / 12.89 | 3.848 / 4.924 |
+| 纯文本 | 1024/1024 | 352.44 / 332.09 | 352.44 / 332.09 | 10.02 / 11.60 | 3.968 / 4.994 |
+| 图文 | 256/256 | 135.53 / 145.03 | 91.03 / 119.20 | 11.30 / 13.58 | 4.411 / 5.429 |
+| 图文 | 512/512 | 227.93 / 234.53 | 165.33 / 167.76 | 10.76 / 12.81 | 4.461 / 5.418 |
+| 图文 | 1024/1024 | 341.38 / 315.59 | 265.63 / 251.90 | 9.81 / 12.19 | 4.529 / 5.509 |
+
+这是顺序连续负载下各一轮有效测量，长输出阶段Thermal Status为2–3，不能把跨输入长度的差异全部归因于上下文。64槽本轮decode提升15.8%–24.3%，多占约1GiB；1K prefill没有加速。图片encoder约120ms，图片解码/缩放/patch约257–798ms。64槽的个别轮次SwapPSS达84–145MiB，另列在报告中。
+
+**历史性能对账补充：**旧424.05/140.25 token/s表只计LLM prefill，图文应与本表135.53比较，91.03另外包含了图片处理。手机恢复到Thermal Status 0后，同一2048 PTE、32槽、完全相同1024输入/1024输出、同样开启内存采样，prefill重新测得 **420.57 token/s**、decode **10.427 token/s**、峰值 **3.968560 GiB**；输入和1024个输出ID逐项相同。旧图文提示的LLM prefill复测为 **138.76 token/s**，79个输出ID与历史相同。旧/新模型80份prefill IO描述相同；无采样新提示两轮425.74/422.56 token/s，低热状态下旧提示无采样423.55、开采样423.02。大幅差距主要对应连跑后的设备状态，当前没有约17%的固有prefill回退证据。热状态与同步/调度的独立贡献尚未进一步隔离。详见[历史性能对账及全部控制实验](../../../../../llama-output/qwen35-moe-performance-reconcile-20261026/REPORT.md)。
+
+峰值覆盖初始化、prefill/decode与交接，统计CPU PSS＋去重DMA－PSS中已计DMA＋未映射memfd快照驻留页；目标采样间隔200ms，实际间隔随采样开销变化。这是模型进程占用，未包含整机其它应用或JNI调用方的JVM。12组均跑满目标输出，峰值样本无fdinfo/memfd读取错误；内存曲线未出现decode期间持续增长。详情、初始化耗时、逐token延迟、SwapPSS及原始记录见[完整报告](../../../../../llama-output/qwen35-moe-image-text-performance-20261026/REPORT.md)和[CSV](../../../../../llama-output/qwen35-moe-image-text-performance-20261026/RESULTS_DETAILED.csv)。
+
+固定长度测试可用`--prompt-tokens N`（128的倍数）指定包含模板和视觉token的首轮总输入长度，配合`--max-new-tokens N --ignore-eos`。本次12组均未在目标长度内遇到EOS；这些测试不替代PPL或标准质量评测。
+
+## 32K完整模型质量评测
+
+2026-10-26，完整40层32K PTE已部署到SM8975，中文生成和2920-token长输入预检通过。计划评测AIME 2026共30题、HumanEval共164题、GPQA-Diamond共198题、MMLU-Pro共12032题、IFBench共300题，总计12724题。保持当前GPTQ权重、W2专家、32槽LRU，temperature=0、thinking关闭。每题独立设备进程执行，成功结果逐题保存；五项全部完成前不生成Average。
+
+本次已按用户要求停止。已保存HumanEval/0–128共129题，114题通过，阶段通过率88.37%；HumanEval尚缺35题，其它四项尚未运行，这不是完整评测分数。第130题没有完整结果，不计入已测题目。原始输出、评分、冻结manifest和来源哈希保留在评测目录，并备份到`checkpoints/stopped-20261026/`；[源码内检查点](docs/benchmark-checkpoint-20261026.json)记录所有已测题号及输入/输出哈希。以后续跑同一冻结版本时，`run_device.py`按题号、prompt哈希、输出上限及manifest哈希跳过成功结果，无需重复推理。换用新图或新运行库需要独立结果集，不能合并旧版本分数。
+
+扩容预检同时修复了prefill共享mask固定1024及位置固定896的限制，改为从图的KV窗口取值；memfd快照通过自有句柄读写，普通文件路径继续同步写入。主机和SM8975文件IO回归、32K真实设备预检均通过。完整协议、断点续跑命令和动态结果位于[评测目录](../../../../../llama-output/qwen35-moe-full-benchmarks-20261026/README.md)。
+
 ## 设备终端对话
 
 `qwen35_moe_runner` 在设备上完成 ChatML、文本编码、JPG/PNG 解码与预处理、视觉编码、流式吐字及多轮会话，直接读取原始 `tokenizer.json`。模型文件已部署后，在 device shell 执行：
@@ -931,3 +962,29 @@ Attention 的 160 个投影/卷积滤波器、Router/shared 的 200 个投影、
 | 最终 hidden SQNR | 7.2391 dB | 6.3706 dB |
 
 中文回答 `1加1等于2。` 和图片描述均正常。视觉 QDQ SQNR 为 28.25 dB，手机执行 118.24 ms；256-token 图文 prefill 为 2.963 秒。本轮性能接近，整体精度没有明显改善，仍需结合逐层误差分析，不能把全部差值归因于 GPTQ。完整覆盖统计、校准边界、六组设备记录及复跑命令见[全流程报告](../../../../../llama-output/qwen35-moe-from-safetensors-gptq-20261024/REPORT.md)。
+
+## Android JNI
+
+新增独立 `Qwen35MoeModule`，支持设备端图片文件解码、流式文本、多轮、取消及重置。原 `LlmModule` 接口保持不变。构建、打包及调用示例见 [JNI 接入说明](../../../../../extension/android/jni/moe/README.md)。
+
+
+## 2026-10-26：review 修复与有效长度 prefill
+
+Prefill 保持 AR128，首轮、多轮及 reset 后的输入均按 128 分块。129 个真实 token 使用两次 AR128，第二块的有效长度为 1；300 个 token 使用三块，有效长度依次为 128、128、44。尾部用 inactive padding 补齐，不将空白文字插入普通用户的系统提示。仅显式性能测试 `--prompt-tokens` 保留真实空白补长。
+
+GDN 图新增 INT32 `last_token_index`：padding 的 Q/K/V 与 beta 为零、decay 为 1，conv state 按最后有效位置选取。Full attention 的物理窗口为逻辑 context capacity＋128，历史区覆盖完整逻辑上下文；mask 与 KV 反馈只提交真实 token。超过 4K 的 full attention 复用长 decode 的按 head/序列分块 FP16 MatMul，避免整块 GQA 展开放入 VTCM；softmax 仍覆盖全部历史，权重与 UINT16 cache 的量化规则不变。这样尾块不会挤掉历史，也不会回退到 AR1。Native MoE 描述符区分物理长度与有效长度，padding 不参与专家读取、计算路由及 LRU 更新。Head 使用最后一个有效 token 的 hidden，吞吐统计按真实 token 计数。
+
+多轮交接复用原 context、权重及专家 buffer，通过实际校准网格转换 state/KV；已有 decode KV 不重新量化，只追加本轮新 KV。专家 payload 原地复用，只交接槽 ID、LRU stamp 和最后有效 token 的路由。大块 prefill 的工作缓冲在首次阶段切换时缩至 AR128，DSP worker 保留；取消或输入失败后使专家元数据失效并要求 reset，避免使用被部分覆盖的旧槽。
+
+本次同时修复：共享 context 批量初始化失败后清理未借用的 context，Graph 构造失败时回收已取得资源；按目标 context 生成并检查 RoPE；去掉普通 decode 导出入口的 1152/2048 限制；CLI/JNI 从部署计划的 `model_configuration` 读取 embedding、KV、state swap、IO 和调度设置；decode 初始 KV 快照只保存真实前缀，chat 导入后释放快照及 JNI memfd。原 `LlmModule` API 不受影响。
+
+新 shared 导出自动从编译后的图提取 `cache-encoding.bin`，按 checkpoint config 生成足够长度的 cos/sin；`separate_shared.py` 一起保留这些文件与 IO metadata。运行时优先使用这套配套资产，拒绝长度不足的 RoPE。旧 PTE、旧 cache metadata 与旧 Native skeleton 不能混用此版 padding ABI，需要重新导出和构建。
+
+本机验证记录：
+
+- `runner/tests/run_host.sh`：共享 context 部分初始化/回滚/重试，KV 的 1、2、63、64、65、127、128 有效长度及 UINT16 网格转换，配置覆盖与 RoPE 越界保护通过；10 个 PyTorch 测试通过，包含 129-token 两块连续 state 更新及长 GQA 分块后的全局 softmax 数值检查。
+- 真实已校准第 0 层：完整 AR128 与原 FP16 chunk 实现逐元素一致；有效长度为 1、65、127 时，更改所有 padding 内容不会改变有效输出、conv state 或 recurrent state。
+- 四层、2048 逻辑上下文：12 个方法各包含一个 QNN delegate，共享一个 context；prefill 历史为 2048，物理窗口为 2176；编译元数据确认 8 个 cache IO 均为 UINT16，并提取实际 scale/offset。额外 32K full-attention 验证中，3 个方法同样各包含一个 QNN delegate、共享一个 context，物理窗口为 32896；分块处理消除了未分块时 32 MiB InputSlice 无法放入 TCM 的编译错误。
+- Android terminal runner、decode DSO、JNI、shared provider、V85 Native 与 GDN op package 构建通过；原有 163 组 HVX/HMX 锁失败与恢复测试通过。
+
+设备完整 benchmark 已停止，本轮没有替换其冻结版本文件。新多轮 AR128 的端侧数值、耗时与内存峰值仍待设备回归；完整历史区会影响静态缓存占用，不能用本机编译结果推断端侧性能或峰值。

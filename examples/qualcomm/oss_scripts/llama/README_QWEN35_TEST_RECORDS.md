@@ -1,6 +1,6 @@
 # Qwen3.5 / Lincal3.5 测试记录归档
 
-最初归档：2026-10-15；最近更新：2026-10-17。
+最初归档：2026-10-15；最近更新：2026-10-19。
 
 当前导出配置、最终性能/PPL和验证范围见[主 README](README.md#validation-record-2026-10-15)。本文保留清理前52份报告中的测试数据、过程和结论；各记录使用当时的配置与测试口径，较早的实验配置和问题描述不代表当前实现。
 
@@ -8,6 +8,8 @@
 
 ## 目录
 
+- [2026-10-19：第 1 层 GDN 极小权重 scale 饱和修复](#qwen36-layer1-tiny-scales-20261019)
+- [2026-10-17：Qwen3.6-35B-A3B 真实单层 MoE 可行性测试](#qwen36-moe-layer0-20261017)
 - [2026-10-17：正式入口接入、review与测试代码清理](#qwen35-cli-integration-20261017)
 - [01. llama-output/qwen3_5-mainline-integration/cross-model-fixes/REPORT.md](#record-01)
 - [02. llama-output/qwen3_5-prefill-optimization/FINAL_SUMMARY.md](#record-02)
@@ -6245,3 +6247,2564 @@ Prefill输入n、输出1；decode输入16、输出n−16。首个输出来自pre
 删除88个Qwen相关临时导出、benchmark、审计、画图脚本及测试driver源码/可执行文件，4个本轮开发的临时回归测试文件，并清理37个对应pyc。保留原有受版本控制的SWA/mask/C++回归测试和正式自定义op源码。
 
 删除清单及各文件SHA256保存在`llama-output/qwen35-context-performance-20261016/test_code_cleanup.json`。清理前后核对77个PTE路径及大小完全一致；所有PTE、输入/输出、日志、报告、CSV、配置与测量结果均保留。后续导出使用[主README的正式命令](README.md#standard-qwen35-export-entry-point-2026-10-17)。上述验证完成时尚未commit或push，后续代码提交由`preview`分支记录跟踪。
+
+> 2026-10-17 收尾说明：以下GDN state8、归一化byte cache、StateCacheUnpack/Pack和整数MatMul内容均为历史实验记录。按用户要求，相关源码、标注入口、op注册和临时测试代码已撤销，不能照下方历史片段启用。当前仅full-attention K/V采用KV8；GDN recurrent/conv state保持UINT16，chunk MatMul保持FP16，INT4 embedding及通用prefill优化保留。详见文末清理记录。
+
+<a id="qwen35-gdn-state8-20261017"></a>
+## Qwen3.5-0.8B：GDN recurrent state UINT8 实验（2026-10-17）
+
+结论：**量化标注、混合 dtype、原生 HVX/VTCM、PTE和设备推理均已打通，但当前 per-tensor UINT8 state 的精度损失很大，默认配置继续保留 UINT16。**
+
+### 范围
+
+只修改 recurrent state；conv state、Q/K/V、decay/beta和core输出保持UINT16，FA KV8和embedding INT4的生产默认配置不变。实验输入来自本地Qwen3.5-0.8B第0层的真实权重，形状为state [1,16,128,128]。对照采用相同FP32 embedding、input RMSNorm、输入投影、causal conv、Q/K L2和gate，以隔离state位宽误差。这里**没有重新量化整个0.8B模型，也没有把W4投影/INT4 embedding误差混入state消融**；不代表完整模型PPL或端到端性能。
+
+校准使用已缓存WikiText-2 raw train的连续1024个token，8个128-token窗口，真实传递非零conv/recurrent state；测试使用此前性能矩阵相同WikiText-2 raw test的前1024个token。两个版本的Q/K/V、decay/beta和core输出的校准scale/zero point完全相同，只有state网格不同。
+
+### 实现
+
+新增`annotate_gdn_state_8bit`，只将core第5个输入和第1个输出改成8bit，并通过SharedQuantizationSpec共享校准网格。默认core标注先执行，recipe的override随后执行；scale/zero point来自MinMax校准，非写死。正常导出报告按实际calibrated cache encoding记录conv/recurrent/FA各自dtype。仅实验时，在所选recipe实例的自定义标注列表追加：
+
+```python
+from executorch.examples.qualcomm.custom_op.deltanet import annotate_gdn_state_8bit
+
+recipe.recipe.custom_quant_annotations.append(annotate_gdn_state_8bit)
+```
+
+当前默认recipe不追加此标注。
+
+`DeltaNetState8.cpp::deltanetCoreQhpiState8`为独立的混合精度实现，注册到现有DeltaNetCore和DeltaNetCoreVtcm：五个U16输入＋一个U8 state，输出U16 attention＋U8 state。state在DDR和VTCM中均为byte code；只在HVX寄存器中展开，使用INT32 MAC及FP32缩放/更新。不存在完整state扩展成UINT16量化网格的中间张量。
+
+U16 Q/K先在整数MAC中以32768为中心，再通过sum(S)精确补回实际calibrated zero point；32768是算术重编码常数，不是硬编码state zero point。归约按最多128个K分块避免INT32溢出，支持与原内核相同的K/V<=256及尾部。旧U16内核和注册顺序保留。
+
+### 按指定顺序核对误差
+
+| 指标（非零 state 单步 decode，手机实测对齐 FP32） | UINT16 state | UINT8 state |
+|---|---:|---:|
+| FP32 min/max（state 输入） | [-2.38344, 2.17460] | 相同 |
+| FP32 min/max（state 输出） | [-2.38645, 2.17800] | 相同 |
+| 量化范围 | [-3.57608, 2.69304] | [-3.56479, 2.70432] |
+| 饱和比例（原 FP32 state 超出量化范围） | 0% | 0% |
+| state 输入 SQNR | 60.34 dB | 17.98 dB |
+| state 输出 SQNR | 58.20 dB | 18.00 dB |
+| attention output SQNR（core＋RMSNorm/z＋FP32 out_proj） | 37.38 dB | 8.81 dB |
+
+该单步输入使用FP32预热128token后的非零state；它单独检查state保存/加载的损失，没有混入之前128步的UINT8递推误差。attention output包含core、RMSNorm/z门控和FP32 out_proj；后两部分在主机用设备core输出计算，不是整个attention在手机上的整图误差。
+
+UINT16校准scale为0.0000956605727、zero point=37383；UINT8 scale为0.02458476834、zero point=145。步长扩大约257倍。首128token FP32 state的绝对值中位数仅0.00098467，P90为0.00860886；**93.0542%**的元素低于UINT8半步长，会落入零码，而原FP32的精确零元素只有0.3418%。因此主要问题是小信号和小更新被舍入掉，扩大校准范围无法解决。饱和接近零不代表量化精度好。
+
+### Prefill与decode区别
+
+| 128-token 冷启动 prefill，手机 FP16 ChunkGDN | UINT16 state | UINT8 state |
+|---|---:|---:|
+| state 输出 SQNR | 56.05 dB | 17.97 dB |
+| core output SQNR | 61.33 dB | 61.33 dB |
+| attention output SQNR | 37.63 dB | 37.63 dB |
+| state 大小/层 | 512 KiB | 256 KiB |
+
+冷启动state为0，因此第一块prefill的attention输出可以完全相同，损失出现在写回的state。正式prefill仍使用FP16 chunk64/leaf8，块内部不逐token量化state；每128token块之间才保存为UINT8。连续8块的主机参考中，最后一块attention output SQNR从37.50 dB降到14.42 dB；不能只根据第一块输出判定state8无误差。
+
+| 连续 recurrence | UINT16 state SQNR | UINT8 state SQNR | UINT16 attention output SQNR | UINT8 attention output SQNR |
+|---|---:|---:|---:|---:|
+| 128步，手机 PTE 内真实逐步回写 | 42.36 dB | 9.17 dB | 33.11 dB | 6.80 dB |
+| 1024步，PyTorch 逐步量化参考 | 33.99 dB | 6.33 dB | 30.27 dB | 5.57 dB |
+
+128步原生recurrence PTE用于闭环验证逐token回写，不是正式prefill实现。UINT8设备core输出相对逐步量化参考SQNR为75.13 dB，state为55.39 dB；state code一致率99.9996%。单步非零state的UINT8输出code与量化参考100%一致，进一步说明大的FP32误差来自state8本身。
+
+### 性能
+
+SM8750/PKR110/431e3c37，HTP v79，QNN SDK 2.49.40.260810；正常qnn_executor_runner、shared buffer、20次warmup，每轮AR1执行1000次，AR128执行100次，交替运行两精度，三轮取中位数。没有锁频或profile；数据用于功能及微基准，不是整模型吞吐结论。
+
+| 单算子 PTE execute，3轮中位数 | UINT16 state | UINT8 state | 延迟变化 |
+|---|---:|---:|---:|
+| 正式 FP16 ChunkGDN prefill，AR128 | 1.19301 ms | 1.11605 ms | −6.45% |
+| 原生 VTCM core decode，AR1 | 0.248197 ms | 0.262874 ms | +5.91% |
+| 原生逐步 recurrence，128步 | 2.17043 ms | 11.69697 ms | +438.92% |
+
+这些是单算子PTE的execute延迟，含独立delegate调用开销，排除加载/ADB，不含输入投影、norm/z、out_proj和FFN；不能直接乘18换算整个模型耗时。原生state8 recurrence是功能原型，尚未优化到U16内核水平；正式prefill使用FP16 ChunkGDN，不能把上表11.70ms当作prefill时间。
+
+每层state存储减半。0.8B共有18个GDN层，仅recurrent state由9 MiB降到4.5 MiB；conv与FA KV大小不变。
+
+### 验证与限制
+
+x86、Android、Hexagon v79构建通过。HVX byte展开、lane顺序及饱和打包验证通过；35组不同K/V、尾部及K>128的归约/更新检查通过。两层GDN＋FA小图确认AR128/AR1的cache位宽分别为Conv16/FA8/Recurrent8/FA8，输入输出编码共享；默认16位配方仍为Conv16/FA8/Recurrent16/FA8。
+
+共6个微型PTE：原生core的AR1/128各两精度，正式FP16 ChunkGDN的AR128两精度。均只有一个QNN delegate且无CPU算子；state8图的state输入/输出为BYTE，其他IO为UINT16。Chunk路径的state Convert为UINT8→FP16及FP16→UINT8，使用真实浮点计算；不是已放弃的UINT8→UINT16计算网格方案。
+
+C++ runner已按每个输入/输出的实际nbytes和dtype初始化及回写，无需修改运行时代码；补充UINT16 conv＋UINT8 recurrent＋UINT8 FA的native KVManager regression，并保留sanitizer检查。当前大误差下不切换默认配方，不继续做完整模型PPL/全量导出。若后续坚持state8，应先研究按head/block缩小量化范围，并相应适配kernel的量化参数布局。
+
+### 文件
+
+`accuracy.json`为逐步量化参考；`prefill-accuracy.json`为真实FP16 chunk参考；`device-accuracy-vs-fp32.json`为手机输出相对FP32；`device-results.json`及`device-prefill-results.json`记录各轮性能和实现一致性。`qnn-audit-*.json`记录混合IO dtype，PTE和原始输出保留。临时实验脚本置于/tmp，未加入代码库。当前新增实现未commit/push。
+
+<a id="qwen35-gdn-state8-optimization-20261017"></a>
+
+> 性能比较更正：以下“普通UINT8原库／新库”实验没有同步修改PTE内部绝对库路径，不能用于比较库代码优化。精度/PPL消融仍有效；正确绑定路径后的内核性能及修复见[后续记录](#qwen35-state8-performance-20261017)。
+
+## GDN UINT8 state 通道归一化优化（2026-10-17）
+
+## 结论
+
+原生 UINT8 state 已能运行；本轮解决的是全张量共用量化步长引起的小值丢失。选定按 head/value 通道归一化缓存，复用现有 DeltaNetCoreVtcm，不增加新的 op 类型。
+
+实际手机连续 1024 token：prefill attention 累计 SQNR **37.17 dB**，逐 token recurrence **25.91 dB**。
+生产默认仍是 UINT16 recurrent state；归一化 UINT8 作为经过小 PTE 和 GDN core PPL 消融验证的可选原型保留。完整生产 W4／INT4 embedding／FA KV8 PTE 的 PPL、图文输入和端到端性能本轮未测。
+
+## 实现与数学关系
+
+`examples/qualcomm/custom_op/deltanet.py::ValueScaledDeltaNetCore`：`from_calibration` 观察训练样本每个 token 的 FP32 state 更新，计算 `c[h,v] = max_train,b,k,t |S[b,h,k,v]|`。缩放系数与量化网格只从训练集拟合。首个测试窗口用于比较方案，额外三个1K窗口在选定方案后验证，未重新拟合参数。
+
+```text
+R[k,v] = S[k,v] / c[v]
+delta_R = beta * (V/c - decay * K^T R_old)
+R_new = decay * R_old + K * delta_R
+Y = (Q^T R_new) * c
+```
+
+每个 head 独立应用上述关系。c 与 token/key 坐标无关，因此是可逆的状态表示变换；在非零 warm state 上 FP32 输出／state 与原公式 SQNR 为 136.97／126.94 dB。
+
+Q/K/decay/beta 的计算方式不变。core 内部使用归一化 V 和 R，输出再按通道恢复 Y。PT2E 自动校准归一化 V、R 和 Y 的量化网格；R 的输入输出共享同一组 UINT8 scale/zero point。缩放乘除节点也必须使用 MinMaxObserver；实验最初误用默认 MovingAverageMinMaxObserver 时范围收窄，已修正。
+
+cache 保存的是 R。warm-start 的物理 S 必须先除以 c；之后直接传递返回的 R。prefill/decode 必须使用同一份 c 和共享 cache 编码，不能与旧的 S-cache 图直接交接。零 state 初始化保持为量化 zero point。
+
+每层 Python FP32 缩放 buffer 8 KiB（16×128×4），state 仍为 256 KiB；18 层 recurrent state 由 9 MiB 降到 4.5 MiB，不含 conv/FA cache。没有创建 UINT16 state 计算网格；原生路径只在寄存器中展开 byte，prefill 延续原 FP16 ChunkGDN。
+
+`src/ops/DeltaNetState8.cpp::outputState8` 将 delta 与 U16 输出的中心化、乘加、舍入和打包向量化。35 组 K/V shape 含尾部、K>128 的 libnative 对照通过。AR1 的微小速度差与测量波动重叠，128 步原生循环没有可靠提速；主要精度改善来自通道归一化。UINT16 内核和旧 kernel 索引未改变。
+
+## 单层精度：按指定顺序检查
+
+固定本地 0.8B 第0层真实 FP32 embedding／投影／causal conv／L2／gate 输入，独立 train1024 校准、test1024 验证。不能将这组结果解释为 W4 投影精度。
+
+### 1. FP32 min/max
+
+| 位置 | 原始物理 S 最小值 | 最大值 | 归一化 R 最小值 | 最大值 |
+|---|---:|---:|---:|---:|
+| 128 | -2.383440 | 2.174600 | -1.110773 | 1.126003 |
+| 1024 | -3.059072 | 2.831918 | -1.720514 | 1.794810 |
+
+### 2. 量化范围
+
+普通 UINT8 的统一物理步长为 0.02458477。新 R 的 step=0.0078431414、zero=128、code=[0,255]，R 可表示范围 [-1.003922,0.996079]。
+训练得到 c 范围 [0.00365009,3.65685916]，因此物理 S 每通道有效步长为 [0.0000286282,0.0286812633]。小幅值通道不再被最大通道决定步长。
+
+### 3. 饱和比例
+
+以对应 FP32 物理 state 检查可表示范围：第128 token 超范围 **0.002670%**，第1024 token **0.085831%**。这是 FP32 超范围比例，不把合法零值或实际 endpoint code 一概算成饱和。
+手机冷 AR128 prefill 输出中，zero-point code 占比由普通 UINT8 的 93.04% 降到 15.81%；该指标包含真实小值量化成零，不等于饱和率。
+
+### 4–6. state 输入 SQNR、state 输出 SQNR、attention output SQNR
+
+下表为手机结果。attention 是 core 输出继续通过同一 FP32 RMSNorm/z/out_proj 后与 FP32 对照比较；不含残差/FFN。非零 AR1 输入为精确 FP32 前128 token state 一次量化，不是经历128次 byte舍入的 state。
+
+| 路径／配置 | state 输入 dB | state 输出 dB | attention 输出 dB |
+|---|---:|---:|---:|
+| ar1／state16 | 60.34 | 58.20 | 37.38 |
+| ar1／state8-new | 17.98 | 18.00 | 8.81 |
+| ar1／scaled8 | 37.84 | 36.66 | 35.88 |
+| prefill／state16 | — | 56.05 | 37.63 |
+| prefill／state8-new | — | 17.97 | 37.63 |
+| prefill／scaled8 | — | 37.79 | 37.58 |
+| recurrence／state8-new | — | 9.17 | 6.80 |
+| recurrence／scaled8 | — | 18.77 | 28.83 |
+
+原生 recurrence128 是逐 token 舍入的诊断图，正式 prefill 使用 FP16 chunk64/leaf8，两者不能混用名称。
+
+连续8次128-token手机调用，直接将原始 UINT8 state 输出反馈到下次输入，host 不做反量化/再量化：
+
+| 路径 | 最后一块 state 输入 dB | 最后 state 输出 dB | 最后一块 attention dB | 全1024 attention累计 dB |
+|---|---:|---:|---:|---:|
+| prefill | 33.82 | 33.37 | 36.82 | 37.17 |
+| recurrence | 13.48 | 13.03 | 24.82 | 25.91 |
+
+## 粒度消融
+
+按 head 单独设置 affine grid 提升有限；沿 value 维分组更有效。以下为量化参考实现的全1024 attention累计 SQNR：
+
+| state方案 | 每token舍入 decode dB | 每128token舍入 prefill dB |
+|---|---:|---:|
+| global | 5.57 | 15.81 |
+| head-k128-v128 | 6.77 | 18.88 |
+| head-k128-v8 | 18.17 | 29.99 |
+| head-k16-v16 | 16.25 | 29.83 |
+| head-k4-v4 | 23.74 | 35.30 |
+| global16 | 30.27 | 37.75 |
+| 选定 value 通道归一化，实际 PT2E QDQ图 | 25.72 | 37.27 |
+
+未选用直接的4×4 affine block方案：还需要改变 QHPI 量化参数表示和归约实现，且 held-out clipping 升到约1.96%。选定方案复用原6输入／2输出 core，新增的只是 V/c 与 Y×c 两个图节点。
+
+## PPL 与最终 hidden SQNR
+
+**这是全0.8B文本模型上的 GDN core 消融，不是生产 W4 PTE 评估。** embedding、所有 Linear/FFN、FA、conv 路径保持 FP32；仅 GDN core 的Q/K/V/decay/beta/Y为校准 A16，state为对应位宽。归一化方案另校准 V/c 与 Y/c。
+
+prefill 模拟每128token持久化一次 state，内部FP16 ChunkGDN；decode 模拟每token量化一次 state。模型投影/FA采用整段因果计算以降低测试开销，因此这里不报告GPU执行时间作为decode性能。
+
+WikiText-2 raw train前1024用于校准；test前4096切成四个独立冷启动1024窗口，各1023个teacher-forced目标，共4092。下表先汇总NLL再取exp，不平均PPL。不是标准全测试集，也不是连续4K cache实验。
+
+| 方案 | 前1024 PPL | 四窗口合并 PPL | 四窗口最终 hidden SQNR dB |
+|---|---:|---:|---:|
+| fp32-decode | 10.8785 | 19.0496 | — |
+| state16-decode | 10.8610 | 19.1786 | 23.23 |
+| state8-decode | 85.7426 | 166.8354 | 1.85 |
+| scaled8-decode | 11.1978 | 19.9046 | 16.14 |
+| state16-prefill | 10.9081 | 19.1048 | 36.81 |
+| state8-prefill | 11.7138 | 20.4664 | 11.81 |
+| scaled8-prefill | 10.9572 | 19.1559 | 26.39 |
+
+每个窗口的 PPL：
+
+| 起始token | FP32 | UINT16 decode | UINT8 decode | 归一化 UINT8 decode | UINT16 prefill | UINT8 prefill | 归一化 UINT8 prefill |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| 0 | 10.8785 | 10.8610 | 85.7426 | 11.1978 | 10.9081 | 11.7138 | 10.9572 |
+| 1024 | 24.9312 | 25.1244 | 383.9310 | 25.4320 | 24.9989 | 26.5915 | 24.8758 |
+| 2048 | 20.3502 | 20.4309 | 173.7796 | 21.7753 | 20.4383 | 22.2210 | 20.5301 |
+| 3072 | 23.8597 | 24.2670 | 135.4268 | 25.3126 | 23.9029 | 25.3491 | 24.0625 |
+
+四窗口合并后，归一化 UINT8 相比 UINT16：decode PPL **+3.79%**，prefill **+0.27%**。decode仍有逐步量化累计损失；prefill更接近基准。
+
+Transformers FP32同一首1024输入 PPL=10.87851560，本地 FP32 PPL相同；最终 hidden SQNR=115.98dB，逐位置 NLL最大差=3.4213066e-05。新PPL基准已与HF核对，不与历史不同语料、完整量化PTE的PPL直接比较。GPU峰值约5303MiB；全程串行单模型。
+
+## 手机耗时
+
+SM8750／431e3c37；独立小PTE的execute，AR1 warmup20＋1000次，AR128 warmup20＋100次；三轮交替顺序取中位数。排除加载/ADB，包含单delegate调用；未包含投影/norm/z/out_proj/FFN。
+
+| 路径 | UINT16 | 普通UINT8，原库 | 普通UINT8，新库 | 归一化UINT8 |
+|---|---:|---:|---:|---:|
+| ar1 | 0.245624 ms | 0.269605 ms | 0.260276 ms | 0.231372 ms |
+| prefill | 1.180240 ms | — | 1.126620 ms | 1.153190 ms |
+
+各轮原始耗时见 `device-summary.json`。归一化的额外缩放没有造成明显回退，但这些小幅收益不能推算成整模型token/s。128步原生循环只有一轮诊断数，不作为优化速度结论；正式prefill只看chunk路径。
+
+## 验证与产物
+
+三份归一化PTE：AR1、AR128逐token诊断、AR128正式chunk。均一个QNN delegate、零CPU算子，外部IO为5×UINT16＋UINT8 state，输出UINT16 attention＋UINT8 state。AR1 QNN图为ElementWiseDivide→DeltaNetCoreVtcm→ElementWiseMultiply，core签名保持5×UFIX16＋UFIX8。
+
+FP32非零state等价性、batch2/K3/V7、拆段state交接、无效scale及空校准拒绝通过；native35组HVX归约/更新/输出对照通过；完整UINT16路径未改。详见 `verification.json`。
+
+产物目录：`llama-output/qwen35-gdn-state8-optimization-20261017/`。主要文件：`group-sweep.json`、`equalize.json`、`scaled-accuracy.json`、`scaled-state-statistics.json`、`device-results.json`、`device-sequence.json`、`ppl.json`、`ppl-extra.json`、`ppl-aggregate.json`、`ppl-hf-reference.json`、`verification.json`。旧对照产物保留在 `llama-output/qwen35-gdn-state8-20261017/`；两版DSP库SHA保存于 `library-sha256.json`。
+
+未提交或推送本轮修改。下一步若接入正式模型，应在生产W4/INT4 embedding/FA KV8的校准路径中学习每层c，再同时派生共享R-cache的prefill/decode；当前原型结果不能替代该完整PTE精度验证。
+
+<a id="qwen35-state8-performance-20261017"></a>
+
+## UINT8 GDN 性能定位与修复（2026-10-17）
+
+## 结论
+
+小幅提升包含两个不同问题：实验换库没有替换 PTE 真正引用的路径；UINT8 native kernel 存在临时向量落栈、逐K行重复准备系数及加载delta的开销。已修正测试路径并优化内核。正式AR128 prefill依旧是FP16 chunk，缩减state持久化位宽不能使其矩阵计算同步减半。
+
+同一台SM8750／431e3c37、相同输入、相同QNN编译图，仅运行时算子库切换；三轮交替顺序，warmup20，AR1迭代1000、128步诊断迭代50。均为独立小PTE execute时间，不是整模型token/s。
+
+| 路径 | UINT16对照 | 归一化UINT8旧内核 | 归一化UINT8最终内核 | 相对UINT8旧版耗时下降 |
+|---|---:|---:|---:|---:|
+| ar1 | 0.245855 ms | 0.228294 ms | 0.198000 ms | 13.27% |
+| recurrence | 2.166420 ms | 6.599960 ms | 3.135540 ms | 52.49% |
+
+AR1相对UINT16耗时下降约19.5%。128步原生诊断仍比UINT16原生内核慢，不把它当作正式prefill；正式prefill仍走约1.15ms的FP16 chunk。完整模型decode/prefill端到端性能本轮未测。
+
+## 1. 换库路径问题
+
+`QnnBackendCommon.cpp` 按PTE compile spec里的`op_package_path`原样注册库。旧micro-PTE写入`/data/local/tmp/hunter/qwen35-gdn-state8/`；归一化micro-PTE写入`/data/local/tmp/hunter/qwen35-state8-optimization/`。把新so推到另一个测试workspace不会覆盖这些路径。
+
+因此此前标记“普通UINT8原库／新库”的换库AB比较无效，两次仍可能加载同一旧路径；不能用这些数字判断SIMD修改有没有收益。此前FP32/QDQ精度、PPL消融及归一化PTE本身的执行结果仍有效。
+
+此次只重写测试PTE的runtime op-package路径到独立`qwen35-state8-perf-before`和`qwen35-state8-perf-final`目录。重新反序列化后校验QNN delegate data SHA完全相同、IO不变；校验每轮手机对应路径so的SHA与host版本一致。没有重新编译QNN计算图。
+
+第一次未修路径的本轮测试已移到`invalid-path-runs/`，不作为优化结果。寄存器版本和试验性I16系数分支的结果分别保存在`register-runs/`、`exact16-runs/`。
+
+## 2. 保留的内核修改
+
+代码：`examples/qualcomm/custom_op/deltanet_op_package_htp/DeltaNetOpPackage/src/ops/DeltaNetState8.cpp`。
+
+- `reduceState8Tile<Aligned>`：把indexed accumulator数组改为显式HVX寄存器变量，减少归约结束后的数组落栈与重载；<=128 keys一组，保持完整Q/K位数与I32溢出界限。
+- `storeStateProjection`：直接恢复Q/K零点补偿并保存投影，不保留跨K循环的八个FP32总和向量。
+- `updateStateRows8<Aligned>`：V tile在外、K行在内，四个delta向量跨所有K行复用；旧实现每K行调用一次update、重载delta并把word/code临时数组放入栈。
+- `deltanetCoreQhpiState8`：把state/key的scale除法与固定系数准备移到K循环外，避免128行重复计算。
+- 已对齐且V stride是128倍数时使用VMEM路径，其他shape保留未对齐/尾部路径。
+
+试过“所有Q/K系数可放进I16时省去sum(S)零点补偿”的额外分支。约95%的样本head/token满足条件，但三轮结果没有稳定额外收益，最终移除，保留更简单的寄存器/复用版本。UINT16 native内核未改。
+
+## 3. QNN profile解释prefill收益为什么小
+
+profile使用runtime level2，仅用于定位。它显著增加测量开销，不用profile运行的绝对耗时代替上面的无profile性能。下列比例按每节点cycles的中位数加总，属于算子周期分布，不等于并行图关键路径或DDR带宽分布。
+
+归一化UINT8的AR128 FP16 chunk图约208个profile节点：
+
+| 分类 | 节点cycles占比 |
+|---|---:|
+| 36个MatMul | 31.91% |
+| 20个Gather/index_select | 20.22% |
+| 全部8个dtype/layout Convert | 6.34% |
+| 其中state入口和出口两次Convert | **1.80%** |
+| 额外V/c和Y×c两次缩放 | 7.64% |
+
+UINT16 prefill对应state两次Convert约2.46%，普通UINT8约1.98%。换成byte持久化后，进入ChunkGDN的工作state仍为真实FP16，K@S、Q@S、state更新及三角逆等矩阵/中间张量访问没有减半。不要把全部state相关计算或VTCM访问都算成UINT8节省。
+
+因此正式prefill只有小幅收益有依据。若继续降低prefill延迟，应优先减少Gather/布局物化、三角逆相关中间操作及缩放节点开销；单改state存储位宽不能替代这些计算优化。
+
+AR1在修正绑定后采集的native core周期：
+
+| 图／库 | core节点中位cycles |
+|---|---:|
+| state16／before | 1195626 |
+| scaled8／before | 1071490 |
+| scaled8／final | 739728 |
+
+归一化UINT8 core自身周期下降约31%，无profile的execute下降约13%。delegate、输入输出和DSP调度等其他成本仍在，不能把core周期收益直接当作整模型吞吐收益。
+
+QNNProfiler把cycles/us/count等数值直接写入ETDump；默认Inspector按ns→ms统一缩放会改变显示量级。本轮bound profile使用原始delegate数值，事件单位以名称后缀为准；旧prefill CSV恢复cycles时乘回1e6。没有把cycles直接换成毫秒。
+
+## 4. 精度与验证
+
+测试中AR1和128步诊断的attention输出、state输出与旧库均逐code100%一致、最大差0。calibration、scale/zero point、R表示和网络量化规则未改变。该结果针对本轮固定输入，不是任意浮点输入都逐bit一致的承诺。
+
+libnative随机90组涵盖aligned/unaligned、K到256、V尾部、独立输出与原地更新，通过；有1处靠近FP32半步舍入边界的差异为1code，已记录，其他更新与参考一致。x86/Android/v79构建通过。完整生产W4 PTE PPL没有重测；此前state精度消融记录保持独立。
+
+## 产物
+
+目录：`llama-output/qwen35-state8-performance-20261017/`。最终数据为`device-results.json`、`device-summary.json`、`accuracy-vs-before.json`、`profile-bound-node-summary.json`、`verification.json`；包含每轮runner日志、raw输出、已绑定PTE及before/final库SHA。汇编对照为`before.asm`、`after.asm`，数学检查为`math-final.log`。
+
+本轮没有提交或推送。
+
+<a id="qwen35-prefill-graph-20261017"></a>
+
+# Qwen3.5 AR128 GDN prefill 优化（2026-10-17）
+
+> 后续整模型复测发现，本节的 dense32 高次幂三角逆在后续层会产生非有限值。0.83219/0.87959 ms 是第0层历史小图测量，不能作为稳定完整模型的性能。当前实现已改为32×32矩阵内嵌8×8叶块，保留Gather消除；修复、UINT8专属融合及重新测量见[稳定版记录](#qwen35-state8-cacheio-stable-20261017)。下方保留原始过程以便追溯。
+
+## 结果与测量范围
+
+已接入 `examples/qualcomm/oss_scripts/llama/model/chunk_gdn.py`，由标准 `llama.py` 的 `replace_prefill_cores()` 自动使用。部署 AR 保持 128，内部仍是两个顺序更新 state 的 64-token chunk。没有增加实验开关；AR1 native VTCM 内核不在本次修改范围内。
+
+同一 SM8750／431e3c37，真实 Qwen3.5-0.8B 第 0 层 Q/K/V、decay、beta 和非零初始 state；B=1、H=16、K=V=128。共享 buffer，warmup20、iteration100、三轮交替顺序，中位数。QNN SDK2.49.40.260810；测试全部串行导出。
+
+| state 路径 | 原版 AR128 | 新版 AR128 | 耗时下降 | 加速比 |
+|---|---:|---:|---:|---:|
+| UINT16 | 1.19436 ms | **0.83219 ms** | **30.32%** | 1.435× |
+| 归一化 UINT8，R=S/c | 1.16197 ms | **0.87959 ms** | **24.30%** | 1.321× |
+
+这是独立 GDN 小 PTE 的 execute 延迟，含 delegate 调用，排除加载和 ADB；不含投影、norm/z、out_proj、FFN、视觉编码器。不能直接作为完整模型 token/s，也不能将它乘层数视为整模型实测。本轮没有重导完整模型、重测端到端吞吐或完整生产 W4 PTE PPL。旧完整 PTE 不会自动改变，需要重新导出。
+
+## 保留的修改
+
+1. **Gather 改静态切片。** 原来把 64×64 lower 展平成 4096 元素，按 int32 索引提取对角/左下块，再按 even/odd 索引提取逆矩阵。现在直接切出两个 32×32 对角块和左下块，逆矩阵以 `[:,0::2]`、`[:,1::2]` 取两块。删除 `leaf_indices`、`inverse_indices` 及运行时 arange。
+2. **三角逆叶块8→32。** 对两个 32×32 严格下三角块做有限幂级数，再只合并一级。每个叶块用 `I+L` 开始，四轮 `power=power@power; inverse=inverse@(I+power)` 得到至 L³¹ 的逆；最终左下块仍为 `B⁻¹ T A⁻¹`。MatMul调用数保持不变，但逆矩阵的拼接/重排减少；本次 profile 中 MatMul 节点周期加总也降低约14.1%。这不是减少理论 FLOPs 的算法。
+3. **减少布局物化。** AR128 中 Concat19→7、Reshape33→19、Split2→0。dtype Convert仍有8个、Transpose仍有16个，没有声称它们全部消失。
+4. **mask/符号融合。** `exp(clamp(g_i-g_j))*lower` 末尾已经清掉上三角，删除 clamp 前的重复 `*lower`；把 strict mask 的负号预合并到常量 `negative_strict`。动态 Multiply22→20、Neg2→0。beta仍在原位置，所有校准得到的 QDQ边界参数保持一致。
+5. 保留 odd block 的 `+2**-24` 物化：直接让切片进入 QNN Concat 曾出现 stride 错误。实机验证后保留这项兼容处理。
+
+| 原始 QNN wrapper 类型 | 原版数量 | 新版数量 |
+|---|---:|---:|
+| Gather | 20 | **0** |
+| StridedSlice | 14 | 30 |
+| Pack | 0 | 2 |
+| Concat | 19 | 7 |
+| Reshape | 33 | 19 |
+| Split | 2 | 0 |
+| MatMul | 36 | 36 |
+| Convert / Transpose | 8 / 16 | 8 / 16 |
+| Multiply / Neg | 22 / 2 | 20 / 0 |
+| wrapper总数 | 204 | 170 |
+
+归一化 UINT8 图另外各有一个 `V/c` Divide 和 `Y*c` Multiply；它们仍存在。
+
+## 精度：连续8×128 token
+
+用相同测试流，从零 state 开始，每步把手机 raw state 输出直接作为下一步输入；没有用 FP32 state 重置，也没有 host DQ/Q。指标参考 FP32 第0层，attention output 包含 FP32 RMSNorm/z/out_proj，未加入 W4投影误差。
+
+| 路径 | core output 累计 SQNR，旧→新 | attention output 累计 SQNR，旧→新 | 第1024 token state SQNR，旧→新 |
+|---|---:|---:|---:|
+| UINT16 | 50.2855→50.2729 dB | **37.7526→37.7556 dB** | 41.3269→41.3313 dB |
+| 归一化 UINT8 | 43.3874→43.5530 dB | **37.1684→37.1673 dB** | 33.3664→33.6227 dB |
+
+逐128token的 state输入、state输出、core输出、attention输出 SQNR 在 `accuracy-*.csv` / `analysis.json`。优化只改变 FP16 运算组织，未声称逐bit一致。UINT16最后一个块的core SQNR下降在旧版同样存在（43.0905→43.0881dB），不是此次新引入的现象。
+
+GPU检查覆盖8个真实128-token块：新版相对旧版 core/state SQNR均大于60dB。随机shape覆盖 `[B,H,T,K,V]=(1,1,64,32,64)、(2,3,128,64,96)、(1,4,256,128,128)`，对FP32 recurrence SQNR均>57dB；三角逆对FP64 inverse的最大绝对误差<5.5e-5。导出无index_select/arange。两种PTE均一个QNN delegate、零CPU fallback；IO为6个UINT16→2个UINT16，或5个UINT16+BYTE→UINT16+BYTE。state8不是扩展到UINT16计算网格，内部chunk仍是真实FP16。
+
+## 未合入的候选
+
+以下部分是筛选阶段的单轮，不能与最终三轮中位数混作同一组AB；原始记录保存在对应device JSON/runner日志。
+
+| 候选 | 测量 | 决定 |
+|---|---|---|
+| 只改切片、保留8叶块 | 三轮中位0.96407ms，配对原版1.19014ms | 有效，但32叶块更快 |
+| 最后一级改为两块直接solve | 单轮0.99437ms，配对切片0.96315ms | 更慢 |
+| 合并Q/K相关MatMul并solve | 三轮中位0.95374ms | 不如最终方案 |
+| 两chunk准备合并、head/chunk折叠 | solve三轮1.05055ms；完整inverse单轮1.00764ms | 布局开销抵消减少调用的收益 |
+| 合并batch+MatMul / 连续batch轴 | 单轮1.02445ms / 1.38608ms | 更慢 |
+| 16叶块 / 32叶块 | 同轮0.92606ms / 0.84212ms | 选择32 |
+| 64叶块 | 单轮0.87690ms，对照32为0.84750ms；精度也略差 | 选择32 |
+| beta移到inverse列上 | 三轮0.85637ms，对照mask32为0.82900ms | 保留原beta位置 |
+| `V/c`改量化倒数乘法 | 同轮三轮0.87811→0.86762ms，仅降1.19% | 冷启动core SQNR60.27→52.43dB，未合入 |
+
+倒数乘法试验保留原来的激活网格，倒数取自校准后DQ(c)，另建UINT16常量编码；它引入额外倒数量化误差。1K累计core SQNR43.5530→42.8570dB，attention37.1673→37.1309dB。没有为约1%的收益更改生产归一化参数，也没有跨QDQ边界直接删除`V/c`或`Y*c`。
+
+## Profile与剩余瓶颈
+
+runtime profile level2、warmup2、iteration10。Inspector保留原始delegate数值，事件后缀为cycles/us/count。详细profile大幅扰动耗时（UINT16约9.80→5.82ms），不用这些绝对数值报告性能。以下是每节点周期中位数的加总，不等于并行图的关键路径，也不等于DDR/VTCM字节数。
+
+| UINT16节点类别 | 原版周期加总 | 新版周期加总 |
+|---|---:|---:|
+| Gather + StridedSlice | 2,126,347 | 133,513.5 |
+| MatMul | 3,334,480 | 2,864,036.5 |
+| Convert | 732,525 | 705,665.5 |
+| Transpose | 294,800.5 | 289,002.5 |
+| Concat | 89,582.5 | 23,588.5 |
+| 所有节点 | 9,604,640.5 | 7,038,102 |
+
+新版归一化UINT8的`V/c`仍约330,498cycles，占节点周期4.29%；新版MatMul约37.37%、Multiply约20.07%、Add约18.32%、Convert约8.37%。UINT8新版仍略慢于UINT16新版，R归一化缩放和内部FP16计算没有随byte持久化消失。后续需要在保持校准/量化边界的前提下融合缩放与邻接算子，或优化MatMul/逐元素链；不能将直接删QDQ或低精度倒数当成无损融合。
+
+## 复查与产物
+
+`ChunkGDN`的标准替换接口、input/output顺序、cache网格及state反馈协议不变。没有改FA/SWA mask、MHA/SHA、量化recipe或runner选图。只保存最终实现，实验候选代码在`/tmp`，未加入仓库源码。
+
+`analysis.json`包含性能、精度、profile、PTE SHA和source SHA；`boundary-verification.json`核对前后QDQ参数；`source-validation.json`保存数值/shape检查；`*-audit.json`保存QNN算子dtype/shape；`device-production-*.json`保存最终三轮；`feedback-*`保存连续反馈raw；`profile-*`保存ETDump和CSV；`baseline-source.py`保留原版源码供复现。
+
+没有提交或推送。
+
+<a id="qwen35-state8-cacheio-stable-20261017"></a>
+
+# GDN UINT8 cache IO 融合与三角逆稳定性修复（2026-10-17）
+
+## 范围与结果
+
+SM8750／431e3c37，Qwen3.5-0.8B第0层真实输入，AR128，B=1、H=16、K=V=128，非零初始state。三个小PTE使用相同稳定三角逆；共享buffer、warmup20，每轮500次，五轮交替顺序，中位数。QNN2.49.40.260810，Hexagon6.7／Tools21.0.04，手机实际库SHA与主机一致。
+
+| 路径 | 五轮execute耗时（ms） | 中位数 | 对UINT16耗时变化 |
+|---|---|---:|---:|
+| UINT16 | 0.883452 / 0.890244 / 0.892334 / 0.892984 / 0.897644 | 0.892334 ms | 基准 |
+| 旧归一化UINT8 | 0.919218 / 0.920312 / 0.920994 / 0.920228 / 0.924284 | 0.920312 ms | +3.14% |
+| 融合UINT8 | 0.850580 / 0.866480 / 0.851366 / 0.860464 / 0.852160 | **0.852160 ms** | **−4.50%** |
+
+融合UINT8相对旧UINT8耗时下降7.41%。这次没有把共有的Gather/三角逆优化计入UINT8专属收益。测量为独立GDN delegate execute，不含投影、norm/z、out_proj、FFN或视觉编码器，不能作为完整模型吞吐。
+
+## 原因与实现
+
+旧byte路径存R=S/c，在R坐标中做FP16 recurrence：`V/c → ChunkGDN → Y*c`。因此除了cache转换，还多了输入Divide、输出Multiply及中间量化，抵消了byte存储收益。
+
+新路径在边界融合转换与缩放：
+
+```text
+byte R → StateCacheUnpack → physical FP16 S
+physical V + S → FP16 ChunkGDN → physical Y / new physical S
+new physical S → StateCachePack → byte R
+```
+
+`StateCache.cpp`两个QHPI算子直接计算`S=(code−zp)*step*c`与`code=round_even(S*(1/c)/step+zp)`。c取自已校准的冻结常量DQ，step/zp取运行时QHPI tensor metadata；不是写死的量化网格。倒数用FP32常量，未再量化为UINT16。HVX每次处理128个value，按32个key row分任务，保留非整齐维度尾部。
+
+`generation.py::replace_prefill_cores()`识别已校准的归一化UINT8图，保留physical V/Y与byte R输入输出的原网格，去掉中间`V/c`及`Y/c`量化和恢复Multiply。每层有独立c，两个不同层scale的替换验证通过。普通UINT16图和非匹配图继续用普通ChunkGDN；未更改默认state16配置、FA/SWA mask、MHA/SHA或runner选图。
+
+| QNN节点 | UINT16 | 旧UINT8 | 融合UINT8 |
+|---|---:|---:|---:|
+| MatMul | 36 | 36 | 36 |
+| Convert | 8 | 8 | 6 |
+| Divide | 0 | 1 | 0 |
+| Multiply | 26 | 27 | 26 |
+| StateCacheUnpack / Pack | 0 / 0 | 0 / 0 | 1 / 1 |
+| Gather / Concat | 0 / 7 | 0 / 7 | 0 / 7 |
+
+state持久存储从每层512KiB减至256KiB；18层一个逻辑state合计9→4.5MiB。AR128全部外部输入/输出逻辑字节数仅从3.0078125→2.5078125MiB，下降16.62%，因为Q/K/V/Y等仍是16bit。内部MatMul与工作state在本版仍FP16，每128token才读写一次外部state，内部流量并未减半。新c/倒数常量合计16KiB/层，比旧单份UINT16 c增加12KiB/层；不能把所有模型内存都说成减半。
+
+## 修正上一版数值稳定性结论
+
+上一轮dense32高次幂三角逆的0.83219/0.87959ms，仅覆盖第0层小图。整模型state16对照也出现NaN：本次参考输入中第5个GDN（transformer层索引5）、第二个64-token chunk的inverse首次非有限，输入lower仍有限。不能把这个问题归因于UINT8。
+
+aligned keys、beta=1时dense32的L²/L⁴最大值为30/4060，L⁸溢出FP16，而最终数学逆是有界的。当前32×32操作数内只保留独立8×8叶块，执行到L⁴，再以mask合并8→16→32，最后合并32→64；避开高阶dense幂。仍无Gather、Concat7、MatMul36，相比不稳定版增加6个Multiply。保留odd slice的`+2**−24`物化兼容处理。
+
+aligned keys beta=1、0.999、0.99、0.9均有限；beta=1的128步output SQNR53.21dB。其他beta的最大inverse绝对误差达0.0197，因此没有将旧随机小矩阵的5.5e−5界推广到全部输入。见`inverse-validation.json`、`overflow-location.json`。
+
+## 精度与兼容验证
+
+连续8×128token，手机raw byte state直接反馈，无host DQ/Q或FP32重置。物理state按前次诊断约定用原始FP32训练c恢复；实际算子使用冻结DQ(c)。attention指标为设备core输出加CPU FP32 RMSNorm/z/out_proj，不包含W4投影误差。
+
+| 指标 | 旧UINT8 | 融合UINT8 |
+|---|---:|---:|
+| 累计core SQNR | 43.3865 dB | 44.0044 dB |
+| 累计attention output SQNR | 37.1698 dB | 37.2678 dB |
+| 第1024token state SQNR | 33.3711 dB | 33.5134 dB |
+
+GPU整模型参考测试：四个独立cold WikiText-2 test窗口，各1024token，4092个预测目标；复用train校准，所有模型权重与其他路径保持FP32，仅GDN输入/gate/output A16与state路径变化。该测试使用原始FP32 c，未模拟小PTE冻结c的常量量化，**不是生产W4／INT4 embedding／FA KV8 PTE的设备PPL**。
+
+| 路径 | PPL | 最终hidden SQNR |
+|---|---:|---:|
+| FP32 | 19.04965 | reference |
+| UINT16 | 19.10795 | 36.8345 dB |
+| 旧归一化UINT8 | 19.14796 | 26.4378 dB |
+| 融合UINT8 | 19.07242 | 28.7002 dB |
+
+这批样本PPL接近，但UINT8 hidden精度仍低于UINT16；PPL略低不能证明UINT8更准确。生产默认保留UINT16，完整W4 PTE精度和端到端性能尚未复测。
+
+新prefill输出raw byte state已直接接现有AR1图，未改delegate数据，输出/state对CPU QDQ SQNR72.42/63.59dB。三个prefill PTE均一个QNN delegate、零CPU算子；UINT8 IO为五个UINT16加一个BYTE输入、UINT16加BYTE输出。
+
+x86、Android arm64、Hexagon v79库编译通过。libnative校验499851个值及800个舍入边界：7个FP16差异、最大1ULP；2个byte差异、最大1code，来自系数乘法重结合。覆盖V=1/31/64/96/127/128/129/256/257、row尾部和非对齐指针。未做SM8850设备验证。
+
+## 证据与剩余工作
+
+`analysis.json`汇总性能、逐128token精度、QNN节点、详细profile及PTE/source/library SHA；`final-compare-results.json`和`final-compare-*`保存五轮实测；`accuracy-*.csv`保存输入/输出state和attention指标；`ppl-reference.json`为参考PPL；`decode-handoff.json`为AR1兼容验证；`rewrite-validation.json`验证每层scale和fallback；build/stress日志同目录。
+
+详细profile只使用原始cycles比较节点，不将周期加总当作图关键路径或DDR/VTCM字节计数。旧UINT8 Divide约325760cycles，新图无该Divide；内部36个MatMul仍占新图节点周期约42.76%。若要进一步获取8bit计算收益，需要另测integer MatMul和相应校准，而不是仅缩小持久state。
+
+未提交或推送。
+
+<a id="qwen35-gdn-integer-matmul-20261017"></a>
+
+# GDN 整数 MatMul 对照（2026-10-17）
+
+## 结论
+
+可以使用与KV8相同的整数MatMul：UINT16左输入、UINT8右输入、UINT16输出，计算图不先把右矩阵还原为FP16。单层AR128已经导出PTE并在SM8750运行。但是目前整数候选没有超过最新融合FP16版本，且精度下降，因此没有替换生产默认路径。
+
+## 测量范围与配置
+
+Qwen3.5-0.8B第0层真实Q/K/V/gates/state，B=1、H=16、K=V=128，外部AR128、内部两个64-token chunk，手机431e3c37。校准只用保存的WikiText train 8×128输入；测试为独立连续8×128输入。MinMax校准，physical输入/输出以及R=S/c byte cache网格复用原来的校准结果。未使用test值重新定scale。
+
+持久state采用原来的归一化R，未直接将物理S用单一8bit网格再量化；后一种做法会丢掉value通道归一化收益。所有可运行PTE均一个QNN delegate、零CPU算子，state输入输出均BYTE，其余五输入和attention输出UINT16。
+
+最终计时：shared buffer、warmup20、iteration500，五轮交替顺序，execute中位数；不包含加载和ADB，也不包含投影、norm/z、out_proj、FFN、视觉编码器。精度采用手机连续raw byte cache反馈，core参考FP32；attention额外使用CPU FP32 RMSNorm/z/out_proj。FP16精度复用同一PTE前轮已保存raw，未将测试state重置为FP32。
+
+| 路径 | AR128耗时 | 1K累计core SQNR | 1K累计attention SQNR | 第1024token state SQNR |
+|---|---:|---:|---:|---:|
+| 旧归一化R、FP16 MatMul | 0.923438 ms | 43.3865 dB | 37.1698 dB | 33.3711 dB |
+| 最新融合cache IO、FP16 MatMul | **0.853852 ms** | **44.0044 dB** | **37.2678 dB** | **33.5134 dB** |
+| 完整整数chunk | 0.895760 ms | 37.2444 dB | 32.3472 dB | 26.4963 dB |
+
+完整整数版本相对旧FP16路径耗时下降约3.00%，但比最新融合FP16路径慢约4.91%，累计attention SQNR下降约4.92dB。不能选旧基准宣称它超过当前最快版本。本轮没有导出完整模型、测完整模型token/s或PPL。
+
+五轮耗时：
+
+| 路径 | 各轮execute（ms） |
+|---|---|
+| 旧FP16 | 0.925742 / 0.920152 / 0.923438 / 0.920314 / 0.925734 |
+| 融合FP16 | 0.853852 / 0.851460 / 0.864872 / 0.851402 / 0.854438 |
+| 完整整数 | 0.890806 / 0.895760 / 0.893480 / 0.902296 / 0.895920 |
+
+## 试验演进与QNN审计
+
+1. **只改36个MatMul。** 在FP16逐元素图中建立校准后的integer边界，36个MatMul实际全部UFIX16×UFIX8→UFIX16。Convert从8增到116。同轮三次iteration100测量：旧FP16为0.94552ms，整数MatMul候选1.11048ms；warm非零state单块core/state SQNR为35.94/27.36dB，而FP16为47.84/36.17dB。
+2. **只改K@state、Q@state。** 四个MatMul整数化，其余32个FP16。Convert20；同轮0.94650→1.04376ms。warm core/state SQNR46.31/36.04dB。这个局部方案误差较小，但没有性能收益。
+3. **周围运算一起量化。** 所有逐元素、布局、矩阵运算均为量化tensor；QNN wrapper审计浮点tensor出现次数为0。Convert降到38，避免每个MatMul周围反复转换。32个MatMul为16×8→16；4个`power@power`为8×8→8，随后按需要requantize至16位。
+
+三角逆平方的两输入来自同一个FX节点，现有量化annotation按输入节点而非输入序号建map，不能直接给同一节点同时配置16位和8位。若强行覆盖，会形成QNN不支持的8×8→16；本试验将四个平方统一为8×8→8，保持真实整数计算，没有FP16 MatMul。其余32个继续用KV8式16×8→16。
+
+完整integer PT2E图末尾的同dtype cast曾在lowering时被消除，导致输出错误保留UINT16；增加明确的cache转换边界后，最终PTE确认输出为BYTE，量化参数仍取原校准网格。编译后该边界是integer Convert，QNN审计不存在浮点tensor。
+
+临时部分整数图触发了`FuseConsecutiveCast`对Convert分支的断言；只在该实验进程中停用此融合，保留全部边界，未修改全局backend代码。最终完整整数图走标准pass，不需要这个临时patch。
+
+把36个MatMul全部设为8×8→8的候选在本机QNN graph optimization中段错误退出，未得到可运行PTE。四个小平方使用8×8的完整整数候选则编译并实机运行成功；不能把一次候选编译失败扩大为INT8 MatMul整体不支持。
+
+曾有两个无效实验：直接使用FP16输出dtype进行UINT16 QDQ参考会出现数值转换异常，已改为FP32 QDQ再转换；在DQ与MatMul之间保留FP16 cast会导致MatMul实际仍为FP16，已通过QNN dtype审计剔除。这些数值和计时没有纳入结论。
+
+## Profile与限制
+
+profile level2、warmup2、iteration10。只对每节点周期中位数加总，不将它当作关键路径、实际DDR流量或普通execute毫秒数。
+
+| 节点周期加总 | 仅MatMul整数化 | 完整整数 |
+|---|---:|---:|
+| Convert | 3,771,249 | 570,985.5 |
+| MatMul | 3,832,313.5 | 3,571,850 |
+| Multiply | 1,124,019 | 2,492,009 |
+| Divide | 326,179 | 323,935 |
+| 所有节点 | 10,195,300.5 | 8,712,151 |
+
+只改MatMul时Convert约占37%；完整整数时转换开销明显下降，但Multiply变重，且MatMul没有显示出足以弥补其他开销的收益。矩阵右输入是动态state、key、correction等，存在运行时量化/重排成本；仅依据8bit位宽不能推断这些算子整体必然更快。
+
+完整整数warm单块设备对CPU QDQ的core/state SQNR为44.71/28.98dB，存在需要继续定位的backend/整数算术差异；不能把全部设备误差都归因于权重或cache量化。CPU参考已出现量化损失：连续1K core SQNR约37.5dB，未满足与FP16近似无损的目标。未将该候选合入标准llama.py默认选路。
+
+## 产物
+
+最终完整整数小PTE：`integer/fullinteger8square-scaled8.pte`。
+
+`integer/analysis.json`保存五轮数据、IO类型、QNN MatMul类型、PTE SHA、profile和逐128token精度；`integer/device-fullinteger-results.json`为最终交替计时；`integer/feedback-fullinteger8square-scaled8/`为连续反馈raw；`integer/accuracy-*.csv`为state输入/输出、core、attention指标；`integer/*-audit.json`为QNN tensor dtype/shape；`integer/calibration.json`及`encodings-*.json`为MatMul校准范围/网格。
+
+`normalized/`为早期FP32参考图与未成功lowering的尝试，`normalized-half/`为DQ后误插入FP16 cast的候选；这些不是最终integer性能结果。临时脚本在`/tmp`，没有添加新的生产GDN op或测试源码。未提交或推送。
+
+
+<a id="qwen35-gdn-experiment-cleanup-20261017"></a>
+
+## 撤销GDN低位实验，保留KV8（2026-10-17）
+
+按用户要求撤回GDN recurrent state8及integer MatMul实验。删除DeltaNetState8.cpp/.h、StateCache.cpp、ValueScaledDeltaNetCore、ScaledStateChunkGDN、annotate_gdn_state_8bit及byte cache pattern替换；包恢复原四个DeltaNet op及原UINT16 HVX/VTCM内核。移除新增的state8测试fixture、试验专属wrapper标注顺序/报告逻辑和HVX byte转换工具；原有KV8、embedding INT4、SWA/mask与runner逻辑不变。
+
+保留与位宽无关、已经验证的通用prefill改进：静态slice代替Gather、mask/符号常量折叠、32×32操作数内嵌稳定8×8三角逆叶块，避免dense32高阶幂溢出。移除为byte融合拆分的forward_fp16辅助入口。当前标准导出为AR128，GDN state/conv UINT16、内部FP16 MatMul；full-attention K/V沿用annotate_kv_8bit。
+
+实验结论保留在本README，不再提供GDN state8或integer MatMul的生产入口。旧实验PTE仅为历史产物，不适合搭配清理后op库部署；正式模型需按当前代码重新导出。
+
+清理验证：移除46个`/tmp`试验源码/driver/可执行文件及缓存，清除byte算子旧object和依赖；x86、Android arm64、Hexagon v79算子库重编通过，三个库均无StateCacheUnpack/Pack、state8.hvx或DeltaNetState8符号。0.8B/2B recipe核对保留annotate_kv_8bit。清理后AR128 UINT16的两个校准输出与已保存稳定版reference逐元素完全一致；导出仍为36个FP16 MatMul、零Gather。源码无state8入口残留，`git diff --check`通过；没有重新运行完整模型性能或PPL。
+
+
+<a id="qwen36-moe-layer0-20261017"></a>
+
+## Qwen3.6-35B-A3B 真实单层 MoE 可行性测试（2026-10-17）
+
+模型 `/hunter/model/Qwen/Qwen3.6-35B-A3B` 的配置类型仍为 qwen3_5_moe。只读取第0层，hidden=2048，256个routed experts、Top8、intermediate=512，保留真实router和shared expert。输入取真实embedding→GDN→残差→post-attention RMSNorm的hidden，参考为Transformers 5.8.1 FP32；设备计时仅包括MoE FFN，不包括GDN、norm、视觉或其他层。
+
+专家权重为对称INT4 group32、FP16 scale、RTN；router/shared expert FP16。运行时Top8→Gather选中专家的packed byte和scale→解包为FP16→gate/up和down MatMul→加权合并shared expert。实际是W4存储、FP16计算，没有原生INT4稀疏GEMM，没有固定专家编号，也没有把所有256个专家的FFN都算一遍。
+
+手机431e3c37、SM8750，QNN 2.49.40.260810，shared buffer，关闭profile。计时为warmup之后execute，排除加载、ADB和文件IO，三轮中位数：
+
+| 测试 | 耗时 | 对FP32 MoE输出SQNR | Top8集合重合率 |
+|---|---:|---:|---:|
+| AR1，warmup2/iteration20 | 34.40425 ms | 22.6694 dB | 100% |
+| AR128，32次AR4调用，warmup1/iteration2 | 6700.6235 ms | 22.5342 dB | 99.9023% |
+
+AR128单QNN图编译约14分钟仍在SDK GraphPrepare::build_graph_deps，RSS约12.2GiB，主动停止，没有发生OOM。最终AR128实验PTE是同一AR4 QNN图顺序执行32次，CPU仅slice_copy/cat；一个delegate条目、32次调用、一份context，不能当作原生AR128单图prefill性能。初版32个delegate条目导致设备重复内存占用，已去重；外层输出顺序按QNN原始IDs/probabilities/hidden修正，重新导出并重跑。生产backend及llama.py未改。
+
+另外8×128独立test输入，实际命中249个专家，全部输出有限；综合输出SQNR为22.3240dB，Top8集合重合率99.8901%（8192次选择中9次成员不同）。对只量化专家权重的FP32参考为38.4630dB；该W4参考自身对FP32为22.4233dB。主要输出精度损失已存在于RTN权重量化，未测完整模型PPL。
+
+AR1详细profile按去除warmup后的每节点周期中位数加总：解包/scale83.53%、专家MatMul8.63%、Gather6.20%、大tensor布局/cast1.43%、其余0.21%。这是节点周期统计，不是普通execute的时间分摊或DDR/VTCM实测流量。当前通用算子拼接性能不适合整模，需要融合专家读取/INT4解包/矩阵计算，并按expert聚合prefill token。
+
+每层routed expert INT4数据384MiB、scale48MiB，合计432MiB；40层仅这部分为16.875GiB，超过当前手机约10.86GiB物理RAM，整模需要额外的权重换入设计或更大内存设备。A3B不能用来估算全部驻留权重。
+
+产物位于 `llama-output/qwen36-moe-layer0-20261017/`：README详细说明方法和限制，analysis.json汇总最终结果与SHA，source/保存复现代码；ar1.pte为441.71MiB，ar128-tiled.pte为448.80MiB。没有将35B MoE加入正式支持列表，没有修改0.8B/2B或GDN/KV量化默认值，未提交或推送。
+
+
+### 后续：动态A8/W4与8槽位外存验证（2026-10-17）
+
+MoE不要求FP16。已在SM8750/QNN2.49.40实机运行动态W4/A8 MatMul，一个delegate、零CPU算子、量化IO，图中只有MatMul；同PTE更换三套权重，均对CPU整数参考逐元素一致。权重使用SFIX8容器加BW_SCALE_OFFSET(bitwidth=4)。直接packed SFIX4作为MatMul输入的动态和静态配置均未通过SDK校验，不能把逻辑W4支持等同于packed4无需布局适配或已证明硬件4bit吞吐。
+
+真实路由expert117的gate/up子矩阵（64输入、32输出、group32）使用整数部分和乘真实group scale，再求和，避免浮点权重矩阵。Activation/partial网格仅用train校准；设备对CPU QDQ SQNR39.94dB、对W4权重FP32参考29.91dB，最大绝对差0.00085449，动态scale减半时输出恰好减半。这是子矩阵能力验证，未给出完整整数MoE精度/PPL。
+
+全部256个专家存432MiB外存bank，每个专家1.6875MiB。Android C++ O_DIRECT加载器仅分配8槽、13.5MiB缓冲，进程峰值约17MiB。使用真实128-token路由轨迹：逐token请求1024次、miss921次，读1554.19MiB，pread892.031ms；按expert归并后只读213个不同专家、359.44MiB，pread159.113ms。每种调度独立进程、初始应用cache为空，均只持有8个槽位；此为一层纯IO测量，不包括router、整数解包、NPU计算、ADB或完整模型推理。
+
+A3B是每token激活规模，Top8随层和token变化；公共权重和热专家可常驻，缺失项换入。128-token prefill需要处理专家并集，但可8个一批，不必全部驻留。旧34.40ms/6.70s不能代表此整数/外存路径。两段尚未合并为完整MoE端到端PTE，未更改正式llama.py或0.8B/2B/GDN量化默认值。
+
+详细记录及源码位于 `llama-output/qwen36-moe-streaming-20261017/README.md` 和 `source/`；JSON保留ABI校验、设备数值、IO字节/命中/时间/RSS。未提交或推送。
+
+
+### AR128 完整 MoE 整数计算与 5 ms 目标（2026-10-17）
+
+用户明确性能目标为128-token prefill。使用同一真实第0层输入、group32 W4权重及Top8路由，在SM8750上建立独立GGML/Hexagon基准，复用本地高通llama.cpp fork的HVX Q4×Q8点积。完整图包含router、TopK/softmax、routed gate/up、SwiGLU、down、加权求和及shared expert；没有CPU算子fallback，未计入attention/GDN、图加载、权重读取/重排或SSD IO。
+
+真实128-token输入命中213个专家，单专家最多承接31个token。没有固定8个专家，没有为每个专家计算全部token。专家权重始终为packed Q4 group32，激活动态Q8，INT32组内点积后乘scale并以FP32累加；router/shared保留FP16权重，优化版允许它们走HMX。Routed专家的MUL_MAT_ID限制为HVX整数，不是FP16专家MatMul。
+
+| 候选，profiling打开 | 完整MoE中位数 | 对原FP32 MoE输出SQNR |
+|---|---:|---:|
+| 原始整数核，一次图内4×32，router/shared也用HVX | 33.0519 ms | 22.5792 dB |
+| 紧凑激活副本，整块128 | 50.1345 ms | 22.5792 dB |
+| 同专家2 token复用Q4解包，4×32 | 27.0193 ms | 22.4897 dB |
+| 保持128 token，gate/up K切2×1024、down K切4×128 | 26.0235 ms | 22.4897 dB |
+| K分块，加4 token复用解包 | 23.5029 ms | 22.4897 dB |
+| 限制4 token内核循环展开，尝试降寄存器压力 | 23.6052 ms | 22.4897 dB |
+
+各行2次warmup后5次图调用，表中均打开profiling。保留4 token展开版本，关闭profiling后两轮各7次计时中位数为23.120729/22.484115ms。warm compute目标5ms尚未达到，没有将不成功的紧凑布局或限制展开候选当作收益。
+
+K分块保持group32完整，权重值/scale不变，每个子矩阵仍看到全部128-token路由；不同K部分的权重互不重叠，避免沿token分块重复读取权重。紧凑激活副本虽然减少VTCM，但每次点积要额外广播，反而变慢。4 token版本复用一次权重解包执行四份整数点积，尾部按2/1处理。该版本K循环仍有向量spill/reload，未声称已无spill。
+
+最终输出全部有限，对W4权重FP32计算参考SQNR37.7256dB；逐token对原FP32 SQNR最小/中位/最大17.4258/22.6723/25.6805dB。Router/shared HMX舍入使1024次选择中1个成员变化，Top8集合重合率99.9023%；不是全部误差都来自专家点积。未测完整35B模型PPL。
+
+最终profile的平均gate/up约10.14ms、down6.82ms，占NPU节点时间约84%；router/加权0.63ms、shared约0.51ms，其余约2.15ms。此为逐节点NPU分组，不直接等于host调用时间。当前主要瓶颈仍在HVX整数专家投影，尚未获得整数HMX矩阵吞吐。
+
+此warm基准把单层256专家约432MiB驻留DDR，**不满足最终8槽位流式执行器的内存目标**。独立8槽位加载器已经证明只用13.5MiB专家缓冲可读同一213专家并集，但冷读取359.44MiB用时159.113ms；两段尚未合并执行，不能将22.48–23.12ms叫作含SSD端到端，也不能简单相加称作实测执行器延迟。5ms内仅读这些权重就要求约75.38GB/s payload带宽，这是数据量推算，不是实测DDR带宽或严格不可实现证明。
+
+源码、构建/运行脚本、各版本输出/计时/反汇编、hash和完整方法说明位于`llama-output/qwen36-moe-ar128-5ms-20261017/README.md`及`source/`。只修改本次实验副本，没有修改外部SDK/llama.cpp源码或正式llama.py/attention/GDN/量化默认值，未提交或推送。
+
+
+### AR128 MoE 热点定位与预排、线程调度优化（2026-10-17）
+
+继续使用同一真实35B-A3B第0层输入、213个命中专家及group32 W4权重，在SM8750进行单层MoE warm测试；没有改attention/GDN或量化规则。
+
+上一版NPU逐算子profile中，gate/up 10.1424ms、down 6.8230ms，合计约占84%。添加诊断周期计数后，gate/up计算区段8.9056ms、暴露DMA等待0.8965ms；down计算区段5.0061ms、等待1.1353ms。激活DMA及Q8量化总计约0.2221ms，优先处理专家投影热循环。
+
+分段时间选择每个投影部分“计算+等待”最大的worker，再按gate/up、down求和，未把六个并行worker简单相加。计算区段包含寻址、解包、INT32点积、group scale、VTCM读取/spill及写回，不能称为纯MAC时间；DMA pop等待也不是全部DDR成本。level3的host时间被大量trace日志放大，未用来做性能比较。
+
+第一项优化在载入时按点积顺序重排INT4 nibble，使一个word的四个K值直接对应vrmpy lane；运行时以mask/shift替代多条shuffle/align。INT4整数、scale、DDR字节数、激活Q8方法及FP32累加均不变；没有重校准，没有专家FP16矩阵。1/2/4 token路径和host逆排列同步修改。反汇编hvx_mm_id静态vshuff从16处降到4处、valign从8处降到0处，向量spill仍存在；不能当作动态指令计数或声称已无spill。
+
+第二项优化根据真实router结果按token数排序命中专家，6个worker通过原子计数各自领取完整专家，替代每线程遍历所有专家、分摊输出行。减少专家级短预取/寻址序列，并改变并行访存方式；总权重数据量没有减少6倍。任务状态每次调用初始化，实验任务数组上限256，仅用于当前独立基准。
+
+关闭profiling，每轮2次warmup、7次完整图调用：
+
+| 配置 | 第一轮中位数 | 第二轮中位数 | 两轮中位数均值 |
+|---|---:|---:|---:|
+| 上一版，6 worker | 23.0376ms | 23.1492ms | 23.0934ms |
+| 预排nibble，6 worker | 19.7552ms | 20.0226ms | 19.8889ms |
+| **预排nibble+专家任务，6 worker** | **19.5298ms** | **19.2959ms** | **19.4129ms** |
+
+先交替测原版/预排，再测预排/专家任务。原版到最终版延迟均值下降15.94%，加速约1.19×。额外减少为4个worker反而24.1064ms，没有采用。最终profile中gate/up为7.5247ms、down5.7390ms，两个专家投影仍占约80%；所有这些NPU节点时间与host调用时间为不同口径。
+
+所有候选与上一轮final128输出逐元素一致，最大绝对差0、全部有限。对原FP32 MoE输出SQNR保持22.4897dB，对W4/FP32参考37.7256dB，路由未新增变化；没有测完整35B模型PPL。
+
+5ms目标仍未达到。这些结果排除SSD IO，且单层256专家约432MiB仍驻留DDR。此前8槽位加载器的159.113ms冷IO成本未重测，也没有与计算合成执行器，不能将19ms当作含SSD端到端性能。仅保留本次独立源码副本，未接入标准llama.py/量化配置，未修改外部SDK/llama.cpp，未提交或推送。
+
+完整记录、代码生成/构建/运行脚本、分段周期、逐次耗时、输出hash及反汇编位于`llama-output/qwen36-moe-ar128-hotspots-20261017/README.md`、`source/`、`phase-breakdown.json`和`comparison.json`。
+
+
+### AR128 MoE 专家数组直接索引（2026-10-18）
+
+256个专家权重原本已按expert维连续存储，使用`base + expert_id * stride`取址。本次保留权重布局，在独立GGML实验增加显式`experts[256]`描述符，router的Top8 ID直接索引权重地址、该专家token列表及数量；不复制选中的完整专家矩阵。gate/up的2个K部分及down的4个K部分分别取各自的专家基址。
+
+路由改为CSR列表，提前算好量化激活在VTCM中的byte offset及输出byte offset，4/2/1 token内核省去每个输出tile重复计算slot取模/地址。仍按token数安排六个worker领取专家ID；未重编号专家或修改Top8 slot/合并顺序，每次调用重建，避免复用过期路由。v79路由scratch由63KiB降为11KiB，不含共有的队列/任务状态或临时栈；权重仍432MiB全部驻留DRAM。
+
+同机关闭profiling，旧/新交替两轮，每进程2次warmup后15次完整AR128 MoE调用。旧版两轮中位数19.490834/19.175886ms，均值19.333360ms；新版19.282605/19.354531ms，均值19.318568ms。差异约0.08%，没有明显提速，不宣称已解决专家投影瓶颈或达到5ms。MoE输出、router logits、IDs、scores、shared输出逐字节一致；对原FP32 SQNR22.4897dB、对W4/FP32为37.7256dB，真实命中213个专家，无新增PPL。
+
+代码及构建入口在`llama-output/qwen36-moe-ar128-hotspots-20261017/source/indexed-experts.h`、`prepare_variant.py`、`build.sh packed-indexed`；`indexed-comparison.json`记录全部样本与输出hash，`experts-build/`保留旧版库。仅修改独立实验副本，未接入正式llama.py；计时不含attention/GDN、图加载或SSD，尚未与8槽位加载器合并，未提交或推送。
+
+
+### AR128 MoE 专家融合流水线（2026-10-18）
+
+借鉴按专家组织中间结果、融合后处理的做法，在独立GGML/Hexagon副本实现完整routed FFN的HTP操作。仍为真实第0层256专家/Top8、group32 packed INT4、动态Q8、INT32点积及FP32跨组累加；router/shared沿用FP16/HMX。专家计算仍是HVX整数核，未改为FP16，没有接入HMX整数核。
+
+每次调用重建CSR路由；输入只量化一次，在VTCM保存2MiB紧凑结果。六个worker各自连续处理同一专家的小批token，gate/up的2个K部分→SwiGLU→量化/布局→down的4个K部分及部分和均留在VTCM。每条路由加权后写入互不重叠的8MiB持久scratch，再按原Top8顺序合并。完整融合cap24占用7.87695MiB VTCM，只计算有效token；超过24条时分块，未修改专家ID或合并顺序。
+
+SM8750同一构建关闭profiling，串行未融合/融合/未融合/融合，每进程2次warmup后15次完整MoE调用。未融合两轮中位数19.080104/19.028021ms，均值19.0540625ms；融合17.658802/17.666094ms，均值17.662448ms，延迟下降7.30%、约1.079×。修复后的两阶段cap32候选另测一轮18.091146ms，保留为对照。
+
+连续8组真实128-token输入覆盖249个专家，每块单专家最多26–38个token，已覆盖cap24尾部。完整版及两阶段版的输出和IDs与未融合版逐字节一致，最大差值0，全部有限；首块MoE输出SQNR对原FP32为22.4897dB，8块合并22.3431dB，对W4/FP32参考39.3512dB，没有新增整模PPL。
+
+首次完整融合动态分配scratch约21.9ms，加入输入紧凑缓存单独未明显提速；采用context持久scratch后保留上述最终候选。两阶段早期直接DMA读取尚在DDR缓存中的gate/up结果导致SQNR12.9377dB，已修复为缓存一致的HVX搬运；该早期无效结果未参与精度或性能结论。level3分段只用于诊断，不使用被日志放大的host时间。
+
+代码、复现、候选历史及SHA在`llama-output/qwen36-moe-expert-pipeline-20261018/README.md`、`source/`、`comparison.json`、`manifest.json`。仍是单层432MiB专家权重驻留DRAM，计时排除attention/GDN、加载/重排及SSD IO；未合并8槽位外存执行器，未接入正式llama.py/其他模型，未提交或推送。5ms目标尚未达到。
+
+### AR128 MoE 整数HMX与40层成本诊断（2026-10-18）
+
+在SDK的`Tools/target/hexagon/include/hmx_hexagon_protos.h`找到并打通真正的packed INT4 × UINT8 HMX路径。模拟器和SM8750手机的32×32×32探针均1024/1024输出与CPU整数参考相同，包含负权重和输入零点修正，没有展开成专家FP16矩阵。完整group32混合候选使用持续HMX消费者及每HVX worker一个请求槽，至少8条路由的专家批次交给HMX，其余保留HVX。8组真实输入的MoE输出与原版逐字节一致，但探索性整层延迟20.417605ms，未采用。
+
+group32独立scale要求逐组输出/缩放。当前HMX清累加器、加载乘加、UINT16输出的纯指令序列实测约20.65ns；若每专家只做一次32-row tile、不分块，213专家需要654336组，外推13.51ms，不含DMA、排列及缩放。这不是硬件峰值下界或完整MoE性能。大K合并的人工指令探针有吞吐潜力，但CPU真实层量化预检中，group32 W4A8为22.57dB，group128为20.62dB、group256为19.80dB、per-channel为18.67dB；采用RTN而非GPTQ，未选择精度折损，未测整模PPL。
+
+另测读取真实213专家约359.44MiB权重的无计算DMA pass，六worker双缓冲，二维DMA单次诊断7.83495ms，连续1D为6.715ms，后者不含补齐；这些不是稳定性能基准或硬件下界。运行时连续读取并在VTCM反向补齐的完整MoE候选18.454479ms。加载时先按640-byte tile对齐，DRAM由432MiB升至480MiB；关闭profiling，原版/预对齐交替两轮，各2次warmup及15次调用，原版中位数17.653073/17.741146ms、均值17.6971095ms，预对齐17.447657/17.618802ms、均值17.5332295ms，仅0.93%收益，未采用内存代价。首轮预对齐曾16.859115ms，正式对照未维持该收益，不使用首轮作为结论。
+
+进一步复用已有Q8工作区批量预取多个输出tile，不增加VTCM分配；根据首块真实路由，权重DMA请求由68480降至2096次，但完整MoE探索中位数17.846510ms，未见提速。上述四个候选各通过8组真实输入逐字节校验，首块设备SQNR保持22.4897dB，均未替换保留版17.662448ms。
+
+40层按保留版同耗时外推，仅MoE热计算约706.5ms，排除attention/GDN与SSD，非整模实测。128 token真实命中213个专家，不能将A3B理解为跨token固定的同一组3B权重；40层按相同流量外推约14.04GiB权重读取。单层359.44MiB要在5ms内读完需要约75.4GB/s有效传输，尚未计其他流量。40层专家bank共16.875GiB，超过本机约10.86GiB总RAM；此前159.113ms/层的独立冷SSD读取成本尚未与计算合并。当前需要继续处理可合并K的整数计算/校准误差和整模专家缓存/换入，5ms目标未达到。
+
+本轮完整记录与样本在`llama-output/qwen36-moe-integer-hmx-20261018/README.md`、`results.json`及`manifest.json`；预对齐及批量DMA副本位于相邻`qwen36-moe-padded-dma-20261018/`、`qwen36-moe-burst-dma-20261018/`。未修改正式模型/量化配置、外部llama.cpp或SDK，未提交或推送。
+
+### AR128 MoE K128 原生整数 HMX 与 5ms 目标（2026-10-18）
+
+继续使用本地Qwen3.6-35B-A3B真实第0层、256专家/Top8、hidden2048、expert/shared512及SM8750/v79。完整MoE计时包含router、Top8、routed FFN和shared expert，排除attention/GDN、SSD、加载及载入时重排。专家保持packed INT4，激活进入整数HMX；没有使用专家FP16 MatMul。首块128 token命中213个专家，校准与精度分别使用独立的1024-token train/test，测试集分8块且覆盖249个专家。
+
+将权重/激活量化group32改为group128，4个K32连为一次K128深度HMX命令，减少累加器输出和缩放。累加输出先除4以适配UINT16，减去同步缩放的输入零点修正，FP32后处理乘4；SDK模拟验证整数恢复误差≤3。真实整层初版16.2776ms，8块设备输出SQNR20.4783dB，相对原版22.3431dB有精度损失。
+
+每次HMX请求从一个N32输出块扩为4块、再扩为8块，六个HVX producer服务一个HMX consumer。载入时把每个N32/K128块预排为2048-byte原生N4、64-byte FP16 scale、64-byte INT16权重code和，共2176byte；运行时连续DMA，省去位重排/权重和计算/二维补齐。专家bank从432MiB降为408MiB，213专家实际读取339.46875MiB；八块版使用7,579,648byte VTCM。各RTN候选在8块真实输入上与K128初版逐字节一致。
+
+为恢复精度，用train真实专家路由的GU输入及FP32 GU/SwiGLU产生的down输入统计E[x²]，对每个group128搜索1.00至0.80的截断比例，最小化激活加权权重平方误差。此为scale/截断校准，不是GPTQ，不增加推理图计算。CPU固定FP32路由参考中，RTN为20.5252dB、不加权MSE20.9662dB、激活加权21.6258dB；真实设备最终8块为21.5014dB，比原group32基准低0.8417dB。首块为21.6910dB。全部有限，最终8块Top8 ID与原版相同。没有测整模PPL，不能据此认定40层精度合格。
+
+关闭profiling，baseline/candidate交替两轮，每进程2次warmup、16次计时，避免约10/12ms快慢分布下奇数样本中位数偏移：
+
+| 配置 | 两轮合并中位数 | 两轮合并平均值 | 1024-token设备SQNR |
+|---|---:|---:|---:|
+| group32 W4A8，原HVX融合版 | 17.5255ms | 17.0907ms | 22.3431dB |
+| group128 W4A8，原生N4/HMX，激活加权校准 | 10.6619ms | 11.0159ms | 21.5014dB |
+
+中位数延迟下降39.16%，平均值下降35.54%，**仍未达到5ms**。五worker、成对输出转换/预计算scale以及提高HMX线程优先级没有形成更快的稳定候选，未采用。最低9.8ms探索样本不作为最终性能。
+
+独立纯IO诊断只把真实213专家的339.47MiB权重由DRAM读入VTCM，完全跳过专家计算/重排/缩放，使用DSP qtimer计数。128/256/512/672KiB DMA块、六worker的10次中位数分别6.1614/6.1757/6.1693/6.1668ms；四worker、768KiB为6.1302ms，672KiB有一次5.5549ms但未稳定。5ms仅读这些payload就要求约71.19GB/s，本次约57.8GB/s。此为当前DMA实现的实测限制，不是所有算法/硬件的严格下界；不能将IO-only与完整图时间相加。当前先受权重读取量及传输吞吐约束，继续少量指令融合不能保证5ms。
+
+新bank按40层相同尺寸仍约15.94GiB，超过本机约10.86GiB总RAM；旧独立加载器159ms/层的冷SSD成本尚未消除，也未与本内核合并。单层warm计时不能代替40层外存执行器性能。
+
+完整过程、复现命令、全部样本、8块SQNR、IO计数与SHA位于`llama-output/qwen36-moe-native8-hmx-20261018/README.md`、`RESULTS.json`、`MANIFEST.json`；纯IO源代码在相邻`qwen36-moe-io-limits-20261018/`。新快路径保留为独立研究候选，原group32精度基准保留，未接入正式llama.py或修改量化默认值。
+
+### AR128 MoE 减少实际权重读取（2026-10-18）
+
+使用同一SM8750/v79、真实第0层256专家/Top8及上一轮激活加权校准的group128 W4A8。该checkpoint量化后的GU存在整行code为零的通道；只有完整gate或up行在全部K上均为零，才删除对应恒零SwiGLU通道。只在原group128内部置换，gate/up行与down列同步重排，保留到K32/N32边界，保持原量化scale和激活分组。未引入幅值剪枝或减少Top8；不能假定其他checkpoint有同样稀疏度。
+
+256专家的有效中间通道最少93、最多510、平均300.06，原为512。将固定stride改为`offsets[256]`索引的可变长度INT4 bank；每专家128-byte头描述实际N/K块，连续DMA只读取保留payload。同步重算整数输入零点修正所需的权重code和。GGML I8 tensor仅承载不透明字节，每字节仍两个INT4权重，计算仍为UINT8×N4 HMX。随后缓存HMX消费者请求字段，只执行有效N32块的SwiGLU。
+
+专家bank由408MiB降至289.0527MiB；首块实际213专家读取由339.46875MiB降至241.08960MiB，减少28.98%，包括专家头，不含额外约5KiB索引表读取。纯IO使用6 worker、128KiB双缓冲、DSP qtimer，两个串行交替轮次各16次：原bank中位数5.8827ms、紧凑bank4.3877ms，下降25.41%。收益来自实际少读字节，本轮有效字节带宽没有提高。IO-only不含计算，也不代表SSD或硬件严格下界。
+
+另测已有`GGML_HEXAGON_OPPOLL=1`完成队列轮询，减少AP唤醒开销，但持续占用一个Android CPU核，不增加权重带宽。完整MoE关闭profiling，每进程2次warmup、16次计时，两个串行交替轮次合并32样本：
+
+| 配置 | 合并中位数 | 平均值 |
+|---|---:|---:|
+| 原bank，阻塞等待 | 10.0123ms | 10.5475ms |
+| 紧凑bank，阻塞等待 | 9.6981ms | 9.7360ms |
+| 原bank，轮询 | 9.3589ms | 9.4066ms |
+| **紧凑bank，轮询** | **8.3610ms** | **8.3655ms** |
+
+相同轮询配置下，中位数下降10.66%；原阻塞版到最终轮询版平均延迟下降20.69%。两项收益分列，不能将轮询收益归给压缩。时延重复首块真实128-token输入；精度独立覆盖8块1024 token、249专家及超过32条路由的尾块。输出和Top8 ID与原group128版逐字节一致，最大绝对差0，全部有限，SQNR保持21.5014dB。本轮压缩没有新增量化误差，但不代表相对FP32逐位一致，也没有测整模PPL。
+
+更大分组GU1024/down512的独立消融正式中位数5.6973ms，但设备SQNR降至19.9256dB，未采用。HVX广播、VTCM stride、原生TopK及CPU亲和性没有形成更好的保留结果。**5ms完整MoE目标仍未达到**；当前4.39ms仅纯搬运，不能与计算简单相加。所有MoE时延包含router/shared，排除attention/GDN、SSD、载入与离线打包，专家仍驻留DRAM。新bank按40层同尺寸约11.29GiB，仍超过本机约10.86GiB总RAM，未解决整模外存换入。
+
+完整方法、复现命令、候选、正式样本和SHA在`llama-output/qwen36-moe-weight-io-fast-20261018/README.md`、`source/`、`RESULTS.json`、`MANIFEST.json`。代码保留在独立实验副本，未接入正式llama.py、改其他模型默认值或提交推送。
+
+### AR128 MoE 参考 Houmo 路径（2026-10-18）
+
+检查本地Houmo Qwen3.6-35B-A3B包装、AutoRound/GPTQ workflow及hmquant 1.4.0 wheel。其`MoeBlock`自定义OP携带三组专家qweight/scale及部分和格式，参考实现按专家分组、输入一次量化、grouped GEMM内部处理组scale并重排输出。可读Triton核为CUDA数值模拟，不能当作M50原生NPU内核移植或据其速度推断Hexagon性能。M50官方为最多双IPU、每IPU四tile，峰值153.6GB/s、最大48GB内存；这些规格及官方809-token示例与本手机AR128单层计时口径不同，没有取得同口径5ms的对应实测。
+
+真实首块213专家平均4.8075条路由，53专家仅1条，129专家至多4条。当前32行HMX tile的未加权M维有效比例15.02%，不是NPU整体利用率。按bank头及路由静态计数共131,296次group输出，对应256.4375MiB原始部分和VTCM写入；这不是DDR落盘或硬件计数器值。需继续研究矩阵核内部分组缩放和输出粒度。
+
+尝试每worker两套raw缓冲/请求，使下一批HMX与上一批HVX缩放重叠，VTCM由7,579,648增为8,366,080byte。相同紧凑group128 bank、6 HVX、轮询开启、profile关闭，原/新交替两轮，每进程2次warmup和16次计时：合并中位数8.35495→8.81919ms，慢5.56%，不采用。未单独证明变慢全部源自哪一项。
+
+另按专家token数选择现有compact INT4 HVX整数核或HMX。相同构建串行扫描，每档2次warmup、7次计时：HVX阈值0/1/2/4/8的中位数分别8.53542/8.58578/8.67089/9.34984/11.43177ms，未形成分流收益。阈值0也含新增activation code和预计算，不能与旧保留版当作完全相同路径。该探索不能证明专用小M核没有潜力。
+
+两项候选及五档阈值均通过连续8块真实输入校验，输出和Top8 ID与原版逐字节一致，全部有限，SQNR保持21.5014dB。手机已恢复原保留版，仍约8.36ms；完整MoE含router/shared，排除attention/GDN、SSD和加载，未测整模PPL，5ms未达到。后续优先研究细组scale/累加融合，及用GPTQ/AutoRound恢复约5.70ms大K候选的精度；本轮没有完成后者，也不承诺能恢复。
+
+详情、源码、正式/探索样本及SHA位于`llama-output/qwen36-moe-houmo-study-20261018/README.md`、`RESULTS.json`、`MANIFEST.json`，小M候选位于相邻`qwen36-moe-small-m-20261018/`。正式模型、量化配置及外部Houmo/llama.cpp/SDK未改，未提交推送。
+
+
+### AR128 MoE：GPTQ、全局压紧与融合后续（2026-10-18）
+
+本地Qwen3.6-35B-A3B真实第0层、AR128、256专家/真实Top8；SM8750/v79、6HVX、1HMX、8MiB VTCM。专家packed INT4、整数A8×N4 HMX，router/shared沿用FP16。完整MoE包含router、专家FFN及shared，排除attention/GDN、SSD换入、载入与离线校准；仍为DRAM驻留实验。
+
+| 配置 | 完整MoE正式中位数 | 1024-token设备输出SQNR |
+|---|---:|---:|
+| 原group128压紧版 | 8.3610ms | 21.5014dB |
+| group128无新增误差优化 | 8.1116ms | 21.5014dB |
+| 原粗组GU1024/down512、MSE | 5.6973ms | 19.9256dB |
+| GPTQ粗组+全局压紧 | 5.2552ms | 21.1760dB |
+| 兼容原同分规则的Top8+输出融合 | 5.1296ms | 21.1760dB |
+| 再合并GU提交、shared投影和路由，保留候选 | **5.0207ms** | **21.1759dB** |
+
+正式采集为关闭profile、每进程2次warmup+16次计时、两个串行交替轮次，最终候选共32样本，平均5.0224ms、范围4.9476–5.1213ms。相对原8.3610ms降低39.95%；**未稳定低于5ms，不能用最低一次称达标**。精度独立用8块/1024 token按总signal/noise能量计算，非八个dB平均，未测整模PPL。
+
+优化及验证：
+
+1. 原细组路径取消冗余逐组HMX clear，v79探针验证compound after输出后无需再次clear；交替控制8.3383→8.2027ms。激活移除四份旋转副本，全局compact由2MiB降512KiB；固定×4折入FP16 scale，扩大N块批量8→16，工作区8,316,928bytes，同轮控制8.1937→8.1116ms。8块输出/路由逐位一致，作为细组保留路径。
+2. 对粗组实现完整Hessian GPTQ，block128、无act-order、1% damping、W4[-8,7]/FP16 scale；每专家90%真实路由统计+10%均匀先验，down使用已量化GU/SwiGLU/A8输入。CPU4线程串行256专家，独立train1024/test1024，479.75秒，无GPU或整模并发导出。CPU固定FP32 router/shared 20.2774→21.6322dB；手机真实整数输出19.9256→21.1760dB，二者不混用。
+3. down变单一512通道量化组后，可以跨原128通道边界全局压紧GU恒零通道，GU行/down列同步重排，不改变已有GPTQ code/scale；8块逐位一致。GPTQ组内bank273.2227→全局240.0508MiB，原细组bank289.0527MiB。首块实际213专家读取由原细组241.0896MiB降到最终199.6165MiB，含实际调用专家头，排除未调用空占位bank及约1.7KiB offsets；不是硬件总线流量计数。首块最大31路由/专家，无cap32尾块重读。
+4. 每专家两段GU连续打包、一次HMX请求，独立scale不合并；8块逐位一致。新partial Top8遇同分/非有限值回原完整排序，保持原tie order；1000组有限/重复/零值+3组非有限回退探针通过。首版不同tie order改变过一处专家集合，已舍弃。
+5. Top8/Gather/原数值softmax融合为一次调用；shared sigmoid×输出及最终相加融合；shared gate/up/标量门控投影并为1056行FP16 HMX。后者改变标量门控累加路径，8块相对原GPTQ输出最大绝对差0.00017658，SQNR21.175953→21.175911dB，路由ID不变；最终构建再次验证8块输出与该候选一致，全部有限。
+
+最后轻量profile仅取两次计时的OPBATCH，7个DSP节点平均4.8740ms，专家pipeline约4.2655ms，占87.5%，其中仍混合DMA、输入打包、HMX、缩放及SwiGLU，尚未逐项拆分。profile数字未混入正式时延。较大N批量、较少worker、cap24/28没有稳定收益；最终batch4约5.019ms、batch2约5.100ms，保留8。成对处理输出行保持逐位一致但约5.055ms，未采用。独立Top8/shared候选正式5.0267ms，与融合路由仅差约0.006ms，主要收益不来自这项融合。
+
+最终关闭profiling恢复保留候选，轮询占用一个Android CPU核；原无新增误差group128的8.11ms版本也保留。专家仍在DRAM，本轮未集成SSD；240MiB按40层同尺寸约9.38GiB，另有其他权重/runtime，不能认定整模可全驻留本机约10.86GiB RAM。单层较细组仍低约0.326dB，整模PPL及40层误差未验证。
+
+完整方法、样本、源码路径、SHA与复现命令：`llama-output/qwen36-moe-final-fuse-20261018/README.md`、`RESULTS.json`、`MANIFEST.json`。GPTQ在相邻`qwen36-moe-gptq-wide-20261018/`，最终构建/bank/路由核在`qwen36-moe-merged-gu-20261018/`。独立实验未接入正式llama.py、未改其他模型默认配置、未commit/push。
+
+
+### AR128 MoE 内部optrace与进一步优化（2026-10-18）
+
+继续在真实第0层、AR128、256专家/Top8、SM8750/v79、6HVX/1HMX/8MiB VTCM上测试，仍为DRAM驻留的完整MoE FFN，包含router/shared，排除attention/GDN、SSD、载入。W4/A8及FP16 router/shared、GPTQ权重和量化网格保持不变。
+
+新增400–409成对周期时间戳，覆盖GU/down打包、DMA pop等待、HMX请求等待、输出修正/缩放、SwiGLU、down量化、写回及HMX命令服务；旧300–308只是累计cycles，不当作绝对时间。修正旧MOE_WEIGHT_PACK的误名，它实际记录DMA pop等待。最终level3 trace每worker平均：原/新DMA等待1.776/1.800ms、输出后处理0.901/0.914ms、输入打包0.504/0.204ms、down量化0.071/0.034ms、SwiGLU0.259/0.257ms、HMX请求等待0.150/0.144ms。worker时间会重叠，不能相加；HMX服务区间不是硬件busy计数器。DMA仍是最大等待，没有宣称已经消除或测到性能极限。
+
+同一最终构建和bank、关闭profiling，每进程2次warmup+16次计时，按0/63/127交替两轮：
+
+| 配置 | 32样本中位数 | 平均值 | 范围 |
+|---|---:|---:|---:|
+| tuning0：关闭本轮优化 | 4.985364ms | 4.991647ms | 4.958125–5.042084ms |
+| tuning63：打包/预取/量化准备/1D DMA | 4.771380ms | 4.776947ms | 4.743282–4.883282ms |
+| tuning127：再加寄存器SwiGLU，保留 | **4.763151ms** | **4.767292ms** | **4.715781–4.849115ms** |
+
+同构建下降4.46%，保留版本本轮32次全部低于5ms。上一轮5.0207ms为独立测试，不把它与本轮控制4.9854ms之间的状态/构建差异全部归因优化。计时重复首块128-token输入，数值用8块1024 token；所有消融和最终构建输出文件/路由ID按字节完全一致，全部有限，SQNR保持21.175911dB，无新增量化误差，没有重跑整模PPL。
+
+保留实现：跳过不消费的HMX M行清零，被消费行及dummy字节仍写完整；GU结束后提前一次读取down完整payload，与SwiGLU/A8准备重叠；HMX消费N4后先复制最多2KiB metadata，再让下一批DMA提前复用大buffer；每原GU1024/down512量化组只求一次scale/倒数，按全局压紧有效前缀计算等价的带零尾max，跳过恒零尾通道及冗余gate/down清零；连续权重显式使用1D DMA；SwiGLU中间量留寄存器。量化grid复用单独没有明显收益，需与有效前缀处理配合。tuning63到127约8微秒，未单独称显著提升。
+
+尝试down缩放时直接路由写回、释放每worker256KiB，再把权重buffer557056扩至819200bytes以整块预取多数GU；8块同样按字节一致，但探索约4.76–4.78ms，没有进一步收益，未保留。最终tuning127不启用这两项，仍用原buffer、cap32/batch8、6worker及轮询，profile0；实际权重读取仍约199.6165MiB payload+头，没有再次压缩bank。
+
+Level3改变调度并打印大量日志，host sample会被放大，未混入上述正式统计。可回放的Chrome trace JSON、PNG/SVG时间线、正式全部样本、源码/二进制hash、配置位及复现命令位于`llama-output/qwen36-moe-optrace-20261018/README.md`、`RESULTS.json`、`OPTRACE.json`、`MANIFEST.json`。实验代码未接入正式llama.py或quant recipe，未commit/push。后续仍应优先少读DDR字节、改善传输/消费布局；SDK有DLBC weights图选项，但未验证当前不透明bank的编码/解码，未计入任何硬件压缩收益。
+
+### AR128 MoE 专家调度与提前DMA：4.733→4.542ms（2026-10-18）
+
+继续使用真实Qwen3.6-35B-A3B第0层、128token、256专家/真实Top8、SM8750/v79、6HVX/1HMX/8MiB VTCM；INT4/N4权重和动态A8整数HMX、FP16 router/shared、GPTQ量化网格均保持原样。计时包含完整MoE FFN图，专家驻留DRAM，排除attention/GDN、SSD、载入及离线打包。
+
+同一最终构建、原bank、profile0，每进程2次warmup+16样本，按127/1151/17535/50303和反向顺序两轮交替：
+
+| 配置 | 32样本中位数 | 平均值 | 最小–最大 |
+|---|---:|---:|---:|
+| 上轮算法tuning127 | 4.732604ms | 4.732832ms | 4.697968–4.781198ms |
+| 专家按bank顺序调度tuning1151 | 4.563177ms | 4.563161ms | 4.507864–4.593385ms |
+| **再将GU DMA移至输入打包前tuning17535，保留** | **4.542317ms** | **4.544240ms** | **4.502656–4.605000ms** |
+| 再合并初始两批DMA，未保留 | 4.584871ms | 4.624678ms | 4.525000–5.038594ms |
+
+本轮同构建中位数降低4.0208%/0.190287ms，保留配置32/32次低于5ms；trace之后再次确认9样本中位数4.544531ms。上一轮4.763151ms为独立测试，本轮控制4.732604ms与其分列，避免将状态/构建差异算成收益。时间重复首块真实128token，精度另测8×128token。
+
+保留两点：原按路由token数降序的任务排列改成专家ID升序，在当前GU/down bank内对应offset递增顺序；仍用原子取任务和原路由表，结果写固定token/slot，最终求和顺序不变。原GU先打包A8再提交前两批权重DMA，改成先提交相同请求再打包输入，读取与打包重叠；batch8、原双buffer、原VTCM与读取字节量均不变。调度贡献约0.169427ms，提前GU DMA再贡献约0.020860ms。
+
+修正纯DMA probe，只读取实际src0/src2 payload，不读四个空part及128-byte头。首块213专家实际payload为209258496bytes/199.564453MiB，连426个头199.616455MiB。6worker、128/256/512/672KiB chunk的9样本中位数分别3.207552/3.219896/3.207865/3.202969ms；最终构建按路由数/地址顺序纯DMA为3.212448/3.207396ms，基本相同。不能把完整图收益称为物理内存带宽提高，更符合传输/计算调度配合改善；未用PMU继续区分TLB、总线和VTCM冲突，也不把纯DMA当硬下界。
+
+最终同构建profile3每worker累计平均，原/新DMA等待2.071/1.600ms、输出解包修正缩放0.919/0.919ms、GU打包0.119/0.124ms、down打包0.087/0.084ms、HMX请求等待0.138/0.151ms。worker时间重叠；profiling改变时序和日志成本，不能用DSP trace的4.366/3.833ms替代正式完整图结果，也不能把HMX命令服务当硬件busy。DMA仍是最大等待，输出后处理仍值得继续拆。
+
+其他消融均未保留：按权重大小降序4.754ms；GU/down相邻存储约4.55–4.58ms；worker额外2/4/6KiB padding约4.56–4.57ms；缩放metadata/correction外提未稳定获益；最后一批GU缩放时提前down约4.564ms、与GU提前组合约4.548ms；合并初始两批请求正式反而较慢。同专家相邻bank的256个段与原bank逐字节一致，但没有因此保留新格式。
+
+统计现有N4码，GU/down零码比例20.8797%/19.1612%；1bit零位图+非零4bit编码约4.165/4.234bit，反而更大。8值分组的3bit基础码+溢出位图估计3.6897/3.7906bit，未计metadata与对齐，未实现codec、不计解压或DLBC收益。本轮读取总字节没有减少。
+
+30组探索/正式/最终确认运行各8块，共240个验证块的最终输出/路由ID与上一轮逐字节一致且全部有限。1024token pooled输出SQNR由原独立FP32/BF16评估继承，仍21.175911dB；首块analyzer为21.640311dB，是不同统计口径。未重跑整模PPL。最终设备恢复原bank、tuning17535=127+1024+16384、cap32/batch8/6worker、profile0及轮询，未接入正式llama.py/recipe，未commit/push。详细记录、全部样本、Chrome trace、时间线及SHA位于`llama-output/qwen36-moe-bandwidth-20261018/README.md`、`RESULTS.json`、`OPTRACE.json`、`MANIFEST.json`。
+
+### AR128 MoE shared/routed重叠：4.545→4.288ms（2026-10-18）
+
+继续使用真实Qwen3.6-35B-A3B第0层、AR128、256专家/真实Top8、SM8750/v79、6HVX/1HMX/8MiB VTCM。专家仍为原GPTQ packed INT4/N4和动态A8，router/shared仍FP16，原量化网格与N4 bank未更改。范围是完整MoE FFN图，权重驻留DRAM，排除attention/GDN、SSD、载入和离线GPTQ/打包。
+
+同一最终构建/数据目录、profile0，三轮正序/反序/移位串行，每进程2次warmup+32次计时，各96样本：
+
+| 配置 | 中位数 | 平均值 | P95 | 最小–最大 |
+|---|---:|---:|---:|---:|
+| 上轮算法，同构建控制 | 4.545391ms | 4.545715ms | 4.598281ms | 4.421094–4.766094ms |
+| shared/routed重叠 | 4.342135ms | 4.341658ms | 4.389557ms | 4.216875–4.547500ms |
+| 再加shared预取 | 4.310730ms | 4.308675ms | 4.334895ms | 4.203281–4.495000ms |
+| 再加成对输出缩放 | 4.292839ms | 4.287749ms | 4.315821ms | 4.178386–4.363073ms |
+| **再加参数专门化/输入交织打包，保留** | **4.287969ms** | **4.287757ms** | **4.335287ms** | **4.176719–4.510000ms** |
+
+同构建降低5.6634%/0.257422ms，共480正式样本。保留配置96/96次低于5ms；trace之后恢复profile0，额外16次中位数4.289271ms。上一轮独立4.542317ms与当前同构建控制4.545391ms分列，不将差异归因优化。最后专门化相对成对版本只约5µs，属于同一性能档，不单独称显著收益。时间重复首块真实128token，精度另外覆盖8×128token。
+
+主要结构变化：原shared GU/SwiGLU/down与routed分开执行，共7个DSP计算节点；新图保留router和Top8，第三个CUSTOM完成shared/routed与合并，共3个DSP计算节点，optrace已确认。worker0先做shared，worker1–5同时做routed；shared结束后worker0加入专家任务队列。单个HMX服务在FP16和整数请求之间交替，分别加载bias并清累加器；不是两路MatMul同时占用同一HMX。重叠的是DMA、HVX准备/后处理及worker任务。
+
+原每worker的integer raw预留128KiB，batch8/coarse2最多只消费32KiB，故每worker回收96KiB，6个合计576KiB。加原空余VTCM用于shared：512KiB FP16 activation、256KiB权重双buffer、8KiB raw、66KiB的16行GU暂存、256byte bias。GU阶段后，activation区复用为128KiB down activation和门控。新总VTCM8343808/8388608bytes，剩44800bytes，无越界扩容。
+
+shared GU用两个128KiB buffer预取，down在相同256KiB区域容纳8批32KiB预取。SwiGLU到down的中间量留VTCM，shared down raw转FP32后直接乘门控，Top8求和与shared相加并入原pipeline combine。shared权重只作FP16 crouton无损重排，反解逐bit验证；虽然用I8 tensor装字节容器，里面仍为原FP16，不是INT8计算。专家N4读取字节不变。
+
+成对后处理用INT16无饱和环绕减法代替INT32修正再截回INT16，两行scale共用一次64-lane FP16乘法。输入先交织两行U8，再扩展生成原`[0,u0,0,u1]`。此前28组局部探索均8块字节一致，但单独端到端收益很小：跨专家预取、大buffer无稳定收益，5/4worker约4.61/4.82ms。此次主要收益来自shared/routed重叠，仍用6worker。
+
+曾定位并修复算子内部数据可见性：GU cached store写DDR后，后续cache-bypassing DMA读取了未提交内容。独立GU诊断与CPU FP16参考96.18dB。mode1/2显式DMA写回，mode4在GU全部写完后仅清理540672byte GU范围的cache，再DMA读回；检查API状态。修复前serial-v1/overlap-v1数值无效，未计入正式成绩。GGML builder的9参数限制通过显式填写已有src[9]处理，tensor/HTP协议原本支持10槽，没有改外部ABI。mode3仅诊断，不是有效FFN配置。
+
+重新使用保存的独立FP32/BF16参考计算1024token pooled最终输出SQNR：旧21.175911028dB，新21.175912788dB，差约0.00000176dB，不称精度改善。新旧输出之间96.434389dB、最大绝对差4.87417e-5，**不是新旧逐字节一致**；全部路由ID与旧版逐字节一致。最终新serial/overlap/prefetch/后处理各配置之间的8块输出逐字节一致，均有限；没有重新校准或重跑整模PPL。正式15组各8块，共120验证块，均重复同一组1024真实token。
+
+trace确认worker0的shared区间与其他5worker重叠，之后加入routed。profile3原/新每worker输出后处理0.938/0.457ms、GU+down打包0.211/0.133ms、DMA等待1.576/1.925ms。计算变快可更早到等待点，不能把等待增加当带宽下降。baseline CUSTOM不含图外shared，新CUSTOM含shared，窗口范围不同；profiling扰动调度，shared区间约1.83/2.21ms不可当profile0时延，worker时间不可相加，HMX服务区间不是硬件busy。DMA仍最大，没有宣称达到极限。
+
+最终设备恢复shared_mode4、tuning6571135、cap32/batch8/6worker、profile0和op-poll；轮询仍占用一个Android CPU核。实验源码在`llama-output/qwen36-moe-shared-overlap-20261018/source/`，正式llama.py/quant recipe未修改，未commit/push。复现命令、全部正式样本、误差、Chrome trace、时间线和SHA见该目录`README.md`、`RESULTS.json`、`FORMAL.json`、`OPTRACE.json`、`MANIFEST.json`。
+
+
+### AR128 MoE输出DMA/VTCM汇总：4.289→4.095 ms（2026-10-18）
+
+延续上一轮真实Qwen3.6-35B-A3B layer0，AR128、hidden2048、FFN512、256专家/真实Top8。SM8750/v79/431e3c37，6 HVX、单HMX、8 MiB VTCM，原MAX vote、op-poll和权重bank不变。时间为完整MoE FFN（router/route/shared/routed/combine），不含attention/GDN、SSD/装载、离线GPTQ；专家仍常驻DRAM。正式llama.py/quant recipe没有整合，未commit/push。
+
+三轮交错、每轮32次，加2次warmup，每配置96次，合计384正式样本；保留方案96/96低于5 ms。old为上一轮原二进制，control为本轮同构建关闭新逻辑。
+
+| 配置 | 中位数 | 均值 | P95 |
+|---|---:|---:|---:|
+| old | 4.288724 ms | 4.292498 ms | 4.384362 ms |
+| control | 4.293542 ms | 4.288837 ms | 4.321445 ms |
+| token | 4.092422 ms | 4.114804 ms | 4.237331 ms |
+| expert | 4.094791 ms | 4.094981 ms | 4.133672 ms |
+
+保留expert-major布局，较原二进制降低 **4.5219% / 193.93 µs**，较同构建control降低4.6291%。token/expert中位数相差仅2.37 µs，属于同档，expert均值/P95更低。所有单点原样保留，未删长尾。正式时间重复首块128token，精度另跑8×128=1024不同token，各轮重复这组数据。
+
+保留三项：
+
+1. shared GU的128×1056 FP32结果放到worker0尚未启用的routed VTCM工作区。输入准备barrier之后原FP32输入暂存已无读者，shared结束后worker0才加入专家任务。省掉540672byte GU中间量DDR往返、range cache clean和重读。
+2. routed down结果在原VTCM中原地乘路由score，通过DMA按expert-sorted route索引连续写8 MiB DDR bank；每chunk完成DMA后再复用工作区。建立token/slot→route position反向索引，保留原真实Top8和分数。route bank首次分配flush/invalidate，之后DMA读写、不经CPU缓存。当前隔离图没有其他MATMUL_ID复用这个通用ddr_spad；未来整合需明确独立生命周期。
+3. 汇总前按反向索引把8路8 KiB结果DMA到连续VTCM token槽，再按slot0到slot7、最后shared的原顺序求和。每worker16槽/1 MiB，初始128 DMA descriptor<队列256；消费后环形复用。展开8个独立向量，但每元素加法顺序不变。
+
+仍为原N4×动态A8整数HMX，GU1024/down512网格、FP16 router/shared和FP32 SwiGLU不变，专家实际权重读取约199.56 MiB/首块。总VTCM仍8343808/8388608byte，余44800byte；shared与combine复用不同生命周期的原worker区，不新增VTCM分配。
+
+1024token最终输出及路由ID与上一轮4.288ms保留版本**逐字节一致**，全部有限；12正式运行均通过，独立参考pooled SQNR仍 **21.17591278795492dB**。与更早4.54ms旧输出仍是96.434389dB、max abs4.87417e-5，不能把这个跨两轮比较说成字节一致。没有重跑整模PPL或重新校准。
+
+新增413号MOE_COMBINE_EXEC trace确认：profile3同构建控制/保留的pipeline CUSTOM（两者均含shared）4.0035/3.7820ms，worker平均combine0.3392/0.1549ms，store（含等待）0.0590/0.1709ms；仅worker0 shared完整区间2.2930/1.8885ms。DMA store显式等待提交，cached store返回较早，不能单看store变长判定更慢。worker时间不能求和当整层时间，HMX命令服务不是硬件busy，没有硬件总线字节PMU，不宣称量到了RFO或固定带宽提升。端到端收益以profile0正式结果为准。
+
+本轮67组探索中，shared请求合并、缩放融合SwiGLU、第三GU buffer、大shared预取、stride padding、L2fetch、token就绪提前combine/跨专家预取都没有稳定大收益。FP16双行sigmoid使SQNR变为21.173134dB、旧新输出43.670164dB但没有明显性能优势，未保留。当前只保留有稳定收益且输出一致的路径，不称到达硬件极限。
+
+最终配置：shared_mode4/tuning6571135/shared_local1/combine68/combine_window16，cap32/batch8/6worker、profile0、op-poll。trace后恢复配置再测16次，中位数 **4.088515ms**，8块输出再次一致。
+
+复现与证据目录：`llama-output/qwen36-moe-shared-batch-20261018/`，见`README.md`、`RESULTS.json`、`FINAL_FORMAL.json`、`OPTRACE.json`、`trace-*.chrome.json`、时间线、精度bin及`MANIFEST.json`。源码关键函数为`source/shared-async.h::moe_shared_compute`及`source/expert-pipeline.h::moe_pipeline_worker/moe_combine_fetch/moe_pipeline_combine_tokens`。
+
+
+### AR128 MoE VTCM FP32累加：4.088→3.844 ms（2026-10-18）
+
+与上一轮相同统计范围：Qwen3.6-35B-A3B真实layer0，AR128、hidden2048、FFN512、256专家/真实Top8；含router、route/softmax、shared/routed FFN及合并，不含attention/GDN、SSD/装载、离线GPTQ。专家仍常驻DRAM。SM8750/v79/431e3c37，6 HVX、单HMX、原MAX vote/op-poll不变；每次计时覆盖graph_compute+synchronize。正式llama.py/quant recipe未整合，未commit/push。
+
+| 配置 | 中位数 | 均值 | P95 |
+|---|---:|---:|---:|
+| old | 4.088020 ms | 4.090735 ms | 4.172734 ms |
+| control | 4.102917 ms | 4.101393 ms | 4.139505 ms |
+| accum19 | 3.862761 ms | 3.860546 ms | 3.916796 ms |
+| packed22 | 3.844115 ms | 3.843725 ms | 3.891796 ms |
+| packed23 | 3.847474 ms | 3.847853 ms | 3.886602 ms |
+| packed24 | 3.855599 ms | 3.853530 ms | 3.923828 ms |
+
+每配置3×32=96正式样本，合计576次。顺序为六配置正序/反序/从packed22旋转；先2次warmup，未删除长尾。old为上一版原二进制本轮重测，control为新构建关闭新功能。保留packed22，相对原二进制降低 **5.9663% / 243.91 µs**，相对同构建控制降低6.3077%。保留配置P95 3.891796ms、最大4.023594ms，不称每次低于4ms。
+
+主要修改：把原8 MiB route DDR bank写出/读回改为1 MiB `[128,2048]` FP32 VTCM累加；专家仍完整贡献8路score×down，按到达顺序累加，最后加shared。每token一把QuRT PI mutex，保护完整2048维更新，任何时刻只持有一把。128锁约2048byte在context DDR heap中，首次使用初始化后复用，context teardown逐个destroy/free，不占VTCM。
+
+为容纳累加区，先减小每worker chunk，继而无损去重重复scale：输入每1024维原grid只存一次，128token compact从524288降到294912byte；down每512维从1024降到640byte/row。Q8码、原scale、maximum、inverse及舍入过程不变。另回收shared不活跃的66 KiB GU暂存，把bias紧跟raw；在严格HMX/寄存器SwiGLU guard内移除不用的scalar partial暂存。单独packed布局、关闭累加的cap32/cap24对照，8块输出和路由均与旧版逐字节一致。
+
+最终cap22 worker stride1013760byte，VTCM：packed input294912+integer bias2048+6worker6082560+shared794880+FP32 sum1048576=**8222976/8388608byte**，剩**165632byte**。cap23相近速度但余量79616，cap24余5888且未更快，保留cap22。首块213个活跃专家、最多31路/专家，cap22只让该31路专家分成22+9；推算N4 payload从199.564453增到约200.703125MiB（额外1.138672MiB），仍通过移除16MiB route中间量往返获得净收益。该payload是按descriptor/bank长度计算，非硬件字节PMU。
+
+仍是原packed N4/INT4×动态A8整数HMX、GU1024/down512网格，router/shared FP16矩阵乘和原FP32 SwiGLU没有降精度；没有减少Top8或忽略小score。
+
+本轮输出**不是字节一致**，FP32求和顺序变化且最低位可能随调度变化。18正式进程各8块，合计144验证块重复同一组1024不同token，全部有限、ID与上一版逐字节一致。保留方案对上一版输出 **143.653344–143.664645dB**，max abs **1.49011611938e-08**。独立参考pooled SQNR约 **21.1759128dB**，旧21.17591278795492，约1e-8dB变化不称精度改善。更早4.54ms版本与当前仍约96.4343dB，不混为当前比较。未重跑整模PPL。
+
+同步演化必须保留记录：早期交换/TTAS自旋锁曾在cap23/24第7个验证块等待，首块timed能完成，故先前自旋版本时延均不作为最终有效结果。TTAS曾一次通过8块，正式复测仍复现等待；同cap24 packed但关闭累加，8块输出/ID完全与旧版一致。最终改用SDK `qurt_pimutex_lock/unlock`，争用时由QuRT挂起等待者并提供优先继承，三轮全部576计时和144验证块未超时。现有证据不能证明旧自旋停顿的全部底层原因。失败源代码/二进制/未完成正式数据归档为`FAILED_SPINLOCK*`，与保留PI结果分开。runner记录自身PID，60秒超时只清理对应PID。
+
+新profile3控制/累加CUSTOM总区间3.7655/3.7645ms，接近；worker平均store（含DMA或mutex/累加）0.16031/0.07127ms、最终combine0.15672/0.03842ms、专家DMA等待1.80577/1.94779ms。局部计算缩短、等待增加会改变调度，不能简单求和当整层收益。约6%收益以576次profile0交错复测为准，不以两次trace总区间推导。HMX服务范围不是硬件busy，也没有读取总线字节PMU。
+
+SIMD批量Top9/shared HMX优先调度没有稳定收益，保持关闭。最终配置cap22/shared_mode4/shared_local1/tuning6571135/combine0/accumulate/pack-grids，GU双buffer/batch8/6worker、原Top8/FP32非线性、profile0/op-poll。trace后额外16次中位数 **3.848229ms**，1024token相对上一版143.657147dB、max abs1.49011611938e-08，路由再次一致。
+
+完整复现和证据：`llama-output/qwen36-moe-route-schedule-20261018/README.md`、`RESULTS.json`、`FORMAL_ACCUMULATE.json`、`OPTRACE.json`、`trace-*.chrome.json`、时间线、精度bin及`MANIFEST.json`。代码核心为`source/expert-pipeline.h`的累加/PI锁/内存guard、`source/group-quant.h`和`expert-hybrid.h`的无损布局、`shared-async.h`的活跃区复用及`prepare_pipeline.py`的上下文锁资源生命周期。
+
+### AR128 MoE 2ms目标复核：权重搬运约3.20ms，保留原版（2026-10-18）
+
+本轮未达到2ms，正式llama.py/recipe未修改，设备恢复上一轮实际二进制。真实Qwen3.6第0层、128token、256专家/Top8，INT4×动态A8、原量化网格、FP16 router/shared、原FP32 SwiGLU；包含完整MoE FFN，专家DRAM常驻，排除attention/GDN、SSD/装载。45组完整验证运行、832正式计时样本、360验证块重复同一组1024不同token，全部有限、路由ID一致；对上一轮输出最大绝对差7.4505805969e-09，独立参考SQNR21.1759127953–21.1759128000dB。没有重测整模PPL。
+
+探索缓存DMA、L2fetch、HVX直接加载、跨专家GU预取、额外DDR/总线投票、3–6worker与完整GU权重缓冲、二维DMA、FastRPC uncached及无损gate/up成对布局。最终实际旧二进制/成对候选各64样本交错对照，中位数3.848282/3.838750ms，均值3.841824/3.838469ms，P95为3.874140/3.902678ms；均值只差3.35µs且候选尾延迟更高，未采用。本轮另一次原二进制64样本中位数3.780365ms，后续控制回到约3.85ms，没有将进程/设备波动算代码收益。
+
+纯IO只读真实首块213专家各一份GU/down payload，共209258496byte=199.564453MiB；6worker两轮合并18个qtimer样本中位数3.203802ms、65.315675GB/s，2/3/4worker约3.198/3.199/3.205ms，二维DMA更慢。该结果是当前路径测量，不是硬件理论下界，也不能从完整图时间减去它当独立计算时间。
+
+保留cap22因一个31-route专家重读，payload为210452480byte=200.703125MiB。在2ms读完仅该payload需105.22624GB/s；若吞吐保持本轮测量，则需把读取量降至约124.58MiB（至少少37.93%），尚未包括其他传输/解压/计算。host逐专家无损压缩并解压校验，最佳Zstd9实际加权payload172223069byte=164.245MiB（原81.835%），按同吞吐只读取仍约2.6368ms；没有实现设备解压，不能称NPU优化成绩，也不能据此证明所有无损编码的压缩率上限。当前尚无验证通过的2ms方案。
+
+完整记录：`llama-output/qwen36-moe-transfer-20261018/README.md`、`RESULTS.json`、`FINAL_CROSSCHECK.json`、`IO.json`、`LOSSLESS_COMPRESSION.json`及源码/原始bin/日志/`MANIFEST.json`。实验副本保留用于复现，未commit/push。
+
+### AR128 MoE 无损软件压缩与 QNN DLBC：未获得收益（2026-10-19）
+
+继续使用真实 Qwen3.6-35B-A3B layer0、AR128、256 专家/Top8 的完整 MoE FFN 口径；SM8750/v79/431e3c37，专家 DRAM 常驻，排除 attention/GDN、SSD/加载与离线 GPTQ。原 N4×动态 A8、GU1024/down512 网格、FP16 router/shared、FP32 SwiGLU不变。未减少 token、Top8、FFN 宽度或量化位数，正式 `llama.py`/recipe 未整合。
+
+C3 以 8 个 INT4 码为单位，在可无损表示为 24 bit 时存 3 byte，否则存原 4 byte，加 flags；GU 分批、down 整份 DMA 后在 VTCM 原地反向展开。全 bank host 独立/原地解码均逐字节还原，256 专家/2777 chunk 通过。真实首块按 cap22 次数加权，payload 从 210452480 降至 196265472 byte，仅少 6.741%。设备完整图 8 次中位数 **38.646485 ms**，远慢于原版。1024-token 输出有限、路由 ID 与旧版一致，max abs 7.45058e-09、对旧输出 SQNR155.880252dB、独立参考21.1759127974dB。profile3 两次 pipeline 平均38.2665ms，worker平均解码36.4693ms；反汇编有大量VLUT/位操作和寄存器溢出到栈，软件解码成为瓶颈。线程时间不能相加，DMA等待降低不等于带宽提升，失败方案未采用。
+
+独立检查 SDK 的 `ENABLE_DLBC_WEIGHTS`（类型5，与现有 use_dlbc 类型4不同）：真实 GU 权重排除全零输出通道后，拼为 M/N/K=8/32768/1024 的 QNN FullyConnected。使用 QNN 自己的 W4/A8 校准：权重是 SFIXED8 容器加 BW_AXIS bitwidth=4、离线 context 约16MiB，未改成 W8。此微基准不是完整 MoE，也不与原动态 A8/分组网格宣称数值等价。SDK2.45的权重压缩前/后均17039360byte、压缩比100%；context从17117184增至17391616byte。手机off/on/on/off每组68次，丢弃前4次warmup，各配置128正式样本；accelerator execute中位数 **286/292μs**，原生UINT8输出逐字节一致，没有收益。2.45同时开启input/weights DLBC仍无压缩；2.49额外离线off/weights/both context也未缩小，后者未上机计时。没有给现有GGML DMA直接套QNN开关或集成原生MoE。
+
+128-byte码块的离线hash字典分析，即使假设无限缓存、无查表/索引成本，真实路由最多省3833728byte（1.82166%），主要是down零块/同一专家重读；未实现设备字典，不是性能成绩。
+
+最后恢复上一轮实际二进制、原bank、cap22/accumulate/pack-grids、profile0/op-poll。32次完整图中位数 **3.842396ms**、均值3.839046ms、P95 3.864690ms；此为旧版复测，不称新优化。恢复后1024token全部有限、ID一致，对旧输出159.441519dB、max abs7.45058e-09，独立参考21.1759127977dB。**2ms未达到，本轮未采用新候选，未重测整模PPL，未commit/push。** 详细格式、原始样本/输出、SDK配置与profiling CSV、源码/实际二进制哈希见`llama-output/qwen36-moe-c3-20261019/README.md`、`RESULTS.json`、`MANIFEST.json`。
+
+### 真实 GDN attention 接完整 MoE：AR128 首层 11.278ms（2026-10-19）
+
+使用真实 `/hunter/model/Qwen/Qwen3.6-35B-A3B` 第0层：hidden2048、GDN K/V heads16/32、head dim128、256专家/Top8、FFN512。SM8750/v79/431e3c37，8MiB VTCM。一个Android进程中串联当前ExecuTorch优化attention的QNN context与上一轮实际最快GGML/Hexagon MoE，包含input RMSNorm、完整GDN attention、第一次residual、post-attention RMSNorm、完整MoE、最后residual、runtime交接及同步。不是独立耗时相加，也不是统一QNN图或完整35B PTE。专家DRAM常驻，不计embedding、SSD/加载、其他层、视觉、最终模型norm/LM head。
+
+RTX3090上CUDA校准1024个WikiText train token、关闭TF32，out_proj fixed-grid GPTQ。最初沙箱看不到NVIDIA设备节点，误判主机驱动不可用；主机CUDA实际tensor运算通过后，已用GPU重新导出正式图，早期CPU图未用于成绩。attention为K/z及depthwise conv W8，其他投影W4/group32，A16，chunk内部FP16；conv/recurrent边界UINT16，交给原MoE的normalized input/residual为FP32。MoE保持原INT4/N4×动态A8、GU1024/down512网格、FP16 router/shared、FP32 SwiGLU、cap22/accumulate/pack-grids，DSP二进制未改。
+
+3轮各32次、每进程6次warmup，共96个完整层正式样本，全部保存：
+
+| 同一次完整层调用的实际区间 | 中位数 | 均值 | P95 |
+|---|---:|---:|---:|
+| attention及两侧block RMSNorm、第一次residual | 6.316953ms | 6.246650ms | 6.519570ms |
+| MoE及末尾residual | 4.985521ms | 5.013232ms | 5.122032ms |
+| **完整第0层** | **11.277839ms** | **11.259882ms** | **11.600169ms** |
+
+均值占比55.48%/44.52%；各区间中位数不可严格相加。逐轮完整层中位数11.313100/11.166667/11.281407ms，全部样本最小9.339218、最大24.534167ms，未删除第三轮长尾。单独连续运行控制各24次：attention中位5.861016ms，MoE+final residual中位4.111953ms。控制不逐次交替资源，不能相加冒充完整层，也不能将串联MoE区间4.99ms全部算作原3.84ms算术内核回退。默认QNN priority100曾造成约21ms的早期串联等待，正式使用公开QNN context priority200。QNN RAW IO可能有内部拷贝，未宣称零拷贝。
+
+PTE仅包含一个QNN delegate、零CPU fallback；native context IO顺序由PTE DelegateCall自动映射。显式保留GGML输入/残差，防止最后add覆盖normalized input；早期有输入复用问题的MoE-only控制已排除。正式3进程与2控制进程的attention normalized output逐字节一致；首块实际触及208专家，cap22 payload207447040byte，区别于旧FP32 attention输入的213专家。
+
+**精度仍有明显问题，不能称精度已解决。** 首块完整层hidden相对真实FP32 attention+MoE参考SQNR **13.004234dB**；attention residual14.895448dB、normalized MoE input11.631490dB。固定设备真实attention输入后，MoE output对FP32 MoE为20.842222dB，conditional layer30.698880dB，说明显著误差已在attention前端出现。8个独立cold-state AR128块共1024不同token全部有限，最后residual逐元素完全正确；conditional MoE output SQNR19.631–20.842dB，FP16 router对FP32的Top8 rank agreement97.56–99.32%，不宣称ID bitexact。未测连续warm-state前填或整模PPL，没有把单层时间乘40冒充整模测量。
+
+源码、GPU导出、完整层runner、正式样本/输出及哈希见`llama-output/qwen36-full-layer-20261019/README.md`、`RESULTS.json`、`ACCURACY.json`、`MANIFEST.json`。正式`llama.py`/recipe/MoE内核未整合修改，未commit/push。
+
+### 35B-A3B attention分段：共享IO与RPC修正，完整层11.294→7.982ms（2026-10-19）
+
+对上一轮同一attention context进行基础/详细profile，并保留冻结量化参数提取五个子图。SM8750/v79、431e3c37，真实第0层AR128、hidden2048、GDN value heads32、Top8 MoE，原权重bank和DSP库不变。
+
+此前6.32ms是QNN直调RAW IO原型的调用墙钟，包含较大IO/RPC开销；同图加速器段约3.4–3.5ms。独立attention三轮交替、每轮warmup20/96次：RAW5.785912ms→rpcmem+memRegister4.174844ms→共享IO加ExecuTorch Burst同款control100us/poll9999us配置 **3.448906ms**。每配置288样本，四个attention输出逐字节一致。
+
+完整层同一个二进制三轮交替A/B，每配置96样本、每轮6次预热，包含两份FP32 hidden复制、runtime切换和同步：
+
+| 配对完整层区间 | RAW原配置 | 共享IO+RPC | 中位数下降 |
+|---|---:|---:|---:|
+| attention+两侧norm+首次残差+边界复制 | 6.353698ms | **3.924037ms** | **38.24%** |
+| MoE+最后残差 | 4.987136ms | 4.065339ms | 18.48% |
+| **完整层** | **11.293594ms** | **7.982031ms** | **29.32%** |
+
+五个独立子图的基础profile加速器段：input norm+投影0.5800ms，conv/布局/SiLU/QK归一化/gates准备1.2300ms，GDN core1.5365ms，norm/z门控0.2890ms，out_proj+残差+post norm0.2100ms。分图改变IO和融合边界，不能把子图相加冒充整图精确分账。整图详细profile映射确认较重的非core节点集中在conv两侧Transpose、cache拼接后的Slice、conv输出布局和大激活SiLU链；详细profile周期不换算为正常运行毫秒。
+
+历史0.832ms对应0.8B/H16独立core及后来发现非有限值的dense32三角逆；当前稳定H16旧基准为0.892334ms。35B的H32 state元素数翻倍，这与额外IO开销是两个不同问题。
+
+直接跨QNN/GGML注册同一fd发生fastrpc映射冲突，失败退出未计成绩；最终用独立QNN共享buffer，再显式复制共2MiB的normalized/residual到GGML，复制在计时内，不宣称零拷贝。三轮四个attention输出逐字节一致，最后残差逐元素正确；完整层对原量化版SQNR162.01–164.52dB、最大绝对差2.98e-8。原对全FP32参考约13dB的精度问题没有在本轮修复，也没有重测PPL。完整层仍未达到5ms；未测40层/SSD换入。
+
+独立原型和完整证据：`llama-output/qwen36-attention-breakdown-20261019/README.md`、`RESULTS.json`、五个子图PTE/输入/profile、`full-qnn-audit.json`、`full-node-sources.json`、`layer-ab-*`。生产`llama.py`、量化recipe、attention/GDN数学实现与MoE库未修改，未commit/push。
+
+### 真实前四层AR128：三层GDN＋一层FA、四套独立MoE（2026-10-19）
+
+独立实验，未接入生产。SM8750/v79、431e3c37；本地Qwen3.6-35B-A3B真实层索引0/1/2/3，各自attention、router、shared和256专家bank。四套bank在同一GGML backend中同时驻留，四套QNN context常驻；真实层输出直接送下一层，不在中途换成参考hidden。沿用原最佳N4×动态A8整数HMX库及共享IO/RPC配置，cold AR128，排除加载和SSD换入。
+
+最终同一二进制3个epoch，每epoch6次预热、32次正式计时，共96次四层调用：
+
+| 层 | attention | attention含两侧norm/首次残差 | MoE含最后残差 | 完整层区间 |
+|---|---|---:|---:|---:|
+| 0 | GDN | 3.930860ms | 4.051979ms | 7.993073ms |
+| 1 | GDN | 3.889844ms | 6.200703ms | 10.130469ms |
+| 2 | GDN | 3.921433ms | 5.829063ms | 9.794297ms |
+| 3 | full attention | 1.599896ms | 5.718281ms | 7.367553ms |
+
+**四层整体中位35.312605ms，均值35.392557ms，P95 35.893593ms**，三个epoch中位35.316615/35.307683/35.313203ms。整体中位÷4为8.828151ms；各区间中位数不可严格相加。跨层hidden传递平均合计约0.110009ms，计时内包含QNN/GGML交接、显式复制及同步。第3层FA的FP32实现对Transformers SQNR132.596891dB，确认了partial RoPE、Q/K norm、query gate和因果mask。
+
+MoE切换控制：实际量化链输入下，各层MoE独立运行中位数合计20.735417ms，四bank交替整体21.077630ms，相差0.342213ms/1.65%。额外使用各层真实FP32参考hidden重测：独立中位数合计20.270000ms，交替整体20.601250ms，相差0.331250ms/1.63%。差额包含缓存/调度/频率等影响，未声称是硬件分离出的纯bank切换；当前驻留四层未发现毫秒级放大。
+
+实际bank含router/shared分别247.176/391.832/393.528/394.753MiB，四套权重缓冲合计1496620544B。量化后第0层零通道紧凑化省掉的权重更多，不能代表后续层。量化链实际选中208/215/193/177个专家，按cap22和header有效payload推算每块权重207447040/339720192/314382848/302657024B，不是DDR硬件流量计数；后续层负载明显更重。
+
+四层bank与各自原生N4解码模拟匹配，MoE条件SQNR29.44/36.85/33.44/33.82dB，所有残差逐元素正确、输出有限。**精度尚不合格**：第1层GDN normalized对同输入FP32 attention仅−1.37545dB，四层累积hidden对FP32链约−0.044dB；该问题不是bank错绑，FP32输入的切换对照单独验证了性能结论。没有测PPL、40层、SSD换入、长历史cache或decode。
+
+产物及复现：`llama-output/qwen36-four-layer-20261019/README.md`、`RESULTS.json`、`ACCURACY.json`、`FA_PARITY.json`、`MANIFEST.json`、逐层PTE/bank、`formal.log`、`teacher.log`。首轮旧二进制35.274063ms记录保存在`initial-formal/`，未混合进最终样本。生产`llama.py`/recipe/GDN/MoE内核本轮未改动，未commit/push。
+
+<a id="qwen36-layer1-tiny-scales-20261019"></a>
+
+### 第 1 层 GDN：极小权重 scale 引起设备端饱和（2026-10-19）
+
+这里的第 1 层指 **layer index 1，即第二个 Transformer block**。使用 Qwen3.6-35B-A3B 真实权重，固定前述四层量化链送入该层的同一份 `[1,128,2048]` hidden，分别运行 FP32、冻结 PTQ Q/DQ 图、替换 ChunkGDN 后的 Q/DQ 图和手机 QNN context。SM8750/v79，设备 431e3c37；Q/V/a/b 和 out_proj 仍为 W4/block32，K/z、depthwise Conv 仍为 W8，conv/recurrent state 的外部 IO 仍为 UINT16。
+
+#### 如何定位
+
+同输入下 PyTorch 冻结 PTQ 图的 normalized SQNR 为 **20.12224dB**；替换 ChunkGDN 前后 normalized SQNR 为36.91552dB、state 为53.55317dB。但手机 normalized 对 FP32 只有 **−1.37545dB**。独立 core 使用同一组冻结 Q/DQ 输入时，设备 attention output 对原 recurrent Q/DQ 为59.85435dB、state 为52.94678dB。严重误差发生在设备执行路径，不能归因于普通 W4 PTQ 误差或直接判定三角逆失效。
+
+继续把原量化图拆成输入投影、conv/QK/gates、core、norm/z、out_proj 五段，保留原校准参数。投影的第318、337输出通道在 PyTorch 量化结果中为零，手机却出现约−41.85754/+41.97395的饱和值。对应的投影与 depthwise Conv 权重 scale 约1e−9～1e−7；例如 K/z 的第318通道为4.54661e−9，第337通道为1.52590e−9。
+
+给完整图额外添加中间输出后，修复前、修复后各自的四个最终输出与无额外输出的图**逐元素相等**，确认观察点没有消除原问题。完整图中按相同 FP32 输入比较：
+
+| 位置 | 修复前 SQNR | 修复后 SQNR |
+|---|---:|---:|
+| Q/V/a/b 投影 | 4.32539dB | 24.26779dB |
+| K/z 投影 | 4.87412dB | 45.15099dB |
+| depthwise Conv 输出 | 2.90762dB | 34.30939dB |
+| normalized query | 10.03998dB | 25.13047dB |
+| normalized key | 10.51241dB | 41.86867dB |
+| GDN attention output，门控前 | 28.14454dB | 30.47286dB |
+| RMSNorm/z 门控输出 | −15.09651dB | 13.97249dB |
+| out_proj 输出，残差前 | −11.87427dB | 16.02754dB |
+| 残差及 post norm 后 normalized | −1.37545dB | **20.08072dB** |
+
+GDN attention output 的全头 SQNR 掩盖了低能量头的异常：head4/5 的 FP32 RMS 分别为1.68547e−5/1.87366e−5，错误设备结果为1.02220e−3/1.03158e−3，两个头分别仅−35.55/−34.71dB。后面的 RMSNorm/z 门控把这些错误进一步放大，**head4/5 占门控总误差能量的99.894%**。修复后这两个头的 core RMS 恢复到1.73251e−5/1.91789e−5，gate RMS 也恢复到接近参考值。
+
+#### 修复与消融
+
+在 `quantize/qwen35.py::stabilize_gdn_weight_scales` 中，只处理 GDN 的 `in_proj_qvab.conv`、`in_proj_kz.conv` 和 `causal_conv2d` 冻结权重。对过小的权重 scale 使用 `torch.finfo(torch.float16).tiny`（2^−14）作为安全下限，并根据原已量化权重重新计算整数码：`new_code = round(old_code * old_scale / safe_scale)`，随后按原 W4/W8 范围截断。**不能只改 scale 而保留整数码**，否则会把这些小权重放大。该下限是本设备验证有效的数值保护；QNN 内部闭源，未把具体某条 FP16 或定点指令的下溢宣称为已证实原因。
+
+修复放在 PT2E 转换后、out_proj GPTQ 和共享 AR128/AR1 激活范围采集之前。激活校准的 scale/zero point、UINT16 cache 网格及权重位宽没有被此函数替换。对本层共修改7117个 scale（W4 block6656、K/z W8 channel113、depthwise W8 channel348）；正式函数与已验证 PTE 的全部冻结 buffer 完全一致，重复调用不再修改任何值，out_proj 权重及全部 activation/cache Q/DQ 编码保持原样。FP32参考下的 PyTorch normalized SQNR仅从20.12224降至20.11893dB。
+
+| 修复范围 | normalized SQNR | conv cache SQNR | state SQNR |
+|---|---:|---:|---:|
+| 原版 | −1.37545dB | 7.85019dB | 30.96707dB |
+| 仅输入投影 | 6.39848dB | 24.93823dB | 31.63989dB |
+| 仅 depthwise Conv | 20.08067dB | 7.85019dB | 31.65221dB |
+| 两处一起修复 | **20.08072dB** | **24.93823dB** | **31.65221dB** |
+
+因此本轮当前128-token输出的主要异常在 depthwise Conv，输入投影的异常还会写入 conv cache，仍需一起保护。无需改变 GDN state 位宽或重写 core。
+
+额外两组固定 hidden 及非零 state 验证，逐组都比较同输入 FP32 attention：
+
+| 输入 | 原版 normalized | 修复后 normalized |
+|---|---:|---:|
+| 原量化链实际输入，cold128 | −1.37545dB | 20.08072dB |
+| 独立参考序列第128～255位置，cold128 | −0.97273dB | 20.62566dB |
+| 独立参考序列第768～895位置，cold128 | −1.32846dB | 20.22309dB |
+| 第128～255位置，承接首128步的非零FP32 conv/state | −0.96869dB | 20.82347dB |
+
+非零输入单独编码后，conv 输入 SQNR70.09404dB、state 输入54.43325dB，两者超出量化范围的比例均为0；cold输入全零，不能用零信号的SQNR证明精度。该warm控制按输入各自的校准参数重新编码，没有验证直接复用原始UINT16缓存的长序列路径。本原型conv输入/输出scale分别为0.00127918646/0.000659527606，后续若直接回传原始缓存，需要检查编码对齐。
+
+同一 hidden、cold cache、共享 IO/RPC poll、profile关闭，原版/修复版交替三轮，每轮64次、各192次正式样本：完整 attention front（含两侧 norm、out_proj、首次残差，不含MoE）中位 **3.480156→3.496693ms**，约+0.48%；P95 3.508953→3.532438ms。此处是独立 attention 对比，与上文四层共驻的3.889844ms不可混作同一组测试。修复没有增加运行时算子。
+
+完整证据保存在 `llama-output/qwen36-layer1-fix-20261019/`：`RESULTS.json`、`HEADS.json`、`STAGES.csv`（FP32 min/max、量化范围、饱和比例、SQNR）、`PER_TOKEN.csv`（128个token逐位置SQNR）、`scale-floor/attention.pte`、原版/修复版中间输出，以及 `source/` 中的复现脚本。旧四层基准产物未覆盖。本轮修复了目标单层的严重错误；残留 W4/激活量化误差仍在，尚未据此宣称完整四层/40层或PPL已修复，MoE实验未整合进 `llama.py`，未commit/push。
+
+#### 修复第 1 层后，完整四层 AR128 重测（2026-10-19）
+
+按用户要求回到前四层真实链，**只替换 layer1 的修复版 attention context**；layer0/2/3 context、四套专家 bank、runner 二进制和运行参数沿用原版。上下文 SHA256 核对确认仅 layer1 不同，runner SHA256 与历史基准相同。使用独立目录及原 bank 的符号链接，没有覆盖旧产物或重复拷贝全部专家。输入仍为同一份128-token embedding，真实上层输出直接送下一层，全部权重常驻。各版本三轮，每轮6次预热、32次正式样本，共各96次；profile关闭。
+
+计时从第0层输入 hidden 已写入缓冲后开始，到第3层输出完成并同步结束。包含两侧 norm、投影/attention、残差、MoE 路由/专家/shared、层间 hidden 传递、QNN/GGML交接及同步；排除第一层输入缓冲初次复制、模型加载、embedding、最终LM head、采样和SSD换入。输出落文件在计时外。
+
+| 版本 | 四层整体中位 | 均值 | P95 |
+|---|---:|---:|---:|
+| 历史原版记录 | 35.312605ms | 35.392557ms | 35.893593ms |
+| 本轮原版对照 | 35.375912ms | 35.416551ms | 35.892774ms |
+| 本轮仅第1层修复 | **35.596172ms** | 35.637976ms | 36.009713ms |
+
+同轮对照增加0.220260ms/0.623%。修复版三轮整体中位为35.667891/35.616641/35.573828ms。各段独立统计中位数，不能相加冒充整体中位：
+
+| 层 | attention类型 | 原版attention→修复后 | 原版MoE→修复后 | 原版整层→修复后 |
+|---|---|---:|---:|---:|
+| 0 | GDN | 3.997057→3.999089ms | 4.058073→4.094532ms | 8.057969→8.095625ms |
+| 1 | GDN | 3.891250→3.893959ms | 6.199011→5.965521ms | 10.141719→9.926511ms |
+| 2 | GDN | 3.886406→3.878464ms | 5.802943→6.290521ms | 9.726432→10.210182ms |
+| 3 | Full Attention | 1.637006→1.605859ms | 5.686719→5.665547ms | 7.381250→7.327917ms |
+
+第1层attention耗时基本相同；修复改变了后续hidden和真实路由，MoE负载随之变化。选中专家数由208/215/193/177变为208/201/214/180；layer1的cap22/header推算有效payload从339720192降为322534912B，layer2由314382848增至343088128B。这是按路由和bank布局推算的有效权重payload，不是DDR硬件流量计数；整体差额还包含设备运行波动，不能全部解释为scale保护的计算开销。
+
+逐层与同输入FP32 attention及完整FP32参考链比较：
+
+| 层 | 原版normalized→修复后 | 原版累计hidden→修复后 |
+|---|---:|---:|
+| 0 | 11.63149→11.63149dB | 13.00423→13.00423dB |
+| 1 | −1.37545→**20.08072dB** | −2.29869→**13.12396dB** |
+| 2 | 15.99442→15.06053dB | −0.26735→12.37218dB |
+| 3 | 24.61287→22.51170dB | −0.04411→**11.60127dB** |
+
+后两层的“同输入”参考分别使用各版本实际到达该层的hidden，因此conditional SQNR不能当作输入完全不变的算子A/B；累计hidden统一对同一份FP32四层链。所有层、所有epoch的输出有限，最后残差逐元素正确；修复版MoE对各自原生N4模拟为29.44/28.75/29.78/30.88dB。本轮证实目标修复在真实四层链中生效，整体性能仍在35.6ms附近。未重测PPL、长历史cache、decode、SSD换入或40层；其余GDN层没有在本轮重新导出。
+
+产物：`llama-output/qwen36-four-layer-retest-20261019/RESULTS.json`、逐层性能`RESULTS.csv`、`MANIFEST.json`、`baseline.log`、`fixed.log`、`baseline_ACCURACY.json`、`fixed_ACCURACY.json`及全部逐层输出。独立实验未整合进`llama.py`，本轮未新增生产代码变更，未commit/push。
+
+#### 四层单层权重驻留：手机闪存按层换入（2026-10-19）
+
+按“当前层MoE权重驻留DRAM，其余层bank存放手机文件系统，逐层按需换入”的口径测试。沿用真实Qwen3.6-35B-A3B的layer0/1/2/3、128-token输入、layer1已修复的attention、原INT4专家格式及计算内核。四套QNN attention context、图和计算scratch仍驻留；只把MoE权重改为单缓冲复用，不包含attention权重卸载。当前层加载的是该层全部256专家bank及router/shared，并未实现按实际选中专家读取或IO/计算重叠。实验未接入生产。
+
+原四层MoE权重缓冲共1496620544B（1427.29MiB）；复用槽为414007296B（394.83MiB），减少72.34%。换层前等待上一层计算同步完成，复用同一物理缓冲；各层张量描述保留，使用可变缓冲属性。冷读额外需要8MiB常规对齐暂存，合计约402.83MiB权重及读取缓冲，不代表整个进程的总内存。
+
+先加载layer0权重到DRAM，标准计时从首层hidden就绪开始；layer1/2/3的文件读取、写入NPU缓冲、计算及层间交接全部在计时内。另记录计入layer0重新加载的时间，用于说明下一次遍历也需要换回首层。文件句柄、图/context创建和输出落文件不在计时内，仍不含embedding、LM head、采样和SSD写回。以下为本手机文件系统的读取结果，并非PC NVMe SSD测试，也未实际运行40层。
+
+| 模式 | 正式样本 | 四层整体中位 | P95 | 计入首层重新加载的整体中位 |
+|---|---:|---:|---:|---:|
+| 四层MoE全部驻留DRAM | 96 | **35.26823ms** | 36.11762ms | 35.26823ms |
+| 单层缓冲，文件页缓存命中 | 8 | **174.67148ms** | 190.14406ms | 223.24758ms |
+| 单层缓冲，O_DIRECT冷读 | 8 | **554.73047ms** | 570.50909ms | **660.30477ms** |
+
+相对同轮全驻留，对应4.95倍和15.73倍耗时；冷读标准计时增加519.46ms。页缓存模式虽然只有一个应用权重槽，但全部bank的365406个文件页仍驻留内核页缓存，不能将其作为真实闪存速度或整机节省了同等DRAM的结果。
+
+冷读通过`O_DIRECT`绕过页缓存，并在开始前对这些实验bank调用`POSIX_FADV_DONTNEED`；`mincore`测得bank页缓存前后均为0。每次标准计时内`/proc/self/io::read_bytes`为1237499904B，计入首层后为1496702976B，与文件按页对齐后的总量一致。其余两种模式计时内read_bytes均为0。
+
+本手机对RPC共享内存直接`pread(O_DIRECT)`返回EFAULT，首轮失败不计成绩。最终实现先读入8MiB页对齐普通内存，再复制到NPU可访问的共享权重槽，完整统计两段开销；没有悄悄回退到缓冲文件读取。
+
+| 换入层 | 文件读取中位 | 暂存→NPU共享DRAM复制中位 | 整体装载中位 |
+|---|---:|---:|---:|
+| 1 | 155.3077ms | 24.5645ms | 180.1988ms |
+| 2 | 119.5443ms | 24.1548ms | 143.4357ms |
+| 3 | 163.0199ms | 32.2170ms | 194.8220ms |
+
+三层分别统计的中位数合计约437.87ms读取、80.94ms复制、518.46ms装载；各段中位数不能严格相加等同整体中位。按三层有效文件字节/读取时间估算约2.83GB/s，仍是该路径在本机的实测值，不是设备标称带宽或DRAM硬件流量计数。当前主要瓶颈已经变为按层搬运约1.24GB权重，计算仍是几十毫秒。
+
+精度单独核对：全驻留、页缓存换入、O_DIRECT换入的32个权重张量FNV1a64哈希全部一致，哈希诊断只放在独立warmup，不计入正式性能。正式各模式首末两个快照的所有层输出有限，最后残差逐元素正确；最终hidden对同一FP32四层参考，resident为11.60127150dB，cached为11.60127150dB，direct为11.60367358/11.60194848dB，未观察到绝对SQNR下降。
+
+**不能据此宣称换入与全驻留逐位一致**：cached与resident末快照为158.99572dB/maxdiff1.19209e−7，而direct与resident末快照为42.73822dB/maxdiff0.00571293，direct自身首末重复约42.06177dB。权重哈希一致，说明不是文件换入后权重字节变化；数值波动在计算/runtime路径中的具体原因尚未隔离，本轮不把它写成零额外误差，也没有测全模型PPL。该问题与读取带宽的实测结果分别保留。
+
+结论：在这一“仅保留当前层、整层串行换入”的实现下，128-token四层耗时由约35ms升至约555ms，首层也需重新加载时约660ms。后续降低开销应比较只读取实际路由命中的专家、连续区间合并读取、多层/专家缓存、双缓冲预取与计算重叠；本轮没有把这些尚未实现的收益计入结果。
+
+产物保存在`llama-output/qwen36-four-layer-storage-20261019/`：`RESULTS.csv`、`RESULTS.json`、`resident.log`、`cached.log`、`direct.log`、哈希诊断`hash-*.log`、各模式首末逐层输出，以及`source/storage_bench.cpp`、独立改写的`moe_factory.h`和复现脚本。手机端已拉回主机的初轮输出副本曾清理以释放空间；旧四层基准和全部专家bank未覆盖。本轮没有修改生产推理代码，未commit/push。
+
+#### 四层闪存换入优化：真实路由选择、并发读取、有限专家缓存（2026-10-19）
+
+延续上节的真实前四层、AR128、SM8750/v79手机`431e3c37`，优化MoE权重换入。仍使用原INT4专家bank和N4×A8整数HMX内核，未减少Top8、未丢弃低分专家、未修改attention精度；layer1继续使用scale修复版context。旧基准未覆盖，本轮仍为独立原型，未接入`llama.py`。
+
+**实现变化**：
+
+1. 将MoE执行图拆为router和专家计算两个子图。每层先执行本层attention和真实router，将当前128个token的Top8 ID读回，再求命中专家的并集。专家读取清单在正式计时内生成，没有使用预录的测试路由或预测下一层ID。保留原图的scratch分配、hidden/residual和router输出；子图UID设0，避免两个子图误复用同一个GGML图缓存。
+2. 只把两个大bank（`gate_up_part0`、`down_part0`）放在可复用专家槽。四层router/shared/小占位bank分别保留8MiB元数据及权重缓冲，合计32MiB；前后端QNN attention context仍驻留。这里的“元数据”缓冲也包含router和shared权重，不仅是索引。
+3. 根据原bank offset/header定位完整专家payload，按4KiB页对齐并合并重叠、相邻区间。只读实际命中的专家，保留原INT4格式和专家索引，不在装载时反量化。少量页边界会带入相邻专家的字节，物理读取量按实际页统计。
+4. 使用持久IO线程池，各线程通过8MiB对齐普通缓冲执行`pread(O_DIRECT)`，随后复制到NPU共享专家槽。读取与复制在多个线程之间流水执行；没有把本机不支持的“直接O_DIRECT到RPC共享内存”当成成功路径。
+5. 增加容量受限的CPU DRAM热门专家缓存，每层32或64个。名单来自各层**独立train/calibration序列的1024-token FP32路由频率**；正式测试使用另一段test序列。命中的缓存字节复制到复用槽，其余仍从手机闪存冷读。缓存范围与闪存读取范围严格切开，避免并发写同一目标页。没有用重复测试把全部bank偷偷暖进文件页缓存。
+6. 另外试过在本层attention/router期间并发读取该层全部专家。实际选择性读取必须等待真实router，不能提前知道本次命中ID；本轮没有把预测预取算作真实路由收益。
+
+**计时与缓存边界**：每组1次预热、8次正式样本，profile关闭；除单列的重叠实验只有3次正式样本。首先加载第0层完整专家bank并写入首层hidden，之后才开始标准四层计时；第1/2/3层实际路由、读取规划、闪存读取、CPU复制、attention、MoE及层间同步都在计时内。额外列出计入第0层重载的整体时间。context/图创建、一次性热门缓存初始化、embedding、LM head、采样及输出落文件不在标准计时内，不能把本表称为完整40层模型TTFT。
+
+全部正式组的bank `mincore`页缓存均为`0→0`，`/proc/self/io::read_bytes`逐样本等于规划并执行的物理页读取总量。下表GB使用十进制，MiB使用2^20字节。
+
+| 方案 | 四层中位 | P95 | 计入首层重载的中位 | 计时内闪存读取 | MoE权重及IO工作内存 |
+|---|---:|---:|---:|---:|---:|
+| 上节串行整层换入 | 554.73ms | 570.51ms | 660.30ms | 1.2375GB | 402.83MiB |
+| 本轮串行整专家bank，router/shared驻留 | 535.05ms | 549.23ms | 630.35ms | 1.2146GB | 434.83MiB |
+| 整专家bank，4线程 | 408.20ms | 426.98ms | 480.95ms | 1.2146GB | 458.83MiB |
+| 真实命中专家，4线程，无热门缓存 | **366.86ms** | 371.56ms | 440.37ms | **0.9413GB** | **458.83MiB** |
+| 真实命中专家，8线程，无热门缓存 | 366.31ms | 370.17ms | 444.62ms | 0.9413GB | 490.83MiB |
+| 每层32热门专家，4线程 | **324.89ms** | 327.43ms | 398.43ms | **0.7951GB** | **635.71MiB** |
+| 每层32热门专家，8线程 | 326.60ms | 359.00ms | 400.61ms | 0.7951GB | 667.71MiB |
+| 每层64热门专家，4线程 | **283.28ms** | 286.22ms | 349.91ms | **0.6573GB** | **813.48MiB** |
+| 每层64热门专家，8线程 | **280.74ms** | 292.51ms | 347.71ms | **0.6573GB** | **845.48MiB** |
+
+相对上节554.73ms，低内存的“真实命中+4线程”减少33.87%，32专家/4线程减少41.43%，最快64专家/8线程减少49.39%，约1.98倍速度。计入首层重载，最快347.71ms相对660.30ms减少47.34%。本轮另有535.05ms串行对照，区分了router/shared驻留、拆图等基础变化与后续优化，不能把全部收益都归因于选择性读取。
+
+四线程配置更适合内存紧张时使用：无热门缓存时，8线程仅快0.55ms却多32MiB缓冲；32专家时4线程反而略快；64专家时8线程只快2.55ms且P95更高。不是线程越多越好。
+
+整bank预取与attention/router重叠的3样本探索中位396.41ms，同轮非重叠4线程为408.20ms；读取字节仍为1.2146GB，没有解决大头。此项样本较少、且并非交替AB，不把这11.78ms全部认定为稳定的纯重叠收益。正式保留的推荐配置仍是按真实路由读取加有限缓存。
+
+**为什么仍明显慢于全驻留**：本测试每token选8个专家，但128个token合在一起，四层分别命中约208/201/214/180个不同专家，并非整个block只用8个。个别运行因已有的微小数值波动，后两层并集会变为213/181；全部样本都按当次真实ID读取。即使每层保留64个热门专家，后面三层仍需读取约657MB；热点缓存减少的是闪存字节，不会消除NPU槽内的复制和执行。
+
+以64专家/4线程为例，各段分别统计的中位：
+
+| 层 | attention front | router及ID取回 | 权重读取+复制wall time | 专家/shared及最终残差 |
+|---|---:|---:|---:|---:|
+| 0 | 4.107ms | 0.352ms | 计时前预装载 | 3.842ms |
+| 1 | 4.029ms | 0.377ms | 84.874ms | 5.552ms |
+| 2 | 4.275ms | 0.371ms | 82.405ms | 5.866ms |
+| 3 | 1.890ms | 0.336ms | 78.448ms | 5.264ms |
+
+三层装载中位合计245.73ms，约为283.28ms整体的87%，仅用于判断瓶颈；不同段的中位不能严格相加等同整体中位。日志`read_worker_ms`和`copy_worker_ms`是多个并发线程工作时间之和，不是可相加到关键路径的串行耗时。当前应继续处理实际读取字节和装载路径，单纯优化几毫秒attention无法追回这部分延迟。
+
+**DRAM账目与40层限制**：四层复用一个394.83MiB专家槽。4线程需要32MiB IO暂存，四层router/shared等需32MiB；32专家缓存实际176.89MiB，64专家实际354.65MiB。因此上表对应635.71或813.48MiB，已经把CPU热门缓存计入，没有把文件页缓存漏掉。该数值是显式MoE权重/IO分配之和，**不是整个进程RSS**，未含attention权重/context、图scratch、激活、其他allocator和系统。
+
+如果40层的每层缓存大小与本次四层均值相同，保持单个专家槽、4线程、每层8MiB router/shared缓冲，则MoE侧预算粗估：不放热门缓存约0.73GiB，每层32专家约**2.46GiB**，每层64专家约**4.19GiB**。这是容量外推，不是实测40层峰值；完整模型还要加attention/embedding/激活/系统，不能说“四层813MiB即可装下整个40层”。实际整合应使用**全局固定字节上限的缓存池**，在总DRAM预算内分配各层热门专家，未命中仍按真实路由从闪存读取，而不是给40层无限增加缓存。本轮实现和测试的是固定四层的每层32/64配置，尚未实现全模型动态淘汰。
+
+热门缓存初始化属于冷启动成本：32专家/4线程本次242.01ms，64专家/4线程464.13ms，64专家/8线程443.05ms；均是进程启动时建立四层缓存的一次性时间，未计入标准四层执行，也未隐藏在第一轮预热中。后续连续遍历仍需重新换回第0层，本表已有含首层重载口径。
+
+**精度验证**：所有正式组首末快照的四层hidden、MoE、normalized和cache均有限，最终残差逐元素正确，Top8 ID合法且分数和约为1。无缓存选择性读取、32专家/4线程、最快64专家/8线程的最终hidden对统一FP32四层链均约**11.60127dB**；相对本轮串行整bank对照，最快组两个快照为161.01/162.31dB，maxdiff均1.19209e−7。最省内存的4线程选择性读取为171.22/162.84dB，32专家/4线程为168.51/168.50dB。未观察到本轮装载优化引起的绝对FP32 SQNR下降。
+
+仍不能宣称所有运行逐位一致：64专家/4线程首快照对整bank对照约42.35dB、maxdiff0.00686，末快照恢复约169.18dB；绝对FP32分别11.60367/11.60127dB。本轮整bank4线程也有一次类似小波动，上节O_DIRECT原型已有同类现象。未定位具体kernel/runtime原因，因此保留日志及重复性数据，不将其描述为已修复或零误差。本轮没有测试全模型PPL、AR1 decode或40层。
+
+本轮可复用的结果：DRAM受限优先采用单槽、真实路由、4线程和受预算约束的32专家缓存；64专家模式作为更高内存换性能的选项。该原型把闪存换层耗时降低约一半，但尚未达到全驻留的35ms四层水平。
+
+完整证据位于`llama-output/qwen36-moe-storage-optimization-20261019/`：`RESULTS.csv`、`RESULTS.json`（逐层耗时、物理读取、首末精度和重复性）、`HOT_CALIBRATION.json`（独立校准排名及命中统计）、`MANIFEST.json`（输入context来源、环境、源码及二进制哈希）、正式`final-*.log`和逐层快照。`source/stream_bench.cpp`实现装载优化，`source/moe_factory.h`实现单槽及子图准备，`source/build.sh`复用原优化GGML库构建Android可执行文件；`source/run_device.py`在原已部署bank上串行复现，`source/analyze.py`生成结果。正式配置使用8MiB读块和8次样本，原数据与旧模型未覆盖；本轮只追加测试记录，未改生产推理路径，未commit/push。
+
+#### 专家权重读取与计算流水线：已装载专家先算，后续专家后台读取（2026-10-19）
+
+用户提出在权重使用前提前装载。本轮在前述四层原型上实现了**同层专家级装载/计算重叠**：attention和真实router先执行；IO线程根据本次真实Top8读取专家，某专家的gate/up和down完整到达后发布就绪标记，DSP不再等待本层全部专家装载完成。仍复用同一个394.83MiB专家槽，未另加一整层权重缓冲，仍未接入生产`llama.py`。
+
+原路径是`attention → router → 全部命中专家读完 → MoE计算 → 下一层`；新路径是`attention → router → 后台读取`，与之并行的专家内核按就绪状态执行，读线程继续装载后续专家。IO清单完全来自当次真实router，没有用上一轮测试ID、预测ID或丢弃低权重专家。INT4存储、N4×A8 HMX计算、K/z及attention量化配置不变。
+
+**关键实现及正确性约束**：
+
+1. `source/stream_bench.cpp::initialize_readiness`为所有读取/缓存复制job建立专家依赖计数。必须完成该专家两个bank的所有相关job，才能发布ready。页对齐导致一个job触及相邻专家时，两者都记录依赖，避免专家计算中又被另一个job写到相同payload页。
+2. IO worker完成`O_DIRECT → 普通对齐暂存 → NPU共享槽`后，在ARM侧用`dc cvac`及`dsb ish`清理payload缓存；随后release写ready并清理标记所在缓存行。CPU DRAM热门缓存命中也走相同发布顺序。不是仅用普通bool就假定CPU/DSP自动一致。
+3. 当前专用AR128/256专家协议复用router输出每128字节行中空闲的64字节，放256个ready word；没有改变Top8 ID和score。DSP `moe_storage_wait`按缓存失效和同步后可见的标记等待，配有超时。该padding协议只适用于本固定形状实验，未作为通用算子接口接入。
+4. 在`ggml/src/ggml-hexagon/htp/expert-pipeline.h`的当前专家执行前增加等待；`expert-hybrid.h`原本存在跨专家DMA预取，本轮也在该预取入口检查ready。未就绪时保留下一任务但不发起DMA，轮到它时再等待，避免提前读到旧层/未装载payload。原DDR→VTCM→HMX流水保留。
+5. 首版忙等待能正确执行，但增添开销；改为QuRT允许的最小100μs短休眠。逐专家交替两个bank的读取也降低了吞吐；最终保留按bank连续区间顺序装载，仍逐专家发布ready。程序保留对照选项，正式推荐`IO_EXPERT_GROUP=256`，不是要求256个专家全部ready才计算。
+6. DSP首次完成一个专家后，在另一条空闲缓存行写完成标记并清理；IO worker在自己的时钟上观察该标记。这个观察时间是“至少已有一个专家完成”的时间上界，避免把CPU/DSP不同计数器直接相减，能证明不是只把线程启动并行、实际计算仍全程等待。
+
+先前原型只试过读取和attention重叠；此处是在MoE专家计算内部重叠读取，不能混称同一项优化。这里也没有跨层提前得到下一层的精确专家名单：下一层router仍依赖当前层最终hidden。下一层固定权重/热门专家可提前装载；冷专家若要在router前预取，需要预测并处理误命中，或者额外整层/分组缓冲。这些跨层策略本轮没有实现或计入收益。
+
+**正式性能**：同一SM8750/v79手机、前四层真实链、128-token输入、layer1 scale修复版context，profile关闭。32专家/4线程配置按`legacy→ordered→stream`、`stream→ordered→legacy`、`ordered→legacy→stream`三轮交替，每轮每组1次预热、8次正式样本，各24次。64专家/4线程另做`legacy→stream`与`stream→legacy`两轮，各16次。每组仍是4个IO线程、每线程8MiB暂存；热门名单沿用独立train/calibration频率。
+
+| 每层热门缓存 | 本轮原路径四层中位 | 同读取/发布协议但串行 | 专家流水线四层中位 | 对原路径降低 | 流水线P95 | MoE权重及IO工作内存 |
+|---|---:|---:|---:|---:|---:|---:|
+| 32专家，4线程，各24样本 | 324.20896ms | 327.91864ms | **308.43763ms** | **4.86%** | 313.69671ms | **635.71MiB** |
+| 64专家，4线程，各16样本 | 293.80435ms | 未单独测 | **273.45013ms** | **6.93%** | 288.70736ms | **813.48MiB** |
+
+32专家对同协议串行减少19.48ms/5.94%；对已有原路径净减少15.77ms/4.86%，差额包括缓存清理、就绪协议和启动管理开销。三轮流水线中位308.577/307.929/309.049ms，原路径324.209/327.187/320.629ms；同协议串行某轮出现较高读取波动，不能只引用其355ms当对照来放大收益。64专家两轮流水线分别273.121/275.078ms，原路径298.145/290.406ms。本轮64专家串行与上节历史283.28ms有波动差异，收益使用本轮交替对照，不跨轮拼接。
+
+计入第0层完整专家bank重载，32专家原路径396.20508→流水线**380.79193ms**；64专家360.11094→**341.86586ms**。这些时间仍不含context/图创建、一次性热门缓存初始化、embedding、LM head和采样，不是40层模型的完整TTFT。四个QNN attention context及router/shared缓冲继续驻留。
+
+物理读取没有靠丢专家减少：32专家两种路径的计时内读取中位均795107328B；64专家均657313792B。个别样本因已有数值波动导致少量真实路由变化，按该次ID规划的字节数相应变化。逐样本`/proc/self/io::read_bytes`与实际job读取字节一致，bank页缓存均为`0→0`。工作内存与之前相同；ready/progress只复用padding和少量任务管理内存，没有再开394.83MiB整层槽。表中内存仍不是整个进程RSS，未含attention、scratch、激活及系统；不能将四层预算直接当作完整40层预算。
+
+**直接重叠证据，32专家流水线的各段独立中位**：
+
+| 换入层 | 首个任意专家ready | IO线程观察到已有专家完成 | 全部装载完成 | MoE调用耗时（含等待） |
+|---|---:|---:|---:|---:|
+| 1 | 61.174ms | **70.914ms** | 100.657ms | 101.087ms |
+| 2 | 61.993ms | **62.488ms** | 95.450ms | 95.806ms |
+| 3 | 58.468ms | **59.634ms** | 90.607ms | 90.964ms |
+
+表前三列相对各层IO开始计时；不是完整四层开始的时间。所有正式流水线样本的换入层均观察到`0 < compute_observed_ms < io_ms`，且完成装载的专家数等于真实命中并集。由此验证后续权重还在读取时，已有专家完成了计算。`moe_ms`现在包含权重ready等待，和`io_ms`重叠，不能再按串行段相加；多线程`read/copy/clean_worker_ms`同样不是可相加的wall time。
+
+收益只有几个百分点的原因是剩余瓶颈仍为**约0.66～0.80GB的实际冷读取**。32专家原路径三层装载中位合计约284.82ms，而对应MoE计算合计约18.06ms；流水线主要覆盖这18ms左右的计算，不能把280ms量级的存储搬运全部藏进几十毫秒计算。若要大幅继续降低完整长提示prefill开销，应同时研究在固定内存预算内提高缓存命中，或对多个AR128块按层复用已装载权重，减少同一权重反复读取；这些尚未实测，未计入本轮性能。
+
+**精度**：正式各组首末快照的四层hidden、normalized、MoE及cache均有限，最终残差逐元素正确；32专家组还检查Top8 ID范围、非负score及score和约1。最终hidden对同一FP32四层参考仍约**11.60dB**。32专家流水线6份末层快照中5份约11.60127dB，1份11.60347dB；64专家4份约11.60127～11.60158dB，没有观察到绝对FP32 SQNR恶化。没有重测完整模型PPL。
+
+仍保留此前native/runtime重复性限制：32专家流水线有一份对稳定原路径快照仅40.85dB/maxdiff0.00697，其余约158dB；64专家原路径自己也有首末约41dB的变化。不是所有组都逐位一致，不能据此宣称已修复历史运行波动或零附加误差。完整绝对SQNR和跨路径比较都保存在JSON中；64专家跨路径控制使用`cache64-b-legacy.sample0`，同时保留另一轮原路径的波动快照。
+
+测试时手机文件系统一度剩余不足1GB；只删除了**已完整拉回主机的本轮/上一轮实验快照副本**，释放至约1.7GB，模型和专家bank未动。正式快照文件在计时外`fsync`，避免前一快照的后台写入直接干扰后续样本。设备仍接近满盘，实测包含本机当时存储状态，不当作设备标称吞吐上限。
+
+产物：`llama-output/qwen36-moe-storage-pipeline-20261019/RESULTS.json`、`RESULTS.csv`（32专家正式交替组）、`CACHE64_RESULTS.json`、`MANIFEST.json`、`formal-r*.log`、`cache64-*.log`和首末逐层快照。`source/run_formal.py`复现32专家交替测试，`source/run_device.py`可设置`HOT_EXPERTS=64`、`IO_EXPERT_GROUP=256`复现64专家组。`source/build.sh`单独构建修改后的HTP库与Android原型，修改后的GGML源码在独立`ggml/`目录；旧库未覆盖。忙等待、细粒度读取顺序等探索日志保留，但不混入正式成绩。原型尚未整合到`llama.py`，未运行完整40层、AR1 decode或全模型PPL，未commit/push。
+
+#### 手机存储带宽诊断：连续读、真实专家区间与完整流水线（2026-10-19）
+
+用户追问流水线是否把“SSD带宽”用满。本轮没有直接将既有2.6～2.8GB/s装载吞吐当作硬件上限，而是增加独立只读探针，对同一手机、同一批专家bank测试连续读取、真实miss区间、CPU→RPC缓冲复制、缓存同步及Linux native AIO队列深度。
+
+设备`431e3c37`的内部块设备路径含`1d84000.ufshc`，测的是**手机内部UFS文件系统路径**，不是主机NVMe或USB传输速度。`/proc/diskstats`、`/sys/block/sda/stat`均返回Permission denied，没有拿到硬件busy/util计数；下文百分比是实测文件吞吐之比，**不是SSD/NAND硬件利用率百分比，也没有证明理论硬件峰值**。
+
+**测试控制**：不新建大数据文件、不改专家权重，仅对已部署bank执行`O_DIRECT`读取，所有测试串行。每组1次预热、5次正式样本；`mincore`在所有正式组开始/结束均为0，逐样本`/proc/self/io::read_bytes`与规划页字节数完全一致。该计数证明绕过文件页缓存的存储IO计账，不是NAND总线流量计。读取完成后只校验每块首尾字，属于诊断采样校验，未用它宣称全文件哈希一致。
+
+三类输入：
+
+- `full.plan`：layer1/2/3两个大bank的全部数据，1214631936B。连续区间分成最大8MiB请求，可跨层并发，用于观察本文件路径的大块读取能力。
+- `miss64.plan`：来自前轮稳定真实路由快照及独立训练集top64缓存名单。保留原偏移、原bank、每层屏障，共657313792B冷读；按8MiB上限拆成**369个磁盘请求**，平均1.78MB、中位1.06496MB。装载对照另复制284016640B真实缓存页到RPC槽，总写入权重槽约941MB，匹配原访问清单。请求分布由实际命中/未命中空洞形成，不能用8MiB上限代表每次请求都连续读8MiB。
+- `compact.plan`：仍读取原文件，只将每文件同样的冷读字节数改为连续前缀，保留相同三层屏障，总量仍657313792B、8MiB上限下81个请求。**这是地址布局对照，不是实际被选专家的权重，也没有导出或推理重排后的模型**，只量化访问地址形状的潜在损失。
+
+**并发扩展结果，GB/s为十进制，每格为5个样本中位**：
+
+| 同步pread线程数 | 整bank连续纯读 | 真实miss64区间纯读 |
+|---|---:|---:|
+| 1 | 2.8545GB/s | 1.8909GB/s |
+| 2 | **3.3521GB/s** | 2.5609GB/s |
+| 4 | 3.2997GB/s | 2.6677GB/s |
+| 8 | 3.2537GB/s | 2.7085GB/s |
+| 16 | 2.8144GB/s | 2.5970GB/s |
+
+| Linux AIO应用队列深度 | 真实miss64区间纯读 |
+|---|---:|
+| 4 | 2.7358GB/s |
+| 8 | **2.7401GB/s** |
+| 16 | 2.7249GB/s |
+| 32 | 2.7349GB/s |
+
+同步线程数/异步应用队列深度表示应用最多提交的读请求，不等于物理NAND队列深度。并发继续增加没有得到显著增长。1MiB请求下，真实区间pread8为2.6498GB/s、AIO16为2.7125GB/s；2MiB请求下pread4为2.6607GB/s、AIO8为2.7329GB/s，均未突破8MiB上限方案的吞吐平台。因此本轮不以继续增加读线程、缩小读块或加大AIO深度作为已验证的优化。
+
+**分离复制/同步开销**：
+
+| 路径 | 数据范围 | 中位耗时 | 以冷读字节计算的有效吞吐 |
+|---|---|---:|---:|
+| 真实区间，AIO8，仅冷读 | 657.31MB | 239.889ms | **2.7401GB/s** |
+| 真实区间，4线程，含热页复制到cached RPC槽 | 冷读657.31MB＋热页复制284.02MB | 245.728ms | 2.6750GB/s |
+| 上项再加ARM缓存clean | 同上 | 244.807ms | 2.6850GB/s |
+| 真实区间，8线程，含复制和clean | 同上 | 242.666ms | 2.7087GB/s |
+| 等字节连续地址对照，AIO8，仅冷读 | 657.31MB，地址不同 | **192.926ms** | **3.4071GB/s** |
+
+复制和clean探针通过与原路径相同heap/flags分配cached RPC缓冲，但未创建QNN context、DSP导入或执行计算；该表用于隔离装载路径，不是完整模型对照。copy与clean的几毫秒差异在设备运行波动内，不能写成“缓存同步反而加速”。相对纯读，复制和同步的wall-time增加较小，因为多线程执行已存在重叠；日志中的worker时间之和不能直接加到端到端时间上。
+
+所有纯IO测试结束后，单独重跑原四层64专家缓存/4线程流水线，1预热＋8正式样本：整体中位**271.17234ms**、P95 277.48963ms；计入首层重载338.24719ms。逐样本`冷读字节 / 三个换入层io_ms之和`的中位为**2.62734GB/s**，仍保持真实路由、原量化及0→0文件页缓存，各换入层仍观察到专家计算早于IO完成。模型/权重未改，性能变化属于本轮设备状态下的重测，不能把273.45→271.17ms算作新增代码优化。
+
+由此得到两个不同结论：
+
+1. 当前完整装载约为本轮整bank连续纯读最高值的**78.38%**，相对等字节连续地址对照为**77.11%**。因此尚未达到该手机文件路径能实现的连续吞吐。
+2. 当前完整装载约为本轮**真实专家区间纯读最好值的95.89%**。保留现在的访问布局时，IO、复制、同步和计算流水线已经接近本轮观测到的路径平台；仅把现有队列继续加深，没有观察到成倍空间。该比值受不同测试的时序、DVFS及负载影响，是近似路径比较，不是硬件%util。
+
+当前应优先研究**减少实际冷读字节与改善bank地址布局**。热门专家在按ID排列的bank中分散，跳过缓存和未命中专家后形成许多空洞；可以离线把固定热点集中为连续区域，再按校准集共现关系排列其余专家，保留“逻辑expert ID→物理offset”索引。该建议由地址对照推断，本轮尚未实现重排bank或验证其精度/端到端收益。即使按本轮3.407GB/s连续读能力估算，657MB冷读本身仍约**193ms**，尚未计入其他开销；单靠补齐这部分带宽不能回到全驻留35ms四层。更大的prefill收益还需减少重复搬运，例如受总内存预算约束的缓存或多个AR128块的按层权重复用，不能仅依赖更早启动读取。
+
+存储空间本轮约剩2.7GB，仍接近满盘；结果包含当时文件系统/映射/加密路径和设备时钟状态，不是裸UFS峰值。初轮探针有线程捕获错误导致进程退出，已修复并保存`failed-*`日志，失败样本及smoke结果均未混入正式统计。没有对手机执行root、修改系统队列或覆盖旧模型。
+
+证据位于`llama-output/qwen36-storage-bandwidth-20261019/`：`RESULTS.csv`、`RESULTS.json`（全部31组正式IO对照及模型重测）、`PLANS.json`、四份`.plan`、`MANIFEST.json`、`DEVICE_INFO.txt`、`model-stream.log`及各配置日志；`source/make_plans.py`重建访问清单，`source/io_probe.cpp`实现同步/内核AIO及RPC装载隔离测试，`source/run_device.py`按配置串行测量。原量化、生产推理路径及专家bank未改，未commit/push。
+
+#### 两层专家驻留：先处理完全部AR128块，再切换下一组（2026-10-19）
+
+按用户提出的两层驻留方案，新增独立四层原型，在同一SM8750/v79手机上实测。输入使用真实Qwen3.6-35B-A3B前四层的同一段**1024-token文本embedding**，每次图调用仍为**AR128**，共8块；前三层为GDN，第4层为全注意力。不是8个互相独立的冷128-token请求，也不是完整40层模型结果。
+
+两种调度使用相同的两个专家共享槽、四层attention context、原生INT4专家bank、router/shared权重和UINT16 cache。区别只在循环顺序：
+
+```text
+逐块换层：
+  对每个128-token块：
+    读取L0/L1专家 → 运行L0/L1
+    读取L2/L3专家 → 运行L2/L3
+
+两层驻留：
+  读取L0/L1专家 → 全部8块依次运行L0/L1，保留各块hidden
+  读取L2/L3专家 → 全部8块依次运行L2/L3
+```
+
+四层专家装载由**32次减为4次**。每次装载当前层全部256个专家；实际计算仍为每token的真实Top8以及shared expert，没有裁剪模型、预测路由或丢弃专家。两个大bank从手机内部UFS经2个`pread`线程、各8MiB对齐暂存复制到RPC专家槽；使用`O_DIRECT`。本轮没有热门专家额外缓存，也没有跨层预取/读算重叠，因此比较的是相同整bank装载策略下的调度收益，**不能把倍数直接套到上一节的top64热门缓存流水线**。
+
+**先补齐因果计算及缓存反馈**：
+
+- 沿用已修复layer1 scale的三个GDN context，跨块分别保留conv/recurrent state。conv输出与输入的量化网格不同，按各自校准scale/offset建立转换表，反馈前重新编码；没有直接复制不匹配的UINT16码值。state网格相同也走等价映射。
+- 旧第4层只有冷128-token全注意力，本轮单独导出AR128＋896-token历史K/V输入的新context。历史右对齐，逐块更新K/V、RoPE绝对位置和因果mask；输出128条新K/V后保存最近896条供下一块读取。固定容量1024可覆盖本次完整提示。
+- FP32下，分块normalized输出对完整1024-token参考的SQNR：GDN层0/1/2分别**125.865/128.234/128.684dB**，全注意力**125.724dB**；最大绝对误差均不超过1.24e-5。由此核对分块缓存和位置语义，没有用错误的冷图循环代替prefill。
+
+**正式性能，1次预热＋3次计时，中位数**：两条换入路径的首次专家读取全部计入计时；context/图创建和一次性router/shared装载在计时外。额外四层全驻留组只作为不读闪存的计算对照，首次专家装载在计时外。最终轮关闭逐层trace；输出/cache快照在计时外关闭文件并`fsync`，完成后才开始下一样本。
+
+| 调度 | 1024-token四层总耗时 | 最小～最大 | 计时内实际读取 | 专家槽分配 |
+|---|---:|---:|---:|---:|
+| 两槽，逐块换层 | **3929.764ms** | 3865.977～3974.172ms | **10.9241GiB** | 789.66MiB |
+| 两槽，两层处理完全部8块再换组 | **783.511ms** | 781.142～795.753ms | **1.3655GiB** | 789.66MiB |
+| 四槽，四层全常驻，计时内无权重读取 | **342.935ms** | 341.044～342.954ms | 0 | 1579.31MiB |
+
+两层驻留对同装载策略逐块对照**加速5.016倍、耗时减少80.06%**，物理读取计账由11729698816B降至1466212352B，严格为八分之一。该计数来自`/proc/self/io::read_bytes`；少量页对齐差异相对逻辑bank总大小1466194944B单独保留。不是把文件页缓存读命中当作UFS读取，也不是USB或主机SSD吞吐。
+
+两层驻留各段独立中位：attention（含两侧norm、首次残差及输入交接）**143.449ms**，MoE（含router/shared/末次残差）**193.052ms**，cache反馈**7.274ms**，专家读取及复制**438.240ms**。独立中位不能严格相加成总中位。闪存装载仍约占总时间56%；计算段与四层全驻留对照接近，主要收益来自避免反复搬相同专家权重。
+
+**内存预算**：两个固定共享专家槽合计828014592B＝**789.66MiB**；四层router/shared等metadata槽合计32MiB；两路完整prompt hidden缓冲16MiB；IO暂存16MiB，上述明确分配合计**853.66MiB**。此外还有输入embedding副本8MiB、四层attention常量/context、GGML scratch、QNN IO、全部层cache以及运行库；853.66MiB不是总进程/总手机DRAM。RPC/ION分配也不能仅靠`VmRSS`完整统计。专家槽只保留两层，四层attention和router/shared继续常驻。没有复制一份四层专家作为CPU热缓存。
+
+**数值重复性与精度**：原最快MoE使用多线程按完成顺序累加，逐层trace看到层0normalized逐位相同、层0hidden出现约1e-8差异，后续量化/递归会把差异放大；全驻留重复运行也能复现。因此本轮正式对照统一设置现有`MOE_ACCUMULATE=0`，采用固定Top8槽顺序合并，专家仍为原生INT4＋A8计算，未改成FP16专家MatMul。
+
+最终带`fsync`的三组各3次测试，共9个完整1024-token hidden和所有最终cache，**相对逐块组sample0全部逐位一致、全部有限**。三组最终hidden对同一FP32四层参考均为**12.216008dB**。两层驻留按第0～7块分别为11.599/12.136/12.449/12.117/12.778/12.305/11.808/12.681dB，未出现随调度切换新增的误差。这证明本次受控样本下调度等价；12.216dB是已有量化链的绝对误差，不能称为无量化损失。
+
+同时保留探索阶段的重复性限制：未固定合并顺序时，同一调度的完整prompt重复SQNR曾低至约22.95dB；固定合并顺序的较早一轮仍观察到一个MoE层输出差异，经后续层放大到58.96dB。最终9份逐位相同不等于已证明native内核所有输入/所有重复运行完全确定。本轮没有修改这些底层内核，没有重测完整模型PPL。
+
+**适用范围**：本次减少读取的倍率来自**1024÷128＝8块的权重复用**。单次总输入只有128 token时，两种顺序都必须装载四层专家一次，不能得到八倍IO收益；AR1 decode也不能把尚未生成的后续token提前按层批处理。上下文更长时仍需维护全部历史KV和每层独立state；只测了1024和前四层，未把四层结果外推为完整40层端到端成绩。旧35.31ms对应冷128-token/不同全注意力图，本轮342.94ms对应带历史KV的1024-token四层，二者不能直接混用。
+
+产物：`llama-output/qwen36-two-layer-residency-20261019/RESULTS.json`、`RESULTS.csv`、`STAGES.csv`、`MANIFEST.json`、`DEVICE_CONTEXTS.txt`、`FP32_GDN_CAUSAL_PARITY.json`、`final-{group,chunk,resident}.log`和`results/final-*`快照。探索日志和`before-fsync/`单独保留，不混入正式统计。`source/residency.cpp`实现两槽调度，`source/qnn_front.h`实现量化缓存反馈，`source/export_warm_fa.py`导出历史KV图；`source/build.sh`构建独立Android程序，`source/run_device.py --mode group --samples 3 --name final-group --ordered-combine`复现两层驻留，`source/analyze.py`生成统计。未整合到`llama.py`，生产量化配置、旧专家bank和原生算子库未改，未commit/push。
+
+#### SM8975/V85：QNN 2.48.1＋设备ODM库兼容性实测（2026-10-20）
+
+设备`A7SR026915000282`，`ro.soc.model=SM8975`、`ro.board.platform=art`，产品名WKL-AN20。按用户指定使用`/hunter/qnn_sdk/src/backends/qnn/2.48.1.260715`，重新构建隔离的Python 3.11 `PyQnnManagerAdaptor`，编译目标直接为`SM8975/HtpArch.V85`。没有将V85伪装成V81编译。运行时从以下只读系统路径复制库到独立测试目录：
+
+```text
+/odm/lib64/libQnnHtp.so
+/odm/lib64/libQnnHtpV85Stub.so
+/odm/lib64/libQnnSystem.so
+/odm/lib64/rfsa/libQnnHtpV85Skel.so
+```
+
+哈希验证：ODM `libQnnHtp.so`和`libQnnSystem.so`分别与指定2.48.1 SDK的Android版本逐字节一致；HTP build ID为`v2.48.1.260715235057`。SDK确实不包含hexagon-v85/Stub，但主机编译器能够直接编译本轮V85图。设备目录中的V85 Stub/Skel补齐了运行时；`libQnnHtpPrepare.so`也来自相同2.48.1 SDK。未混用2.51运行库。设备端`LD_LIBRARY_PATH`指向独立运行目录，`ADSP_LIBRARY_PATH`包含该目录、`/odm/lib64/rfsa`及系统DSP搜索目录。
+
+**兼容性测试**：每个输入3次预热＋20次计时，profile关闭，下表为同一轮20次调用的均值，不是跨轮性能中位数。客户端输入输出均为FP32，包含ExecuTorch调用、转换及拷贝；不含图创建和模型加载。所有新图均断言只有一个`QnnBackend` delegate，plan中无host operator。
+
+| 测试 | 输入/形状 | 平均调用耗时 | 输出检查 |
+|---|---|---:|---|
+| FP16 Add | 三组`[1,4,8,8]`输入 | 1.107/0.857/0.970ms | 三组全部逐元素一致 |
+| 当前`ChunkGDN` | AR128，32 heads，K/V维128，warm state | **4.1909ms** | 对独立FP32 recurrence：attention **59.962dB**，state **59.022dB** |
+| 真实层0专家0，W4A8 SwiGLU | `[1,128,2048]`；GU `[1024,2048]`，down `[2048,512]` | **1.43495ms** | 全部有限；对PyTorch QDQ 25.873dB |
+| 相同专家，W4A16 SwiGLU | 相同输入和真实权重 | **1.23025ms** | 全部有限；对PyTorch QDQ 69.763dB |
+
+GDN测试使用当前生产`ChunkGDN`代码，chunk64/inverse_leaf32，随机归一化q/k、非零初始state；参考用独立逐token FP32 recurrence，另保存相同PyTorch混合精度图输出。device对该PyTorch输出的SQNR为attention62.550dB/state60.012dB，最大绝对误差对FP32为1.5685e-5/1.9995e-4。此处不是完整linear-attention，没有输入/输出投影或MoE；也不是之前UINT16 state、不同heads/IO/内核配置下0.832ms测试的同口径复测。
+
+专家权重来自`/hunter/model/Qwen/Qwen3.6-35B-A3B`，只读取第0层第0个专家，测试整个GU→SwiGLU→down。使用12组随机输入校准、W4 per-channel；这是格式及执行兼容性检查，**不是生产GPTQ/group32精度评估，不含router、shared expert、Top8混合或256专家读取**。对源FP32输出的SQNR为W4A8 11.118dB、W4A16 11.321dB，主要包含本次粗粒度W4校准的误差，不能用来替代原整层/整模PPL或SQNR。W4A8本次慢于W4A16也不能外推完整MoE吞吐；未根据权重存储位宽推断具体HMX指令。
+
+**已有MoE图的实际阻塞**：拉取设备`qwen35_moe_sm8975_20261020_probe/candidate.bin`，metadata显示编译版本`v2.49.40.260810104044`、coreAPI2.38。使用本轮2.48.1库加载时，ExpertGather和DeltaNet的包注册接口均返回0，但`contextCreateFromBinary`返回**5000**，明确报`Using newer context binary on old SDK`。因此这份图不能仅靠替换V85 Stub/Skel使用，必须拿到源图并用2.48.1重新导出。注册接口返回0只证明路径已登记，不证明DSP侧算子执行成功；该旧MoE图本轮没有执行推理。
+
+本轮开始时，上节四层原型目录`llama-output/qwen36-two-layer-residency-20261019`以及依赖的GGML优化库/bank目录已不在当前工作区，已向用户询问迁移/归档路径。没有恢复原型前，不报告SM8975的完整四层、两层驻留、UFS读取或完整模型性能，也没有把单专家1.43ms当成完整MoE耗时。
+
+产物位于`llama-output/sm8975-sdk2481-device-20261020/`：`RESULTS.json`汇总全部比较，`MANIFEST.json`保存源码/主机绑定/库哈希，`DEVICE_LIBS.txt`记录实际部署库和设备，`existing-moe-probe.log`保存5000失败原因，`candidate-metadata.json`保存旧图版本；各测试目录有独立PTE/context、输入、FP32/QDQ参考、device输出和runner日志。`source/build_host.sh`构建2.48.1绑定，`export_gdn.py`与`export_expert.py`重建新图，`run_case.py`部署并验证。生产SDK默认值、模型量化配置和用户已有改动未覆盖；未commit/push。
+
+### SM8975/V85：重建真实四层 MoE 与两层驻留测试（2026-10-20）
+
+用户确认旧原型已删除并允许重新导出后，从`/hunter/model/Qwen/Qwen3.6-35B-A3B`重新读取真实第0～3层权重，完成三层GDN＋一层full attention、四套router/shared和每层256专家/真实Top8的设备测试。SDK固定为`/hunter/qnn_sdk/src/backends/qnn/2.48.1.260715`，设备为`A7SR026915000282`、SM8975/V85；运行库继续使用上一节核对过的ODM HTP/System/V85 Stub/Skel。没有使用2.49生成的旧context。
+
+**本轮重建版本与历史版本的区别**：已删除的不只有PTE，也包括原GGML专家优化内核及GPTQ bank。本轮重新实现了独立FastRPC整数专家服务，权重为packed INT4，激活动态A8，使用原生N4×UINT8 HMX；GU按1024维、down按512维量化，FP32 SIMD后处理和固定Top8槽顺序合并。专家没有改用FP16 MatMul。新bank采用CUDA激活加权MSE的RTN网格，**没有恢复成历史GPTQ bank**；router/shared使用FP16 QNN图。因此下面是新重建版本内部的受控比较，不能将与历史35.31ms或342.94ms的差异全部归因于SM8975硬件。历史35.31ms还使用了不同的冷full-attention图。
+
+注意力沿用当前优化配置：K/z及depthwise conv W8，其他投影W4/group32、A16，稳定微小weight scale并对out_proj做fixed-grid GPTQ；prefill GDN使用当前`ChunkGDN`的FP16内部计算。conv/recurrent state和full-attention K/V边界均保持UINT16。四个attention PTE及四个router/shared PTE均检查为单个QNN delegate，无host operator；专家由独立原生服务执行，尚未拼成完整35B的单一PTE。
+
+**计时范围**：从已生成的真实token embedding开始，经过四个完整attention/MoE block，包含两侧norm、两次残差、跨图IO、同步及cache反馈。128-token输入是一次完整四层prefill；1024-token输入按8个AR128块处理。tokenizer、embedding lookup、最终norm/LM head、context创建和一次性router/shared装载在计时外。全驻留专家预装载在计时外；两种换入调度包含第一次专家读取。每组1次预热＋3次计时，正式数据关闭细粒度profiling，输出和cache快照及`fsync`均在计时外。
+
+| 输入及调度 | 四层整体中位 | 最小～最大 | 专家装载次数 | 计时内物理读取 | 专家槽分配 |
+|---|---:|---:|---:|---:|---:|
+| 128 token，四层全驻留 | **53.668ms** | 52.890～56.375ms | 0 | 0 | 1600.14MiB |
+| 1024 token，四层全驻留 | **412.142ms** | 411.990～412.192ms | 0 | 0 | 1600.14MiB |
+| 1024 token，两层处理完8块再换组 | **966.963ms** | 934.400～1023.812ms | 4 | **1.56264GiB** | **800.07MiB** |
+| 1024 token，每块依次换入两组 | **4764.748ms** | 4751.118～4945.724ms | 32 | **12.50110GiB** | **800.07MiB** |
+
+两层驻留相对相同换入策略的逐块对照**加速4.928倍**，物理读取严格减少为八分之一：`1677869056B`对`13422952448B`。读取计数来自`/proc/self/io::read_bytes`，不是CPU页缓存命中数。每次加载一层全部256专家，计算仍只执行真实Top8；没有热门专家缓存、预测路由、丢弃小score或跨层IO预取。专家bank文件通过手机内部UFS的`O_DIRECT`读取，两条`pread`线程各用8MiB暂存并复制到共享专家槽，CPU发布后同步DMA buffer，DSP换入后失效旧bank缓存。
+
+| 1024-token调度 | attention中位 | MoE中位 | cache反馈中位 | 读取及CPU复制中位 |
+|---|---:|---:|---:|---:|
+| 四层全驻留 | 132.941ms | 270.299ms | 6.525ms | 0 |
+| 两层驻留 | 136.275ms | 306.702ms | 9.444ms | 511.026ms |
+| 逐块换入 | 143.974ms | 508.910ms | 17.176ms | 4089.124ms |
+
+各段独立中位不可严格相加成总中位；MoE段包含router/shared、整数专家、末次残差和交接，DSP bank缓存失效也计入该段。两种换入方式的有效读取/复制吞吐都约**3.06GiB/s**，与本轮直接读取的字节数一致。这个数包含文件读取及复制，不是存储器裸峰值或硬件总线PMU。两层驻留的主要收益来自复用8个块的专家权重，未证明UFS已经达到硬件峰值。800.07MiB仅为两套专家槽，此外还有四层attention常量/context、router/shared、全部state/KV、原生工作区、IO暂存和hidden，不是进程或整机总DRAM。
+
+**缓存与数值验证**：
+
+- 三层GDN分别维护自己的conv/recurrent state；full attention保留896条历史K/V、使用绝对RoPE位置和因果mask。cache输出按各自校准scale/offset映射到输入网格；网格完全相同时直接复制，不把不同量化网格的码值直接反馈。
+- CUDA FP32分块对完整1024-token参考的normalized SQNR，层0～3分别为**126.014/128.082/128.405/125.650dB**，最大绝对差不超过`1.24e-5`。这是同一真实权重FP32实现的因果分块检查，没有把量化输出当作FP32参考。
+- 1024 token的三种调度各3次，**共9个完整hidden及全部最终cache逐位相同、输出全部有限**。两层驻留没有新增可见数值误差。
+- 128-token最终hidden对FP32四层链为**12.924dB**；1024-token整体为**13.830dB**。1024-token按第0～7块分别为12.924/14.511/13.501/14.470/14.685/14.234/12.674/14.005dB。这里仍有原有量化误差，不能称为FP32精度；本轮未测完整模型PPL、图像输入、decode或40层。
+
+**恢复执行路径时定位和修复的性能问题**：
+
+1. 新QHPI实验的context在设备加载阶段返回5005，未用于正式结果；普通动态W4 bank输入还触发整块TCM迁移限制。最终使用FastRPC映射外部专家bank，QNN继续执行attention/router/shared，独立原生服务执行专家。没有据此断言V85不支持所有QHPI算子。
+2. 初版原生专家服务使用DDR标量读取、普通复制和逐元素除法打包，层0专家计算段约123～126ms。分段profile显示主要时间在搬运/打包，HMX服务代码段仅约0.24～0.29ms；后者不是HMX硬件busy时间，重叠worker指标不可相加当总时间。
+3. 改为DMA读取N4权重、输入及scale/code和，在VTCM做HVX最大值归约、A8打包、零点修正与输出缩放。修正了signed INT16解包的通道排列。验证样本上新输出对标量版**逐字节一致**，专家计算段降到约7.8～8.0ms；此数字不含QNN router/shared，不能当完整MoE或四层延迟。
+4. 将主机cache反馈的网格相同路径改为直接复制，其他路径先批量复制再在普通主机内存中查表。四层AR128的cache反馈由探索版约35ms降到正式中位1.046ms。首次残差及跨层hidden拷贝仍包含在整体计时中。
+
+新原型位于`llama-output/qwen36-four-layer-sm8975-20261020/`。`RESULTS.json`含范围、精度和汇总，`RESULTS.csv`和`SAMPLES.csv`保留汇总/逐样本时间，`CAUSAL_PARITY.json`保留FP32分块检查，`MANIFEST.json`记录源码、二进制、输入和bank的SHA256；正式日志为`final-resident128.log`、`final-resident.log`、`final-group.log`、`final-chunk.log`，`results/`保留9组完整输出/cache。
+
+实现入口：`source/export_fronts.py`导出校准过的attention，`prepare_banks.py`生成真实专家N4 bank，`export_moe.py`导出router/shared；`IntegerMoE.cpp::execute/projection/prepare_activations`实现原生专家调度、DMA/HMX和HVX量化，`integer_rpc_impl.cpp`负责VTCM/QuRT/FastRPC，`residency.cpp`负责两层驻留及缓存反馈，`qnn_front.h`负责QNN元数据/共享IO。原生服务仍有进一步优化空间，例如持久worker及双缓冲预取；没有宣称恢复了已删除旧内核的全部优化。
+
+环境按2.48.1设置后，重建依次运行`prepare_reference.py`、`export_fronts.py`、`prepare_banks.py`、`export_moe.py`、`build_native.sh`、`build_runner.sh`。`source/build_host.sh`可独立构建2.48.1绑定；本轮绑定副本与实际校准文本也保存在新目录内。已有产物可用以下命令复测两层驻留，另外将`--mode`改成`resident`或`chunk`进行相同口径对照：
+
+```bash
+conda activate et_npu
+python llama-output/qwen36-four-layer-sm8975-20261020/source/run_device.py \
+  --setup --mode group --samples 3 --tokens 1024 --name rerun-group
+```
+
+该脚本从设备ODM路径补齐四个运行库，并推送同一SDK的Prepare及本轮产物；原生库使用Hexagon SDK6.7.0.0/Tools21.0.04的V85编译器。`--setup`仅首次部署需要；默认不并行导出/测试。正式`llama.py`、生产量化配置和其他用户改动未覆盖；未commit/push。
+
+### SM8975：纠正重建版运行路径的性能回退（2026-10-20）
+
+用户指出上一节性能不符合预期后，保留原始二进制，在**同一台SM8975、同一SDK2.48.1、同一组四层PTE/N4 bank和真实输入**上重新建立优化前后对照。没有重新校准、更改量化精度、减少Top8或修改attention图。上一节的53.668ms来自另一批3个样本，本轮原始版5个AR128样本的中位为52.688ms；原记录保留，不用新的采样覆盖旧数据。
+
+本轮发现的是重建实现的适配和搬运问题。它仍不能用于判断SM8975与历史SM8750的硬件优劣：历史35.31ms使用的原生内核及GPTQ/裁剪bank已经删除，本轮的MSE N4 bank与原生服务是另一套实现。
+
+**实际资源与功耗配置检查**：设备API返回8个128-byte HVX单元、12个硬件线程、12MiB VTCM；此前重建版固定6个HVX worker、4MiB VTCM。诊断时Q6为2304MHz、HMX为1824MHz；补充原生服务独立的compute client/core/bus/HMX性能投票后，观测频率没有进一步上升。因此没有把问题归因于“没有升频”。投票在服务关闭时销毁，VTCM/HMX仍在每次调用完成后归还给QNN。
+
+**排除的开销**：原始版profile中，VTCM申请约0.04～0.05ms、创建7个线程约0.07～0.09ms、释放资源约0.08ms，远小于整个专家调用。线程创建没有在本轮改成持久线程池。HMX服务代码段约0.24～0.28ms，这不是硬件busy计数，不能直接当作HMX利用率。worker计时互相重叠，也不能相加当总耗时。
+
+**保留的修改**：
+
+1. **批量DMA与双缓冲**：原来每个N32块同步搬运，再准备bias、等待HMX、做后处理。现在每个worker使用两块256KiB权重缓冲，当前批参与HMX计算/缩放时预取下一批。GU一次覆盖8个N32块，512维down一次覆盖32个N32块，减少小DMA事务和串行等待。DMA仍直接读取packed N4，专家仍为整数N4×A8 HMX。
+2. **按设备资源配置工作区**：改为8个HVX worker＋1个HMX服务线程，每个worker划分1MiB，共申请8MiB VTCM。尝试过使用12MiB、512KiB双缓冲，未优于8MiB版本，因此没有采用更大的申请。6→8 worker的单独收益有限，主要收益来自搬运路径，不能把全部加速归因于并行度。
+3. **只失效实际缓存的bank区域**：DMA描述符启用了source cache bypass，专家权重/scale/code和/专家header都由DMA读入VTCM。DSP标量访问DDR的区域只有全局magic和offset table，位于开头4KiB。换入时将原先整块400MiB bank的DCACHE invalidate缩到这4KiB；CPU发布共享buffer的同步保持不变。该修改针对当前DMA-only权重路径，不可直接推广到读取权重的其他实现。
+4. **共享跨图IO**：router输入直接注册attention的normalized hidden输出buffer；原生专家直接使用同一hidden及router输出的ids/scores/shared buffer。去掉重复的主机复制，保留各context的内存注册及拥有者生命周期，并检查交接的shape/dtype一致。
+5. **读取与CPU复制重叠**：旧路径的两条线程各自`pread→memcpy→pread`。新路径使用两条读取线程、两条复制线程、4个8MiB暂存块和有界队列，使下一块读取与上一块复制重叠。专家槽仍为两套800.07MiB，IO暂存从16MiB增加到32MiB；不是将四层专家全部常驻，也没有减少读取量。两层处理完所有AR128块后才换组的调度保持不变。
+
+关闭细粒度profiling，核心8次、AR128全驻留5次、其他3次计时，各自先预热1次。范围继续是已生成embedding进入四个完整attention/MoE block至hidden输出，包含残差、交接、cache反馈；不包含tokenizer/embedding lookup/最终head/context创建。resident预装载在计时外，group包含全部换入。快照及fsync在计时外。
+
+| 相同设备上的对照 | 原始版中位 | 修改后中位 | 耗时下降 | 原始/修改后最小～最大 |
+|---|---:|---:|---:|---|
+| 层0原生专家核心，AR128，不含QNN router/shared | 7.784ms | **6.381ms** | **18.0%** | 7.705～8.144 / 6.314～6.456ms |
+| 四层完整AR128，全驻留 | 52.688ms | **45.608ms** | **13.4%** | 51.995～54.919 / 45.099～47.335ms |
+| 四层1024 token，全驻留，8个AR128块 | 412.269ms | **356.963ms** | **13.4%** | 412.054～413.062 / 356.684～357.138ms |
+| 四层1024 token，两层换入，含物理IO | 1061.035ms | **855.596ms** | **19.4%** | 1002.628～1065.088 / 850.876～876.035ms |
+
+前两种全驻留结果对应`source/runtime-fixed/`二进制；加入IO流水线后保存为`source/runtime-fixed-io-pipeline/`，只改变计时外的resident预装载和group读取实现，专家内核与量化保持相同。后一项使用相邻重跑批次`verify-before-group1024`与`verify-after-pipeline-repeat1024`。IO波动明显，上一节原始版group中位为966.963ms；新版pipeline两批中位分别为**850.012/855.596ms**，不能把其中某批差值当作固定硬件收益。
+
+进一步拆分1024-token全驻留，attention约132.5ms保持相近，MoE段从270.734ms降到215.495ms；其收益来自专家和交接。加入IO流水线前，同一新专家版本的group读取/复制中位601.642ms、整体972.093ms；加入后两批读取/复制中位481.234/483.661ms。每批始终读取4层、`1677869056B`，仍为1.56264GiB；有效读取/复制吞吐约3.23GiB/s，包含复制和同步，不是UFS裸峰值。没有在计时中利用页缓存命中冒充物理读取。
+
+**为何增加算力没有按比例缩短时间**：层0纯专家测试使用的真实参考路由在128 token中选中212个不同专家，1024个token/expert组合平均只有4.83个token/专家。按当前bank和16-row分批推算，仅N4矩阵读取就约319.5MiB，另外还有metadata、输入、路由结果写回/合并。这里的212是纯专家参考输入统计，不代表量化四层链每一层的实际路由数。当前主要受权重搬运及细粒度调度限制，不能用芯片TOPS比例预测这个原型的速度，也没有依据宣称已达到SM8975的上限。
+
+**数值与失败尝试**：
+
+- 本轮分析脚本验证了原始/修改后共30条结果记录，其中完整四层28个hidden及全部最终cache、两个纯专家输出，全部与原始正确输出逐字节一致；hidden全部有限。包括6次新IO流水线运行，没有因缩小invalidate范围或共享buffer引入旧数据。
+- 原有最终hidden SQNR保持AR128的12.924dB、1024 token的13.830dB，没有提高或降低；本轮没有重新测试完整模型PPL或decode。
+- `O_DIRECT`直接读入rpcmem专家槽返回`EFAULT(14)`，没有采用；选用正常对齐暂存块＋共享槽复制流水线。
+- 单独请求QNN `DDR_PERF_MODE`返回13006（`ERROR_FAILED`），没有启用，也没有据此判断V85普遍不支持该特性。该实验判断分支没有留在最终runner。
+
+`RUNTIME_FIX_RESULTS.json`、`RUNTIME_FIX_SUMMARIES.csv`、`RUNTIME_FIX_SAMPLES.csv`保留本轮范围、逐样本值、精度和对照；`RUNTIME_FIX_MANIFEST.json`记录原始/修改后源码与二进制SHA256。原始bank/context/输入哈希继续参考上一节`MANIFEST.json`。`source/before-runtime-fix/`保存原始二进制及探索版本；`source/analyze_runtime_fix.py`可重新核对全部输出。细粒度日志包括`core-runtime-before-profile.log`、`hardware-capabilities-profile.log`、`core-8x256-profile.log`；这些开启profile的时间不用于上表。
+
+本轮修改仅保留在上述四层原型与测试记录中，未接入正式`llama.py`、未改变生产模型量化配置，未commit/push。
+
+
+### SM8975：补回冷图、VTCM融合与路由优化（2026-10-21）
+
+继续处理用户指出的“历史SM8750四层约35.6ms，新SM8975反而慢”的问题。实验仍是本地`Qwen3.6-35B-A3B`真实第0～3层、三层GDN＋一层full attention、每层256专家/Top8、AR128，设备`A7SR026915000282`、V85、QNN SDK 2.48.1.260715及设备ODM库。全部修改保留在独立原型`llama-output/qwen36-four-layer-sm8975-20261020/source/`，没有接入生产`llama.py`，没有修改生产模型量化配置，未commit/push。
+
+这轮确认存在可修复的软件开销，不能将上一轮45.6ms解释为硬件上限。校准参数、位宽和Top8保持不变；专家仍为原生N4×动态A8整数HMX，router/shared仍为FP16。下述量化后零通道压缩保留已有整数码和scale，未重新GPTQ或重新校准。
+
+#### 找到并保留的改动
+
+1. **补齐量化后零GU通道压缩**。旧重建bank每层400.035MiB，保留了很多已量化为零的gate/up行。扫描冻结N4码，只移除gate或up整行均为零的SwiGLU通道，并同步移除down对应列；保留其余行的顺序、码、scale与down动态量化网格。不依据“down列为零”单独删通道，避免改变中间激活最大值和A8 scale。layer0去除54257/131072个GU通道；四层bank文件共从1677869056B缩到1526194176B。layer0参考路由的N4矩阵读取推算由319.5MiB降至205.8125MiB（cap16→32也在其中），这不是DDR硬件计数。压缩bank仍按128B/4096B对齐，支持原有O_DIRECT换入。
+2. **输入A8只准备一次**。128个token的hidden一次性动态量化，8个worker各处理16行；之后按专家路由gather和重排HMX输入，消除Top8重复读hidden及重复求最大值/量化。A8码在VTCM使用I16容器存放，节省工作区，实际计算仍是A8，没有改成16位激活运算。
+3. **GU后处理与SwiGLU融合，复用临时空间**。gate块先写入工作区，up块到达时直接生成gate×sigmoid(gate)×up，覆盖gate；GU与down的metadata寿命不重叠，共用40KiB。每专家分批上限32行，匹配HMX的M32 tile，减少超过16行时的重复权重读取。
+4. **使用全部12MiB VTCM保存固定Top8结果**。最终布局为8×448KiB worker区、512KiB输入码和8MiB路由结果。全部Top8槽留在片上，最后按slot0→7固定顺序相加，消除8MiB结果写DDR后再读回的路径。每worker双64KiB权重缓冲，GU/down分别最多批量提交2/8个N32块，减少HMX请求同步。曾试过1MiB到达顺序累加，但微小FP32顺序变化会被后续PTQ/TopK放大，最终未采用。
+5. **修正cold AR128误走warm FA图**。原重建版即使只有128个新token且无历史，第3层仍计算896个masked历史位置＋128个新位置。本轮从冻结Q/DQ图去掉历史K/V concat，仅将相关KV形状改为128，权重、scale/zero point及因果语义保持。该独立cold图仅用于128-token冷测试，1024-token实验继续使用原1024列warm图。CPU冻结图对照误差约96～99dB、cache相等；设备上本次所有最终hidden/cache与原warm路径逐字节相同。没有在生产PTE中重新加入短上下文方法。
+6. **FastRPC持久映射与描述符调用**。由每次传入多块MiB级sequence，改为初始化/首次使用时映射buffer，调用时只传fd、bank代次和槽位。复用QNN已注册的hidden、ids/scores/shared、residual；明确处理`AEE_EALREADY(26)`，其他错误仍检查。DSP共享/残差输入失效与输出flush、CPU读同步保留。最终残差在DSP按原括号顺序执行；中间三层hidden直接绑定原生输出供下一层QNN读取，CPU只读取最后一层，不再每层复制。
+7. **持久QuRT线程与一次路由分组**。8个HVX worker和1个HMX服务线程在原生服务打开时创建，以信号量等待任务；VTCM/HMX仍逐调用申请/释放，空闲线程不持有HVX/HMX。原来每个专家都扫描128×8个索引，改为worker0一次构建按专家分组的CSR表，再按各专家的offset读取token/slot。表保留原token/slot顺序，放在worker0原有padding中，不增加VTCM申请。
+8. **修复共享映射退出顺序**。持久HAP映射曾使QNN退出时报告`fastrpc memory failed to unmap`。最终先关闭原生服务、归还HAP引用，再由QNN注销共享buffer；只解除自己创建的FastRPC映射，不解除QNN已有映射。纯专家、cold、1024连续prefill和两层换入复测均正常退出，unmap警告为0。
+
+#### 正式性能与口径
+
+计时从预生成embedding进入四层开始，到最终hidden完成，包括两侧norm、首次及最终残差、router/shared/Top8专家、运行时交接和cache反馈。排除tokenizer、embedding lookup、最终LM head、模型/context创建及输出文件落盘。resident权重预加载在计时外；group在计时内完整读取四层bank，两层处理全部8个AR128块后再换下一组。没有实际运行完整40层、decode或图片。
+
+表格采用最终源码重新构建后的`release-v85-csr-*`批次；此前`final-v85-csr-*`批次也保留，未覆盖。全部正式结果关闭profiling。cold32次、warm128与1024 resident各8次，均预热6次；纯专家16次/预热6次；group3次/预热1次。早期探索批次的样本/预热数不同，逐批保存在CSV，不把它们合并成一个统计总体。
+
+| 测试 | 原始重建版 | 上轮修复 | 本轮最终中位 | 本轮最小～最大 |
+|---|---:|---:|---:|---:|
+| 层0纯原生专家核心，AR128，不含QNN router/shared | 7.784ms | 6.381ms | **3.521ms** | 3.511～3.563ms |
+| 四层AR128，保持同一warm FA图 | 52.688ms | 45.608ms | **38.587ms** | 38.542～38.667ms |
+| 四层cold AR128，使用修正的128列FA图 | — | — | **35.614ms** | 35.483～36.163ms |
+| 四层1024 token，8个AR128块，全驻留 | 412.269ms | 356.963ms | **305.201ms** | 304.839～307.588ms |
+| 四层1024 token，两层驻留，含全部物理IO | 1061.035ms | 855.596ms | **810.180ms** | 797.743～823.712ms |
+
+相同warm图的四层AR128对原始版减少26.8%，连续1024减少26.0%。修正cold图后为35.614ms，相对原始52.688ms的总下降32.4%包含了cold/warm图差异，不能全部算成相同计算量的内核加速。最终cold的attention、MoE、cache反馈分别约13.169/21.531/0.802ms；这些是各段独立中位，不能直接相加冒充总时间。warm FA与cold FA差约3.0ms，定位到了之前比较中的实际多余计算。
+
+1024 resident中，attention约128.888ms，MoE约169.061ms，cache反馈约6.346ms；attention计算图未改变，主要收益来自专家与数据交接。group读/复制中位487.553ms，物理读取1526194176B（与四个新bank文件完全一致），有效读/复制约2.92GiB/s。上一轮读取量为1677869056B，不能把group全部收益归因于吞吐提高。本轮较早的pool版本测得763.875ms，中间CSR批次为778.797ms，最终重新构建版本为810.180ms；IO波动存在，没有挑更快的一批替代最终记录。resident专家槽仍按最大bank大小分配，约1598.59MiB，group双槽约799.30MiB；文件变小不等于当前resident槽按同等比例减少。
+
+#### 尚余瓶颈及历史SM8750对照
+
+原生profile确认Q6 2304MHz、HMX 1824MHz、8个HVX单元、12个硬件线程和12MiB VTCM。持久线程任务发送约0.006～0.010ms；VTCM申请约0.040～0.049ms、释放约0.106～0.110ms，均逐层归还。以profile的layer1为例，worker观测的DMA等待约3.49～3.75ms，而其总专家处理区间约5.06～5.11ms；HMX请求等待约0.06～0.08ms，F32后处理约0.63～0.92ms。worker区间相互重叠，不能求和；DMA等待也包含竞争/调度，不是纯硬件DDR计数。HMX服务代码段约0.23～0.28ms，不等于硬件busy利用率。当前剩余重点仍是大量细粒度专家权重搬运，不能用TOPS比例预测速度。
+
+历史SM8750修复后cold四层为35.596172ms，1024 resident为342.94ms；本轮SM8975对应35.614/305.201ms。cold已恢复到相近水平，**没有验证出显著的cold代际加速**；1024较历史数值低约11.0%。历史原生库/GPTQ bank已经删除，当前MSE N4 bank、量化输入与真实路由不同；历史计时从首层hidden就绪开始，本轮还计入首层buffer写入及显式cache反馈，因此这不是同二进制/同负载的芯片比较。保留原始总时间，不通过减去某段估计值声称严格同口径的硬件加速。
+
+未采用的尝试：QNN HVX线程4/6/8覆盖没有收益；将输入码进一步压成I8、给权重换成双128KiB缓冲，数值相同但cold中位37.129ms，慢于I16/双64KiB版本36.459ms，已回退；DMA直接暂存shared/residual并写回，纯专家正确但完整链触发DSP异常，已回退。QNN详细profile明显扰动attention计时，所有profile开启的整体时间均不计入正式表格。
+
+#### 正确性、文件和复现
+
+最终正式cold32次、warm8次、1024 resident8次及group3次，共51个四层输出及全部408份cache，与原始正确参考逐字节一致；退出顺序修复后另12次四层输出及全部cache也一致，且无unmap警告。纯专家保存的最终输出逐字节一致。最终hidden对原FP32参考SQNR保持AR128 **12.923572dB**、1024 **13.830287dB**，全部有限。本轮解决性能回退，未声称提高量化精度、解决完整模型PPL或验证40层可用性。
+
+`V85_SECOND_PASS_RESULTS.json`、`V85_SECOND_PASS_SUMMARIES.csv`和`V85_SECOND_PASS_SAMPLES.csv`保存各批原始样本/统计、精度及范围，`V85_SECOND_PASS_MANIFEST.json`保存最终源码、二进制、cold图和compact bank的SHA256。`source/analyze_v85_second_pass.py`重新检查所有正式输出；`source/v85-final-csr/`保存最终版本，`source/before-v85-second-pass/`保存探索对照。`final-v85-csr-profile-cold128.log`是原生阶段profile，正式计时参考`release-v85-csr-cold128.log`、`release-v85-csr-warm128.log`、`release-v85-csr-resident1024.log`和`release-v85-csr-group1024.log`。更早`final-v85-profile-cold128.log`因库目标文件名未覆盖，原生计数为零，不作为原生profile证据；部署工具已改为明确目标文件名。
+
+示例（已存在设备输入/context/compact bank时）：
+
+```bash
+# 32次cold AR128；正式计时无profile
+python llama-output/qwen36-four-layer-sm8975-20261020/source/run_device.py \
+  --compact --chain-hidden --cold-fa --mode resident --tokens 128 \
+  --samples 32 --warmups 6 --name cold128-repeat
+
+# 连续8个AR128块；保留warm FA cache
+python llama-output/qwen36-four-layer-sm8975-20261020/source/run_device.py \
+  --compact --chain-hidden --mode resident --tokens 1024 \
+  --samples 8 --warmups 6 --name resident1024-repeat
+```
+
+### SM8975：Qwen3.6-35B-A3B 全部40层导出及分组换入实测（2026-10-21）
+
+本轮使用 `/hunter/model/Qwen/Qwen3.6-35B-A3B` 的全部真实40个decoder block，30层GDN＋10层full attention；没有复制前四层权重来代替后36层。每层256专家、Top8、hidden=2048，AR固定128。设备为 `A7SR026915000282`／SM8975 V85，QNN SDK `2.48.1.260715`，运行使用设备ODM的HTP/System/V85 Stub/Skel。
+
+#### 导出产物和精度配置
+
+- 独立原型目录：`llama-output/qwen36-full40-sm8975-20261021/`。每层保留 `attention.pte`、`moe-front.pte` 及提取的QNN context，专家以外部 `experts.n4` bank供原生整数kernel按索引访问。这是40层分层导出、串联执行的原型，尚不是可直接交给生产 `llama.py` 的单文件完整语言模型PTE。
+- Attention维持W4A16/block32，合并K/z投影及depthwise conv为W8，GDN out_proj做GPTQ，conv/recurrent/full-attention K/V的外部IO均为UINT16。GDN沿用已优化的AR128路径。MoE专家为N4权重×动态A8整数HMX，router/shared为FP16，Top8及累加顺序保持原样。专家bank使用激活加权MSE量化，并非已删除的历史GPTQ专家bank；只压缩已有N4码中gate或up整行为零的通道，不改变保留码和scale。
+- 复用原四层及其冻结校准结果，串行新增36层和9个cold FA context。新增153个阶段的墙钟记录合计 **1826.861秒（30.45分钟）**，未计ADB部署和已有四层的历史导出；最大单阶段进程RSS约 **2.831GiB**。不是同时加载35B模型或并行导出多个模型。
+- 40个常规attention与40个router/shared图均检查输入输出顺序，导出检查为单QNN delegate。40个warm context文件共1237551152B，全部40层专家bank为 **16625393664B（15.484GiB）**。还有10个独立cold FA图，仅供无历史128-token测试。1024-token实验使用1024列warm FA图，不将cold图用于有历史的输入。
+
+#### 全层运行遇到的问题及最终内存策略
+
+最初同时保留80个QNN context时，context创建结束后首次400MiB专家bank的DSP映射失败，原生返回 `integer_rpc_run_mapped:25`，设备日志出现QuRT Error12。失败时系统MemAvailable约631MiB。此证据指向context并存引起的DSP映射资源问题，尚未区分地址空间上限、碎片与其他DSP映射配额，不能解释成芯片计算能力上限。SDK多context共享spill/fill试验没有消除故障，未纳入最终计时配置。
+
+最终同时只保留 **两层QNN context＋两个专家bank槽**。每组两层把本次全部token处理完成，再释放context、换下一组；每层的cache和IO buffer保留，避免丢失状态。专家槽共 **838934528B（800.07MiB）**。1024-token测试中同一组完成8个AR128块后才换组，每轮仍只读40个bank，不重复读取8遍。
+
+新增的切换接口先结束CPU输出读取、释放原生HAP IO引用，再让QNN注销同一DMA buffer并释放context；否则下一组重新注册共享hidden会报 `memRegister:8003`。两bank的映射和原生工作线程保持复用。原生IO映射表容量也由64扩到256，支持初始化全部40层IO的对照试验。最终两组正式测试均正常退出，无FATAL和FastRPC unmap错误。
+
+#### 正式结果：40层串联，不外推
+
+每项先预热1次，再记录3次。计时包含两侧norm、Attention投影/GDN或FA、首次残差、router/shared/Top8专家、最终残差、cache反馈、必要hidden交接、全部专家bank读取/复制/DMA同步，以及每组QNN context装载/注册/释放和原生映射交接。关闭profiling；输出文件保存、校验、初始元数据/IO buffer准备在计时外。
+
+输入是已准备好的embedding。tokenizer、embedding lookup、最后的model norm、LM head、采样和图片encoder不在时间里；没有测试decode。下表“计算与交接”是逐样本从总时间减去实测bank和context区间，**不是已实现的40层全驻留性能**。各列为独立中位数，不能要求它们严格相加等于总时间。
+
+| 输入 | 128 token，无历史 | 1024 token，8×AR128 |
+|---|---:|---:|
+| 40层总时间中位 | **7.908352s** | **10.610759s** |
+| 总时间最小～最大 | 7.862950～8.246200s | 10.511542～10.666011s |
+| 专家bank读取/复制/同步 | 4.779767s | 5.046029s |
+| QNN context装载/注册/释放与映射交接 | 2.775319s | 2.766988s |
+| 计算与数据交接 | 354.657ms | 2823.157ms |
+| Attention，含投影、两侧norm和首次残差 | 143.297ms | 1327.372ms |
+| Router/shared | 15.366ms | 109.135ms |
+| 原生N4×A8 Top8专家与融合最终残差 | 170.689ms | 1219.565ms |
+| Cache反馈 | 23.996ms | 115.304ms |
+| 本次40层串联的总吞吐 | 16.19token/s | 96.51token/s |
+
+全部6次正式样本的 `/proc/self/io` 物理读取量均为16625393664B，与40个bank的总文件大小完全一致。O_DIRECT读取，随后复制到双DMA槽并同步；这是整个读取/复制区间的有效吞吐，约3.24／3.07GiB/s，不能当成单独测得的UFS峰值。预热/初次验证有额外context文件物理读取，原日志保留。128-token原型首次跑通为9.596秒，随后context缓存等影响使正式运行降至7.86～8.25秒；这里报告固定预热1次后的全部3次，没有用最快单次替代中位数。
+
+128-token最终总时间中约95.5%属于bank换入和context管理；1024-token通过每次换入处理更多AR128块摊薄开销，但总时间仍主要花在这两项。每轮换入约15.5GiB真实专家数据，没有因Top8而只从UFS读取8个专家；Top8只限制这轮DRAM→VTCM的专家计算。进一步优化应先减少实际换入字节、减少context重建或将其流水重叠，不能把这里的秒级总时间归因于GDN核心。
+
+进程高水位RSS约1.294／1.309GiB，包含已触碰的context文件映射；不是整机或DSP内存峰值。正式运行记录到的最小系统MemAvailable约3.56／3.62GiB。前后thermalservice状态均为0；电池温度接口无输出，没有据此估计温度。
+
+#### 正确性与记录
+
+两层context窗口的四层128和1024结果（hidden＋全部8份cache）都与此前保留context版本逐字节一致。全部40层的两项正式测试，每项3次的最终hidden及全部80份cache均逐字节一致；输出全部有限。对同一输入的CUDA FP32分层参考，信噪比如下：
+
+| 指标 | 128 token | 1024 token |
+|---|---:|---:|
+| 第40层block输出hidden SQNR | 11.486558dB | 10.773034dB |
+| 用同一FP32最终RMSNorm归一化后hidden SQNR | 10.479537dB | 10.136652dB |
+
+最终norm只用于离线比较，不计入时间。以上没有验证完整模型PPL、LM head输出或生成文本质量。
+
+`RESULTS.json` 保存范围、位宽、内存/热状态及精度；`SAMPLES.csv`、`LAYERS.csv`、`LOADS.csv`、`SUMMARIES.csv` 保存逐次、逐层、逐bank数据；`EXPORT_STAGES.csv` 保存串行导出记录，`MANIFEST.json` 保存各层PTE、context、bank及源码/二进制SHA256。原始日志为 `full40-cold128.log`、`full40-prefill1024.log`。首次全context失败保存在 `initial-full-context-failure/`，共享spill/fill及映射失败试验也保留独立命名。
+
+复测（需要已部署的该目录、指定设备和et_npu环境）：
+
+```bash
+python llama-output/qwen36-full40-sm8975-20261021/source/run_device.py \
+  --layers 40 --tokens 128 --mode group --context-window --cold-fa \
+  --breakdown --warmups 1 --samples 3 --name full40-repeat-cold128
+
+python llama-output/qwen36-full40-sm8975-20261021/source/run_device.py \
+  --layers 40 --tokens 1024 --mode group --context-window \
+  --breakdown --warmups 1 --samples 3 --name full40-repeat-prefill1024
+```
+
+本轮只在独立原型中修改导出/运行脚本、QNN context生命周期和原生IO生命周期，未接入生产 `llama.py`，没有改动生产量化recipe，未commit/push。
+
+### SM8975：40层MoE连续AR1 decode补测（2026-10-21）
+
+在全部40层prefill原型上增加真实AR1图，模型仍为 `/hunter/model/Qwen/Qwen3.6-35B-A3B`，设备 `A7SR026915000282`／SM8975 V85，QNN SDK `2.48.1.260715`，运行使用设备ODM库。仍保留独立原型，未接入生产 `llama.py`，未commit/push。
+
+#### 测试口径和实现
+
+输入状态来自之前手机上实际完成的128-token全40层prefill：每层conv/recurrent或full-attention K/V cache均接入AR1。连续计算位置128～143，共16个新位置，每步依次经过全部40层，并反馈本步的全部cache。下一位置输入使用同一真实语料的已知embedding（teacher forcing）；这是decoder block链的AR1测试，不含LM head、采样、tokenizer、embedding lookup、最终model norm或图片encoder。没有执行文本生成或测量PPL。
+
+40层的 `attention.pte`、`moe-front.pte` 均导出为AR1，每图检查为单QNN delegate，输入输出顺序保存于 `FRONT.json`／`io.bin`。Attention从已校准的AR128冻结QDQ图specialize而来，直接复用已有整数权重码、GPTQ结果、scale/zero point，没有重新校准。W4A16/block32、K/z与depthwise conv W8，以及UINT16 conv/recurrent/full-attention K/V IO保持。AR1 GDN编译了SDK2.48.1的V85 `DeltaNetCoreVtcm`，router/shared保持FP16。GDN自定义图与标准router图分进程编译，避开主机SDK混合配置连续编译时遇到的崩溃。
+
+原生专家kernel专门执行一行：N4权重×动态A8整数HMX，Top8和固定槽位累加顺序不变。运行时先完成本层router，再依据真实Top8索引，从同一冻结 `experts.n4` 文件中O_DIRECT读取这8个专家的原始payload，重写槽内offset表，保留payload码、scale、sums和专家ID。读取按4096B对齐，计时包括对齐多读、复制、DMA同步和路由索引处理。专家双槽总大小 **26288128B（25.070MiB）**，没有跨层专家缓存，因此后续token仍会重新按路由读取。
+
+AR1只需8×448KiB worker区、单行输入码及8×2048个F32路由结果。沿用4MiB路由区起点时，实际末端为4MiB＋64KiB；工作区由prefill的12MiB收紧到 **5MiB**。四层连续两步的hidden及8份cache与12MiB版本逐字节一致。
+
+#### 先做的功能和资源验证
+
+- 四层、连续两步，Top8选择性读取与完整bank读取的hidden和8份cache逐字节一致。对照的O_DIRECT字节数分别为95059968B和3052388352B。常驻context与两层切换的输出也逐字节一致。这些短测用于功能验证，不把四层速度外推成40层速度。
+- 单层 warm-cache AR1 与同一初始状态的冻结QDQ CPU参考比较：post-attention norm输出35.112dB，首次残差39.049dB，conv输出46.871dB，recurrent state输出55.936dB，全部有限；详情 `AR1_CPU_QDQ_CHECK.json`。四层连续两步的最终hidden对FP32参考为16.931dB。
+- 尝试将40层的80个QNN context都常驻。12MiB专家工作区版本返回原生error15；收紧到5MiB后仍在专家bank的DSP映射处返回error25。当时原生资源查询显示总/可用VTCM均为12MiB。该常驻试验没有得到有效完整输出，不列性能结果。现有context组织方式仍存在DSP映射资源限制，不能将失败解释为VTCM容量用满或芯片计算速度上限。
+- 最终有效测试采用两层context窗口：每个AR1 token都依次换入20组context。切换前先释放原生HAP IO引用，再注销QNN buffer，保留40层的状态buffer。context装载/注册/释放、映射交接均纳入本次总时间。
+
+#### 正式性能
+
+预热1轮16步，再测3轮16步；关闭profiling和中间输出采集。每轮重置为同一真实prefill128状态，但轮内16步持续更新cache。中位结果如下，各分段独立取中位，不能要求严格相加等于总中位。
+
+| 项目 | 16步整轮 | 平均每步 |
+|---|---:|---:|
+| **40层总耗时** | **33.746597s** | **2109.162ms** |
+| context装载/注册/释放及映射交接 | 25.684607s | 1605.288ms |
+| Top8专家读取/复制/同步 | 6.228693s | 389.293ms |
+| 计算与其他交接 | 1.774207s | 110.888ms |
+| Attention，含投影、两侧norm和首次残差 | — | 65.617ms |
+| router/shared | — | 8.933ms |
+| 原生Top8专家及融合最终残差 | — | 25.254ms |
+| cache反馈 | — | 10.685ms |
+| **本次decoder链decode吞吐** | **0.474122 token/s** | — |
+
+三轮总耗时分别为34.664919／33.687506／33.746597s；平均每token范围2105.469～2166.557ms。每轮16步共有640次本层Top8读取：逻辑payload **8315122176B**，4096B对齐实际物理读取 **8335388672B**，三轮计数相同。平均每token逻辑519695136B、物理520961792B，约496.828MiB／token。当前reader每层串行读8段，区间有效吞吐约1.25GiB/s，包含复制和同步，未单独测存储峰值。
+
+context管理约占76%，专家换入约占18%，其余计算与交接约占5%。因此本次0.474 token/s主要受分层原型的context重建和外存换入影响；“计算与其他交接”只是从同一实测扣除装载区间，不能当作已测得的全权重/context常驻40层速度。
+
+与上一轮prefill放在一起，范围均为prepared embedding到40层block输出；prefill一次换入处理全部本次输入，decode每个新位置都经过全部40层：
+
+| 测试 | 真实测量总时间中位 | 本次范围内吞吐 |
+|---|---:|---:|
+| prefill128，无历史 | 7.908352s | 16.185 token/s |
+| prefill1024，8×AR128 | 10.610759s | 96.506 token/s |
+| prefill128状态后，连续16步AR1 | 33.746597s | 0.474122 token/s |
+
+#### 正确性与产物
+
+3轮的16个最终hidden及每轮全部80份最终cache逐字节一致，输出全部有限。对同一语料、同一位置的CUDA FP32分层参考，最终block hidden SQNR为 **9.520855dB**；离线用同一FP32最终RMSNorm比较为 **9.161381dB**。参考自身从FP32状态开始，本次从设备量化prefill状态开始，误差包含prefill累计误差，不能全部归因于AR1。单层冻结QDQ对照单独隔离了实现误差。没有以hidden SQNR替代完整模型PPL或文本质量验证。
+
+有效正式运行正常退出，QNN error和FastRPC unmap错误均为0，前后thermalservice状态均为0。原型目录 `llama-output/qwen36-full40-sm8975-decode-20261021/` 内保存 `RESULTS.json`、`SAMPLES.csv`、`STEPS.csv`、`MANIFEST.json`，原始正式日志 `full40-decode-window.log`。`before-ar1-vtcm-size/` 保留12MiB工作区的试验、被停止的初始window运行及二进制；5MiB常驻失败单独记录于 `validate-ar1-full40-retained.log`，未混入正式样本。80个AR1 PTE、QNN context及专家索引均保留，专家bank只读复用此前40层目录。
+
+复测（需要已部署数据和指定设备）：
+
+```bash
+python llama-output/qwen36-full40-sm8975-decode-20261021/source/run_decode.py \
+  --layers 40 --steps 16 --samples 3 --warmups 1 \
+  --name full40-decode-repeat
+```
+
+默认即为两层context窗口和Top8选择性读取。`--retain-contexts` 是资源验证选项，本次40层运行失败；`--full-bank` 用于已通过的四层功能对照，不作为decode最终读策略。
+
+### SM8975：decode四层有界FIFO与后台预加载（2026-10-21）
+
+按用户提出的“初始化4层、消费后出队并提前加载后续层”实现独立原型，模型仍为 `/hunter/model/Qwen/Qwen3.6-35B-A3B` 全部真实40层。SM8975 V85，设备 `A7SR026915000282`，QNN SDK `2.48.1.260715`＋设备ODM库。128-token设备prefill状态后连续16步AR1，固定同一真实语料的teacher-forced输入；不含LM head、采样、embedding lookup、最终model norm或图片encoder。未接入生产 `llama.py`，未commit/push。
+
+#### 四层队列如何运行
+
+1. 初始装载L0、L1、L2、L3。每层有Attention和router/shared两个QNN context，最多4层／8个活跃context；正在装载的层也占槽位。
+2. 主线程按原顺序完成当前层的Attention、router、Top8专家和cache反馈。完成L0后释放该层自己的原生HAP IO引用，将槽位标为待回收；全链共用的hidden输出映射保留。
+3. 主线程进入L1的Top8专家读取区间时，唤醒后台线程卸载L0、装入L4；之后依次用同一槽位装入L5、L6……。先释放旧context，再创建新context，峰值不超过4层。
+4. 同一个token走完40层后，继续同一环形队列，提前准备下个token的L0～L3。40层的conv/recurrent/full-attention K/V state和IO buffer保持各自状态，context回收不清空cache。第16步结束时排空队列，最后的卸载/drain计入总时间。
+5. 每层的真实Top8需要本层router输出，所以专家仍按实际路由O_DIRECT读取原始N4 payload。没有提前猜测路由，没有把后续层的256专家整体读入DRAM。双专家槽仍为26288128B（25.070MiB），专家kernel仍为N4×动态A8整数HMX／5MiB VTCM，其他量化位宽、校准参数、GPTQ码及输入全部保持。
+
+这里的4层上限指活跃QNN context，40层的状态/IO缓冲及OS文件页缓存另外保留。只读context文件继续mmap；本轮没有测整机RSS峰值，不能用“4层”推算整个进程只有4层权重大小。
+
+#### SDK线程规则和共享映射
+
+SDK本地文档 `docs/QAIRT-Docs/QNN/general/api_usage_guidelines.html#multi-threading` 明确规定，同一handle及其parent/dependent handle的QNN API调用需要外部同步。当前同一backend/device下，以SDK互斥锁串行化context创建/注销、graph执行和共享IO相关操作。原生专家执行也放在同一门控下，保持共享映射和计算资源交接的确定顺序。
+
+后台SDK操作安排在主线程的专家读盘区间。直接在消费结束后立即抢SDK锁，会阻塞下一层的Attention API，减少可重叠的I/O；因此队列显式区分“IO窗口允许装载”和“主线程等待队列就绪”两种允许生产的时机。后者保证队列缺项时能继续装入，不会双方等待。
+
+增加按fd释放HAP引用的原生RPC接口：每层退役只释放自己的post-norm hidden、ids/scores/shared、residual映射，公共链输出保持映射；最后一个token最后一层完成后，先归还公共HAP引用，再排空QNN context。同步/后台队列都沿用这一生命周期，避免后台注销正在使用的共享buffer。
+
+`source/layer_queue.h` 保存4槽FIFO与后台线程，`source/decode.cpp` 控制IO窗口和SDK等待计时，`source/native_core.h`／`integer_rpc_impl.cpp` 实现按fd释放。状态机为ready→running→retired→loading→ready，最终进入done；取消路径会先停止并join生产线程。所有工作保持在独立目录 `llama-output/qwen36-full40-sm8975-queue4-20261021/source/`。
+
+#### 正式结果
+
+三组均先预热一轮16步，再测3轮16步；同一二进制、模型、原生算子和数据。正式关闭host trace及QNN详细profiling。队列稳态时间排除首批4层装载，包含最终drain；另外列出加回首批装载的时间。各项独立取中位。
+
+| 方案 | 16步总时间 | 稳态平均每token | 吞吐 | 加回初始化后每token |
+|---|---:|---:|---:|---:|
+| 两层同步窗口，本轮复测 | 37.538312s | 2346.144ms | 0.426231 token/s | 2346.144ms |
+| 四层同步FIFO | 40.422656s | 2526.416ms | 0.395818 token/s | 2532.560ms |
+| **四层后台预加载FIFO** | **24.221452s** | **1513.841ms** | **0.660571 token/s** | **1520.066ms** |
+
+后台队列相对本轮两层窗口平均延迟下降 **35.48%**，相对四层同步FIFO下降 **40.08%**。将首批4层初始化也计入后，对两层窗口的降幅仍为 **35.21%**。预热后首批4层装载中位 96.866ms；该进程第一次预热装载为214.831ms，这不包含tokenizer、embedding及全模型初始化。
+
+各轮稳态每token最小～最大：两层窗口 2331.587～2361.743ms；四层同步 2523.690～2574.183ms；四层后台 1511.675～1521.360ms。
+
+上一批两层窗口的历史中位为 2109.162ms/token，本批复测为 2346.144ms/token；存在跨批波动，本次对照的正式改善比例使用同批复测。相对历史批次，新后台队列的平均延迟下降约 28.23%。本轮前后thermalservice状态均为0；没有足够的频率/调度证据解释全部跨批差异。
+
+#### 提前加载隐藏了哪些时间
+
+四层后台FIFO的每token独立中位：
+
+| 项目 | 每token时间 |
+|---|---:|
+| 队列缺项等待 | 0.011720ms |
+| 主线程等待SDK门控 | 955.996ms |
+| 后台context装载/回收的实际工作区间 | 1397.331ms |
+| Top8专家读/复制/同步 | 443.116ms |
+| Attention/router/专家/cache反馈 | 108.313ms |
+
+后台context工作与专家I/O重叠，不能将两列相加算总耗时。队列本身几乎没有缺项等待，仍有约956ms/token在SDK门控前等待；当前主要剩余开销仍是context生命周期。
+
+同样4层上限，后台线程的累计context工作区间也比同步FIFO更短（约1397对1935ms/token）。因此整体降幅同时包含后台执行位置、生命周期交错及I/O重叠的实测变化；没有进一步隔离CPU调度、缓存及SDK内部因素，不能把全部收益单独归因于重叠字节读取。
+
+单独的40层两步host trace记录了80次上下文回收/装载和80段专家I/O：context工作 3065.238ms、专家I/O 836.127ms、两者交集 **821.428ms**。约 **98.24%** 的I/O与装载重叠，对应约 **26.80%** 的context区间被I/O覆盖。这是功能短测trace，未混入正式性能样本。
+
+时间线保存在上述独立原型目录的 `QUEUE_TIMELINE.png`／`.svg`。
+
+时间线展示初始化L0～L3之后，读取L1专家时卸载L0并装入L4，读取L2时装入L5。图中的空白不代表NPU空闲，包含未画出的实际计算和SDK等待；原始host时间区间另存 `QUEUE_TRACE.json`／`TRACE_SUMMARY.json`。没有据此声称获得DSP硬件busy或DDR计数。
+
+#### 精度、容量和物理I/O验证
+
+三种模式、各3轮，共9份完整16步hidden及全部720份最终cache，均与上一轮发布基准逐字节一致；全部输出有限。故这组输入的最终hidden SQNR仍为9.520855dB，离线最终norm后9.161381dB，没有因队列调度而改变。没有新增完整模型PPL或文本生成验证。
+
+两种4槽模式每轮都记录峰值4层、共640次层装载和640次卸载（每层各含两个QNN context）。每轮专家逻辑读取8315122176B、实际O_DIRECT及 `/proc/self/io` 物理读取8335388672B，三种模式一致。没有通过减少层数、减少Top8、少读专家或更换位宽取得速度提升。正常退出，QNN error和FastRPC unmap错误均为0。
+
+结果为 `RESULTS.json`、`SAMPLES.csv`、`STEPS.csv`；正式日志 `full40-window2.log`、`full40-queue4-sync.log`、`full40-queue4-async.log`。`MANIFEST.json` 保存本次源码、主机runner、原生DSP库和冻结模型manifest的哈希。原模型和专家bank只读复用前一轮目录。
+
+复测（需要已部署的模型数据和指定设备）：
+
+```bash
+python llama-output/qwen36-full40-sm8975-queue4-20261021/source/run_decode.py \
+  --layers 40 --steps 16 --samples 3 --warmups 1 --queue async \
+  --name queue4-repeat
+
+# 同步四槽对照：--queue sync；两层窗口对照：--queue off
+```
+
+
+### SM8975：40层decode固定context、state与KV buffer（2026-10-21）
+
+独立原型 `/hunter/cpp_code/ET/npu/executorch/llama-output/qwen36-full40-sm8975-persistent-20261021`，真实Qwen3.6-35B-A3B全部40层，SM8975 V85，QNN2.48.1＋设备ODM库。从128-token设备prefill状态连续16步AR1，context1024、teacher forcing；不含embedding lookup、最终norm、LM head、采样和图片。未集成生产llama.py。
+
+80个QNN context和470个IO注册handle仅初始化一次；各层GDN recurrent/conv state、full-attention K/V及对应输出buffer整个会话保留。临时交接buffer共用，专家仍按真实Top8读入两个固定槽。使用contextCreateFromBinaryListAsync的顺序资源共享模式，不再逐层contextFree/create。SDK的VA优化模式四层测试失败，最终使用SEQUENTIAL_WITHOUT_VA_OPTIMIZATION；设备警告VTCM context sharing不支持，未据此声称启用该功能。
+
+| 方案，均为同批3轮16步中位 | 每token | 吞吐 |
+|---|---:|---:|
+| 四层后台context队列 | 1494.244ms | 0.669235 token/s |
+| 固定context/IO，共享state工作区中间版 | 624.137ms | 1.602211 token/s |
+| 固定context/IO，各层state/KV直接绑定最终版 | **619.679ms** | **1.613740 token/s** |
+
+最终延迟下降58.53%，初始化一次约4.931s；加回初始化摊到16步约927.854ms/token。每token专家I/O约473.638ms，计算和cache反馈约145.562ms。
+
+40层有效state/KV输入51.875MiB，共用临时交接buffer44KiB；两个专家槽25.070MiB。READY时原型rpcmem分配108.953MiB，不包含SDK内部权重与分配、模型文件页及CPU快照，不能当作完整RAM峰值。80个context binary文件合计约1.109GiB，不等于实际DRAM占用。
+
+9份完整输出和720份cache与原40层基准逐字节一致；hidden SQNR仍9.520855dB。最终三轮循环中context创建/销毁、IO注册/注销和RPC buffer分配/释放全部为0；初始化与退出时context80/80、IO470/470平衡。专家读取字节数与旧方案一致，正式日志无QNN error或FastRPC unmap错误。详细记录见原型目录的REPORT.md、RESULTS.json、SAMPLES.csv及MANIFEST.json。
+
+
+### SM8975：decode真实Top8并发IO与有界直读专家缓存（2026-10-21）
+
+独立原型`llama-output/qwen36-full40-sm8975-decode-io-20261021`，真实Qwen3.6-35B-A3B全部40层、context1024，从128-token设备prefill状态连续16步AR1，teacher forcing；不含embedding、最终norm、head、采样和图片。PTE、N4 payload、路由和HMX整数算术保持。未接入生产llama.py。
+
+串行基准的专家IO约471.635ms/token，其中pread约353.982ms、复制116.780ms、同步0.215ms。改为同层Top8并发pread/复制，并按层分区缓存原始N4权重；命中和新接纳专家直接从当前层RPC缓存DMA到VTCM，省去再次复制到临时槽。DSP只保留当前层缓存映射；context、state、KV和buffer依然整个会话固定保留。
+
+同一二进制，各预热1轮＋正式3轮16步中位。每轮都清空专家缓存标签，第一token命中为0：
+
+| 方案 | 实际专家缓存 | 每token | 吞吐 | IO墙钟/token | 物理读/token |
+|---|---:|---:|---:|---:|---:|
+| serial | 0.00MiB | 617.849ms | 1.618519 token/s | 471.635ms | 496.828MiB |
+| parallel8 | 0.00MiB | 337.794ms | 2.960380 token/s | 191.530ms | 496.828MiB |
+| mapped256 | 251.25MiB | 310.792ms | 3.217590 token/s | 155.061ms | 356.414MiB |
+| mapped512 | 502.50MiB | 293.130ms | 3.411455 token/s | 137.474ms | 267.430MiB |
+
+最快版总延迟下降52.56%，IO墙钟下降70.85%，物理读减少46.17%；命中率45.82%。输入来自真实当前router，未预测未来路由；全约15.48GiB专家bank继续保存在存储。约502MiB缓存为固定上限，不代表全模型常驻。
+
+12份完整hidden与960份最终cache与原固定context基准逐字节一致，原SQNR保持。context/IO注册/RPC buffer生命周期操作在循环中均为0，结束80/80及470/470平衡；正式物理读与O_DIRECT字节相符，所有正式运行成功、无QNN/FastRPC或缓存unmap错误，前后thermal状态0。并行pread/copy时长为worker工作时间之和，不能和IO墙钟相加。当前未实现读盘与HMX跨层重叠。
+
+最快版原型rpcmem合计611.453MiB，不含SDK内部权重和CPU/文件页，不是完整RAM峰值；一次setup约5.361s。复测使用`source/run_decode.py --layers 40 --steps 16 --samples 3 --warmups 1 --io-workers 8 --cache-mib 512 --mapped-cache --name repeat-fast`。详细结果、实现和限制见原型目录REPORT.md。
+
+### SM8975：64步decode的专家局部性验证（2026-10-21）
+
+同一独立原型、runner/DSP二进制、PTE和专家bank，将连续AR1扩到64步，位置128～191，context1024。涵盖真实40层，不含embedding、最终norm/head和采样；teacher forcing。两种容量各预热1轮＋正式3轮，每轮清空缓存标签，第一token命中为0。
+
+| 实际专家缓存 | 每层槽数 | 命中率 | 直接读字节/token | IO墙钟/token | 总时间/token中位 |
+|---|---:|---:|---:|---:|---:|
+| 502.50MiB | 8 | 46.50% | 264.08MiB | 134.342ms | 289.551ms |
+| 1005.00MiB | 16 | 59.01% | 201.66MiB | 118.793ms | 271.054ms |
+
+增加502.50MiB缓存后，总延迟下降6.39%，直接读字节减少23.64%；这属于增加容量的收益，不是同等内存下更换策略的收益。两种容量三轮范围分别287.371～290.063和270.790～271.481ms/token。原型rpcmem分别611.453和1113.953MiB，不等于全进程RSS或整机峰值。默认配置保持原值。
+
+相同8槽/层的因果路由模拟：LRU命中46.50%，累计LFU43.94%，每4token衰减的LFU46.17%，未替换当前策略。空间上，缓存未命中的10,957个读请求中只有171处可相邻合并，约减少1.56%的请求数，不代表相同比例的墙钟收益。不能按expert ID相邻盲目预读，也不能把跨几十MiB的文件区间合并读取。
+
+三组单轮探索及两组各三轮正式测试，共9组输出；另外8组全部64步hidden和最终80份state/KV与无专家缓存对照逐字节一致。设备命中计数及直接读字节与路由重放模拟一致。所有运行成功、前后thermal状态0，循环内context/IO注册/RPC buffer生命周期操作均为0，退出80/80及470/470平衡。读盘与命中专家计算的重叠、按共同出现频率重排bank均尚未实现。
+
+详细记录见`llama-output/qwen36-full40-sm8975-decode-io-20261021/LOCALITY.md`和`LOCALITY_ANALYSIS.json`；复测使用`source/run_decode.py --layers 40 --steps 64 --samples 3 --warmups 1 --io-workers 8 --cache-mib 1024 --mapped-cache --name repeat-locality1024`。
+
+### SM8975：命中专家先算、miss并行读取（2026-10-21）
+
+独立原型`llama-output/qwen36-full40-sm8975-overlap-20261021`。真实40层Qwen3.6-35B-A3B、context1024，从128-token设备prefill状态执行AR1；不含embedding、最终norm/head和采样，teacher forcing。保持原有路由、N4权重及动态A8 HMX计算。命中阶段只写原始Top8输出slot；miss阶段完成后按slot0～7原顺序求和，shared/residual只加一次。两阶段之间用固定64KiB DSP DDR route缓冲保留输出，专家缓存容量不增加。
+
+502.5MiB缓存，在同一进程中预热关闭/开启各1轮，再交替各测3轮16步；每轮清空缓存标签。三组CPU上限边界一致，policy0/3/6分别1267.2/1267.2/806.4MHz，仍属于设备限频条件下的测量。
+
+| 方式 | 总时间/token中位 | 范围 | MoE加载＋计算联合墙钟/token |
+|---|---:|---:|---:|
+| 关闭重叠 | 279.758ms | 266.558～280.423ms | 177.451ms |
+| 开启重叠 | 252.458ms | 249.458～252.672ms | 153.417ms |
+
+总时间下降9.76%，MoE联合墙钟下降13.54%；三组逐对改善17.101、27.751、27.300ms/token。中位轮命中阶段与IO批次区间重叠37.523ms/token，Native调用合计从47.505升到68.088ms/token，新增RPC/准备开销已计入。命中率和O_DIRECT请求字节不变，收益不来自少算专家或少读权重。
+
+1005MiB组出现明显IO及CPU限频变化，不作为稳定提速结论；最初各方案顺序跑的64步结果也保留为环境波动记录，不将跨时间差值直接认作优化收益。`read_ms`排除命中阶段RPC时间，`io_wall_ms`则是与计算重叠的IO完整墙钟，两者不能重复相加。
+
+四组64步测试共12份hidden＋960份最终cache、两组交替16步测试共12份hidden＋960份最终cache，均与相同输入的历史完整基准逐字节一致。DSP逐调用核对mask专家数，Host核对总执行次数及partial覆盖。所有循环内QNN context/IO注册/RPC buffer生命周期操作为0，退出80/80与470/470平衡。两个partial调用各自仍申请/释放HAP计算资源，其开销已计入；没有重建QNN context。
+
+详见原型目录`REPORT.md`、`RESULTS.json`、`SAMPLES.csv`及`SEQUENTIAL_RESULTS.json`。复测使用`source/run_decode.py --layers 40 --steps 16 --samples 6 --warmups 2 --io-workers 8 --cache-mib 512 --mapped-cache --alternate --name repeat-alternating512`；单独开启用`--overlap`。尚未接入生产llama.py。
+
+### SM8975：每层24专家缓存（2026-10-21）
+
+同一独立重叠原型，真实40层、context1024、64步AR1（位置128～191），teacher forcing；不含embedding、最终norm/head、采样。每层仍只计算真实Top8，将保留历史专家的缓存容量从8扩到16、24。各容量单轮64步、从空缓存开始，不是三轮中位；顺序24→8→16，前后thermal状态均0，CPU上限边界均1843.2/1843.2/1036.8MHz。
+
+| 每层缓存数 | 实际专家缓存 | 命中率 | O_DIRECT请求/token | 40层时间/token |
+|---|---:|---:|---:|---:|
+| 8 | 502.5MiB | 46.50% | 264.08MiB | 263.603ms |
+| 16 | 1005.0MiB | 59.01% | 201.66MiB | 229.086ms |
+| 24 | 1507.5MiB | 66.31% | 165.40MiB | 212.968ms |
+
+24对比8，本轮耗时下降19.21%，读请求字节减少37.37%，增加1005MiB缓存；对比16再减少约16.118ms/token，增加502.5MiB。时间差仅为本批单轮观察，不与历史不同限频条件的数据直接计算加速。24槽不是Top24，也不等于恰好保留3个token。
+
+三组全部64步hidden及最终80份state/KV与无专家缓存对照逐字节一致，实际路由完全相同，DSP均执行20480个专家，命中及请求字节与模拟一致。循环内context/IO注册/RPC buffer生命周期操作为0，退出80/80、470/470平衡。24槽原型rpcmem为1616.453MiB，峰值1621.684MiB，不是完整RAM峰值。
+
+原型目录`llama-output/qwen36-full40-sm8975-overlap-20261021/CAPACITY24.md`、`CAPACITY_RESULTS.json`与`CAPACITY_SAMPLES.csv`保存细节；本模型使用`--cache-mib 1536 --mapped-cache --overlap`得到24槽/层。
+
+### SM8975：按AR128 prefill四层一组、每层24专家槽执行（2026-10-21）
+
+按用户明确的新口径实现于独立目录`llama-output/qwen36-prefill128-group4-experts24-20261021`。本次实际Attention/router输入shape均为`[1,128,2048]`，使用原AR128冻结图；128个token完整通过第0～3层后，才加载第4～7层，直至40层。不同于此前连续AR1的teacher-forcing测试，不能混用两者时间或缓存命中率。
+
+同时4层执行context，每层最多24个专家权重槽，合计96槽、150.77MiB；换组复用这4个bank buffer。各层GDN state/conv和MHA K/V buffer保持。128个token各自仍选择Top8，对专家并集分批，每批最多24专家，一个专家服务分派给它的全部位置；最终按原token/slot顺序合并，不将专家集合截断到24。
+
+40层本输入共5227个层号/专家组合、238批、40960次token–expert分派、40次最终合并。DSP和Host均检查覆盖计数。四层功能验证、40层功能验证及正式3轮的全部hidden和最终state/KV，均与原AR128全bank基准逐字节一致；正式共3份hidden、240份最终cache。
+
+预热1轮＋正式3轮，每轮从空state/KV完成128-token prefill，包含全部专家IO及context加载/注册/卸载；不含embedding lookup、最终norm/head、采样和图片。正式总时间6.355711、6.436342、6.167889秒，中位**6.355711秒，20.139 token/s**。中位轮context换组3509.158ms，专家读盘/复制/同步2374.700ms，Native专家计算含批次RPC283.351ms，Attention145.020ms，router/shared15.033ms，cache反馈24.134ms，其余4.314ms。主要耗时是换组和IO，不是GDN核心计算。
+
+各正式轮O_DIRECT及物理读均8458784768B（约7.878GiB），相较完整40层bank的16625393664B少49.12%；不据历史不同测试条件给出耗时加速比例。实际仍需超过24个专家参与每层计算，只保证同时驻留的权重槽不超过24。当前未实现批次间IO/计算重叠。
+
+原型rpcmem合计452.082MiB、峰值454.090MiB，另有8MiB DSP route及约12.56MiB CPU staging，不等于完整RAM峰值。循环内RPC buffer分配/释放均0；执行context峰值8个＝4层，预热＋正式4轮结束context320/320、IO注册1800/1800平衡。测试前后thermal状态均0，CPU上限边界均1843.2MHz。
+
+详见新原型`REPORT.md`、`RESULTS.json`、`SAMPLES.csv`、`GROUPS.csv`、`LAYERS.csv`和`BATCHES.csv`。复测：`source/run_device.py --layers 40 --tokens 128 --slots 24 --samples 3 --warmups 1 --name repeat-prefill128`。未接入生产llama.py。
+
+### SM8975：AR128 prefill保留context，专家按四层换组（2026-10-21）
+
+独立原型`llama-output/qwen36-prefill128-persistent-context-20261021`。沿用真实Qwen3.6-35B-A3B全部40层的冻结AR128图、N4×动态A8整数专家、UINT16 state/KV和原路由。初始化一次恢复80个Attention/router context、注册450个IO handle；context和各层state/KV保留至会话退出。四层分组只控制专家槽及执行顺序，全部128个token完成本组才进入下一组，专家仍为4×24槽、150.77MiB，并未将全部约15.48GiB专家bank放入DRAM。
+
+共享层间临时IO，采用批量context恢复的`SEQUENTIAL_WITHOUT_VA_OPTIMIZATION`配置。设备仍提示不支持VTCM context sharing，不据此声称启用硬件VTCM共享。常驻路径不再换组注销IO或解除Native映射，退出时先关闭Native引用再释放QNN资源。
+
+同一最终ARM runner和DSP SO，每组预热1轮、正式3轮，均从空state/KV完成128-token、40层prefill；不含embedding lookup、最终norm/head、采样、图片和输出保存。两组前后thermal均0、CPU policy0/3/6上限边界均1843.2MHz，顺序执行。
+
+| 方案 | 三轮总时间 | 中位 | 吞吐 |
+|---|---|---:|---:|
+| 同二进制窗口context对照 | 6241.850／6312.761／6191.768ms | 6241.850ms | 20.507 token/s |
+| context常驻 | 2993.969／3021.582／3013.586ms | **3013.586ms** | **42.474 token/s** |
+
+同批中位延迟下降51.72%，吞吐2.071倍。窗口context恢复/注册/释放3355.935ms（加载注册2936.506ms、释放419.428ms），常驻循环内这些API调用均0；日志约0.002ms仅为分组计时标记。专家IO仍约2419.438ms，占总时间80.3%；Native阶段约388.486ms，对照272.328ms，本轮未定位其上升原因，已完整计入总耗时。
+
+常驻版setup2609.227ms，其中context恢复/IO注册2094.241ms；这部分没有消失，只发生于初始化。setup＋首个prefill合计5522.384ms，对照7288.805ms，均非完整应用冷启动时间。常驻版计时内context/IO注册/RPC buffer生命周期操作均0，退出80/80与450/450平衡。
+
+READY原型rpcmem合计254.371MiB、构建共享绑定前的累计峰值457.629MiB，另有DSP route及CPU staging；host RSS/HWM约1.278GiB，结束整机MemAvailable约2.760GiB。host RSS不覆盖全部DSP/共享分配，不能与rpcmem直接相加，也不代表完整内存峰值。context常驻有内存代价，不等于全部专家常驻。
+
+四层和40层功能验证、两组三轮正式测试共576份完整hidden/最终state/KV与原AR128全bank基准逐字节一致；每轮仍执行5227个层号/专家组合、238批、40960次分派、40次最终合并。正式两组每轮物理读均8458784768B，未减少专家读取量。正式日志无QNN error、FastRPC unmap或生命周期不平衡。
+
+详细数据、初始化与稳态口径、内存限制及复测命令见新原型`REPORT.md`、`RESULTS.json`、`SAMPLES.csv`、`LIFETIMES.csv`和`MANIFEST.json`。尚未接入生产llama.py。
+
+### SM8975：AR128 prefill四层各36专家槽（2026-10-21）
+
+同一独立原型`llama-output/qwen36-prefill128-persistent-context-20261021`，80个Attention/router context继续常驻，state/conv/KV仍为UINT16。128 token完整完成四层再换组，将每层24专家槽扩为36，共144槽。沿用完全相同的ARM runner、DSP SO、冻结图、N4×动态A8专家和Top8路由，无需重新导出或修改算子。这里是四层的权重槽容量，不是40层各36专家，也不是将每层路由截断成Top36。
+
+四层功能验证通过后，同批重测24、36容量，各预热1轮＋正式3轮，全部40层、128-token prefill；不含初始化、embedding lookup、最终norm/head、采样和图片。两组顺序执行，前后thermal均0、CPU policy0/3/6上限边界均1843.2MHz。
+
+| 配置 | 三轮时间（ms） | 中位 | 吞吐 | 专家槽内存 | Native批次 |
+|---|---|---:|---:|---:|---:|
+| 4×24 | 3023.197／2974.671／3017.680 | 3017.680ms | 42.417 token/s | 150.766MiB | 238 |
+| 4×36 | 2805.656／2851.152／2854.801 | **2851.152ms** | **44.894 token/s** | 226.141MiB | 165 |
+
+中位延迟下降5.52%，吞吐提高5.84%，增加75.375MiB专家槽。中位轮专家IO从2430.676降至2329.101ms，Native含RPC/资源申请从388.782降至322.079ms。批次少73次（30.67%），但两组均执行5227个层号/专家组合、40960次任务和40次合并；每轮物理读与O_DIRECT请求均8458784768B，约7.878GiB。增加容量没有减少本次128-token输入的专家读取量，不能当作跨请求LRU命中率收益。
+
+36槽原型READY rpcmem合计329.746MiB、构建过程峰值533.004MiB，非完整RAM峰值。一次setup3123.086ms（24槽2718.762ms）；setup＋首个prefill为5853.935ms（24槽5640.848ms），本批冷setup口径并未提速，不与稳态中位混用。
+
+36槽四层9份及两组正式各243份文件，共495份完整hidden/最终state/KV与原AR128全bank基准逐字节一致。每轮context/IO注册/RPC buffer生命周期操作均0，结束80/80和450/450平衡；正式日志无QNN error、FastRPC unmap或清理错误。
+
+细节见原型`CAPACITY36.md`、`CAPACITY_RESULTS.json`、`CAPACITY_SAMPLES.csv`和`CAPACITY_MANIFEST.json`；复测使用`source/run_device.py --layers 40 --tokens 128 --slots 36 --samples 3 --warmups 1 --name repeat-capacity36`。生产llama.py未改，原型仍通过参数选择容量。
+
+### SM8975：四层各64专家缓存，跨AR128块利用时间局部性（2026-10-21）
+
+用户确认范围为当前四层各64专家，共256槽；独立原型`llama-output/qwen36-prefill128-cache64-20261021`。专家缓存含4个索引页固定402.016MiB，当前组的连续AR128块保留各层缓存，全部输入完成本组后再复用这四个buffer进入下四层。Attention及router/shared的全部80个QNN context、40层state/conv/KV继续常驻。没有分配40层各64专家的4020MiB缓存。
+
+只改Host缓存调度，原冻结图、N4×动态A8整数HMX、Top8、UINT16 state/conv/KV及DSP SO保持。先计算本块所有命中专家，再按专家在当前块最后出现位置排序读取miss；按专家批次访问维护LRU和pin。命中直接使用原RPC/DRAM槽，不重复读取或CPU复制权重，仍走原DMA→VTCM计算路径。只使用当前块路由和历史缓存，没有读取未来块路由。每轮从空标签/state开始，四层换组只清空标签，不销毁buffer或context。
+
+全部40层、单块128-token三轮中位**2668.024ms，47.976 token/s**，三轮2659.622／2668.024／2695.784ms。首块缓存命中0，仍读取8458784768B；本结果是64槽容量和批次调度的表现，不能归因于跨块时间局部性。
+
+为验证时间局部性，以1024-token输入、8次AR128执行，对比相同二进制、相同4×64容量，只切换是否跨块保留专家。每组预热1轮＋正式3轮，均覆盖40层全部block、IO、Native RPC、反馈及hidden交接；不含setup、embedding lookup、最终norm/head、采样或图片。
+
+| 配置，均4×64 | 三轮时间（ms） | 中位 | 吞吐 | 正式物理读 | 命中率 |
+|---|---|---:|---:|---:|---:|
+| 不保留跨块专家 | 20072.800／19981.682／20124.752 | 20072.800ms | 51.014 token/s | 58.678GiB | 0% |
+| 保留跨块专家 | 14256.137／14239.249／14308.834 | **14256.137ms** | **71.829 token/s** | **37.514GiB** | **35.91%** |
+
+本批观察延迟下降28.98%，读字节减少36.07%。命中13991/38959，分母为层/AR128块/专家请求，非327680次token–expert分派；同块聚合复用不重复算跨块命中。两组任务相同，均38959次层/块/专家计算、327680次token–expert任务、320次最终合并。命中优先拆批使Native调用752→804，额外开销全部计入；专家IO中位16587.930→10711.936ms，Native含RPC1771.816→1805.088ms。独立脚本逐批重放LRU/pin，命中和按bank索引计算的读字节与设备一致；正式物理读均等于O_DIRECT请求字节。
+
+四层1024-token功能验证9份、单128正式243份、1024对照243份、1024缓存243份，共738份完整hidden/最终state/KV与原AR128全bank对应基准逐字节一致。1024两组每层每块专家集合相同，最终比较完整1024×2048 hidden。循环内context/IO注册/RPC buffer生命周期操作均0，单128退出80/80、450/450，1024退出80/80、470/470平衡。正式日志无QNN error、FastRPC unmap或任务覆盖错误。
+
+1024缓存版READY原型rpcmem合计490.309MiB，构建过程累计峰值697.941MiB；单128为505.621MiB、708.879MiB。含缓存和state/IO，不含全部SDK内存、文件页、DSP heap或CPU staging，非完整RAM峰值。1024缓存版setup2848.291ms另计，结束host RSS约1.287GiB、整机MemAvailable约2.566GiB，不能与rpcmem简单相加。
+
+各组前后thermal均0；128组与1024对照CPU policy0/3/6上限边界均1843.2MHz，1024缓存组结束policy6降到1036.8MHz，policy0/3保持1843.2MHz。两组顺序执行，未逐时采样实际频率；28.98%是本批观察值，不宣称严格控频加速比例，确定的命中及读字节减少不依赖该计时条件。
+
+详见新原型`REPORT.md`、`RESULTS.json`、`SAMPLES.csv`、`CACHE.csv`、`BATCHES.csv`和`MANIFEST.json`。复测：`source/run_device.py --layers 40 --tokens 1024 --slots 64 --samples 3 --warmups 1 --name repeat-cache64`；对照增加`--no-reuse-experts`。仍保持AR128，未接入生产llama.py，也未实现本版命中计算与miss读取重叠。
+
+### 旧全bank基准与4×64版本的1024-token性能回退核对（2026-10-21）
+
+用户指出旧版128-token为7.908秒、1024-token为10.611秒；来源是`llama-output/qwen36-full40-sm8975-20261021/REPORT.md`、`SUMMARIES.csv`和原始`SAMPLES.csv`，数据有效。旧表各项分别取三轮中位，分项不保证严格加和。以下只比较总时间和确切物理读字节，不重新跑推理。
+
+| 输入 | 旧整层bank复用 | 新4×64缓存 | 旧/新读盘量 |
+|---|---:|---:|---:|
+| 128 token | 7.908秒 | 2.668秒 | 15.484／7.878GiB |
+| 1024 token，8×AR128 | **10.611秒** | **14.256秒** | **15.484／37.514GiB** |
+
+旧版同时保留两层完整256专家bank，专家工作buffer800.070MiB；代码在8个AR128块循环外先各加载一次bank，整个prompt只加载40次完整bank。128与1024输入每轮均读取16625393664B，新增7块仅增加计算与交接，专家IO基本不变。
+
+新版本当前四层各64槽，专家buffer402.016MiB；每个AR128块重新查询缺失专家，换出的权重被后续块需要时重读。即使命中35.91%，1024输入仍需24968次miss读取，累计40280723456B，是旧版2.423倍。4×64合计256槽按层分区，不能提供每层完整256专家的复用能力。上述内存仅指专家buffer，不能推断完整RAM峰值。
+
+1024总耗时相比旧版增加34.36%，专家IO从5.046升至10.712秒，抵消了context常驻节省的约2.75秒；Native调用旧320次、新804次，计算/交接也增加。IO区间有效吞吐旧约3.068GiB/s、新约3.502GiB/s，主要问题是总读量增加。正式输出及state/KV与旧基准逐字节一致，不是更换输入、模型或量化精度造成。
+
+此前28.98%提速仅为4×64内部“保留跨块缓存”相对“不保留”的改善；遗漏旧全bank全局基准，不能据此宣称长prefill整体优于此前。1024版目前是真实回退。应保持context常驻，修正专家加载批次覆盖全部相关AR128块的调度，或明确比较不同专家内存容量的整层驻留方案。当前严格4×64实现尚未实现跨块专家优先计算，不能把旧context时间直接扣掉当作新实测。
+
+详细逐轮同样本拆分、代码循环位置及来源hash见`llama-output/qwen36-prefill128-cache64-20261021/COMPARISON_WITH_FULL_BANK.md`和同名JSON。新报告首页已补充回退提示，本轮未宣称该回退已修复。
+
+### SM8975：历史Hot64预加载后由LRU更新（2026-10-21）
+
+独立原型`llama-output/qwen36-prefill128-hot64-20261021`。真实40层Qwen3.6-35B-A3B，AR128，仍为当前四层×64专家槽、402.016MiB。全部80个Attention/router/shared QNN context和各层UINT16 state/conv/KV继续驻留；N4×动态A8 HMX、原Top8及DSP SO不变，仅改变Host缓存的初始内容。
+
+从不重叠的WikiText校准片段各取1024 token，按校准FP32路由频率为每层选前64；评估片段不参与挑选。校准、评估分别从语料第0、2000行开始截取文本，行号不是token偏移。热点表40×64 int32、10KiB，校准集Top64分派覆盖平均82.01%，不等同于评估缓存命中率。
+
+本组四层推理前预加载热点，随后正常批次LRU更新，热点不会永久锁定；先计算实际命中的专家，再按需读取缺失专家。换组复用同四个buffer。402MiB只能把首组热点提前到接收输入前；后续九组仍需换组读取。本次十组预加载全部计时，没有把成本藏到setup，也尚未实现预加载与初始化/计算重叠。
+
+同一ARM runner/DSP二进制，每组预热1轮、正式3轮，表内为总时间中位轮的同样本分项。计时含40层读盘/复制/同步、Native RPC和反馈交接，不含固定setup、embedding lookup、最终norm/head、采样或图片。
+
+| 输入 | 配置 | 预加载 | 后续推理 | 合计 | 全部专家请求读取 | 命中率 |
+|---|---|---:|---:|---:|---:|---:|
+| 128 | 冷LRU | 0 | 2.676秒 | **2.676秒** | 7.878GiB | 0% |
+| 128 | Hot64＋LRU | 1.085秒 | 1.830秒 | **2.915秒** | 8.640GiB | 39.41% |
+| 1024，8×AR128 | 冷LRU | 0 | 14.251秒 | **14.251秒** | 37.514GiB | 35.91% |
+| 1024，8×AR128 | Hot64＋LRU | 1.086秒 | 13.632秒 | **14.718秒** | 38.918GiB | 40.12% |
+
+本批计入预加载后128总耗时增加8.90%，1024增加3.28%；总专家请求读取分别增加9.68%、3.74%。40层预加载2560个专家，其中2060个在被换出前使用过，500个（19.53%）还没用就换出；这不表示它们在整个prompt中永远不被选择。预读改变LRU轨迹，且预加载流量不进入路由请求命中率的分母，所以命中率提高不能单独说明总IO获益。Native调用分别从97→112、804→840，全部计入。
+
+128冷热请求总读取分别8458784768、9277243392B；1024分别40280723456、41787568128B。`RESULT direct_bytes`仅为路由miss，包含预加载应看`PRELOAD_RESULT total_direct_bytes`。部分hot轮存在少量额外文件页物理读；1024-hot中位轮实际41788755968B，比专家请求多1187840B。未强行将两类统计写成一致。
+
+四层验证及四组正式共981份完整hidden和最终state/KV与原全bank基准逐字节一致；冷热每层每块专家集合及分派/合并计数相同。独立脚本回放LRU/pin、seed首次命中和按索引计算的读字节，均与设备一致。循环内context/IO注册/RPC buffer生命周期操作均0，退出80/80及450/450或470/470平衡。
+
+全部前后thermal状态0。128两组与1024冷组CPU上限边界1843.2MHz；1024-hot结束policy6降至1036.8MHz，并出现文件页回收及少量额外IO。顺序测试、未逐时采样实际频率，时间差仅为本批观察；总请求读取增加不受该限制。单128原型READY RPC分配505.621MiB，1024为490.309MiB，不代表完整RAM峰值。
+
+**该版没有整体提速，也未修复旧全bank的1024-token 10.611秒基准回退。** 目前保留为可复测实验，没有接入生产llama.py或改为默认。详细阶段、全部三轮时间、初始化边界与hash见原型`REPORT.md`、`RESULTS.json`、`PRELOAD_RESULTS.csv`和`MANIFEST.json`。复测：`source/run_device.py --layers 40 --tokens 1024 --slots 64 --hot-preload --samples 3 --warmups 1 --name repeat-hot`；对照去掉`--hot-preload`。
+
+### SM8975：完整40层AR128 prefill PTE，专家外存加载（2026-10-21）
+
+按用户确认的“完整40层，专家外存加载”导出独立原型`llama-output/qwen36-full-prefill-pte-sm8975-20261021/qwen36-full-prefill-ar128.pte`。一个`prefill_forward`方法，输入token IDs `[1,128]`，输出最后位置logits `[1,1,248320]`及完整最终hidden `[1,128,2048]`。包含真实embedding、40层Attention/norm/残差/router/shared/Top8 MoE和最终norm/LM head，不是单层或预先记录的路由回放。
+
+完整PTE执行计划共122阶段：embedding 1、Attention 40、router/shared 40、外存MoE 40、final norm/head 1。实际复用原编译图和Native N4×动态A8 HVX/HMX内核，新编译末端W4 block32/A16 head。81个执行QNN context常驻，GDN/conv/MHA cache继续UINT16，专家仍为当前四层×64槽、402.016MiB。动态读盘由CPU调度，embedding从外部BF16表按行mmap，保持checkpoint值不变。本次没有引入INT4 embedding的额外误差。
+
+**单个完整PTE包含多个QNN子图和Native MoE阶段，尚未融合成单个QNN图。** 需专用`source/pte_runner`注册`Qwen36PrefillStage` backend，尚不能用通用llama.py runner直接加载。只含固定128-token冷prefill，没有decode方法、额外短图或图片encoder；单会话串行原型。
+
+PTE内嵌真实dense编译数据，大小1661562096B＝1.547GiB；另有1017118720B BF16 embedding表，专家复用原15.484GiB外存bank。另内嵌10份FA warm图用于cache量化元数据，不额外创建执行context。层间临时arena约4.955MiB，40层复用同一组activation槽。
+
+SM8975/V85、QNN SDK2.48.1.260715和设备ODM库。同一最终PTE/ARM runner/DSP SO，每组预热1轮、正式3轮。计时为完整`module.execute`，含embedding、state复位、40层、全部预加载/专家IO、反馈及head；不含一次性PTE加载/context初始化、采样、图片或文件保存。
+
+| 配置 | 三轮完整时间（ms） | 中位 | 吞吐 | 全部专家请求读取 |
+|---|---|---:|---:|---:|
+| 冷LRU | 2707.974／2804.950／2838.612 | **2804.950ms** | **45.634 token/s** | 7.878GiB |
+| Hot64预加载＋LRU | 2969.796／2953.385／2931.220 | **2953.385ms** | **43.340 token/s** | 8.640GiB |
+
+Hot64中位轮：embedding0.655ms、40层Attention含交接166.087ms、router/shared32.927ms、MoE2740.366ms、最终norm/head4.838ms、runtime/复位等8.511ms。MoE内部含预加载1087.625ms、按需读取/复制/同步1358.676ms、Native含RPC243.110ms、反馈19.640ms；子项不能与MoE总项重复相加。两类专家IO合计2446.302ms，占完整时间82.83%。扣除预加载后的1865.759ms不能当作完整prefill时间，打包PTE也未自动实现IO/计算重叠。
+
+冷/热均5227个层/专家组合、40960次token–expert分派、40次最终合并；Native调用97/112次。Hot64命中2060/5227，预加载2560中500个使用前换出，读请求计数与原型一致。部分正式轮有少量额外PTE/embedding文件页物理读，原始统计保留。各组前后thermal0、CPU policy0/3/6上限边界1843.2MHz；顺序测试、未逐时采样实际频率，不将与历史原型的差值全部归因于PTE开销或融合加速。
+
+两组正式共486份完整hidden及最终state/KV与原AR128量化全bank基准逐字节一致，冷热所有logits也逐字节一致。最终128-token hidden对FP32参考SQNR11.487dB，最后token hidden10.927dB；固定同一PTE hidden，隔离新norm/head的QNN对FP32 SQNR22.241dB，本输入两者argmax均为token1848。保留原型行为不等于无FP32误差，本次未重测完整PPL或多步生成。
+
+READY原型RPC分配507.570MiB、构建累计峰值708.879MiB，非完整DRAM峰值。冷/热setup分别3232.206/4948.434ms，另计。循环内context/IO注册/RPC buffer生命周期操作均0，退出81/81 context、452/452 IO注册平衡。PTE分段在context销毁之后释放，异常路径亦保持该顺序。
+
+报告、执行图及完整证据见新原型`REPORT.md`、`EXPORT.json`、`EXECUTION_GRAPH.txt`、`RESULTS.json`、`SAMPLES.csv`和`MANIFEST.json`。复测：`source/run_device.py --hot-preload --samples 3 --warmups 1 --name repeat-full-prefill`；去掉`--hot-preload`为冷LRU，增加`--deploy`重建独立设备目录。外部bank/索引/roPE及库通过符号链接复用既有原型，保留依赖后再整理旧目录。
+
+### SM8975：完整40层AR1 decode PTE接续prefill（2026-10-21）
+
+独立原型`llama-output/qwen36-full-decode-pte-sm8975-20261021/qwen36-full-decode-ar1.pte`，模型仍为真实Qwen3.6-35B-A3B。一个`decode_forward`方法，输入token IDs INT64 `[1,1]`和position INT64 `[1]` Tensor，输出logits `[1,1,248320]`及最终hidden `[1,1,2048]`。当前context1024，实际接续128-token设备prefill，连续执行位置128～143。新增的PTE完整覆盖embedding、40层Attention/norm/残差/router/shared/实际Top8 MoE及最终norm/head，共122阶段。
+
+沿用已量化/编译的40个AR1 Attention和40个AR1 router/shared图，不重新校准主干。Attention为W4A16/block32，K/z及depthwise W8；AR1 GDN沿用V85 `DeltaNetCoreVtcm`，state/conv/KV UINT16。专家使用原N4×动态A8整数HMX、8线程O_DIRECT加载及按层LRU。最终norm/head先从相同校准输入获得冻结QDQ，再specialize并编译AR1；CPU端specialize前后结果与原prefill head参考逐元素一致。Embedding保持外部BF16行读取。
+
+PTE大小1464092016B＝1.364GiB，内嵌81个实际执行QNN图及1296B cache网格元数据、各层IO顺序。单个完整ExecuTorch图中仍有多个QNN子图/Native阶段；需要专用`Qwen36DecodeStage` backend和`source/pte_runner`，未接入通用llama.py。没有图片encoder。
+
+初始state为上一轮完整prefill runner完成cache反馈后保存的全部80份真实缓存快照及logits，来源SHA写入`SOURCE_PREFILL.json`。cache编码从原QNN二进制直接提取FP32 scale及INT32 offset，没有从显示精度有限的日志反推，也未硬编码量化网格。GDN保持原shape；MHA历史896位置扩为1023位置，左侧补127个量化零、原数据右对齐，按真实编码转换，后续随position更新RoPE/mask和K/V。每步保留状态，只有新测试序列开始才恢复快照。
+
+本次prefill→decode为两个独立PTE/进程的一次性快照交接，尚未实现同进程零拷贝切换；快照只在初始化时读入，不在连续token循环读写。最初普通整数position被ExecuTorch常量检查拒绝129，最终改成动态INT64 Tensor后连续16步通过，失败日志保留在`initial-position-scalar.log`。
+
+decode按层保留专家，默认cache budget384MiB得到40层×6槽、实际376.875MiB，另两个Top8临时bank25.070MiB，总专家buffer401.945MiB，低于prefill 4×64的402.016MiB。6是历史缓存容量，每个token仍实际计算8个专家。没有给每个token强制预读40×64个专家，也没有把15.484GiB专家bank全搬进DRAM。SDK context和state buffer长期保留，权重缓存DSP映射切层管理不等于context重建。
+
+SM8975/V85、QNN SDK2.48.1.260715＋设备ODM库。同一最终PTE、ARM runner及原DSP库。固定输入为旧AR1基准相同WikiText token128～143，预热1轮＋正式3轮；贪心闭环另跑1轮16步。
+
+| 口径 | ms/token | 吞吐 |
+|---|---:|---:|
+| 固定输入，模型图三轮中位 | **307.275** | **3.254 token/s** |
+| 同一中位轮，含Host处理 | 311.559 | 3.210 token/s |
+| 贪心闭环，模型图单轮 | 319.159 | 3.133 token/s |
+| 贪心闭环，含Host处理单轮 | **323.425** | **3.092 token/s** |
+
+固定输入三轮模型时间308.610／307.275／305.885ms/token。模型时间包含embedding、40层、全部专家IO、反馈和head；Host循环另含输入构造、argmax、有限值检查及结果拷贝，排除setup和循环后的文件保存。贪心序列路由不同，不将与固定输入的时间差都归因于采样。
+
+固定输入中位轮每token：Attention70.487ms、router/shared17.525ms、专家IO144.433ms、Native50.242ms、反馈18.694ms、head4.457ms，其余约1.437ms。缓存命中1978/5120＝38.63%，16步读取5090627584B，约303.426MiB/token；贪心命中1627/5120＝31.78%，读取5658800128B。独立脚本逐层重放真实Top8、6槽LRU/pin及bank索引，命中和请求字节均一致。每步320次token–expert任务，16步5120次，没有减少计算量。
+
+功能验证＋三轮正式共324份完整hidden/最终state/KV与旧AR1量化基准逐字节一致，正式所有logits相互逐字节一致。贪心首token取自prefill logits argmax1848，后续每步输入严格等于上步argmax，未使用teacher token充当生成输入。原始WikiText前缀的续写为` On 29 April 1915 , the High Seas Fleet sortied`（包含prefill首token和16次decode预测）；固定16步、未按EOS提前结束，没有以单条续写代替完整PPL评价。
+
+正式setup7136.451ms，贪心setup5525.659ms，含快照导入及81个context初始化，另计。READY原型RPC分配486.785MiB、构建峰值487.844MiB，不含完整SDK/文件页/staging/DSP heap，非完整RAM峰值。全部连续token循环内context/IO注册/RPC buffer生命周期操作均0，退出81/81 context、472/472 IO注册平衡，无QNN error或清理失败。前后thermal0，CPU policy0/3/6上限边界均1843.2MHz，未逐时采实际频率，不与历史不同条件/容量数据直接算加速。
+
+实现、全部阶段数据和证据见新原型`REPORT.md`、`EXPORT.json`、`SOURCE_PREFILL.json`、`GREEDY.json`、`RESULTS.json`、`SAMPLES.csv`、`STEPS.csv`及`MANIFEST.json`。设备已部署后复测：`source/run_device.py --greedy --steps 16 --samples 1 --warmups 0 --name repeat-greedy`；固定输入三轮去掉`--greedy`、使用`--samples 3 --warmups 1`。`--deploy`复用已有专家、prefill快照、embedding及库，清理旧目录前需保留依赖。未改生产llama.py，未commit/push。
+
+### SM8975：完整40层PTE中文聊天验证（2026-10-21）
+
+复用上述Qwen3.6-35B-A3B prefill/decode PTE，新建独立聊天输入和state。使用模型原生chat template、`enable_thinking=False`，通过正常系统提示构成恰好128个真实token，没有padding。用户问：“你好，请用中文介绍一下自己，再告诉我1加1等于几。”设备实际回答：“我是一个人工智能助手，旨在提供简洁、准确且自然的中文回答。1加1等于2。”正文20 token后产生`<|im_end|>`（248046），此条中文介绍和简单计算通过，没有用旧WikiText续写代替聊天验证。
+
+首token来自这次prefill logits argmax，decode一次性导入这次prefill产生的80份state/KV，后续每步输入严格等于上步预测，脚本校验闭环关系。没有teacher forcing。原benchmark runner固定执行64步、不在EOS处提前停止；显示答案按首个EOS截断，原始完整预测仍保留。EOS后的额外预测不属于本条助手回答。
+
+本次prefill图2826.139ms；全部64步decode图平均317.705ms/token，含Host处理321.779ms/token、3.108 token/s。decode统计含EOS后的额外步数，不作为恰好20-token回答延迟。setup、文件交接和保存另计。此为单条简短中文烟测，不代替PPL、多轮或复杂能力验证。完整提示、输入IDs、生成IDs、PTE/runner来源和原始日志见`llama-output/qwen36-chat-sm8975-20261021/REPORT.md`及同目录`INPUT.json`、`ANSWER.json`、`SOURCE.json`、`prefill.log`、`decode.log`；`run_chat.py`可独立复测。
+
+同日增加聊天专用`source/stream_runner`：设备每次argmax后立即发送token及单调时钟时间，Host使用`Popen`逐行读取ADB并实时显示，原benchmark runner保留。默认显示Host接收间隔、Device预测间隔及完整图执行时间；`--text-only`显示连续正文。EOS来自模型generation config，遇到EOS立即停止，不再固定跑满64步。支持`--prompt`和`--max-new-tokens`，后者包含prefill首token和EOS；每次输入、日志、答案及`TOKEN_TIMINGS.jsonl`保存至独立`results/时间戳`目录。
+
+以用户当前问题“什么是注意力机制？”实测，进程未结束前已逐步收到token；正文60 token＋EOS后停止，预测IDs与原相同输入的固定步数结果在EOS前完全一致。正常Host间隔中位315.192ms、范围281.838～359.481ms。首个decode间隔7209.623ms，其中独立decode context初始化6721.482ms；如实显示初始化停顿，不用约300ms的Graph耗时替代该间隔。循环内context/注册/RPC buffer生命周期仍0。细节及证据见该原型`REPORT.md`“实时吐字”小节和`results/20261021-171343-213092/VALIDATION.json`。
+
+### SM8975：prefill四层×64专家池直接交给decode（2026-10-21）
+
+按用户要求创建独立原型`llama-output/qwen36-prefill-expert-handoff-sm8975-20261021`。prefill执行后用`F_DUPFD`保留四块真实专家DMA-BUF，经`exec`交给AR1 decode；权重交接不写文件、不重新读盘或复制。仅写4232B ID/LRU/句柄元数据，四组缓存采样指纹核验一致。交接保留402.016MiB、256个真实专家，所属层为36～39。state/KV继续走原快照及真实量化网格转换，decode context仍需初始化。元数据/句柄导出0.613ms不代表整体阶段切换时间，首个decode Host间隔仍约7.7秒。
+
+decode按原prefill四层窗口语义，从0～3层开始复用四个64槽池，随后依次换组。继承的256个专家在首次使用前被淘汰；16步共160次组切换、继承命中0、全部5120次专家请求miss。与相同中文输入、16步闭环的当前40层×6槽单轮对照：含Host315.863→371.402ms/token，3.166→2.693token/s；模型图309.970→365.597ms/token；专家读取/复制/同步144.077→203.110ms/token；请求读取287.017→496.832MiB/token；命中41.91%→0。两组前后thermal0，CPU上限边界1843200kHz，未逐时采实际频率，时间仅代表本次单轮顺序配对。
+
+两版84个完整文件逐字节一致：input/output IDs、16步hidden/logits及80份最终state/KV。循环内context/注册/RPC buffer生命周期均0。内存交接成功，但四层窗口不能保留AR1下一token需要的其他层历史，未将此回退方案设为聊天默认。此次未施加4GiB总内存限制，也未重测PPL。复现入口`run_handoff.py --mode rolling4 --prompt "什么是注意力机制？" --max-new-tokens 17`，对照用`--mode baseline`；原理、阶段数据、全部SHA及限制见新原型`REPORT.md`与`RESULTS.json`。
+
+### 更正及修正版：四层窗口按各层独立历史回填（2026-10-21）
+
+用户指出回到0～3层应加载它们各自的时间局部性专家。上节实现只交接末组，换组清掉旧标签并按当前Top8读盘，没有保存40层历史及回填；0%命中只代表该简化实现，不能用于否定用户提出的历史回填方案。
+
+新原型`llama-output/qwen36-prefill-history64-sm8975-20261021`在prefill每层完成后保存真实64槽ID/LRU及本层时钟，交接全部40层逻辑历史和末组四块物理缓存。decode进入0～3、4～7等组前，保存出组层的更新历史，再按入组层历史回填最多64专家；Top8缺失补读并更新本层LRU，下一token继续使用各层已更新的历史。逻辑历史跨组保留，物理权重仍仅当前四层驻留。本版先同步回填验证，未引入跨组IO/计算重叠。
+
+相同128-token中文输入后8步贪心短测，history64命中2008/2560＝78.44%，当前每层6槽基准908/2560＝35.47%。但每token预加载3971.318MiB、补读105.159MiB，全部4076.477MiB（3.981GiB），比基准319.277MiB大。预加载1055.674ms/token计入完整图，含ARM循环320.292→1272.288ms/token（3.122→0.786token/s）；不能只看补读60.754ms或高命中率。此为单轮顺序短测，两组前后thermal0、CPU上限边界1843200kHz，未逐时采实际频率，不作为硬件极限。
+
+两版84文件逐字节一致。独立重放各层历史/LRU得到8步命中259/277/239/237/247/229/264/256，与设备一致；按真实bank索引重算预加载33313832960B、补读882135040B，也与设备一致。循环内context/IO注册/RPC buffer生命周期操作均0。新原型保留为独立实验，未替换当前聊天默认；复测`run_history.py --mode history64 --prompt "什么是注意力机制？" --max-new-tokens 9`，对照用`--mode baseline`。完整实现、预加载计时边界及SHA见新原型`REPORT.md`与`RESULTS.json`。
+
+### SM8975：64历史候选与8/16专家预取分离（2026-10-21）
+
+独立原型`llama-output/qwen36-prefill-selective-prefetch-sm8975-20261021`保留各层64个真实历史ID/LRU，四层物理窗口换组时仅预取最近8或16个；候选存在但尚未加载仍按miss处理，缺失补读后更新本层LRU。选择只用过去路由，预取发生在当前组Attention/router之前。本次为同步预取，全部预取、补读、复制和同步均计入完整图；复用原完整40层PTE、量化网格和DSP库，仅重新编译ARM runner。
+
+同一128-token中文输入后8步真实贪心decode，顺序各1轮、无预热：
+
+| 配置 | 完整模型图 ms/token | 含ARM循环 ms/token | 吞吐 token/s | 实际Top8命中 | 全部专家请求读取/token |
+|---|---:|---:|---:|---:|---:|
+| 当前40层×6槽实际权重保留 | 316.291 | **322.406** | **3.102** | 35.47% | **319.277MiB** |
+| 每层64历史、四层窗口预取8 | 455.959 | 463.784 | 2.156 | 43.13% | 777.882MiB |
+| 每层64历史、四层窗口预取16 | 554.173 | 560.572 | 1.784 | 56.52% | 1207.987MiB |
+
+预取8/16分别新增496.958/993.656MiB每token预取，只减少38.353/104.946MiB补读；预取实际使用1104/2560＝43.13%、1447/5120＝28.26%。专家IO总时间由154.350ms/token增至290.888/393.324ms/token，Attention约70ms、Native约49ms基本不变。减少预取显著优于上一轮全64同步回填，但仍未超过当前默认。四层窗口在AR1经过后切换，下一token需要重新读取本层权重；历史ID保留不等于实际权重持续驻留。此结果不替代尚未实施的异步IO实验。
+
+两版各84个完整输出文件与本轮基准逐字节一致。独立重放真实prefill历史、逐层Top8及bank索引，对齐后全部预取/补读字节、每组预取数和内存命中均与设备一致，未把逻辑历史当作内存命中。循环内context/注册/RPC buffer生命周期均0。前后thermal0、CPU上限边界1843200kHz，未持续采实际频率，属于单轮短测。prefill未变，本轮完整128-token耗时约2.90～2.93秒；decode一次性初始化约6.66～6.80秒另计。未施加4GiB总内存限制，也未重测PPL。
+
+保留当前较快的聊天默认，实验入口`run_prefetch.py --mode prefetch --preload-experts 8 --prompt "什么是注意力机制？" --max-new-tokens 9`，预取16改对应参数，基准使用`--mode baseline`。完整阶段拆分、计时边界、内存范围和复现见新原型`REPORT.md`、`RESULTS.json`、`MANIFEST.json`及`analyze_results.py`。
+
+### SM8975：40层各保留16专家，prefill结束按LRU预加载（2026-10-21）
+
+独立原型`llama-output/qwen36-decode-resident16-sm8975-20261021`按用户指定流程：128-token prefill结束保存各层真实ID/LRU，释放prefill四层池，再从每层历史选择最近16专家一次性加载到40层各自16槽；AR1只根据当前token的真实Top8查询、补读和LRU更新，没有未来token预测或四层窗口回填。原PTE/量化网格/DSP库复用，只编译ARM runner。
+
+同一中文输入后16步真实贪心decode，三组顺序各1轮、无预热：
+
+| 配置 | 完整图 ms/token | 含ARM循环 ms/token | 吞吐 token/s | 内存命中 | decode补读/token |
+|---|---:|---:|---:|---:|---:|
+| 6槽空缓存 | 309.296 | 317.580 | 3.149 | 41.91% | 287.017MiB |
+| 16槽＋prefill LRU | **275.875** | **282.870** | **3.535** | **63.65%** | **178.410MiB** |
+| 16槽空缓存 | 273.221 | 280.486 | 3.565 | 62.42% | 184.573MiB |
+
+用户方案相较6槽循环耗时下降10.93%、吞吐提升12.27%、decode补读下降37.84%。一次性640专家预加载另读991.285MiB、耗时262.272ms；计入后16步累计平均299.262ms，比6槽累计低5.77%。同容量消融显示扩大缓存是主要收益：prefill预加载只比16槽空缓存多63次命中、少读98.617MiB，本轮没有额外净时间收益，不能把全部改善归因于继承prefill历史。两种16槽约2.4ms差值不当作稳定快慢结论。
+
+16槽实际专家池1005MiB、全部已计数RPC buffer1114.910MiB，分配和连续执行成功；这不等于完整物理RAM峰值，未施加4GiB总内存限制。ready/结束采样显示预加载版进程VmSwap约13.0→6.5MiB，其余两组为0。前后thermal0、CPU上限边界1843200kHz，未持续采实际频率，数据为单轮短测。decode context初始化约6.7～6.9秒仍另计，首decode吐字间隔包含该停顿和预加载。
+
+两个16槽版本各84个完整输出文件及真实路由与6槽逐字节一致；独立重算prefill最近16选择、逐步LRU/pin、bank对齐读取字节及最终cache ID全部通过。循环内context/注册/RPC buffer生命周期操作均0，退出81/81 context、472/472注册平衡。未重测PPL，未改原聊天默认。复测`run_resident.py --mode warm16 --prompt "什么是注意力机制？" --max-new-tokens 17`，对照用`baseline6`或`cold16`。详细计时边界、内存口径和证据见新原型`REPORT.md`、`RESULTS.json`、`STEPS.csv`、`MANIFEST.json`与`analyze_results.py`。
+
+### SM8975：每层32专家驻留，与16槽同批对照（2026-10-21）
+
+独立原型`llama-output/qwen36-decode-resident32-sm8975-20261021`沿用prefill后各层LRU一次性加载、AR1只按当前token真实Top8查询/补读/替换的流程，缓存从每层16扩到32。复用原完整40层PTE、量化网格和DSP库，只重新编译ARM runner。相同128-token中文输入后16步真实贪心，先16槽后32槽各1轮，无预热：
+
+| 配置 | 模型图 ms/token | 含ARM循环 ms/token | 吞吐 token/s | 内存命中 | decode补读/token |
+|---|---:|---:|---:|---:|---:|
+| 16槽＋prefill LRU | 275.136 | 282.218 | 3.543 | 63.65% | 178.410MiB |
+| 32槽＋prefill LRU | **246.694** | **253.363** | **3.947** | **74.75%** | **123.235MiB** |
+
+32槽循环耗时下降10.22%、吞吐提升11.39%、补读下降30.93%；专家IO115.444→87.834ms/token，Attention/Native基本相当。第一步命中由40/320升到198/320。专家池1005→2010MiB、全部已计数RPC buffer1114.910→2119.910MiB，设备分配及连续执行通过；未施加4GiB总内存限制，不以进程RSS代替总物理峰值。
+
+一次性预加载640→1280专家，991.285→1984.910MiB、266.723→531.947ms。预加载＋16步循环累计4782.218→4585.752ms，降低4.11%；本轮初始化6971.994→7233.111ms，若把初始化计入字段合计则11754.212→11818.863ms，不能宣称短序列完整启动延迟也降低。首decode吐字间隔约8.51→8.96秒。Prefill算法不变，两组128-token图约2918/2916ms。
+
+两版84个完整输出文件和真实路由逐字节一致；独立重算种子选择、逐步LRU/pin、对齐读取及最终cache ID全部通过。循环内context/注册/RPC buffer生命周期均0，退出81/81 context、472/472注册平衡。前后thermal0、CPU上限边界1843200kHz，未持续采实际频率；单轮短测不作为硬件极限，未重测PPL。复测新目录`run_resident.py --mode warm32 --prompt "什么是注意力机制？" --max-new-tokens 17`，对照`warm16`；原聊天默认未改。详细证据见新原型`REPORT.md`、`RESULTS.json`、`STEPS.csv`和`MANIFEST.json`。
+
+### SM8975：prefill与decode直接复用40层×32专家buffer（2026-10-21）
+
+用户指出不需要复制专家权重。此前保留实验使用四层×64 prefill池，再复制到独立40层×32驻留池；复制来自两套池的实现，不是模型要求。新独立原型`llama-output/qwen36-prefill-reuse32-sm8975-20261021`从prefill开始直接使用最终40层×32 DMA-BUF，AR128按32专家分批计算，每层末尾最近32专家原地保留，阶段交接用FD继承和小型ID/LRU元数据，没有搬移或整理payload。Decode按真实物理槽和LRU时间戳接管，AR1仅按当前token真实Top8更新。
+
+同一128-token中文输入后16步真实贪心，基准为原四层×64 prefill后重读32槽；两组顺序各1轮。直接复用交接额外专家复制0B、额外专家文件读取0B，40块buffer采样指纹一致；消除原1984.910MiB、524.532ms的阶段末预加载，新增FD导出2.505ms、导入校验映射141.883ms（导入已包含于decode setup）。
+
+本轮整体没有性能获益：prefill执行2899.906→3165.860ms，32专家分批使Native调用102→185；decode含ARM循环258.944→294.748ms/token，3.862→3.393token/s。16步内存命中3827/5120＝74.75%、请求读取2067546112B均相同，但专家读取/复制/同步总时间1499.742→2036.242ms，其他计算阶段变化较小。单独DMA-BUF原映射、别名、释放原映射及exec继承后的暖态写入微测未复现此回退，根因尚未确认，不能声称mmap就是原因。首decode Host间隔8845.796→7654.652ms；远程执行开始至第17个生成token19813.061→20081.203ms，不能仅以省掉预加载宣称端到端加速。
+
+两版82份完整prefill输出、84份完整decode输出逐字节一致；独立重放最近32种子选择、实际槽位、逐步LRU/pin、对齐读取及最终缓存通过。新基准与此前resident32的84份输出也逐字节一致。连续计算期间context/IO注册/RPC buffer生命周期均0，退出81/81 context、472/472注册平衡。专家池2010.15625MiB（含40个4KiB头），没有另外一份阶段交接专家池；未施加4GiB总内存限制，不以RSS代替总物理内存峰值。
+
+两组前后thermal0、CPU上限边界1843200kHz，未逐时采实际频率，单轮短测。保留原聊天默认，未改生产llama.py或提交。复测`run_reuse.py --mode reuse32 --prompt "什么是注意力机制？" --max-new-tokens 17`，对照`--mode reload32`。实现、计时边界、内存范围、正确性及原始证据见新原型`REPORT.md`、`RESULTS.json`、`STEPS.csv`、`MANIFEST.json`与`analyze_results.py`。
+
+### SM8975：每层16热专家固定＋16冷槽LRU（2026-10-21）
+
+按用户方案新增独立原型`llama-output/qwen36-hot16-cold16-sm8975-20261021`。真实40层Qwen3.6-35B-A3B，保持AR128 prefill、AR1 decode、原PTE、N4权重、量化网格与DSP算子库，只编译两个ARM runner。每层按本次真实prefill路由频次选Top16（相同频次按ID），其他专家取最近16作为冷区。Prefill调整专家处理批次，让最终32个权重原地保留；通过物理槽hot_mask和继承FD交给decode，额外专家复制/文件重读均0B，没有整理payload。Decode热区固定、冷区LRU，当前Top8全部先pin，只替换冷区未pin槽；40层buffer/context在连续decode中保持驻留。
+
+相同128个真实中文chat-template token后，真实贪心生成到相同EOS，共61个token事件（首token来自prefill，随后60次AR1）。两个策略顺序各1轮、无预热，均直接复用buffer，避免把种子重读混入对照：
+
+| 配置 | 命中率 | UFS请求读取/token | 专家IO/token | 含ARM循环/token | 吞吐 |
+|---|---:|---:|---:|---:|---:|
+| 32槽LRU | 72.90% | 132.476MiB | 105.226ms | 272.996ms | 3.663 token/s |
+| 固定热16＋冷16LRU | 67.95% | 157.798MiB | 109.958ms | 278.602ms | 3.589 token/s |
+
+方案功能成立，但本次热集合选择没有IO收益：请求读取增加19.11%、循环耗时增加2.05%。640个固定热专家中265个在60步里完全未用，40层中31层读取增加。相同热种子及时间戳、仅放开所有32槽淘汰的离线反事实回放降至134.793MiB/token，接近原LRU，支持固定保护prefill热点导致冷区占槽的判断；此为离线回放，没有对应设备耗时。Prefill末尾4～64 token频次等候选的短trace回放也未超过原LRU，未据此改变已测试的策略。
+
+先前16步短测同样增加读取（123.235→137.547MiB/token），但单轮循环293.386→284.382ms，没有据此宣布加速；完整回答随后显示读取与耗时均增加。两种长度均独立验证82份prefill、84份decode完整文件逐字节一致，逐层Top8命中、热/冷分类、pin/LRU、bank对齐读取、最终槽位全部与独立重放相符。40块交接buffer采样指纹一致；热区640个ID未替换、40层热payload采样指纹未改变。全部prefill/decode循环内context/注册/RPC buffer生命周期操作0，decode退出81/81 context、472/472注册平衡。
+
+新增逐层IO日志将reader墙钟等待与DMA同步分开，pread/memcpy则记录并发工作线程时间和。完整回答DMA同步仅0.429→0.452ms/token，不是这轮主要耗时；线程时间和不可直接当作墙钟相加。Prefill每组仍读取8655654912B、5337专家请求、185次Native调用、40960个token-expert任务，无新增专家读取。专家池均2010.15625MiB，没有另一份热区池；未施加4GiB总内存限制，也未将RSS视作完整物理峰值。
+
+两组前后thermal0，CPU上限边界1843200kHz，未逐时采实际频率；LRU完整回答组结束VmSwap17984KiB，固定热区组0，时间为单轮短测，读取量通过重放独立核验。保留原聊天默认，未修改生产llama.py或算子，没有提交/push。复测`run_hotcold.py --mode hot16-cold16 --prompt "什么是注意力机制？" --max-new-tokens 65`，对照`--mode lru32`；17为16步短测。细节、真实答案、全部源代码和证据见新原型`REPORT.md`、`RESULTS.json`、`SHORT_RESULTS.json`、`STEPS.csv`、`IO_LAYERS.csv`、`POLICY_DIFF.json`、`UNLOCKED_REPLAY.json`和`MANIFEST.json`。
+
+### 更正：离线数据集固定热16，prefill与decode共用（2026-10-21）
+
+用户明确热专家应由独立数据构造，并且prefill从一开始就按同一冷热方案执行。前一原型按单次prefill频次选热，不符合这个定义；其性能记录仅描述旧原型，不能代替本节方案。新建`llama-output/qwen36-dataset-hot16-cold16-sm8975-20261021`，保持现有PTE、INT4专家格式、量化网格及DSP算子，只编译ARM缓存管理runner。
+
+读取本地缓存的LLaMA-Factory中英文Alpaca demo（各1000条原始记录），固定种子划分记录池并去除跨组重复内容。使用59条记录打包成64×128＝8192token建表样本，中英各32块；另10条记录组成8×128＝1024token独立验证，中英各4块。无padding，记录内容及token块hash均无跨组交集。已有40层真实PTE严格顺序运行全部72个样本，保持单份context常驻，每样本重置state，检查任务及连续执行生命周期。无需整份35B PyTorch模型驻留或重新导出。
+
+只按建表组2621440次真实Top8分配统计每层频次Top16并冻结，独立验证的327680次分配不参与选择。固定表40×16 int32、2560B，SHA256为`29b49fa041855e788439408d280594489034cedbda0ae837882c777455a3f4ff`；建表路由覆盖26.006%、独立验证21.637%，前32样本和全64样本热集合平均重合84.531%，不将此描述为对所有任务已经收敛。
+
+初始化从UFS一次性读取640热专家，固定在每层前16槽；prefill保留热区，只让后16冷槽参与LRU和加载，热命中原位计算，其他专家最多16个一批。当前prompt不修改热表。结束保留热16和最近冷16，继承同一组40个DMA-BUF给decode，无阶段末专家复制/重读；AR1同样只更新冷区。两个阶段分别验证640热ID和40层热payload采样指纹不变。
+
+同一128-token中文问题“什么是注意力机制？”真实贪心生成到同一EOS，共61个事件、60步AR1，顺序各1轮：
+
+| 配置 | Prefill图 | 首次热加载 | Decode命中 | UFS请求/token | 含ARM循环/token | 吞吐 |
+|---|---:|---:|---:|---:|---:|---:|
+| 32槽LRU | 3032.951ms | 0 | 72.90% | 132.476MiB | 272.975ms | 3.663token/s |
+| 数据集热16＋冷16 | 3056.641ms | 328.562ms | 68.93% | 152.505MiB | 274.072ms | 3.649token/s |
+
+首次热加载1042026496B已包含于prefill setup，不能再重复加到setup；图内专家读取8655654912→7770902528B，但包含热加载后8812929024B，比基准增加1.82%。固定热点544个被当前prefill使用，96个未用仍保留；冷批次容量减半使Native调用185→357，真实token-expert任务仍40960，未修改算子。Decode固定热表命中4421次、冷区8814次，总读取增加15.12%；640热专家中224个在这段decode未用。这份数据表较旧单prompt表在此trace的读取略低，但仍未超过本轮32槽LRU，未宣布IO优化成功。
+
+82份完整prefill和84份完整decode文件逐字节一致；冻结表ID、热初始化读取、prefill实际miss/批次数、冷区初始内容、逐层真实Top8/LRU/pin、所有命中/字节及最终缓存均通过独立重算。阶段交接40块buffer采样指纹一致；循环内context/IO注册/RPC buffer生命周期均0，decode退出81/81 context、472/472注册平衡。专家池仍2010.15625MiB，未施加4GiB完整RAM约束；没有修改原聊天默认、生产llama.py或提交/push。
+
+数据采集后两组前后thermal均1，CPU policy上限边界均1267200/1267200/806400kHz，未持续采实际频率；两组ready/结束VmSwap均0。时间只代表相同降频边界下单轮顺序对照，0.4%耗时差不作稳定结论，不与此前thermal0结果直接算加速。请求字节和路由通过重放独立验证。数据仅覆盖此次8192-token双语指令建表及独立验证，未声称覆盖所有长上下文或多模态工作负载。
+
+复测新原型`run_hotcold.py --mode hot16-cold16 --prompt "什么是注意力机制？" --max-new-tokens 65`，对照`--mode lru32`。建表入口依次为`prepare_dataset.py`、`collect_routes.py --split train`、`build_hot_table.py`，随后独立运行validation采集和`validate_hot_table.py`，验证不更新表。实现、数据来源/内容hash、原始路由和计时见`REPORT.md`、`dataset/MANIFEST.json`、`HOT_TABLE.json`、`HOT_TABLE_VALIDATION.json`、`RESULTS.json`、`SUMMARY.json`及`MANIFEST.json`。
+
+### Qwen3.6：同token跨层和连续token同层的Top8重合度（2026-10-21）
+
+直接分析上述实验保存的真实SM8975路由，未修改模型或缓存策略。重合率定义为无序Top8集合交集个数/8；所有层号从0开始。64×128建表样本、8×128独立验证样本每块都独立重置state，不比较不同块之间的token。真实聊天为128-token输入后60个AR1输入位置；LRU32和热16/冷16的路由相同，只统计一份。
+
+| 数据 | 同token相邻层平均重合 | 连续token同层平均重合 |
+|---|---:|---:|
+| 建表组8192token | 0.2698/8＝3.37% | 3.2789/8＝40.99% |
+| 独立验证1024token | 0.2567/8＝3.21% | 3.1420/8＝39.27% |
+| 聊天prefill128token | 0.2612/8＝3.27% | 3.0429/8＝38.04% |
+| 聊天decode60token | 0.2667/8＝3.33% | 3.6496/8＝45.62% |
+
+完整枚举40层780个无序层对，发现8～19层与20～31层的对应距离12层对有明显相关：11→23在独立验证53.96%、聊天decode62.29%，14→26分别56.25%、59.79%。只读取原checkpoint40MiB router权重核验，40份tensor hash各异，原prefill导出清单40个router/shared binary hash也各异；上述router权重余弦约0.79～0.82。不同层相同数字ID仍对应不同权重，可作为目标层预取预测的候选，不能直接跨层复用payload，当前未实现或测量这种预取收益。
+
+Decode时间局部性不均匀：前四层平均14.25%、最后十层55.72%，layer0为6.57%、layer36为65.68%。相邻token同层有8.05%的比较完全不重合，只有0.51%完整Top8相同；45.62%是每个Top8中专家重合比例，不是整组路由重复率。Prefill末位置127到decode首输入位置128仅40次比较，均值7.19%，单独列出；decode路由按输入token而非预测输出token对齐。
+
+全部路由范围/唯一性、两策略一致性、raw日志与既有replay、贪心输入链及数据token文件通过核验，另做24000次Python set独立交集检查。结果只描述当前量化PTE、上述双语输入与一段真实decode，未泛化到所有任务。分析脚本、完整均值/分布、逐层/全部层对CSV、逐token原始ID、权重hash/余弦、图和独立manifest在`llama-output/qwen36-dataset-hot16-cold16-sm8975-20261021/route_overlap/REPORT.md`及同目录文件。
+
+### 热4＋冷16及因果跨层预取：逻辑回放（2026-10-21）
+
+用户提出每层固定热4、冷16，并结合上一token和当前token前12/24/36层路由预取。新增独立分析`llama-output/qwen36-dataset-hot16-cold16-sm8975-20261021/prefetch4hot16cold`，没有修改runner或PTE。热4来自原8192-token独立建表组；同组拟合目标层、4位来源组合和前12层Top8名次的条件概率。独立验证组不参与拟合，上一token已缓存权重不重读，目标当前路由在预测完成后才用于核算。源Top8按router分数降序，前列预测质量明显更高；24/36层信号单独较弱，不能统一强制填16个。
+
+60步真实decode逻辑回放的专家池从32槽2010.156MiB减为20槽1256.406MiB，均不含其他内存。完整复现原LRU32、热16/冷16设备日志请求字节。固定热4/冷16不预取，就绪命中60.849%、按需及总读取192.472MiB/token；盲目合并候选每层预取最多4个后，命中60.177%、总读取365.263MiB/token。按来源和源排名筛选，置信度≥0.60、每目标层token最多2个：命中61.891%、按需187.250、总194.116MiB/token；263个预取中217个当次被用（82.51%），46个最终未使用淘汰，未遗留期末未决。总读取仍较无预取增加0.85%，未宣称减少物理IO或设备加速。
+
+独立验证输入上的同一候选策略选择6544个、正确4437个（67.80%）；只排除热4与上一Top8，未考虑更长缓存历史，不能等同设备预取使用率。其他来源概率/名次/阈值敏感性结果均保存在`REPLAY.json`，没有把单聊天最优参数当作已泛化的生产默认。
+
+回放假设所有预测读取在目标使用前完成，就绪命中属于乐观条件；未模拟实际带宽、IO争用、取消或DMA发布等待，setup种子成本未计入decode。`PLAN.md`给出AR128 prefill与AR1 decode分别执行的方案、按需优先队列、真实LRU与投机内容分离、generation/pin/在途去重、当前整块DMA-BUF同步约束和验收计数。下一步需设备端到端验证，不能用命中率替代延迟结果。
+
+### SM8975：同层跨token热4/冷16，异步读取实测（2026-10-21～22）
+
+用户要求在完整模型实测prefill/decode，并明确缓存更新是同一层不同token之间的时间局部性。新增独立版本`llama-output/qwen36-async-hot4-cold16-sm8975-20261021`，真实Qwen3.6-35B-A3B全部40层，SM8975/V85，SDK2.48.1.260715，复用原PTE和DSP算子/量化配置，只编译ARM runner。每层固定数据集热4＋冷16，共800槽、1256.40625MiB专家buffer；prefill按真实128-token路由最后使用位置保留本层最近16非热专家，FD和时间戳直接交给decode；每次AR1只更新当前层自己的LRU，其他层不清空。没有将来源层同ID权重作为目标层权重使用。
+
+最终prefill采用全模型共用的两个16专家DMA bank交替：Native直接读当前bank，8个reader线程填另一个；本层结束才并行保留最近16冷专家到本层持久池。增加约50.258MiB有界临时DMA内存。早期普通staging再发布的额外复制版本被弃用并单独保留；主基准使用原8线程直接读取，不以较慢的中间版计算收益。
+
+同一128个真实中文chat-template输入“什么是注意力机制？”，每轮到相同EOS，共61个生成事件、60步真实AR1，顺序单模型运行：
+
+| 模式 | Prefill128 | Prefill吞吐 | Decode含ARM循环 | Decode吞吐 |
+|---|---:|---:|---:|---:|
+| 直接同步，第1轮 | 3407.601ms | 37.563token/s | 287.158ms/token | 3.482token/s |
+| 直接同步，第2轮 | 3460.060ms | 36.994token/s | 289.464ms/token | 3.455token/s |
+| Prefill双缓冲＋decode预测早启动 | 3034.130ms | 42.187token/s | 290.310ms/token | 3.445token/s |
+| Prefill双缓冲＋decode预测等待当前按需IO结束 | 3146.948ms | 40.674token/s | 289.378ms/token | 3.456token/s |
+| 最终：仅prefill双缓冲，decode同层LRU | 3136.733ms | 40.807token/s | 290.517ms/token | 3.442token/s |
+
+最终prefill比同步两轮均值3433.831ms下降8.65%；IO与Native调用窗口逐批交集共377.540ms，非worker时间相加。表内prefill含输入embedding、40层attention/router/shared/MoE、state反馈及head，含实际外存读取，排除首次加载/context恢复、热4初始化、阶段交接setup及落盘/ADB。Decode为60步完整循环墙钟，含ARM和日志；一次prefill→decode的exec/setup仍存在，没有混入稳定吞吐或宣称优化TTFT。
+
+Decode实验按目标层、同层上一token、当前token前12/24/36层和来源Top8名次查询离线表，置信度≥0.60、每目标层最多2个，只读目标层权重；同层上一Top8已缓存则不重读。后台2个reader额外约3.14MiB staging，按需优先；队列暂停时真实需求可提升并执行，独立线程边界测试通过。改为当前按需IO结束后启动后，预测IO与计算调用重叠由0.966提高到4.988ms/token，预测IO墙钟6.487ms/token，残余等待0.0085ms/token，但整段decode无稳定加速。因此独立脚本默认`prefill-only`关闭decode预测，保留其同层LRU；`async`仅作显式实验。
+
+60步263次预测中217个当次使用，命中60.849%→61.891%；按需192.472→187.250MiB/token，额外预测6.866，总194.116MiB/token，仍增加0.85%。原32槽与当前20槽容量不同，不把缓存缩小描述成免费IO改善。本轮没有测定4GiB总物理峰值或强制RAM上限。
+
+每轮82份完整prefill、84份完整decode文件逐字节一致，也匹配此前原32槽参考；真实Top8、800物理槽、last-use时间戳、逐token每层热/冷命中、预测ID/概率/槽位、每次对齐读取、最终cache全部独立重放。160个热ID、40层热payload采样指纹保持；循环内context/注册/RPC buffer生命周期均0。各轮前后thermal0，CPU三个policy上限边界均为1843200/1843200/1036800kHz，未持续采实际频率；部分轮结束VmSwap约5～7MiB，时间为单prompt短测，小幅decode差异未作为稳定提升。
+
+复现：`python llama-output/qwen36-async-hot4-cold16-sm8975-20261021/run_async.py --mode prefill-only --prompt '什么是注意力机制？' --max-new-tokens 65`；`sync`为同布局直接读取对照，`async`开启预测实验。实现、计时边界、全部中间结果及原始证据见独立目录`REPORT.md`、`RESULTS.csv`、`RESULTS.json`、`analyze_async.py`、`source`、`tests/prefetch_gate.cpp`和`MANIFEST.json`。未修改原聊天默认、生产llama.py或提交/push。
+
+### SM8975：专家预加载与初始化重叠（2026-10-22）
+
+独立原型`llama-output/qwen36-startup-prefetch-sm8975-20261022`，真实40层Qwen3.6-35B-A3B、同一128-token中文输入、既有PTE/INT4专家/DSP库。热4仍由独立8192-token数据构造，冷16用同层训练频次第5～20名初始化，之后可替换。40层800槽、1256.40625MiB专家池不变。
+
+后台4个reader读取热160＋冷640专家，同时恢复81个QNN Context并注册IO；完成后才发布DMA、进入prefill，推理读取切为8线程。跳过专家槽及流水bank约1306.664MiB的冗余清零，选中payload/头部先写再用；GDN/KV state与其它IO初始化不变。首次保留冷种子，prefill结束按真实token路由最后使用顺序保留冷16，避免把按专家分批执行顺序误作LRU。仍直接继承40块DMA-BUF给decode。
+
+两轮基准与两轮最终配置平均值：
+
+| 指标 | 原异步流水基准 | 最终预加载配置 | 耗时下降 |
+|---|---:|---:|---:|
+| 初始化 | 4.567s | 4.085s | 10.56% |
+| 128-token prefill图 | 3.137s | 2.812s | 10.36% |
+| 设备初始化＋prefill | 7.704s | 6.897s | 10.48% |
+| 启动到首token，含ADB | 7.831s | 6.997s | 10.65% |
+
+最终两轮prefill为2.806～2.818s，首token6.924～7.069s。串行预加载对照虽让prefill降至2.882s，但首token仍7.869s，说明仅移动计时位置没有端到端收益。4/8/16线程均测过，选择初始化4、推理8；各项单轮差值不视为严格独立贡献。完整60步decode最终为287.905～289.910ms/token（3.449～3.473token/s），基准288.677ms/token（3.464token/s），没有稳定decode加速。
+
+热冷预加载1302315008B，最终读取墙钟384.467～389.444ms基本完全重叠，初始化结束后等待0.0095～0.0113ms，均计入setup。640冷种子535个有用、105个未用；图内读取8419127296→7550033920B，含setup总读取8680292352→8852348928B，增加164.086MiB（1.98%）。收益来自关键路径重叠及Native调用385→347，任务仍40960，不是减少总IO。图内reader仍约2.25s，是后续主要瓶颈。
+
+9轮正式对照共304步真实decode；全部82份prefill输出、相同步数的84份decode输出逐字节一致，完整60步也匹配原32槽参考。独立重建训练热点/冷种子，重放实际last-use、物理槽LRU/pin、全部请求字节、命中及最终800槽通过；热160个ID和40层payload采样指纹保持。连续循环内Context/注册/RPC buffer生命周期均0。边界thermal0、CPU上限1843200/1843200/1036800kHz，未持续采实际频率；部分轮有数MiB swap，未强制4GiB总内存上限。仍有一次prefill→decode Context恢复的数秒间隔，本轮未解决阶段切换。未重新做PPL，bitwise核验针对本次调度修改。
+
+复现：`python llama-output/qwen36-startup-prefetch-sm8975-20261022/run_async.py --prompt '什么是注意力机制？' --max-new-tokens 65`，默认使用上述最优组合；`--mode baseline`与`--mode serial`提供对照。详细计时边界、源码、原始记录与核验入口见该目录`REPORT.md`、`RESULTS.csv`、`SUMMARY.json`、`analyze_startup.py`和`MANIFEST.json`。未修改原聊天入口、生产llama.py或提交/push。
+
+### SM8975：取消热区，每层20槽全部LRU（2026-10-22）
+
+新增`llama-output/qwen36-cold20-sm8975-20261022`，并将原`qwen36-chat-sm8975-20261021/run_chat.py`转到新入口。原入口完整备份在新目录`legacy/run_chat.py`。每层20槽全可淘汰，无热4保护；启动预读的20个数据集候选也仅作可淘汰种子。Prefill结束保留真实路由最近20个专家和时间戳，通过同40块DMA-BUF交给decode；decode当前Top8先pin、缺失只淘汰本层LRU，全部hot_mask=0。
+
+同一128-token中文输入，2轮完整60步AR1；另外新跑1轮热4/冷16。发现本轮CPU policy6上限已升到1843200kHz，因此只用这次同条件对照比较时间，三轮边界thermal0、三个policy上限均1843200kHz，未连续采实际频率。全冷20 vs 新对照：decode命中62.11% vs60.85%，读取186.174 vs192.472MiB/token（减少3.27%）；prefill均值2729.641 vs2861.957ms，Native调用291 vs347，图内读取均7550033920B。Decode均值288.938 vs288.854ms/token，未显示稳定加速。旧策略是1轮、新策略2轮，属于短测。
+
+82份完整prefill输出、84份完整decode输出跨新旧策略逐字节一致；独立核对实际最近20、槽位/时间戳、逐请求LRU/pin、热命中=0、所有对齐字节及最终800槽通过。交接40块payload采样指纹相符，循环内Context/注册/RPC buffer生命周期均0。专家池仍1256.40625MiB；prefill双流水bank批次20，比原批次16多12.5625MiB，进入decode前释放。保留初始化异步预读、4/8 reader和专家bank跳过冗余清零；GDN/KV state等不变，没有修改DSP或重新导出模型。
+
+当前命令仍为`python llama-output/qwen36-chat-sm8975-20261021/run_chat.py --prompt '什么是注意力机制？' --max-new-tokens 65`，保留逐token实时输出。证据见新目录`REPORT.md`、`RESULTS.csv`、`CONTROL.json`、`SUMMARY.json`、`analyze_cold20.py`与`MANIFEST.json`。未提交/push。
+
+### SM8975：decode分块读取与状态回写重叠（2026-10-22）
+
+新增`llama-output/qwen36-cold20-io-optimization-sm8975-20261022`，原`qwen36-chat-sm8975-20261021/run_chat.py`已转到新默认配置：热保护仍0、每层LRU20；专家请求按128KiB拆分，由16个ARM线程读取并拷贝不重叠的payload区间。本层GDN/KV反馈在reader工作期间由主线程执行，随后才发布专家buffer并调用MoE。反馈数值、布局、量化映射和实际专家选择不变，本层私有cache下次在下一token消费。
+
+9轮同输入完整回答、共540步AR1。两轮原整块读取基准290.923/286.401ms/token，最终128KiB/16线程两轮230.995/227.849ms/token，均值288.662→229.422ms/token，耗时下降20.52%，吞吐3.464→4.359token/s（提高25.82%）。各轮边界thermal0、CPU三个policy上限1843200kHz，未持续采实际频率，部分结束有数MiB swap。128KiB/8线程复测231.625与247.872，IO有波动；16线程重复后选择16。64/256KiB仅单轮，不声称全局最优。
+
+Decode仍每60步读取11713036288B、7274个专家缺失、命中11926/19200＝62.1146%，186.174MiB/token，全部20槽与淘汰顺序相同。128KiB拆成92724个读取任务，reader批次墙钟约120→88ms/token；pread_worker_ms是并发等待时间和，不能当作总耗时。临时staging由约12.5625MiB降为2MiB；专家池1256.40625MiB与prefill流水bank不变。Prefill路径沿用前版，本轮约2.70～2.79s，不据此宣称加速；仍存在一次prefill→decode Context恢复间隔。
+
+全部82份prefill、84份decode完整输出跨9轮逐字节一致，也匹配原参考；含hidden/logits及80份state/cache。独立重放LRU/pin、读取字节、子任务数和最终800槽通过；runtime检查子块字节总和等于原请求。实际reader类的主机边界/哨兵/同步与8线程/空任务/cached任务/重复epoch测试通过。连续循环内Context/注册/RPC buffer生命周期均0。
+
+曾尝试O_DIRECT直接写rpcmem及继承mmap buffer，地址4096对齐仍都返回EFAULT(errno14)，因此最终保留普通对齐staging→DSP buffer复制；没有借助整份专家文件页缓存驻留。未改变N4算术或DSP库。原命令`python llama-output/qwen36-chat-sm8975-20261021/run_chat.py --prompt '什么是注意力机制？' --max-new-tokens 65`自动使用新版；对照加`--no-feedback-overlap --read-chunk-kib 0 --decode-io-workers 8`。细节与证据见新目录`REPORT.md`、`BREAKDOWN.csv`、`SUMMARY.json`、`analyze_cold20.py`、`TESTS.json`、`direct_probe/probe.log`和`MANIFEST.json`。未提交/push。
+
+### SM8975：全冷LRU由每层20槽增到32槽（2026-10-22）
+
+新增`llama-output/qwen36-cold32-io-optimization-sm8975-20261022`，原聊天入口已转到32槽。真实40层Qwen3.6-35B-A3B，全部1280槽可淘汰；独立数据集Top32仅作启动种子，prefill结束按真实token顺序保留本层最近32专家，直接继承40块DMA-BUF和时间戳；decode当前Top8先pin、缺失只淘汰本层LRU。保留128KiB/16 ARM reader及state反馈重叠，没有冻结热专家，没有改动PTE、DSP或量化规则。
+
+同一128-token输入，按32→20→32顺序，每轮60步真实AR1到同一EOS。20槽新对照235.689ms/token（4.243token/s）；32槽214.072/215.357，均值214.714ms/token（4.657token/s），耗时下降8.90%，吞吐提高9.77%。命中62.1146%→72.9010%，读取186.174→132.476MiB/token（减少28.84%）。20槽之前两轮IO优化均值229.422ms/token，本次采用当前交叉复测作比较。Prefill2721.117→均值2501.082ms，Native调用291→199；启动种子读取变多，含启动的prefill总读取增加2.54%，不能只用图内IO减少宣称总IO下降。
+
+专家池1256.40625→2010.15625MiB，增加753.75MiB；prefill双bank62.82031→100.50781MiB，另增37.6875MiB、decode前释放。Prefill峰值RPC buffer2417.527MiB，不等同整机物理内存；未强制4GiB上限。32槽decode末尾VmSwap约5.6～6.7MiB。各轮边界thermal0、CPU三个policy上限1843200kHz，未持续采实际频率；20槽1轮/32槽2轮是单prompt短测，仍有一次prefill→decode Context恢复间隔。
+
+三轮180步AR1，全部82份完整prefill、84份完整decode文件逐字节一致，也匹配原参考；独立重放全部槽位、last-use、pin/LRU、对齐读取及分块数通过。32槽修复默认指纹掩码`1U<<32`未定义行为，UBSan边界测试确认第32槽参与校验；设备产物hash匹配。循环内Context/注册/RPC buffer生命周期均0。本次没有重新测PPL，调度修改输出数值保持一致。原聊天命令不变，详细记录见新目录REPORT.md、RESULTS.csv、CONTROL.json、SUMMARY.json、analyze_cold32.py、compare_cache.py、TESTS.json与MANIFEST.json。未commit/push。
+
+### SM8975：1024真实输入、连续8×AR128及每层LRU32（2026-10-22）
+
+独立目录`llama-output/qwen36-context1024-cold32-sm8975-20261022`。补齐一次sequence初始化、连续GDN/conv/KV、0/128/.../896位置、warm FA掩码和全序列LRU时间戳。完整1024 KV交给AR1，position1024起生成；每层32专家、共1280槽和2010.15625MiB池保持。10个AR1 FA用冻结QDQ扩到1152容量以容纳后续生成，其他图/权重/qparams/DSP沿用；原PTE执行计划复用，10个FA绑定外部编译context，没有重新校准整个模型。
+
+两轮1024输入、各64步decode：prefill20.249/20.190秒，均值20.220秒（50.64token/s）；decode374.175/380.201ms/token，均值377.188（2.651token/s）。命中71.5674%、139.307MiB/token。相同1152图、128输入对照为370.544ms/token（2.699token/s）；之前快版1024容量/128输入214.714ms/token不能直接作长度对照。10个FA合计从原约32ms/token变为1152容量约146.5ms/token，而30个GDN约34ms/token；额外2048容量实验FA约351.4ms/token、整段605.7ms/token。已定位到FA子图扩容的明显开销，尚未optrace解释内部kernel。原快速聊天入口保留，未用长上下文实验覆盖。
+
+1024图内读取57737969664B（53.773GiB），此为chunk-major：每128token走完整40层，再下一批，32槽不能保存每批全部专家；与此前按层组处理全部token的预填充调度口径不同。Prefill耗时含8次完整执行与IO，排除首次setup和阶段交接；decode含ARM完整循环。实际提示含参考资料、无padding，完整输入和路由记录保存；单prompt短测不外推所有任务。
+
+四轮252步AR1，独立核对全部chunk种子/时间戳/1280物理槽、逐层pin/LRU/字节/分块数通过。两个1152长输入的82份prefill和84份decode完整文件逐字节一致；1152/2048完整hidden/logits一致，128新旧路径的完整prefill/decode hidden/logits也一致。实际Attention类8次更新/完整KV/掩码边界ASan、UBSan通过（ptrace不支持LSan，关闭泄漏检测）。各轮边界thermal0、CPU policy上限1843200kHz；1152长输入结束swap约3.9MiB/0，2048约95MiB。未重新测PPL或强制4GiB总内存上限。
+
+复现：`python llama-output/qwen36-context1024-cold32-sm8975-20261022/run_async.py --prompt-tokens 1024 --decode-capacity 1152 --prompt '什么是注意力机制？' --max-new-tokens 65`。记录和限制见REPORT.md、RESULTS.csv、SUMMARY.json、NUMERICAL_CHECKS.json、analyze_context.py、TESTS.json和MANIFEST.json。未commit/push。
+
+### SM8975：修复长上下文 AR1 FA 性能突降（2026-10-22）
+
+独立目录`llama-output/qwen36-fa-sha-fix-sm8975-20261022`，真实40层Qwen3.6-35B-A3B，保留每层32槽LRU、INT4专家、全部冻结量化参数和原GDN/MoE。原4.66→2.65token/s并非有效上下文自然增长：原快版FA编译容量1024，长输入换1152；即使仍给128输入，1152图也仅2.70token/s。独立第3层原1024/同流程重编1024/1152/2048分别2.933/2.882/14.304/34.259ms；basic profile确认HTP执行本身突增，均6个HVX线程。Detailed/optrace在当前V85系统库返回1003/DSP1100，尚不能断言具体kernel或VTCM spill。
+
+最终仅拆QK/PV两个MatMul的query-head维度，从GQA展开前按`query_head//8`选择KV head，避免2→16 head重复。保留投影、Q/K RMSNorm、RoPE、mask/softmax、所有原Q/DQ及输出投影，只重编10个AR1 FA context并绑定原完整PTE执行计划。通用MHA2SHA虽快，但真实输入key SQNR相对CPU QDQ从32.15降至13.89dB，因此弃用；生产通用pass实验已恢复。最终真实输入单FA14.254→0.528ms，4份完整输出逐字节一致。
+
+同一1024真实输入，按修复→MHA对照→修复串行运行，每轮64步闭环AR1：194.323/377.645/188.480ms/token。修复均值191.402ms/token（5.225token/s），对照2.648token/s，延迟下降49.32%；10个FA合计146.467→7.614ms/token。各轮路由、命中71.5674%和139.307MiB/token读取完全相同。读取等待墙钟存在变化，不能把整段186.24ms收益全部归给MatMul。Prefill保持8×AR128，20.179秒约50.74token/s，长输入chunk-major重复专家IO仍待解决。
+
+两轮修复、新对照与旧MHA参考全部82份prefill和84份decode文件逐字节一致，含完整hidden/logits和80份state/KV。原聊天入口128输入复测187.899ms/token（5.322token/s），与旧快版完整hidden/logits、60份GDN/conv及20份FA cache全部188个有效位置相同。独立重放1280物理槽/每chunk last-use/逐token LRU、全部读入字节和分块数通过；非零随机KV的32/1152/2048容量QDQ回归通过，手机25个产物hash相符。接受对照共252步AR1；弃用SHA/capture的65步未计入最终均值。
+
+原`qwen36-chat-sm8975-20261021/run_chat.py`已转到修复版，默认128输入，1024测试加`--prompt-tokens 1024 --prompt '什么是注意力机制？' --max-new-tokens 65`。保持实时吐字。初始化/阶段切换/结果落盘/ADB不计入稳定吞吐，未重测PPL或强制4GiB总内存上限；单prompt短测、边界thermal0/CPU上限1843200kHz，未连续采实际频率。结构化结果、原始日志、数值核验与限制见新目录REPORT.md、SUMMARY.json、NUMERICAL_CHECKS.json、RESULTS.csv、TESTS.json和MANIFEST.json。未改生产llama.py，未commit/push。
+
+### SM8975：1024输入＋1024步闭环decode长测（2026-10-22）
+
+独立目录`llama-output/qwen36-decode1024-sm8975-20261022`，真实40层Qwen3.6-35B-A3B，沿用每层32槽LRU、128KiB/16 ARM reader和state反馈重叠。只把修复后的10个FA核心拆分图容量从1152编为2048，逐层核对同一冻结QDQ源；其余GDN/MoE/投影精度/量化配置保持。Prefill连续8×AR128共1024真实输入，之后消费位置1024…2047，跑满1024次AR1。Prefill预测首token另计，总共1025个生成事件，没有teacher forcing。长提示词要求完整注意力讲解与代码，本轮全程没有EOS；虽开启固定步数忽略EOS选项，实际未跨EOS。
+
+Prefill循环20.426秒；1024步decode完整循环216.160秒，平均211.093ms/token、4.737token/s。每128步依次4.862/4.709/4.623/4.858/4.769/4.668/4.788/4.635token/s；10个FA均20.37～20.45ms/token，30个GDN约33.28ms/token，没有随位置持续下降的趋势。专家命中68.838%，每token对齐读入152.838MiB，整段152.838GiB；波动与各段命中/读量相符。相比前次短测，提示词、生成内容、FA编译容量和诊断保留方式均不同，不能把5.22→4.74token/s全部归因于有效上下文长度。
+
+每步仍计算全部词表并检查有限值/argmax，保留全部1024份hidden和token ID，只保存最后一步logits，避免累计约970MiB诊断内存干扰长测；最终文件保存/ADB不在循环内。初始context恢复和阶段交接另计。独立重放8个prefill chunk、1280物理专家槽、全部327680次decode专家请求、pin/LRU/对齐读入和分块数通过；输入输出闭环、连续位置、完整hidden及最终logits有限、最终argmax正确。循环内context/注册/RPC buffer生命周期均0，设备25个产物hash匹配。
+
+15秒间隔采集18份设备状态，thermal均0，HAL中NSP类传感器最高62.4℃；末尾进程VmSwap=0。未采DSP实际频率、未强制4GiB总内存上限，未重新做PPL，仅单prompt一次长测。原聊天入口默认不变，复现用`python -u llama-output/qwen36-decode1024-sm8975-20261022/run_long.py`。原始日志、逐token事件和完整输出保存在独立results目录；统计与审计见REPORT.md、SUMMARY.json、WINDOWS.csv、SENSORS.json、TESTS.json、DEVICE_BINARY_VERIFICATION.json和MANIFEST.json。未改生产llama.py，未commit/push。
+
+### SM8975：QNN W2A16真实MoE专家试验（2026-10-22）
+
+独立目录`llama-output/qwen36-moe-w2a16-sm8975-20261022`。现有`QuantDtype.use_16a2w`和SDK2.48.1支持UINT16激活、逐输出通道对称2bit权重（逻辑`[-2,1]`），标准BW_AXIS接口要求静态权重。当前完整MoE原型实际走原生HMX N4×动态A8外存bank，因此本次先验证标准QNN静态W2A16，没有直接将现有native路径改成W2或声称全模型UFS收益。
+
+第0层test记录位置128的真实Top8为112/185/106/43/58/68/236/147，输入hidden2048、GU1024×2048、Down2048×512。双方同一原始权重/输入/路由分数，独立train中均匀128个位置校准A16；16个Linear全部核对UINT16激活网格，权重范围W4`[-7,7]`/W2`[-2,1]`，各为单QNN delegate。SM8975/V85设备按W4→W2→W2→W4，每组预热10次＋128次正式样本：W4均值0.217464ms，W2均值0.145799ms，权重常驻专家分支调用延迟下降32.96%；context12898144→6815584B（12.301→6.500MiB），减少47.16%。不含router/shared/residual、首次加载和UFS换入，不能与当前完整MoE或40层token耗时直接比较。前后thermal0。
+
+同一token手机输出相对FP32：W4 16.314dB、W2 4.487dB；CPU QDQ已为16.315/4.506dB，手机相对CPU QDQ为61.003/30.370dB，主要误差在权重量化前后，非上机才出现。进一步取test前128个token全部真实路由，212个活跃专家、1024次分配，逐专家加载原始BF16并用FP32算术隔离权重误差：routed输出W4逐通道17.349dB、默认W2逐通道4.307dB、独立train驱动的激活加权裁剪W2为6.233dB。裁剪用18种阈值逐输出通道选取，未使用test，未测分组W2/GPTQ；该候选仅CPU误差评估。加残差后SQNR上升不表示专家误差消失。
+
+当前精度不足以直接替换全40层；未修改默认聊天、原生N4 bank或生产量化recipe，未做全模型W2 PPL/文本生成。体积和resident调用收益已实测，外存按需N2格式/载入/原生计算仍需另行适配，不能把context压缩率当作实测UFS减少比例。证据见目录REPORT.md、SUMMARY.json、LAYER128.json、LAYER128_TOKEN.csv、QUANTIZATION_AUDIT.json、device.log、DEVICE_BINARY_VERIFICATION.json和MANIFEST.json。未commit/push。
+
+### SM8975：继续测试 W2A16 的 AR128 性能与完整40层 PPL（2026-10-22）
+
+独立目录 `llama-output/qwen36-w2a16-full-sm8975-20261022`。按要求继续模型级测试。完整40层因果 CUDA QDQ：独立 WikiText-2 train held-out 1024-token 片段，预测1023个真实下一token；每层用另一 train1024 片段均匀128位置校准。只改 routed 专家 GU/down 为逐通道 W2/W4 和 A16 min/max；attention、state/cache、router、shared、embedding、head保持FP32。FP32 PPL=3.9382，W4A16=4.6599，W2A16=13.7361；最后 residual hidden SQNR分别9.111/2.158dB。路由随每层实际量化输出重新计算，非固定FP32路由。它是完整模型的隔离 QDQ 质量评估，不是生产完整PTQ手机PTE的PPL，也不是WikiText官方test全集。逐层逐专家加载，CUDA峰值2943.16MiB，耗时约54.4秒。
+
+新导出第0层真实AR128路由重放图：212个活跃专家、1024次Top8分配，先按专家归组，再GU/SiLU/up/down、恢复顺序与加权求和。FP32重放与缓存参考核对，权重范围W2[-2,1]/W4[-7,7]，A16，双方均一个QNN delegate，use_fp16=False。路由索引固定，所有用到的专家在context常驻，不含router/shared/residual、attention及外存LRU换入。SM8975上W4→W2→W2→W4，各组32次正式AR128：W4均值6.307027ms，W2均值4.973989ms，下降21.14%；context340688928→179486752B（324.906→171.172MiB），减少47.32%。同顺序复测AR1真实Top8，各组128次：0.213556→0.144959ms，下降32.12%。这两者均与现有快速原生N4×动态A8路径不同，未外推全模型token/s。
+
+AR128 context完整O_DIRECT读取两次：W4 335.030/313.177ms，W2 86.749/147.117ms；context首次初始化W4 330.146/342.954ms、W2 192.514/209.944ms，均与稳态执行分开。读取对象是context，非生产专家bank；吞吐波动明显，不作为实测LRU换入收益。手机相对CPU QDQ SQNR：AR1 W4/W2=61.003/30.370dB，AR128=66.147/34.475dB，四份输出有限，实际部署二进制hash核对，前后thermal0。AR128与PPL校准布局不同，PPL不能当作该重放PTE的设备质量。
+
+固定context动态权重更新探针尚未跑通：x86 W2/W4 refinalize均返回6022；补充prepare-only/可更新IO/binary-section配置/V79对照未解决。手机准备探针在获取初始binary大小返回1000，退出清理崩溃，未执行到权重切换。此结果不证明SDK不支持该方案；完整外存流式W2端到端性能仍未测得。未因质量停止实验，亦未替换默认聊天、原N4专家bank或生产recipe。证据为新目录REPORT.md、SUMMARY.json、PERFORMANCE.csv、PPL.json/PPL_LAYERS.csv、手机日志、DEVICE_RUN.json、DEVICE_HASHES.txt与MANIFEST.json。未commit/push。
+
+### SM8975：完整40层 W2A8 外存推理与真实吞吐（2026-10-22）
+
+新增 `llama-output/qwen36-w2-streaming-sm8975-20261022`。W2A16 静态图可运行，当前动态权重更新探针 refinalize 返回6022，不能据此判断SDK不支持。按要求先落地原生W2A8：真实专家GU/down逐通道absmax/1.5、[-2,1]，四个代码/byte，UFS/DRAM保留压缩N2，在VTCM内HVX符号扩展成N4 tile，沿用HMX整数N4×A8计算。不是硬件原生2bit GEMM；没有实现A16高低字节双乘加。40个真实bank共8725626880B，逐层逐专家准备，没有全模型装入主机/GPU。
+
+完整40层PTE计划、attention/GDN/router/shared/embedding/head沿用，外存按需读取，每层32个LRU槽共1280个，128KiB/16 ARM reader与反馈重叠保持。相同128-token prefill、1152 decode容量，每轮48次完整AR1。W4两轮（1闭环＋1用其真实输入重放）、W2固定同一输入两轮：prefill循环均值2651.61→1597.20ms（48.27→80.14token/s，吞吐+66.02%）；decode循环200.05→163.14ms/token（5.00→6.13token/s，+22.62%）。W4范围4.718～5.314，W2固定输入6.104～6.155，W4 IO等待有波动。读入148.85→83.15MiB/token（-44.13%），命中69.69%→68.17%，专家池2010.16→1050.16MiB（-47.76%）。计时包含真实权重读取/复制/同步和所有40层，没有用单层速度外推。
+
+另做两轮W2自由生成、消费自身预测，均48步：5.397/5.623token/s，合并5.508；命中降至56.89%、读取112.63MiB/token。生成文本/路由不同，不能把固定输入6.13当作自然吐字速度。输出出现重复和语义质量下降，本轮未重测W2A8 PPL；前次W2A16 CUDA QDQ 13.74不属于本实现。两轮均未遇EOS；当前只作性能实验。
+
+首次种子读取W4 2083225600B / W2 1095761920B在setup内与context恢复重叠；prefill循环另读6994079744/3614302208B。固定输入两组prefill setup约4.76/4.10秒，命令启动至首token约7.50/5.82秒。初始化、一次prefill→decode恢复交接和最终落盘/ADB不计入稳定吞吐；连续循环生命周期计数均0。缓存数字非整机总内存，未强制4GiB。前后thermal0，W4末尾约7MiB swap、W2为0，未连续采DSP频率，单prompt短测。
+
+相同W2代码分别N2/N4存储，在手机AR1与AR128真实路由输出逐位一致；独立重放六轮完整prefill历史、decode pin/LRU/物理1280槽、全部对齐读入和128KiB子任务通过。同精度同输入的完整hidden/logits/state/KV逐字节一致。40个N2 bank、W4索引、实际kernel/runner指纹核对。一次被中断的W4复测排除并补测。证据见REPORT.md、SUMMARY.json、RESULTS.csv、SMOKE.json、DEVICE_VERIFICATION.json、MANIFEST.json及results原始日志。
+
+原 `llama-output/qwen36-chat-sm8975-20261021/run_chat.py` 新增 `--expert-bits 2`，正常按EOS停止；默认保留W4。示例：`python -u llama-output/qwen36-chat-sm8975-20261021/run_chat.py --expert-bits 2 --max-new-tokens 49`。本次未改生产llama.py/量化recipe，未commit/push。
+
+### SM8975：外存 W2 专家实际接入 GPTQ（2026-10-22）
+
+目录 `llama-output/qwen36-w2-gptq-sm8975-20261022`。原 W2 bank 是逐通道 absmax RTN，没有调用 GPTQ。本轮实际对 40×256 个专家 GU/down 执行 Hessian、Cholesky、逐列及跨 block GPTQ 补偿；先用独立 train 激活做 MSE scale 搜索，GU1024/down512、[-2,1]、damping0.1、block128，匹配现有整数 kernel，不改 router/attention/GDN/shared/embedding/head。每批8专家，约385秒、CUDA峰值1079MiB；N2 bank共8725626880B，80个bank/index文件与手机SHA256核对。
+
+同一独立文本128-token prefill＋127步teacher forcing，共128个next-token预测位置，完整手机PTE实测：FP32参考PPL4.014；W4 PPL4.260、末层hidden归一化SQNR10.09dB；原W2 RTN 35.212/0.72dB；GPTQ＋MSE grids 24.631/2.57dB。不是官方WikiText全集PPL。去幅值归一化为逐token `h / sqrt(mean(h²)+1e-6)`；GPTQ原residual hidden SQNR为−11.37dB，整体RMS为FP32的3.762倍，因此同时记录归一化指标。固定同一设备hidden换FP32 head，PPL依次4.317/33.605/23.964，旧head不是主要差距来源。
+
+同文本prefill为2707.97/1615.79/1732.07ms，127步完整decode为5.123/5.842/5.864token/s，三列依次W4/原W2/GPTQ W2，包含真实UFS IO，排除setup、阶段交接、结果保存；均单轮，不把teacher forcing当自然吐字。GPTQ自由生成异常并在4步decode后EOS，该短次5.608token/s不作为稳定自然生成结论。当前GPTQ W2仍不可作为可用聊天模型，默认保留W4。
+
+相对W4的同输入Top8平均重合率从原W2的66.78%恢复到79.28%；第0层127步全部一致。缓存命中69.18/68.43/68.03%，32槽/层真实LRU、全部物理槽及IO任务独立重放通过，循环生命周期计数均0。N2/N4同权重AR1/AR128设备输出逐位一致；CUDA浮点A8模拟与native并非逐位一致，故质量结论采用手机PPL。
+
+校准仍有限制：train1024有2132个专家未被路由到，使用全局train激活支撑；held-out分配中3.74%落到这些专家。各层采用缓存FP32激活，没有执行量化模型逐层重传播的sequential calibration。40层局部routed SQNR均值原RTN/MSE-RTN/GPTQ＋MSE为0.91/5.31/4.90dB，MSE-RTN在37层高于GPTQ，不能把完整PPL改善全部归功于GPTQ；MSE-only尚未做完整模型对照。
+
+已有聊天入口新增显式实验参数：`python -u llama-output/qwen36-chat-sm8975-20261021/run_chat.py --expert-bits 2 --gptq --max-new-tokens 49`。完整证据见新目录REPORT.md、SUMMARY.json、CALIBRATION.json、LOCAL_LAYER_QUALITY.csv、ROUTING_OVERLAP.csv、HEAD_CHECK.json、GPTQ_PARITY.json及results。未修改生产量化recipe，未commit/push。
+
+### SM8975：每层64个LRU专家缓存（2026-10-22）
+
+新增 `llama-output/qwen36-expert-cache64-sm8975-20261022`，已有聊天入口现在默认每层64个可更新LRU槽，40层共2560槽；`--cache-experts 32`回到原32槽代码和产物。Top8、权重量化、原PTE和DSP kernel保持，ARM prefill/decode runner重编译。Prefill仍AR128，专家流水批次为64；DMA-BUF按40层直接交给decode，交接权重额外读取/复制均0。启动种子沿用原32个前缀，新增32个只按独立train路由频率选择，全部可淘汰，没有固定热专家。交接ABI升级Q36DATA2，ID/stamp数组64，指纹覆盖第63槽，拒绝与32槽元数据混用。
+
+同文本128-token prefill＋127步teacher-forced decode、每种各一轮，32→64槽实测：W4专家池2010→4020MiB、prefill2708→2133ms、decode5.123→6.100token/s（+19.1%）、命中69.18%→84.17%；原W2 RTN池1050→2100MiB、prefill1616→1381ms、decode5.842→6.847（+17.2%）、命中68.43%→85.13%；GPTQ W2池1050→2100MiB、prefill1732→1468ms、decode5.864→6.652（+13.4%）、命中68.03%→83.92%。每token读取依次151.17→76.81、82.47→38.84、83.51→42.01MiB。计时包含真实IO和40层全计算，不含setup、一次阶段交接和结果保存，固定输入速度不能视作自由生成速度，单次对照有IO波动。
+
+三条路径的prefill/decode hidden/logits、全部state/KV、输入输出token和prefill路由，每组167份SHA256对照全部逐位一致。PPL保持4.2597/35.2118/24.6307；64槽不改变W2量化误差。独立重放64槽真实LRU、物理slot、对齐读取和128KiB子任务通过，最终mutable_slots=2560，循环生命周期变化全部0。两条N2无进程swap；W4本轮有170MiB swap，专家池本身约3.93GiB，另有context/IO/scratch，不能声称整模型在4GiB内。前后thermal均0。
+
+使用：`python -u llama-output/qwen36-chat-sm8975-20261021/run_chat.py --expert-bits 2 --gptq --cache-experts 64 --max-new-tokens 49`。W4不传expert-bits；W2 RTN去掉gptq。完整记录见新目录REPORT.md、RESULTS.csv、SUMMARY.json、COLD_SEEDS.json、source/analyze.py和results。原32槽源文件/runner未覆盖，未commit/push。
+
+### SM8975：命中专家计算与缺失读取重叠（2026-10-22）
+
+新增 `llama-output/qwen36-hit-first-sm8975-20261022`，原聊天入口的64槽路径现在默认采用单次DSP调用内的就绪专家调度。命中专家直接参与计算，缺失专家按128KiB分块读取，某个专家全部块完成并发布权重后，独立标记就绪，其对应worker即可继续；其它worker不必等待该层全部缺失专家。每层64槽LRU、Top8、原PTE与所有量化参数保持，最终按原Top8 rank顺序求和，shared/residual各加一次。
+
+相同128-token prefill＋127步teacher-forced完整40层decode，含真实外存读取：GPTQ W2原等待调度150.779ms/token、6.632token/s，单次RPC就绪调度130.752ms、7.648token/s（吞吐+15.3%）；W4为164.535→146.274ms、6.078→6.836token/s（+12.5%）。首版分两次RPC只达到6.806token/s：虽隐藏部分IO，Native调用总时间从41.80升到64.79ms/token，故没有作为默认。
+
+读量和命中不变：W2为42.0096MiB/token、83.9198%，W4为76.8137MiB/token、84.1708%。就绪调度的Native RPC跨度包含其内部等待权重就绪的时间，不能视作纯MoE计算耗时，也不能与重叠IO时间重复相加。W2仍为N2外存/DRAM、VTCM展开N4、HMX N4×A8。各项均单轮固定输入对照，不代表自由生成速度；thermal均0，W2无进程swap，W4两轮最大进程swap约159/66MiB，未约束整模型4GiB。
+
+新增4KiB uncached就绪buffer，只在初始化分配和映射；最后一块通过acquire/release计数观察全部payload写入，DMA-BUF发布后才标为就绪。DSP校验代际号，使用uncached映射、abort和异常超时保护。循环内context/注册/RPC buffer生命周期变化均0。5轮固定输入实验每轮169份prefill/decode hidden/logits/state/KV/token/路由/cache文件相对原64槽版本逐字节一致，独立物理LRU及全部读取块审计通过；既有诊断PPL保持W4 4.2597、GPTQ W2 24.6307，没有改变W2原有精度问题。
+
+原run_chat.py另做W4正常贪心生成17个事件，消费自身预测并遵循EOS，确认默认入口、实时显示及缓存更新有效。详见新目录REPORT.md、RESULTS.csv、SUMMARY.json、ENTRY_SMOKE.json、MANIFEST.json和results。原32槽代码保留，64槽加`--no-hit-first`可对照原等待调度；未改生产llama.py或其它模型recipe，未commit/push。
+
+### SM8975：Native MoE复用CRM资源上下文（2026-10-22）
+
+新增 `llama-output/qwen36-native-moe-opt-sm8975-20261022`，原聊天入口64槽路径已切到本目录，默认仍W4。AR1工作区由5MiB压为2.625MiB（8×320KiB worker＋共享codes/CSR/route输出）；首次调用建立DSP资源管理context，此后逐层`HAP_compute_res_acquire_cached/release_cached`借用和归还VTCM/HMX，会话析构才完整释放。保持命中专家先算、缺失专家单独就绪、单次RPC、原Top8求和顺序。Attention和QNN仍可在Native调用之间使用资源。
+
+同一文本128-token prefill＋127步teacher-forced完整40层decode，含真实外存IO：W2 GPTQ原就绪调度Native57.599ms/token、完整130.752ms、7.648token/s；仅压工作区57.980/130.268/7.676，无明显吞吐收益。加入缓存CRM两次为47.993/121.303/8.244、47.964/121.681/8.218，Native相对57.60下降约16.7%。后一轮与相邻原版56.936/129.605/7.716配对，完整吞吐提升6.5%。W4原66.432/146.274/6.836，本次58.752/140.587/7.113，吞吐+4.0%。不混入32槽数据；Native跨度仍包含专家就绪等待，不能当作纯乘法时间。
+
+16步DSP诊断显示资源申请/等待API约8.590→2.771ms/token、释放4.330→2.594ms；各worker等待、DMA/展开区间有重叠，不能相加。HMX函数调用区间约0.46ms不等于硬件利用率。初始逐调用profile仅作内部诊断；最终累计profile在循环后导出，正式测速关闭打点。此前的QNN context计数不覆盖CRM，这次CRM复用由独立资源句柄管理。
+
+曾试保留最多1GiB多层DSP虚拟权重映射，触发HAP_mmap2失败、Native25，已撤回。另试N2位展开改写，256字节独立解码和完整输出均正确，但完整速度7.810，未稳定超过原展开的8.22～8.24；已恢复原N2Utils实现。失败和候选保留在variants及日志，未进入默认路径。
+
+6轮成功的127步固定输入对照，每轮169份hidden/logits/state/KV/token/route/cache文件与原64槽逐字节一致，物理LRU、pin/淘汰、对齐读量和全部128KiB子任务独立审计通过；W2仍命中83.9198%、42.0096MiB/token，W4为84.1708%、76.8137MiB/token。既有128预测位置PPL保持W4 4.2597、GPTQ W2 24.6307，未修复原W2精度。QNN context/注册/RPC buffer循环变化计数均0。原入口W4正常生成17事件，消费自身预测、遵循EOS，169份文件对旧入口同输入也逐字节一致。
+
+前后thermal均0；W2缓存CRM第一次最大进程swap约2.4MiB、最终复测0，W4有swap，未强制整模型4GiB。以上是固定输入速度，不视作自由生成速度，未给多轮置信区间。完整证据见新目录REPORT.md、RESULTS.csv、SUMMARY.json、PROFILE.json、PROFILE_CACHED.json、VARIANT_HASHES.json、ENTRY_SMOKE.json、MANIFEST.json与results。未改生产llama.py、其它模型recipe或AR128 prefill内核，未commit/push。
+
+### SM8975：异步专家映射和N2查表展开（2026-10-22）
+
+新增 `llama-output/qwen36-native-memory-sm8975-20261022`，原聊天入口64槽路径改到本目录，默认仍W4。保留原量化、Top8和真实LRU。增加常驻DSP线程，用两个映射窗口提前映射下一层专家缓存，与QNN Attention/Router执行重叠，不复制专家权重，也不映射全部40层专家池。N2用HVX的16项查表加交织展开，设备上对全部256种字节独立标量校验；8个专家共享AR1 GU输入tile，VTCM从2.625降为2MiB。
+
+同输入16步内部诊断：DMA/展开的逐层worker最大区间累计4.700→2.620ms/token；前置映射/同步加剩余异步映射等待4.744→0.090ms。映射工作移到后台，其API累计墙钟约8.460ms、入口剩余等待0.022ms，不能说映射本身消失或快了98%。资源获取/归还约2.743/2.622ms，合计仍5.36ms，没有显著下降。并发worker最大区间和后台计时不可直接相加。
+
+128-token prefill＋127步完整40层teacher-forced decode，含真实UFS：W2 GPTQ相邻原版125.711ms、7.955token/s，新版121.742ms、8.214token/s（+3.26%），Native52.642→48.670ms；新版前一轮121.932ms、8.201token/s。历史原版已达到8.218～8.244，不能将不同时间最好成绩混为一组。W4相邻137.813→136.850ms、7.256→7.307token/s（+0.70%），Native59.345→56.834ms；单对W4结果不足以证明稳定整机吞吐提升。
+
+关闭VTCM清零、新版HMX lock3均未见资源API明显收益；非缓存专家映射反而更慢，均未保留。常驻2MiB VTCM的独立HMX context试验返回Native15，改lock3后下一层QNN graphExecute返回1003，已撤回。资源API承担Native/QNN使用权交接，不能直接跳过。继续优化应评估QNN统一资源调度或兼容的VTCM分区。
+
+三轮新版127步实验每轮169份hidden/logits/state/KV/token/route/cache文件对原64槽逐字节一致，物理LRU和全部读取块独立审计通过；W2命中83.9198%、42.0096MiB/token，W4命中84.1708%、76.8137MiB/token，既有PPL不变。循环QNN context/注册/ARM RPC buffer生命周期变化均0。原入口正常W4贪心生成49个事件、48步AR1，使用自身预测并到达配置上限；前16步input/output/hidden/logits和82份prefill文件与旧短参考一致，没有比较不同长度的最终state。
+
+正式对照前后thermal均0；W2新版无swap，W4新版最大进程swap约132MiB、相邻原版约29MiB，未约束整模型4GiB。完整记录见本目录REPORT.md、PROFILE.json、PAIRED_RESULTS.json、RESULTS.csv、SUMMARY.json、ENTRY_SMOKE.json、MANIFEST.json及source/。未修改生产llama.py、其它模型recipe或AR128 prefill内核，未commit/push。
+
+
+### SM8975：64专家decode分项复测（2026-10-22 19:48）
+
+本次重新运行当前优化版，W2 GPTQ/A8、40层、AR128前缀＋127步teacher forcing；保留前两列历史数据，所有值按每生成一个token平均。
+
+| 环节 | 64专家旧调度（历史） | 64专家首次新调度（历史） | 64专家当前优化版（本次） |
+| --- | ---: | ---: | ---: |
+| 外存读取处理，RPC外部分 | 32.32 ms | 4.57 ms | 4.58 ms |
+| Native MoE调用 | 41.86 ms | 57.60 ms | 49.17 ms |
+| Attention | 39.87 ms | 38.43 ms | 38.46 ms |
+| Router＋shared expert | 15.96 ms | 15.81 ms | 16.08 ms |
+| State反馈、head及其它 | 20.32 ms | 14.35 ms | 13.91 ms |
+| **总耗时** | 150.32 ms | 130.75 ms | 122.19 ms |
+| **吞吐** | 6.65 token/s | 7.65 token/s | 8.18 token/s |
+
+Native包含内部等待，RPC外部分与Native按原定义统计；State/head/其它是DECODE_LOOP总跨度扣除前四项，含循环和框架处理。169份输出/状态/cache逐字节一致，LRU及全部读取块审计通过，命中83.9198%、42.0096MiB/token不变，thermal前后0、进程VmSwap为0。原始日志及精确值见`llama-output/qwen36-native-memory-sm8975-20261022/BREAKDOWN_RETEST.json`和REPORT.md；前两列不是本轮重跑的相邻A/B。
+
+
+### SM8975：纠正第二轮优化基线并做A/B/B/A对照（2026-10-22 20:01–20:04）
+
+本轮映射/N2优化应与已经缓存CRM的47.96–47.99ms版本比较。此前只列更早57.60ms作为“优化前”，会掩盖第二轮没有超过历史最好成绩的问题；那个比较只能说明累计演进。
+
+| Native贡献，按每个token归一化 | 历史缓存CRM版 | 此前最新复测 | 变化 |
+| --- | ---: | ---: | ---: |
+| 2057个全命中层调用的累计贡献/127 | 13.120 ms | 10.706 ms | -2.415 ms |
+| 3023个有缺失层调用的累计贡献/127 | 34.843 ms | 38.461 ms | +3.618 ms |
+| Native总计 | 47.964 ms | 49.167 ms | +1.203 ms |
+
+全命中层路径确实更快，但此前跨批次比较的有缺失路径增加抵消了收益。内部16步诊断为88.125%命中、31.0234MiB/token；完整127步为83.9198%、42.0096MiB/token。映射主要移到后台，worker区间有并发，不能把两项约6.7ms直接扣减完整decode。
+
+补做相同输入、真实40层、64槽、每次127步的A/B/B/A连续测试：
+
+| 指标 | 缓存CRM基线，本轮两次平均 | 当前版，本轮两次平均 |
+| --- | ---: | ---: |
+| Native MoE | 52.686 ms/token | 48.659 ms/token |
+| 完整decode | 125.601 ms/token | 122.134 ms/token |
+| 吞吐 | 7.962 token/s | 8.188 token/s |
+| 全命中层Native均值 | 0.816 ms/层 | 0.663 ms/层 |
+| 有缺失层Native均值 | 1.658 ms/层 | 1.593 ms/层 |
+
+缓存CRM本轮124.820–126.382ms/token、当前版121.521–122.746ms，平均吞吐+2.84%，未证明超过历史最好8.22–8.24token/s，也未给统计显著性。当前读写条件下旧程序本身也比历史慢。pread worker累计本轮A/B为198.77/198.97ms/token，含并发、阻塞和调度，不能解释为纯UFS硬件时间。四轮各169份结果逐字节一致，LRU及全部读取块审计通过，thermal前后0；B2最大进程VmSwap采样约17MiB，其余0。未修改kernel/调度。详见`llama-output/qwen36-native-memory-sm8975-20261022/REGRESSION_ANALYSIS.json`和REPORT.md末节。
+
+
+### SM8975 Native内部可加拆分（2026-10-22）
+
+独立计时诊断详见 `llama-output/qwen36-native-breakdown-sm8975-20261022/REPORT.md` 及 `RESULTS.json`/`RESULTS.csv`。相同真实40层、AR128 prefix + 127步固定输入AR1、W2 GPTQ/A8、64槽LRU，计时版基线/当前版Native为53.657/50.336ms/token；它们不是历史47.964/49.167ms的逐项还原。当前版内部为：缺失专家就绪等待24.681ms；ARM/RPC/同步和控制9.740ms；资源获取归还5.528ms；映射/线程启动/锁/分发3.290ms；激活打包与元数据DMA0.915ms；权重DMA提交/剩余等待0.647ms；N2展开1.495ms；bias/HVX后处理0.460ms；HMX请求/完成等待0.102ms；worker其它及共同尾部3.477ms。按最后完成worker接共同尾部统计，分项可加；HMX项不代表纯硬件占用，RPC残差包含统计尾部/运行时。各169份输出哈希一致、同层LRU和读取块审计通过，未修改默认运行入口。
+
+
+### SM8975 Native RPC复用（2026-10-22）
+
+当前 `llama-output/qwen36-chat-sm8975-20261021/run_chat.py` 的64专家分支已接入 `qwen36-native-handoff-sm8975-20261022`，默认 `mailbox8`。保留原8个HVX worker及原同步/算术kernel，用4KiB uncached命令buffer、单个常驻ARM服务线程和有界Native服务RPC复用调度；每320层命令或3秒续接RPC，context/buffer/映射/工作线程保持不变。每个decode token仍为逐层AR1。
+
+真实40层、AR128 prefix＋127步固定输入AR1、W2 GPTQ/A8、每层64槽LRU的最新同版runner对照：Native 41.016→34.207ms/token，完整decode 117.736→110.602ms/token，8.494→9.041token/s（+6.45%）。保留版另两轮113.482/112.735ms，8.812/8.870token/s；全部旧版三轮117.736–121.329ms，存在读取/调度波动，不宣称固定性能或统计显著性。127步5080次直接Native RPC→16次服务RPC＋5080个共享buffer命令，ARM服务线程只创建1次，循环内context创建释放、内存注册注销和RPC buffer分配释放均为0。三轮保留版各169份输出与参考逐字节一致，LRU/route/全部读取块审计通过，命中及需求读取量不变。
+
+W4默认路径也通过AR128＋16步对照，各169份输出一致；640次直接RPC→2次服务RPC，短测试7.819→8.333token/s，不能与127步W2结果直接比较。尾部屏障融合、减为4 worker都未保留；无限RPC服务触发设备明确的10秒超时，已改成有界服务续接。源码、失败记录、完整计数及所有轮次见 `llama-output/qwen36-native-handoff-sm8975-20261022/REPORT.md`、RESULTS.json/CSV和MANIFEST.json。
+
+
+### 当前Native版同轮等待/资源开销复核（2026-10-22）
+
+正式无内部profile对照仍为：Native 41.016→34.207ms/token、完整decode 117.736→110.602ms/token、吞吐8.494→9.041token/s。Native下降16.60%，完整decode下降6.06%，吞吐提升6.45%；当前默认仍保留该RPC复用实现。下文41.605658ms来自另一次带内部profile的诊断运行，没有替代这组正式结果；也不能把两轮差值全部归因于计时开销。11.103041ms资源API及16.565603ms非专家等待分项仅适用于该诊断轮，尚不是34.207ms那轮的逐项还原。后续消融中的“当前mailbox基线”也已启用RPC复用。
+
+历史21.389/24.681ms就绪等待和历史34.207ms Native来自不同版本/轮次。34.207ms已经包含内部等待，并不是等待之外额外34ms，不能把这些不同时轮的数字组合成当前版计算分项。
+
+对当前mailbox版本重新增加最后完成worker及HMX锁时间戳，AR128前缀＋127步固定输入AR1、真实40层、W2 GPTQ/A8、每层64槽LRU，同一轮Native41.605658ms/token＝缺失专家就绪等待25.040054＋资源获取2.765508＋资源归还2.688871＋HMX lock2.923977＋HMX unlock2.724685＋其它算术/DMA/打包/调度5.462562。等待之外16.565603ms，四个资源API跨度合计11.103041ms。接口跨度含内部调度等待，不表示都能删除；HMX请求完成时间不是纯硬件占用。该轮带内部profile，不能当作无profile版的回退。169份输出逐字节一致，LRU及读取chunk审计通过。详情：`llama-output/qwen36-native-current-profile-sm8975-20261022/REPORT.md`、RESULTS.json/CSV。
+
+无内部profile的完整127步消融：当前mailbox基线Native40.839/完整114.241ms；HMX直接在服务线程执行41.022/114.198；逐次lock4为42.061/115.719；二者组合41.544/115.042；先取得HMX锁再唤醒HVX为40.902/114.208。各轮169份输出一致，命中/读量不变，未测到明确收益，均未接入默认。持续占有VTCM或跨QNN调用保留HMX注册的短试验失败，不计性能。详情：`llama-output/qwen36-native-dispatch-sm8975-20261022/REPORT.md`。
+
+另编译了约46KB的QNN单节点MoE资源复用原型：EXCLUSIVE声明的context恢复失败5005；相同签名的最小HVX copy图能恢复；HVX上下文内尝试lock4返回1，未运行完整专家计算。资源声明/设备运行时组合尚未调通，没有可报告性能收益，也未替换正常聊天实现。详情：`llama-output/qwen36-qnn-moe-sm8975-20261022/REPORT.md`。当前默认仍为此前通过验证的qwen36-native-handoff-sm8975-20261022/mailbox8。
+
+### RPC复用后的AR1与读取优化（2026-10-22，后续更新）
+
+在原先测到34.207ms Native的RPC复用实现上继续修改。保留AR1直接调度8个Top8位置、共享一次ID/score DMA、4KiB临时索引bank、按ready协议减少重复同步，以及8个读线程×256KiB分块。每层64专家LRU、Top8数量、W2 GPTQ权重格式和HMX N4×A8计算保持原配置。聊天入口`llama-output/qwen36-chat-sm8975-20261021/run_chat.py`的W2 GPTQ／64专家分支已选择`qwen36-native-io-sync-sm8975-20261022`；其余分支使用原目录。
+
+真实40层、AR128前缀＋127步固定输入AR1、context capacity1152、无内部profile，两轮原版与两轮新版均值如下。原版已经启用RPC复用，并非退回更早实现。
+
+| 环节，ms/token | 原版两轮均值 | 新版两轮均值 |
+| --- | ---: | ---: |
+| Native，含就绪等待 | 41.641 | 37.150 |
+| RPC外读取处理 | 5.006 | 1.889 |
+| Attention | 38.027 | 38.057 |
+| Router＋shared expert | 15.844 | 15.875 |
+| State、head及其它，残差项 | 14.286 | 14.231 |
+| 完整decode | 114.804 | 107.202 |
+| 吞吐，token/s | 8.711 | 9.328 |
+
+Native均值下降10.78%，完整decode下降6.62%，平均吞吐提高7.09%。两轮原版Native41.347/41.934ms、完整decode114.561/115.047ms；新版Native37.124/37.176ms、完整decode106.794/107.610ms，9.364/9.293token/s。历史34.207ms Native／110.602ms完整decode仍有效，但不作为本轮相同条件的原版实测值。本轮没有证明新版Native可稳定低于历史34.207ms；睡眠候选曾为32.205ms，复测回到37.128ms，未采用。新版两轮完整decode均低于历史110.602ms。
+
+四轮各169份输出与原参考逐字节一致；逐层Top8/LRU及全部读取分块核对通过。均命中34105/40640（83.919783%），需求读取5594378240字节/127步（42.009566MiB/token）。读取调用45745→26140，总读量不变。5080层命令仍使用16次服务RPC和1个ARM服务线程，循环内context、内存注册及RPC buffer生命周期计数均为0。临时bank总buffer由13705216降至8192字节，VTCM仍为2MiB。
+
+实际聊天入口另完成8-token自由生成，与原版相同模板/输入的169份结果逐字节一致。两版该W2 GPTQ样本均输出`endah.endah.endah.endah.end`，已有质量问题不由本次性能优化解决；本次没有重测PPL。该短自由生成的吞吐与127步固定输入性能分开记录。手工cache清理、yield、睡眠/计数器退让、资源单线程接管等候选未接入默认。完整消融、源文件、二进制哈希及数值审计见`llama-output/qwen36-native-io-sync-sm8975-20261022/REPORT.md`、RESULTS.json/CSV、SUMMARY.json、MANIFEST.json。

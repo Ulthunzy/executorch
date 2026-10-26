@@ -1,0 +1,846 @@
+{
+  "status": "stopped_by_user",
+  "recorded_at": "2026-10-26T13:38:53+08:00",
+  "run_directory": "llama-output/qwen35-moe-full-benchmarks-20261026",
+  "model_manifest_sha256": "3812e5f55b9b769eea6fe2992a4a5023e648106f065077a6d1316b7c872eec96",
+  "total_tasks": 12724,
+  "completed_tasks": 129,
+  "incomplete_task": "HumanEval/HumanEval/129",
+  "incomplete_task_saved_result": false,
+  "summary": {
+    "AIME 2026": {
+      "completed": 0,
+      "correct": 0,
+      "score": null,
+      "generation_capped": 0,
+      "expected": 30
+    },
+    "HumanEval": {
+      "completed": 129,
+      "correct": 114,
+      "score": 88.37209302325581,
+      "generation_capped": 2,
+      "expected": 164
+    },
+    "GPQA-Diamond": {
+      "completed": 0,
+      "correct": 0,
+      "score": null,
+      "generation_capped": 0,
+      "expected": 198
+    },
+    "MMLU-Pro": {
+      "completed": 0,
+      "correct": 0,
+      "score": null,
+      "generation_capped": 0,
+      "expected": 12032
+    },
+    "IFBench": {
+      "completed": 0,
+      "correct": 0,
+      "score": null,
+      "generation_capped": 0,
+      "expected": 300
+    },
+    "Average": null,
+    "run_scope": "full_dataset_in_progress",
+    "official_leaderboard_submission": false,
+    "inference_errors": 0
+  },
+  "sha256": {
+    "predictions.jsonl": "191dc35cb2db50885c3f028bc0971052c05c26b85f44977e4f9800e803c17773",
+    "SCORED.jsonl": "2b8e0b18bfb6c9eb932a976acc0fa94aa9194d6d07420f5f95d104206dd658ef",
+    "SUMMARY.json": "b2d2e000721efebf5d2c17acdd7b9bccb4a609fcf602d50c39c7aceeff641351",
+    "RUN_MANIFEST.json": "3812e5f55b9b769eea6fe2992a4a5023e648106f065077a6d1316b7c872eec96",
+    "SOURCE_SHA256.json": "23872c2c5d88c427e4b4bcdbb4e6cee025cd62f02fb72da65633c4e9b596c4d5",
+    "TASKS.jsonl": "f7efd9d1e23ada870dddd4586aa664eedfffadb324ba9e8daf6bb85a8db5ee1f",
+    "CASES.jsonl": "12577dca5c0fc6bae37d4506327cb13646cddf74662e5cfd5f93f7a8023c94ed"
+  },
+  "resume": {
+    "command": "/home/hunter/anaconda3/envs/et_npu/bin/python -u llama-output/qwen35-moe-full-benchmarks-20261026/run_device.py",
+    "skip_when_equal": [
+      "key",
+      "prompt_sha256",
+      "max_new_tokens",
+      "model_manifest_sha256"
+    ],
+    "policy": "Resume the frozen model only; successful saved predictions are skipped. Changed model/export/runtime versions require a separate result set and cannot reuse these accuracy results."
+  },
+  "completed": [
+    {
+      "key": "HumanEval/HumanEval/0",
+      "prompt_sha256": "82824399f7275c88cdbc74015b7bf7965fefcb0294d65b0c2a3e0f03a4485963",
+      "max_new_tokens": 4096,
+      "response_sha256": "c06db5fb9cee0be62bb13775f89e29e341a876dcba13921ed98bfd129a38f21c"
+    },
+    {
+      "key": "HumanEval/HumanEval/1",
+      "prompt_sha256": "5ad4a363eb94ace97c704573b3ace613d09cabfcb3fd3f3ddbb01391fac6736b",
+      "max_new_tokens": 4096,
+      "response_sha256": "326d6432e07a3a215c25f7bfbeaaaefb7ebe383c77134f410764d6532ba50e62"
+    },
+    {
+      "key": "HumanEval/HumanEval/2",
+      "prompt_sha256": "0adf9c86d68fc28e4a4c5b2205d7a6d28a453d1dcefa0426ca3c51e0e44151b7",
+      "max_new_tokens": 4096,
+      "response_sha256": "029220b47b8f0be3c68c840f5396b450f116e3c6da677a8f5d4853e808b098e4"
+    },
+    {
+      "key": "HumanEval/HumanEval/3",
+      "prompt_sha256": "2dc0e9eeae036f3188ba769ecbf78aa31171002328846a17f948b34509c70274",
+      "max_new_tokens": 4096,
+      "response_sha256": "6a4eae059484f334f3a2e1c38db1c246e9cde1563e4d6053d594e5285e123065"
+    },
+    {
+      "key": "HumanEval/HumanEval/4",
+      "prompt_sha256": "b84067b0dc01a1de505bc9816d537c92e13e86cd75563ae9e9d4f7e8f11a37a7",
+      "max_new_tokens": 4096,
+      "response_sha256": "efbdd4a51e9a9c207cc9b5bedc699725eca16eafe6db3313508065094a465a6b"
+    },
+    {
+      "key": "HumanEval/HumanEval/5",
+      "prompt_sha256": "2255f8d2c0eb70f71392fb476c2141f088a2bb05a8c4a568dfcfcf3f7ba413fb",
+      "max_new_tokens": 4096,
+      "response_sha256": "9752db962bb0e0036f6c90d17fc46913a66f35859b2df2304c338899bb0b499c"
+    },
+    {
+      "key": "HumanEval/HumanEval/6",
+      "prompt_sha256": "9c5b0ed270e25825e7f49debab1ffadecd48d16bac32b7df710f6f8dbcc998c1",
+      "max_new_tokens": 4096,
+      "response_sha256": "ea01150a7650f34a65bc9e41351ba132f0e92de3836e2e9694ab97eec652c906"
+    },
+    {
+      "key": "HumanEval/HumanEval/7",
+      "prompt_sha256": "836a0f4a24a2236ac714bcec2820eb7563acec1661982079f547f5bf0b799664",
+      "max_new_tokens": 4096,
+      "response_sha256": "c5cdf9b7531a6e47b9643d72359f7dec793e83c6b213642fbb46edc8bc18ab24"
+    },
+    {
+      "key": "HumanEval/HumanEval/8",
+      "prompt_sha256": "b01c9fd779efd0643a24a870e187b65cd4aff42fb2f49a81bfccd8019bb8183e",
+      "max_new_tokens": 4096,
+      "response_sha256": "22dee50d07d8aeb56c11b764dad101a9982216974de0a8616f2450254023891a"
+    },
+    {
+      "key": "HumanEval/HumanEval/9",
+      "prompt_sha256": "496e62c904a6205169a230006f6bcc2b64e7cfc82f0492195da665cfe0c67684",
+      "max_new_tokens": 4096,
+      "response_sha256": "0377b2a6cbc64ba5a02e91b673af48635be4b039b09755c89b17049d26a0a449"
+    },
+    {
+      "key": "HumanEval/HumanEval/10",
+      "prompt_sha256": "10736792f5b61297bead857ccf0e16b184246bb032ee073a3b53474629a1fb41",
+      "max_new_tokens": 4096,
+      "response_sha256": "015f173df1a8d685b3405ccd6ba69210cd4301ac46716ded3b1a04fcf0bf467d"
+    },
+    {
+      "key": "HumanEval/HumanEval/11",
+      "prompt_sha256": "519629fbd7f9363ae58e76d0c5382719843375901bdee718e684fd0d06993670",
+      "max_new_tokens": 4096,
+      "response_sha256": "c52e5567e76d4e172b8a2bceab9b3eca6c5bab43761d119660c27976af9ab0b0"
+    },
+    {
+      "key": "HumanEval/HumanEval/12",
+      "prompt_sha256": "3007194966489b15bbc7bdd408397cba9486a7fb7cc7745c3f73c6baa7e85fb0",
+      "max_new_tokens": 4096,
+      "response_sha256": "da9c5f85d5e3566ab4a854acfeb1eb57117677db4664ec6752593319d855b240"
+    },
+    {
+      "key": "HumanEval/HumanEval/13",
+      "prompt_sha256": "79681608ddbde4c80ebb15b81018de105b012a4df8cf3e50bcbcb246d0c67e1b",
+      "max_new_tokens": 4096,
+      "response_sha256": "a8cb9d1c0bc4c45ad185089431f34adb5acbed8334dd47a3464f6d93cb5c2ae0"
+    },
+    {
+      "key": "HumanEval/HumanEval/14",
+      "prompt_sha256": "77e03354c65f34c7a788598d80a47cf3619971d8370e7d2023d95abd15120a9a",
+      "max_new_tokens": 4096,
+      "response_sha256": "db9f8e8755ff86f80158e9f03e1a117d5dec88c1f44e292353ac86bc4c708553"
+    },
+    {
+      "key": "HumanEval/HumanEval/15",
+      "prompt_sha256": "3ec67dad47288f9741ec589dd6986c85d3c20d8447be2bf544e08254cb715448",
+      "max_new_tokens": 4096,
+      "response_sha256": "bcc39eaea1cfc9ac8ea47588f1ed8430664b461c78d532f2d2d65f33d666b6bd"
+    },
+    {
+      "key": "HumanEval/HumanEval/16",
+      "prompt_sha256": "fed2c3c29faa1fb1633e2e04359ee4b72e75bdf27decf0baf2897c48210b3daa",
+      "max_new_tokens": 4096,
+      "response_sha256": "9f726030396077cdf445de9f217cb76a5189b29560e0a51306f15cdfad50dc9e"
+    },
+    {
+      "key": "HumanEval/HumanEval/17",
+      "prompt_sha256": "1fdcc8241040dcb5e28f2584ca9380af05f4fbbba829a92af35d1e6c05e87265",
+      "max_new_tokens": 4096,
+      "response_sha256": "5d9f1ac52d0c276c1c70f829696c49dfd8fd5878eeb9b2ec7919614998762dd2"
+    },
+    {
+      "key": "HumanEval/HumanEval/18",
+      "prompt_sha256": "9cae30d27b671bced348d8fa6e9418b46f072f822d5c5b44cf9f5af21113044a",
+      "max_new_tokens": 4096,
+      "response_sha256": "04c59678d68ab143e28d579407da8062fee6efd3853f3dbe8ee632c13c2c5eca"
+    },
+    {
+      "key": "HumanEval/HumanEval/19",
+      "prompt_sha256": "6ad23e3400db502bae956e5dec33d1b5389ca2e01be42d800a872a3c146826b7",
+      "max_new_tokens": 4096,
+      "response_sha256": "e84eabc3804c4aaa51a6f30fa11a9be7f6340af194557af13060c2c44cf01f5b"
+    },
+    {
+      "key": "HumanEval/HumanEval/20",
+      "prompt_sha256": "a911ac633fef286eb6206dca725efce5445c26a53b5c28386ab55ef5c199ff78",
+      "max_new_tokens": 4096,
+      "response_sha256": "5bc4e2cbcdf24d3b317ea88662b59d45dee8e59430f1ce4609e5ac4869dbee9b"
+    },
+    {
+      "key": "HumanEval/HumanEval/21",
+      "prompt_sha256": "2e717c4ef09691ff18726561b405fc42f8862f6770ffe4acda6bb34903ba7b37",
+      "max_new_tokens": 4096,
+      "response_sha256": "8f0eac27c944cf3b6277d8273cd6c91d5c608709ceca2fd714db4689ca4f9684"
+    },
+    {
+      "key": "HumanEval/HumanEval/22",
+      "prompt_sha256": "f6cd6c4f866f932da9fd32d567be5b86867903761a594ec4609bfbab0ce7dd1c",
+      "max_new_tokens": 4096,
+      "response_sha256": "3e0343655efafa0780ac0f0da3d2671f571bc6dcc7342c42441e40a9c6e3af8a"
+    },
+    {
+      "key": "HumanEval/HumanEval/23",
+      "prompt_sha256": "e3b51c72f3bb44077d1100579ec9d8153a685e0f2c848c131fa872e58ce8d895",
+      "max_new_tokens": 4096,
+      "response_sha256": "d4da8209ed4da3bd540867af01d1f8143dd365bf7f3e08410c0d0d7be1a8aed3"
+    },
+    {
+      "key": "HumanEval/HumanEval/24",
+      "prompt_sha256": "5951c0d6b9290a91069ddbf9d9af6825ce7fdcaf452701d56828dfbd29824899",
+      "max_new_tokens": 4096,
+      "response_sha256": "50d604f498d69552ccedeeb29376c749e1b0714233e58fce6f65f44bd75540a9"
+    },
+    {
+      "key": "HumanEval/HumanEval/25",
+      "prompt_sha256": "bdabdd89b42569a66385369d555462bddd2d9118b45a45c877f1da5b8d993e83",
+      "max_new_tokens": 4096,
+      "response_sha256": "669048695ac5946dbfa4cd2b2333c152fce2f2f763506b11b48f9f72fac923a1"
+    },
+    {
+      "key": "HumanEval/HumanEval/26",
+      "prompt_sha256": "3de939f4857d71f7c781e797019c8b660a29e3fc9d7ef87ddd9f8ff972e3af35",
+      "max_new_tokens": 4096,
+      "response_sha256": "b7607ff1b8f4719c6964aca773c63a83d01fb53eb2370d65b6e5573661b44956"
+    },
+    {
+      "key": "HumanEval/HumanEval/27",
+      "prompt_sha256": "5378a06678f984228fc8c04f6357c20294bf9288e304ac6f9504a401c57fef53",
+      "max_new_tokens": 4096,
+      "response_sha256": "ef338f5c9c393358504ca1a36fcdfb6d4266fb8ee6ec7e4bcf0e06e7f64e23ae"
+    },
+    {
+      "key": "HumanEval/HumanEval/28",
+      "prompt_sha256": "58ffa515fb7e10111c335709cb0108535aa5bf158b51f72f4f49db668d6c0815",
+      "max_new_tokens": 4096,
+      "response_sha256": "c8b2a6bfc5efef1c1e3dd2721615678485520fad4213c343b4c587a90637d66c"
+    },
+    {
+      "key": "HumanEval/HumanEval/29",
+      "prompt_sha256": "d2edbcc615feae1cf81b638e10ffe8831e5a2891a60348d864260a7153cb7a78",
+      "max_new_tokens": 4096,
+      "response_sha256": "4b0b13c1ed099ef1c79dbae8f0def3ff678bfddbedfe798501311de107fc2fdf"
+    },
+    {
+      "key": "HumanEval/HumanEval/30",
+      "prompt_sha256": "865f487eb1f6eb9d354cbb15bf07e2abd34596a6af183de9898a1b57f329bcca",
+      "max_new_tokens": 4096,
+      "response_sha256": "c6040d2674a5f5669c433d1642fde0eb7d84df11fbcdaa39e30cd0fc6a4fccc4"
+    },
+    {
+      "key": "HumanEval/HumanEval/31",
+      "prompt_sha256": "629a436883086ba4585e031fc25788b8cb25fbb81a1f1fd9507223f854618aef",
+      "max_new_tokens": 4096,
+      "response_sha256": "b7d1976e3256e1714522c283760e1095f404ab665007adfa8eae64521e8390b0"
+    },
+    {
+      "key": "HumanEval/HumanEval/32",
+      "prompt_sha256": "0c4b0aad4d06e04fe77a83e80900c95424be8859f40b4e700dad0ffa9ce5ccb7",
+      "max_new_tokens": 4096,
+      "response_sha256": "2701c05baf407b920900ff334a2f7185058ac7ca8c265643b949b747759c35bb"
+    },
+    {
+      "key": "HumanEval/HumanEval/33",
+      "prompt_sha256": "b7475ddeb3af6351500d07f4a6e05b71f7701f6fe69a8bcd29895961278b09e0",
+      "max_new_tokens": 4096,
+      "response_sha256": "d23929cd15d285415a080d5db36a74b6ae04e80e1edbcc582b76dbef9c1224c0"
+    },
+    {
+      "key": "HumanEval/HumanEval/34",
+      "prompt_sha256": "2dc2c877c826d0b0ee01fe8dfc5c74016249668558d19aec8d924ccbf9be2fac",
+      "max_new_tokens": 4096,
+      "response_sha256": "3b64bd4ab02ecde345860107e9e1cffe060f6bce7c4b6cf312b7b9c57196761a"
+    },
+    {
+      "key": "HumanEval/HumanEval/35",
+      "prompt_sha256": "4f86481ca7d55b8ddaee84e0269c6ecc1053d3df251047793cdac23a70cb461d",
+      "max_new_tokens": 4096,
+      "response_sha256": "8fbfb93f4ed7dcd31f27a5242e77a4b21f58a0b89991ef4c99124890db66f58d"
+    },
+    {
+      "key": "HumanEval/HumanEval/36",
+      "prompt_sha256": "e46341cc00a2c7c14042adf567ee33250a7d5d194d2d6c17d827d6f634804f21",
+      "max_new_tokens": 4096,
+      "response_sha256": "7e0cdbc51ce6bb6a20fd6f859ee050bd690b51b593a85e06c44ca2a9405081ca"
+    },
+    {
+      "key": "HumanEval/HumanEval/37",
+      "prompt_sha256": "e1a4ad55a76ff27ed5469998cad8e3842343d4c0318f9e1b978b14d9a450b603",
+      "max_new_tokens": 4096,
+      "response_sha256": "b9e109a514fe87625df83e12c0c37ee9421374d4bfcf92c6d45c456d821d332a"
+    },
+    {
+      "key": "HumanEval/HumanEval/38",
+      "prompt_sha256": "9025623239cae476fa41ae9de101bc612c1295f295ef01287af740e7cf550301",
+      "max_new_tokens": 4096,
+      "response_sha256": "92f9bd1be9ca2975fd6091d638797f9f16be8e220dfa30f93185220105eba962"
+    },
+    {
+      "key": "HumanEval/HumanEval/39",
+      "prompt_sha256": "74b69104b98f4115931bce2f3908b89dc235a9ce59a22c64ff91464dbbf6a871",
+      "max_new_tokens": 4096,
+      "response_sha256": "8f971135da93a98b6d641f857e1be40524e5dce369416ca89863cbde9caf8470"
+    },
+    {
+      "key": "HumanEval/HumanEval/40",
+      "prompt_sha256": "e014d617a91bebf331cf79a2a897c48820b7b993bcccd38da2f5aa4947f75916",
+      "max_new_tokens": 4096,
+      "response_sha256": "a0b8c6f8cae6962fa99020dd664827a6d2523243e843693175dc835faac993a7"
+    },
+    {
+      "key": "HumanEval/HumanEval/41",
+      "prompt_sha256": "e9ac4c1c179a6cebf06baceeaa02dae6e524cf6773dd81235f14526c93ca88ea",
+      "max_new_tokens": 4096,
+      "response_sha256": "e609c258a31e6cb67862ab7c60c434c17a4268381482cf50a711979b971bbb59"
+    },
+    {
+      "key": "HumanEval/HumanEval/42",
+      "prompt_sha256": "fe09b9563e2884c2c046e73691a853853109471a710e181b0e0333b6cda41c30",
+      "max_new_tokens": 4096,
+      "response_sha256": "92763bf2e56be2c46a803320f13d00f2bd8a09db5686c746a0a23b8023c069f0"
+    },
+    {
+      "key": "HumanEval/HumanEval/43",
+      "prompt_sha256": "24e21cfa926a54e2b41e6f91dfebdd648027be6c5f0e95b2200aeefc7bbc8329",
+      "max_new_tokens": 4096,
+      "response_sha256": "e58d725b98c71e7ee83ea2ffd250aaabea05e976ce390b933a045e358e44d40e"
+    },
+    {
+      "key": "HumanEval/HumanEval/44",
+      "prompt_sha256": "4074d0253b1c6b4750622023fae2fbfa058e3365ca6da5fb9f75ee1e478935b8",
+      "max_new_tokens": 4096,
+      "response_sha256": "1bcf39d5e6b7f2cd09f20308a041c66b13a8739c442fb7b26b2b1d4b2c191635"
+    },
+    {
+      "key": "HumanEval/HumanEval/45",
+      "prompt_sha256": "9a04789ce153fa99e4854f9fbbea5b54420de9ed88073e94bbe2c891a15a65a1",
+      "max_new_tokens": 4096,
+      "response_sha256": "d186f2f1a0a296f9f0e9e36c63c103b6ecd5c53df2e8c1913463bdfb718c14e7"
+    },
+    {
+      "key": "HumanEval/HumanEval/46",
+      "prompt_sha256": "f453a05e56fa47ffa02f755a5565f6c17aacac9fd2d25c21e9c3684f27fb6ffc",
+      "max_new_tokens": 4096,
+      "response_sha256": "4fb8747c8e60fc511ccaae6786951e8777b401137480cb1a23902833f482cc56"
+    },
+    {
+      "key": "HumanEval/HumanEval/47",
+      "prompt_sha256": "ab8f18290d1d5e4fd27b4a026ab1bcae26747126b336bc0c46edc3c634b5d912",
+      "max_new_tokens": 4096,
+      "response_sha256": "6163176f56d0e54f307131eeeb6e92d0bd78cfe00fdd5af64f876a3aa5ceb1c2"
+    },
+    {
+      "key": "HumanEval/HumanEval/48",
+      "prompt_sha256": "060fd37de0ae5dfbe35a5e5dcf056f8aa508b323efe1f827758be2823f254b01",
+      "max_new_tokens": 4096,
+      "response_sha256": "01683a4bd71f62d692ae7cf902430ede0ff6cf4570ddd8daa855cfd0335e94b7"
+    },
+    {
+      "key": "HumanEval/HumanEval/49",
+      "prompt_sha256": "09abdf16790987ef30f64f9640fcc48966527fee71175f7985ed047684351a7c",
+      "max_new_tokens": 4096,
+      "response_sha256": "0b6ae7e48820c3acb0c1be8e219bb8666e32308385703f42083b47a6d17bd99c"
+    },
+    {
+      "key": "HumanEval/HumanEval/50",
+      "prompt_sha256": "15407492ebca523eb7df198c5af5b05ea4340f818aec1ff2aff21b54bc85548f",
+      "max_new_tokens": 4096,
+      "response_sha256": "9f1ebb613f99b176a0d3f26fb5abcef7aa82280d16c531d7b824c12660463575"
+    },
+    {
+      "key": "HumanEval/HumanEval/51",
+      "prompt_sha256": "44475d6c1c20522381fb0bf0afb85ca7c797020e1790748978907c87b9652cad",
+      "max_new_tokens": 4096,
+      "response_sha256": "10193a923960fe5057330b79a92542ee5b3b29f4e6c6d2267976f5a4a0234ca1"
+    },
+    {
+      "key": "HumanEval/HumanEval/52",
+      "prompt_sha256": "61af1adb9442951113f935be033f9ba5909a5702e866c5d072b9aa435334fc49",
+      "max_new_tokens": 4096,
+      "response_sha256": "32b2d6d62c0a4eda842ecc3e2988684d669855eb5bb7c707d13a5d733a741d33"
+    },
+    {
+      "key": "HumanEval/HumanEval/53",
+      "prompt_sha256": "253236867b3564d2fd4fc0ebffcad060ec53be7b3e6aeec7d1d61a92eff4c345",
+      "max_new_tokens": 4096,
+      "response_sha256": "4c69312cd1bcb683c45ecaa60cdc8a761d2890de4e2685b9d61c50014ca906fe"
+    },
+    {
+      "key": "HumanEval/HumanEval/54",
+      "prompt_sha256": "143147d10b177b36c2860cfc85351f1e96fb1b949ee4e408f1e5fb56f22da765",
+      "max_new_tokens": 4096,
+      "response_sha256": "ffe0128653e2fdcbb89309561443aafcf22a9d6acd6f012d2130ec696835bd6a"
+    },
+    {
+      "key": "HumanEval/HumanEval/55",
+      "prompt_sha256": "a9d1907cf0d80c55041f25d7f7526329dd85e6ec9f9a9c0f39bdbe8df34dc7a6",
+      "max_new_tokens": 4096,
+      "response_sha256": "60e6cdb82ed7ed4a9e1419816d33dbfb67d496a9c0ff959ab357072177cf217a"
+    },
+    {
+      "key": "HumanEval/HumanEval/56",
+      "prompt_sha256": "e01155c0803588089e7f506ed9fcae57140d20ba6c6b6d93c750a2593c43cb15",
+      "max_new_tokens": 4096,
+      "response_sha256": "0b5c44ccf87640c4406dcf840d680aa5001cc6263a8f1b9b88bdcbcde2b9695c"
+    },
+    {
+      "key": "HumanEval/HumanEval/57",
+      "prompt_sha256": "c704d9a04216909958beb90751a98a93fa240638f80d082d0c31ef38f22c9879",
+      "max_new_tokens": 4096,
+      "response_sha256": "db2a96dbcbd25dac2b1a4b002a2ad6dbbbac82537e8202763887e11cc9a0a779"
+    },
+    {
+      "key": "HumanEval/HumanEval/58",
+      "prompt_sha256": "ce04af48fb69d40c258f37dec0409f8a526e0445ed7512d05d7457d47fa5b875",
+      "max_new_tokens": 4096,
+      "response_sha256": "91c3424c502c00e250d35303b13ad152d4117d7672b7fd34f626fbd18ef3ccc1"
+    },
+    {
+      "key": "HumanEval/HumanEval/59",
+      "prompt_sha256": "a445cd32e35eefb6e1429f4d81e489d05753893ba6a0d642eef4f1ec265ad334",
+      "max_new_tokens": 4096,
+      "response_sha256": "6c8db0522167732842d0e1e8baf7711a29299074df6a3ac3f009a14e3185a016"
+    },
+    {
+      "key": "HumanEval/HumanEval/60",
+      "prompt_sha256": "f2f99530b2f497d955d3f062cc3bee1e3d44e775eddb10347d227b65d1b400d0",
+      "max_new_tokens": 4096,
+      "response_sha256": "929c9b5d4ec1140f7000cb9e71b9fe9f88011c2ad2f5a251cb8d497a1501db05"
+    },
+    {
+      "key": "HumanEval/HumanEval/61",
+      "prompt_sha256": "c474adc4bc4933ccdb779e3069ae232552c053e2b34f30d83f2617837f4a2d2e",
+      "max_new_tokens": 4096,
+      "response_sha256": "eaf34a8348825cf3a8feae74a6fd18b93865c7af267542fc4cfff349553d1b9b"
+    },
+    {
+      "key": "HumanEval/HumanEval/62",
+      "prompt_sha256": "da1dac4f06d1820c536dbd13aa5a0382573bc4be15fafe2cfb1ccd88d591d78d",
+      "max_new_tokens": 4096,
+      "response_sha256": "6cf4946f90efd18bba164bdfe9b5c668c348ade72eee163485496c3020551491"
+    },
+    {
+      "key": "HumanEval/HumanEval/63",
+      "prompt_sha256": "edb48ee224c2f54a9f254d56e84c31750a351f50be0a8a0a6ce49cd0986c8484",
+      "max_new_tokens": 4096,
+      "response_sha256": "344fdc2bb122d15a6d3fc504667fe70a8785c0ea595baacfc76c3b366b1a8a54"
+    },
+    {
+      "key": "HumanEval/HumanEval/64",
+      "prompt_sha256": "908448b0d5676d12bd38e0bac8e31c8ff03dfea0b233a9099c80605d963297cb",
+      "max_new_tokens": 4096,
+      "response_sha256": "5822e0040e9cde3294dfff787e13f2339578283e5e497849a60645bcf94b68f8"
+    },
+    {
+      "key": "HumanEval/HumanEval/65",
+      "prompt_sha256": "6d8bc6e0d0b010729fbc7cd55548be029e1dc6a84adfd9653425c4f8c8f3e18e",
+      "max_new_tokens": 4096,
+      "response_sha256": "32a9a07e10609d3e7c3356a98912ee97237539671554e7bc69c871a7a7f0fe71"
+    },
+    {
+      "key": "HumanEval/HumanEval/66",
+      "prompt_sha256": "9b198034e66ab51305a6e86eb5ac8a086c7312e8d7563f88f3c49b84d05d3065",
+      "max_new_tokens": 4096,
+      "response_sha256": "41371fc04c3c025650f2f5d236720a6b01e89cc81969188fec34b32113640111"
+    },
+    {
+      "key": "HumanEval/HumanEval/67",
+      "prompt_sha256": "4279c4fc60beedc65c5c7ef7b55fff50f4fdea3b8b02b705da987db65bad2e29",
+      "max_new_tokens": 4096,
+      "response_sha256": "a24542d8b9a1883c95c84734177345c9c9140fdbc4c02874ce6142a8334e6a1f"
+    },
+    {
+      "key": "HumanEval/HumanEval/68",
+      "prompt_sha256": "3d65d427b902de007432f4d2db30e8355fd10e25534e6f0299d87924128cf720",
+      "max_new_tokens": 4096,
+      "response_sha256": "2a7809d12bd2bf2638921d3dfe5d9cb7a310a7edeaea772fd6b855def389122f"
+    },
+    {
+      "key": "HumanEval/HumanEval/69",
+      "prompt_sha256": "c1a9e82691dbd3cf13a2023716fda9b024cfe998905e3a26a858dd61e08b14ae",
+      "max_new_tokens": 4096,
+      "response_sha256": "85ab7f1735609e263e85d746dce84ddc5cdccdab690a94d35ccd133bb74ae66e"
+    },
+    {
+      "key": "HumanEval/HumanEval/70",
+      "prompt_sha256": "2b85bcbf2d64b89bd75ae342c7b4461ddcb6e66a53c3a287c391f5a2642a641d",
+      "max_new_tokens": 4096,
+      "response_sha256": "2e8a5ea5c0fecb53395c3aed97643b2c502a7d9556b9cb6c26c2ade4a70f3437"
+    },
+    {
+      "key": "HumanEval/HumanEval/71",
+      "prompt_sha256": "f926871f869515b00fe909bd931900d3fade144befd76ea661fd4b08b350fc74",
+      "max_new_tokens": 4096,
+      "response_sha256": "742fb427b267522de4f7cc78bbc3f6213bf2b500dbcbdca71b8192b7cc0d0485"
+    },
+    {
+      "key": "HumanEval/HumanEval/72",
+      "prompt_sha256": "618fdb0238c166f4792f4ce5041a3ec7f06a642aa1e32e891a43df2f1ec11257",
+      "max_new_tokens": 4096,
+      "response_sha256": "1f492b602832ca56d568e8149fa340e716563c29fc345d96d82575dfe0d2787c"
+    },
+    {
+      "key": "HumanEval/HumanEval/73",
+      "prompt_sha256": "948777b611fd68918a01b257c6900ceec4014138394991e5fb127d18184a25fa",
+      "max_new_tokens": 4096,
+      "response_sha256": "1bbb3405efd4557c4b76ba3aaef9b799817fe4527c97d7bf829c1db29390cb50"
+    },
+    {
+      "key": "HumanEval/HumanEval/74",
+      "prompt_sha256": "ed9986186c3031a38d523c66836652cd99826286e2f511be4da946c7d4737c2c",
+      "max_new_tokens": 4096,
+      "response_sha256": "1a8cb454a62c35184aea36bb46cfe0dc8b206bb5c02fcaf638309cfb2396a88a"
+    },
+    {
+      "key": "HumanEval/HumanEval/75",
+      "prompt_sha256": "acdebc24f82f607091696145f976fba9bd1e717a70bec60438a3ea62d53bb3b8",
+      "max_new_tokens": 4096,
+      "response_sha256": "b1bc26a283463d4239bfb941a74207043acd9ed4d7f5c91cb36bdfbe5cec3f49"
+    },
+    {
+      "key": "HumanEval/HumanEval/76",
+      "prompt_sha256": "4b6f981c07b571be33511e1ff71701438edc8e1357fe56a4409d283bfeecf57f",
+      "max_new_tokens": 4096,
+      "response_sha256": "e0a75e1c33232ad20f1435558741cd555651cf9789f23836985689dd34814ac0"
+    },
+    {
+      "key": "HumanEval/HumanEval/77",
+      "prompt_sha256": "258fd5a640cdbc6fe459641690bf862395af53efe54d6b4efc2b0e4b1d07866a",
+      "max_new_tokens": 4096,
+      "response_sha256": "4d4f347d67251e3118817982fa6209d7265cf80dba60f670ad65e86e64ff9c47"
+    },
+    {
+      "key": "HumanEval/HumanEval/78",
+      "prompt_sha256": "b7a565b87e07ed0de803d155edd08b34e95448545b76b75c19c2bf16797c1d63",
+      "max_new_tokens": 4096,
+      "response_sha256": "7fea23e2f057d761cbd89cb354b524a01a1363adb0d9770a76c07d3a0ddfd869"
+    },
+    {
+      "key": "HumanEval/HumanEval/79",
+      "prompt_sha256": "be5d32c69fd0a607c962d0019bfe522b78e93d789a337857c3bf8895e69dc24f",
+      "max_new_tokens": 4096,
+      "response_sha256": "3b7e35357e5fa5955aa73a2c6aa188e1d9edbf7219fff1998a8c080d893a5668"
+    },
+    {
+      "key": "HumanEval/HumanEval/80",
+      "prompt_sha256": "eea53c03e324a813aab8718613a6b8dec8629db195fcf477dd8d2047d0b87171",
+      "max_new_tokens": 4096,
+      "response_sha256": "45e3cab5f86ae2a783d812c5fc8bbab3a0ab46dc6a0e9e1fa8a00acedb929273"
+    },
+    {
+      "key": "HumanEval/HumanEval/81",
+      "prompt_sha256": "d6085365e3c0ab2b66f15f0f1ebfcd36ed6f562bcadbc347ed05046c05bf2b85",
+      "max_new_tokens": 4096,
+      "response_sha256": "72b7effbb0358e6ceb5285dcaa20d42d58546519eb2ebcb377e2a32ca5bdc2cc"
+    },
+    {
+      "key": "HumanEval/HumanEval/82",
+      "prompt_sha256": "8a82be0b3c9064d1cd607b7b413f5db75bf6070c4e742aa410a0611a56777c53",
+      "max_new_tokens": 4096,
+      "response_sha256": "a3c948c48ac88b937728026cba8823ee73f0275669a23e15b9cea2f3902000db"
+    },
+    {
+      "key": "HumanEval/HumanEval/83",
+      "prompt_sha256": "2d794d59b49484f40e170f98f4332057b6f4d22b9de77e6613c63c4deabfe8bf",
+      "max_new_tokens": 4096,
+      "response_sha256": "945bf1b18037975fa1d541e4d1c7bdfc1795f3e2a135d0caa6dc219d20799da6"
+    },
+    {
+      "key": "HumanEval/HumanEval/84",
+      "prompt_sha256": "7199d8df5a4893a33f48c4d739d1480e9ace73f5d54898b6f21dace7809298b4",
+      "max_new_tokens": 4096,
+      "response_sha256": "bbb6781bffd234e35f251a8e6c804da18196f775a56ac64346348ebeab648f32"
+    },
+    {
+      "key": "HumanEval/HumanEval/85",
+      "prompt_sha256": "18e8117999e87dbfd611b900e86a572122d3a1a2018b671c5daa4677dd0696c9",
+      "max_new_tokens": 4096,
+      "response_sha256": "50bf2c22ea1e139dc43f1424b5821ad18ed10e6bfcb11dc7e5e871fe09c23305"
+    },
+    {
+      "key": "HumanEval/HumanEval/86",
+      "prompt_sha256": "d11c984a4a3294bb893d4917e1b511e1f88c0d9cafa371e027ddb66f69e80b49",
+      "max_new_tokens": 4096,
+      "response_sha256": "d902475a0e86dc3a3cd03a9723edb2e08be31b23e600ee8cf3fe2e18d46b5791"
+    },
+    {
+      "key": "HumanEval/HumanEval/87",
+      "prompt_sha256": "e54213f9ae8c4fe2a10c766decad0bb12fe484eeb4df071a9d933e5146b88434",
+      "max_new_tokens": 4096,
+      "response_sha256": "ed6f229622acbd50139afc4212583dae7ac7516d69876ca235555885ce8ce4f6"
+    },
+    {
+      "key": "HumanEval/HumanEval/88",
+      "prompt_sha256": "13ec384d0e5616402f6705accbdde97edb35b118930ff18349173bcf8bc9fb67",
+      "max_new_tokens": 4096,
+      "response_sha256": "a29220475b8ea94f599122cdf397773590ccb02bb3fdc0c0d8560d85b65c678a"
+    },
+    {
+      "key": "HumanEval/HumanEval/89",
+      "prompt_sha256": "025811c0c68c1f754ce29843ec5062b341d022a5187881c509b3edb18ede93e3",
+      "max_new_tokens": 4096,
+      "response_sha256": "9b3e5caa70c45566f19e7d6adf0f52f553b585a2882dee2406a638ebb05f49c9"
+    },
+    {
+      "key": "HumanEval/HumanEval/90",
+      "prompt_sha256": "bb7387a36dbf33a8d08ed67c1b8f353327fd2bc2781822f94d33eb21061c241c",
+      "max_new_tokens": 4096,
+      "response_sha256": "b0c905fa503bd0f24b6a7270bc8378151e8a55dd840343a98035b43191409897"
+    },
+    {
+      "key": "HumanEval/HumanEval/91",
+      "prompt_sha256": "b7a7f85901b9190ca76d802073ab24bd27bafdefebdbc59ac5e97be1023ed8b3",
+      "max_new_tokens": 4096,
+      "response_sha256": "064cfa7b313fad6c52d1d71c9fc75532b03ac56297a40488b6f7abf40f545583"
+    },
+    {
+      "key": "HumanEval/HumanEval/92",
+      "prompt_sha256": "eaad081fc7d2fdbed016df880a9bc597e8cf6d4f545fc911a82d048a91088f6c",
+      "max_new_tokens": 4096,
+      "response_sha256": "b013aafbfc2c075db9943afcf29ee218e9985e0ac9de75706515dd6707be226b"
+    },
+    {
+      "key": "HumanEval/HumanEval/93",
+      "prompt_sha256": "429e088f46371540df7d3422975a72f7233df836f3d5065ac6670dd5a30f82a5",
+      "max_new_tokens": 4096,
+      "response_sha256": "e350b61049bf9eee8d81a081a1408a3acf70ca2815b71d902f86ac0de32edf28"
+    },
+    {
+      "key": "HumanEval/HumanEval/94",
+      "prompt_sha256": "a5904da69cb3392352f7db50115ce134df306b7073005d9dd4578a7dc61a363c",
+      "max_new_tokens": 4096,
+      "response_sha256": "4af17d1c83d703d4095c7b73a6f8ac90294b718093ed318d0ffae29dcdbd2ba0"
+    },
+    {
+      "key": "HumanEval/HumanEval/95",
+      "prompt_sha256": "11989b6b67d24ea5326c833dd9825e852388b59421bd96515940b522ab8c38ee",
+      "max_new_tokens": 4096,
+      "response_sha256": "9c0d9896009e08e30e1475c2a514ee92db32811c128bc5405ef1b05f525a35d9"
+    },
+    {
+      "key": "HumanEval/HumanEval/96",
+      "prompt_sha256": "607b596b289f678ddf8c7cd108b5e519b1301674fc9e6cf87b859594a8dea273",
+      "max_new_tokens": 4096,
+      "response_sha256": "984193514725c1f2822ec4db791326ce0129f73ca96f2d339ac7d9f0cbb90204"
+    },
+    {
+      "key": "HumanEval/HumanEval/97",
+      "prompt_sha256": "08257c8945950c33e25743fac6ca56fdb96ac6731c979a9f69f2c2d9676c1e8b",
+      "max_new_tokens": 4096,
+      "response_sha256": "37cd77889cc3e11d540130b8ce88b464a2c50d5daece3105a198c320abf8c0bb"
+    },
+    {
+      "key": "HumanEval/HumanEval/98",
+      "prompt_sha256": "4a96657c6bb036fa74320c584b3353f7d24d9d84ea2da06c585d5d4ac05b0aee",
+      "max_new_tokens": 4096,
+      "response_sha256": "471e397a4961dc1acb1e64e5cce72af6c6ecbd01f2d974b6d9a10a70bf42fac8"
+    },
+    {
+      "key": "HumanEval/HumanEval/99",
+      "prompt_sha256": "7761595153a2f353c0c8d8cb00880d9ab15de877435ae92059b191dbb53cd314",
+      "max_new_tokens": 4096,
+      "response_sha256": "957b5eb7eb03b68517ef96ba2c0410bc9a9460318719be38be8b9f7e672b7c3b"
+    },
+    {
+      "key": "HumanEval/HumanEval/100",
+      "prompt_sha256": "3e2a6f8d830ef573b437b4385d69bf9c11f845210fb9d6899b02535732cf406b",
+      "max_new_tokens": 4096,
+      "response_sha256": "7e87a384b18517286689cca25b03fecb23fe0d0cc3efa3eb1f550f48c0126130"
+    },
+    {
+      "key": "HumanEval/HumanEval/101",
+      "prompt_sha256": "cb7a7d8f631a05f72683a8cf84377cf97b0ceec830bc244c2cece840bfaa91fd",
+      "max_new_tokens": 4096,
+      "response_sha256": "1be34dd1830a2a57494dde57ed1f827784b536b221f4528336f912ccef3d7b4c"
+    },
+    {
+      "key": "HumanEval/HumanEval/102",
+      "prompt_sha256": "a61a196f1a46e5c3da6a45bb2265b3facf744b0cc1389fc5cde6f959dc2b6b22",
+      "max_new_tokens": 4096,
+      "response_sha256": "6681e417e1b00be0bbbae1e737b573fc8d51a2915c3821543f83f701b02c9f19"
+    },
+    {
+      "key": "HumanEval/HumanEval/103",
+      "prompt_sha256": "2711dd78f5d85b7938a07dbec329ba00f3154089dc5ebe760cb316e8cbce1606",
+      "max_new_tokens": 4096,
+      "response_sha256": "d1d5ded1dd90f2f987a0b24770dac6843bb3f67c9ff63db1f3ffe16ed597087c"
+    },
+    {
+      "key": "HumanEval/HumanEval/104",
+      "prompt_sha256": "d83a514bade797ac15931a141bd700619e9e07904cc721909b47ce2934c1a3cf",
+      "max_new_tokens": 4096,
+      "response_sha256": "cc5abf9f36807c8919d37accdab1a2ca6b64a4cd032890a6ae018f3375f6bc41"
+    },
+    {
+      "key": "HumanEval/HumanEval/105",
+      "prompt_sha256": "4eea76c2f4b339d8b47c7fe62b125eb111b6f2eb6012314bc4842e67e4151c0e",
+      "max_new_tokens": 4096,
+      "response_sha256": "03bed90c9083fc7eae8a6f60a19622d9e12b96cb6a8f40e4c6ecf35a260b2b52"
+    },
+    {
+      "key": "HumanEval/HumanEval/106",
+      "prompt_sha256": "b5b5b790df9deda6dd8d2ebef8ccb18047dbf81e4492ec59fdd7239250f98fb1",
+      "max_new_tokens": 4096,
+      "response_sha256": "4b15bb7eb397a9a41ae12f6147672c1cda8dd6f533a50b2e3fae50eda597fb4b"
+    },
+    {
+      "key": "HumanEval/HumanEval/107",
+      "prompt_sha256": "e8622dcf9fd8924ebbf48b615f45d9ff0946de349b8774fc22df08a70fa77820",
+      "max_new_tokens": 4096,
+      "response_sha256": "c6deb5a40f4aa9c32d26f73102cee57951e358efbc9749abe6f9da56c1644668"
+    },
+    {
+      "key": "HumanEval/HumanEval/108",
+      "prompt_sha256": "62847379a1e430a2bbeaa2c0cc85d666b560a401088487553c5d921b70efcd97",
+      "max_new_tokens": 4096,
+      "response_sha256": "1decd0e6436a75ce2dd909ea62d8b26959f911358b078fd26bbd04596d6f5449"
+    },
+    {
+      "key": "HumanEval/HumanEval/109",
+      "prompt_sha256": "1f3e0064dd301a16e487ff0dde5636e522d2a138b4008cc35104ee1260540301",
+      "max_new_tokens": 4096,
+      "response_sha256": "07aa70d309a996bbb46d5d906278826a87edae03d62de74f80f6d2fe4a0d9fff"
+    },
+    {
+      "key": "HumanEval/HumanEval/110",
+      "prompt_sha256": "4535c96405dc25bc548cde8a7a5d345dd24357ad741db37d0f00441277fed342",
+      "max_new_tokens": 4096,
+      "response_sha256": "e123fcaabeed15396aab349d84207c322d423b945d975f38c5b485f9c43d80c6"
+    },
+    {
+      "key": "HumanEval/HumanEval/111",
+      "prompt_sha256": "937864a63271c58c6e5ad756efbdb7be7b60654b0556f818e28bc89dadf16bf3",
+      "max_new_tokens": 4096,
+      "response_sha256": "b8d81abd19fbf1db582c6dfd9db7f0c3205eccee6423c70e0cd75c86f781eb22"
+    },
+    {
+      "key": "HumanEval/HumanEval/112",
+      "prompt_sha256": "8356a0c063a2f5db71fd0a0d32df0d4fc673bd5b1f60a55efa4a927df940cd21",
+      "max_new_tokens": 4096,
+      "response_sha256": "9c7dbbcccbcd540d32222f2ee6b131ed4937c178b530a44ba6425a810c49a120"
+    },
+    {
+      "key": "HumanEval/HumanEval/113",
+      "prompt_sha256": "81fafe3285f3cc7885fde9413ef448acdf8aa7d34fde937546b410e7b4791726",
+      "max_new_tokens": 4096,
+      "response_sha256": "b4ada5a291dc8396a0ea09c51af564bce228cfffeb0b4afd78cdb5bf2680bb46"
+    },
+    {
+      "key": "HumanEval/HumanEval/114",
+      "prompt_sha256": "0b4fd21f7c9fa8c4020bbca0c54bfa6c039e7944f55adf55bc0d12c12f26a743",
+      "max_new_tokens": 4096,
+      "response_sha256": "35bcbfeb2da2a9ef79464377017b9417bfe1662a14993a9fa38170d96662b695"
+    },
+    {
+      "key": "HumanEval/HumanEval/115",
+      "prompt_sha256": "e85d490fcf568104cf0ebca2f80139845768402fa2db14164b8d07c3d4862898",
+      "max_new_tokens": 4096,
+      "response_sha256": "ee5dee201ed1d9f4216036eb2313f3666dd61ca60bc5150f799ebd88b4816c17"
+    },
+    {
+      "key": "HumanEval/HumanEval/116",
+      "prompt_sha256": "7f481d4deb76bb29ade95d1420efdfa7c20f91a04a2636bfbfdf83a337b37396",
+      "max_new_tokens": 4096,
+      "response_sha256": "33f8c29d7437f0c6fa2baf7e4777ada8f4cadd7c02def1ca74b5f07e13459057"
+    },
+    {
+      "key": "HumanEval/HumanEval/117",
+      "prompt_sha256": "60ee96f1c6bfbae016330535ba5e346bab710664e128adb19ce049e40100043d",
+      "max_new_tokens": 4096,
+      "response_sha256": "f6a42de17e4073678e674c2b46c2dee3f2dda3d73c3a399faa7b3346123b783d"
+    },
+    {
+      "key": "HumanEval/HumanEval/118",
+      "prompt_sha256": "a4e5a7c7b119a8214f9be67695cb181d8bccf11edf0a93d018221c8a4a8b951c",
+      "max_new_tokens": 4096,
+      "response_sha256": "161f072337d47bc26738ef4a3f20330af6406484343aa5900010d2c7a609618b"
+    },
+    {
+      "key": "HumanEval/HumanEval/119",
+      "prompt_sha256": "fafe83d893e26b760f0698d18a47057dfd1e007d855b56c2a706e2a30e27c278",
+      "max_new_tokens": 4096,
+      "response_sha256": "550bdefcd618356939570710bc7749aa95b32ef6548184a8cc7f8b7dd4b8f70c"
+    },
+    {
+      "key": "HumanEval/HumanEval/120",
+      "prompt_sha256": "c9624d12288a29df7d0cb23ed8d71644fa8cf36b00acb5ad50f5af7ecd9a8bc4",
+      "max_new_tokens": 4096,
+      "response_sha256": "1835fdc2eae1ac5fb87d0816d35395c92f44330fb4465fc64a918967a8304bfb"
+    },
+    {
+      "key": "HumanEval/HumanEval/121",
+      "prompt_sha256": "ce10a2b065b6dd7f018916bc2c3ce5b78c29a041f20b32447bad7a04ecdfdb5d",
+      "max_new_tokens": 4096,
+      "response_sha256": "bca75e78e70b9aad1faeab9ff66b8a88b487b9d9dd5c97167cda1568c273f702"
+    },
+    {
+      "key": "HumanEval/HumanEval/122",
+      "prompt_sha256": "a72217fccc2349224f76cd0fd575d17676c9d66fde779773209b5c250e38f853",
+      "max_new_tokens": 4096,
+      "response_sha256": "d389147ccb04c8bfa2bd0b655d9d5af331ccb0fd769a662f77e1a2757839977a"
+    },
+    {
+      "key": "HumanEval/HumanEval/123",
+      "prompt_sha256": "9348bc047038586282adcaa512b25f123e7d6dd78488e81c88b96029ad56bf76",
+      "max_new_tokens": 4096,
+      "response_sha256": "c19f2c3a6dc32bfaaadb8be73d14638c327b6587af4fc31d476b7e317f58b024"
+    },
+    {
+      "key": "HumanEval/HumanEval/124",
+      "prompt_sha256": "7d7c36bf0e3937235a4b5fcca578e85093a3508b6fb3a1dbae7d8e8ba5330746",
+      "max_new_tokens": 4096,
+      "response_sha256": "fabbee1b69b53cdb41d22e3dfc9964c8fb39a7b90e1e2d4fffb5be314cd1717e"
+    },
+    {
+      "key": "HumanEval/HumanEval/125",
+      "prompt_sha256": "70d85aaaecd81513dd56a49d41b38412ebe9ef6fe465eef48d390d9a4dd8e3d9",
+      "max_new_tokens": 4096,
+      "response_sha256": "891e66388f1602b2bc62d28a44fe5d4b4fcff298d23110306f65cefbc3461c3a"
+    },
+    {
+      "key": "HumanEval/HumanEval/126",
+      "prompt_sha256": "a9f0cb99c37f6424c2dff0a2c08bab3ed8cef0dd022821c251195eaf374724b6",
+      "max_new_tokens": 4096,
+      "response_sha256": "952e8efaf015b622f130b6096d9db497e884f290d34884c89935f712041eeffb"
+    },
+    {
+      "key": "HumanEval/HumanEval/127",
+      "prompt_sha256": "8d0917fcc953e4f7cadf74369cc1cccc8b087ba726aa37824e6bd9405212278e",
+      "max_new_tokens": 4096,
+      "response_sha256": "ab73b74795b221dc5a90220cc85c433dbf281ab9690c077ee65c93434e696ffe"
+    },
+    {
+      "key": "HumanEval/HumanEval/128",
+      "prompt_sha256": "85767b01610201cab1e3175733928d877e3a590bbb33901016642ecfbaf373ab",
+      "max_new_tokens": 4096,
+      "response_sha256": "7a5cd812e21a37829c5b78d75708e8f12d7c4d9e52a4fb65190264b9108eed32"
+    }
+  ]
+}
