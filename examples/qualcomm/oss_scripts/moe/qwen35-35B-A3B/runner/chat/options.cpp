@@ -125,8 +125,9 @@ Options parse_options(int argc, char** argv) {
       std::filesystem::is_regular_file(
           options.model_root + "/prefill/embedding.bf16"))
     options.runtime.embedding_bits = 16;
-  if (plans.at("version") != 1 || plans.at("ar_len") != 128 ||
-      plans.at("capacity") != options.capacity)
+  if (plans.at("version") != 2 ||
+      plans.value("prefill_pte", "") != "prefill.pte" ||
+      plans.at("ar_len") != 128 || plans.at("capacity") != options.capacity)
     throw std::runtime_error(
         "Prefill plan bundle does not match the compiled context");
   if (options.prefill_order.empty())
@@ -182,8 +183,7 @@ void configure_environment(
                     decode = o.model_root + "/decode";
   const int plan_tokens =
       o.prefill_order == "layer_major" ? prefix_tokens : 128;
-  const std::string plan =
-      prefill + "/plans/prefill-" + std::to_string(plan_tokens) + ".pte";
+  const std::string plan = prefill + "/plans/prefill.pte";
   if (!o.tokenize_only && !std::filesystem::is_regular_file(plan))
     throw std::runtime_error("Missing prefill plan: " + plan);
   // Interactive sessions keep vision resident for later /image turns.

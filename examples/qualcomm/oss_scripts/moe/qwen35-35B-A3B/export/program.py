@@ -35,7 +35,7 @@ def main(argv=None):
         "--prefill-tokens",
         type=int,
         default=128,
-        help="Host plan sequence length; QNN and Native kernels remain AR128",
+        help="Host workspace token bound; QNN and Native kernels remain AR128",
     )
     parser.add_argument(
         "--shared-model",
@@ -141,7 +141,11 @@ def main(argv=None):
             0,
             0,
             allocation,
-            TensorShapeDynamism.STATIC,
+            (
+                TensorShapeDynamism.DYNAMIC_BOUND
+                if not decode and len(shape) > 1 and shape[1] == ar_len
+                else TensorShapeDynamism.STATIC
+            ),
         )
         values.append(EValue(value))
         return len(values) - 1
@@ -160,7 +164,7 @@ def main(argv=None):
         header = struct.pack(
             "<8sIIIIQQQ",
             magic,
-            3,
+            3 if decode else 4,
             kind,
             layer,
             ar_len,
@@ -243,6 +247,7 @@ def main(argv=None):
                 target=settings.target.to_dict(),
                 ar_len=1 if decode else 128,
                 plan_tokens=ar_len,
+                dynamic_sequence=not decode,
                 requested_prefill_tokens=args.prefill_tokens,
                 prefill_order=settings.schedule.prefill_order,
                 compile_settings=settings.compile_settings(),

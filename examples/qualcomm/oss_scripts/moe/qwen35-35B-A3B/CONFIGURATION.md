@@ -39,7 +39,7 @@ EXPORT_STATE.json        # 各阶段完成状态、输入与产物指纹
 EXPORT.json              # 最终格式、组件和产物位置
 qnn-shared/group0..9/    # 四层一组的共享 QNN context
 shared-model/            # PTE 模式：graph.qnn、weights.bin、IO、cache/RoPE
-plans/                   # PTE 模式：prefill-N.pte、decode.pte 及 JSON
+plans/                   # PTE 模式：prefill.pte、decode.pte 及 JSON
 vision/                  # 选择视觉时：vision.bin、VISION.json，PTE 模式含 vision.pte
 head/                    # 选择文本时：编译后的 head
 banks、indices、embedding # 指向 calibration_dir 中权重的符号链接，避免额外复制
@@ -156,7 +156,7 @@ cd /data/local/tmp/qwen35-raw-gptq-20261024/runtime/w2a8-fused-c1152-p128-cache3
 
 `--model-root` 包含 `prefill/` 和 `decode/`；共享权重默认位于它的上一级 `shared-model/`，也可用 `--shared-model` 指定。运行参数包括 `--prompt`（可重复）、`--system-prompt`、`--max-new-tokens`、`--temperature`、`--enable-thinking`、`--max-seq-len` 和 `--cache-experts`。容量必须匹配已编译图，不能在命令行将 1152 图扩展成 2048。当前默认容量 1152、缓存 32 槽。
 
-终端首轮从 `prefill/plans/PLANS.json` 读取配置的 prefill 顺序，并根据真实 padding 后的 token 数选择 `prefill-{N}.pte`。导出阶段已经生成128、256、…、1024的8个无权重host计划，总计约0.61MB；部署只读取并上传它们。默认 `layer_major` 在当前层处理完全部AR128块再切到下一层，复用该层已加载的专家；选择 `chunk_major` 时需使用该调度对应的导出计划，推理不临时重打包。QNN/Native kernel仍固定AR128，未重新编译成AR256或AR1024。
+终端首轮只加载一个 `prefill.pte`。QNN/Native kernel 固定 AR128，长输入在 C++ 中分块，末块 padding 不更新无效位置的 state/KV。默认 `layer_major` 在同一层处理完当前调度窗口内的全部 AR128 块后再切换下一层，复用已加载专家；`chunk_major` 用于对照。PTE 只有一个 `prefill_forward` 方法，host 工作区采用有界动态长度，不按输入长度导出文件或方法。`max_prefill_tokens` 限定 host 工作区和当前首轮调度窗口，不改变 QNN kernel 的 AR128。
 
 计划集合必须与实际编译容量一致，缺少manifest或所选PTE时提前报错。当前单层memo最多额外申请210MiB，在进入decode前释放。原Python运行仍使用该次输入对应的显式PTE，不受终端自动选择影响。
 
@@ -265,7 +265,7 @@ output/
 ├── plans/
 │   ├── PLANS.json
 │   ├── decode.pte / decode.json
-│   └── prefill-128.pte … prefill-1024.pte（含对应JSON）
+│   └── prefill.pte / prefill.json
 ├── shared-model/
 │   ├── group0 … group9/  # 每组图/权重各一份，供两个阶段共用
 │   └── head/            # 公共head

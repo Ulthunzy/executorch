@@ -2,6 +2,7 @@
 #include <executorch/extension/module/module.h>
 #include <executorch/extension/tensor/tensor_ptr.h>
 #include <executorch/runtime/platform/runtime.h>
+#include <executorch/runtime/core/exec_aten/util/tensor_util.h>
 #include <cmath>
 #include "prefill_session.h"
 #include "vision_encoder.h"
@@ -19,6 +20,7 @@
 using namespace executorch::runtime;
 static std::string model_root;
 static std::unique_ptr<PrefillSession> session;
+static bool dynamic_sequence = false;
 
 void qwen35_prefill_append(
     const int64_t* tokens,
@@ -48,6 +50,7 @@ void qwen35_prefill_append(
 
 struct Stage {
   uint32_t kind, layer, plan_tokens;
+  bool dynamic = false;
 };
 
 // PTE 只描述 122 个阶段：embedding、40×(Attention/Router/Native)、head。
@@ -79,7 +82,7 @@ class PrefillBackend final : public BackendInterface {
       memcpy(&aux_offset, p + 32, 8);
       memcpy(&aux_size, p + 40, 8);
       if (!((version == 1 && plan_tokens == 0) ||
-            (version == 3 && getenv("SHARED_MODEL_ROOT") &&
+            ((version == 3 || version == 4) && getenv("SHARED_MODEL_ROOT") &&
              plan_tokens >= 128 && plan_tokens <= 1024 &&
              plan_tokens % 128 == 0) ||
             (version == 2 && plan_tokens > 128 && plan_tokens <= 1024 &&
@@ -89,11 +92,13 @@ class PrefillBackend final : public BackendInterface {
            (aux_offset > processed->size() ||
             aux_size > processed->size() - aux_offset)))
         return Error::DelegateInvalidCompatibility;
-      if (version == 3) {
+      if (version == 3 || version == 4) {
         if (size || aux_size)
           return Error::DelegateInvalidCompatibility;
+        if (kind == 0)
+          dynamic_sequence = version == 4;
         return static_cast<DelegateHandle*>(
-            new Stage{kind, layer, plan_tokens});
+            new Stage{kind, layer, plan_tokens, version == 4});
       }
       std::string base = model_root + "/layer" + std::to_string(layer);
       if (kind == 1) {
@@ -134,11 +139,25 @@ class PrefillBackend final : public BackendInterface {
       if (!session)
         throw std::runtime_error("prefill session not initialized");
       auto stage = *static_cast<Stage*>(handle);
-      if (stage.plan_tokens != uint32_t(session->sequence_tokens))
+      if (stage.dynamic
+              ? uint32_t(session->sequence_tokens) > stage.plan_tokens
+              : stage.plan_tokens != uint32_t(session->sequence_tokens))
         throw std::runtime_error("prefill stage sequence length mismatch");
       const size_t counts[] = {2, 3, 4, 6, 2};
       if (args.size() != counts[stage.kind])
         throw std::runtime_error("stage arguments");
+      if (stage.dynamic && stage.kind != 4) {
+        const size_t first_output[] = {1, 1, 1, 5};
+        for (size_t i = first_output[stage.kind]; i < args.size(); ++i) {
+          auto& tensor = args[i]->toTensor();
+          std::vector<executorch::aten::SizesType> sizes(
+              tensor.sizes().begin(), tensor.sizes().end());
+          sizes[1] = session->sequence_tokens;
+          if (resize_tensor(tensor, {sizes.data(), sizes.size()}) != Error::Ok)
+            throw std::runtime_error(
+                "prefill workspace exceeds its token bound");
+        }
+      }
       auto input = [&](int i) {
         return args[i]->toTensor().const_data_ptr<float>();
       };
@@ -238,6 +257,7 @@ static int prefill_main(int argc, char** argv) try {
   if (samples < 1 || warmups < 0)
     throw std::runtime_error("sample count");
   const auto setup = Clock::now();
+  dynamic_sequence = false;
   executorch::extension::Module module(
       getenv("CHAT_PREFILL_PLAN") ? std::string(getenv("CHAT_PREFILL_PLAN"))
                                   : model_root + "/prefill.pte",
@@ -254,7 +274,11 @@ static int prefill_main(int argc, char** argv) try {
   if (!input_meta.ok() || input_meta->sizes().size() != 2 ||
       input_meta->sizes()[0] != 1)
     throw std::runtime_error("prefill input dimensions");
-  const int plan_tokens = input_meta->sizes()[1];
+  const int prompt_tokens =
+      getenv("PREFILL_TOKENS") ? atoi(getenv("PREFILL_TOKENS")) : 128;
+  const int plan_tokens = dynamic_sequence
+      ? std::min(prompt_tokens, int(input_meta->sizes()[1]))
+      : input_meta->sizes()[1];
   session = std::make_unique<PrefillSession>(model_root, plan_tokens);
 
   struct SessionLifetime {
@@ -266,8 +290,6 @@ static int prefill_main(int argc, char** argv) try {
 
   const double setup_ms = elapsed(setup);
 
-  const int prompt_tokens =
-      getenv("PREFILL_TOKENS") ? atoi(getenv("PREFILL_TOKENS")) : 128;
   const int valid_tokens = getenv("PREFILL_VALID_TOKENS")
       ? atoi(getenv("PREFILL_VALID_TOKENS"))
       : prompt_tokens;

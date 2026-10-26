@@ -252,16 +252,16 @@ def test_inference_reads_exported_plans_without_importing_the_exporter(
     directory = tmp_path / "plans"
     directory.mkdir()
     metadata = dict(
-        version=1,
+        version=2,
         ar_len=128,
         capacity=args.decode_capacity,
         max_prefill_tokens=args.model_settings.context.max_prefill_tokens,
         prefill_order=args.prefill_order,
-        lengths=list(range(128, 1025, 128)),
+        prefill_pte="prefill.pte",
         model_configuration=args.model_settings.to_dict(),
     )
     (directory / "PLANS.json").write_text(json.dumps(metadata))
-    for name in ["decode", *[f"prefill-{n}" for n in metadata["lengths"]]]:
+    for name in ["decode", "prefill"]:
         (directory / f"{name}.pte").write_bytes(b"exported program")
     before = {p.name: p.read_bytes() for p in directory.iterdir()}
     calls = []
@@ -269,7 +269,7 @@ def test_inference_reads_exported_plans_without_importing_the_exporter(
     def check(path, args, phase, expected_tokens=None):
         assert path.is_file()
         calls.append(path.name)
-        return {"phase": phase}
+        return {"phase": phase, "plan_tokens": expected_tokens}
 
     monkeypatch.setattr(plans, "check_plan", check)
     monkeypatch.setitem(sys.modules, "export.program", None)
@@ -277,7 +277,7 @@ def test_inference_reads_exported_plans_without_importing_the_exporter(
     plans.select_plans(args)
     assert args.local_decode_pte == directory / "decode.pte"
     assert plans.load_prefill_bundle(args) == directory
-    assert len(calls) == 9
+    assert len(calls) == 2
     assert {p.name: p.read_bytes() for p in directory.iterdir()} == before
     metadata["capacity"] += 128
     (directory / "PLANS.json").write_text(json.dumps(metadata))
@@ -336,3 +336,66 @@ def test_weight_override_discards_another_exports_plan(tmp_path):
     config.write_text(json.dumps(profile))
     args = parse_args(["--config", str(config), "--weights-path", str(tmp_path)])
     assert args.local_decode_pte is None and args.local_prefill_pte is None
+
+
+@pytest.mark.parametrize(
+    "invalid",
+    [
+        {"dynamic_sequence": False},
+        {"dynamic_sequence": None},
+        {"plan_tokens": 129},
+        {"plan_tokens": 0},
+        {"ar_len": 256},
+    ],
+)
+def test_reject_incompatible_prefill_workspace(tmp_path, invalid):
+    from workflow.plans import check_plan
+
+    args = parse_args([])
+    args.shared_model = None
+    args.prompt_tokens = 128
+    plan = tmp_path / "prefill.pte"
+    plan.write_bytes(b"exported program")
+    metadata = dict(
+        phase="prefill",
+        layers=40,
+        target=args.model_settings.target.to_dict(),
+        compile_settings=args.model_settings.compile_settings(),
+        weight_mode="embedded",
+        prefill_order=args.prefill_order,
+        dynamic_sequence=True,
+        ar_len=128,
+        plan_tokens=128,
+    )
+    metadata.update(invalid)
+    plan.with_suffix(".json").write_text(json.dumps(metadata))
+    with pytest.raises(ValueError, match="invalid dynamic prefill workspace"):
+        check_plan(plan, args, "prefill")
+
+
+def test_chat_bundle_rejects_smaller_workspace(tmp_path, monkeypatch):
+    import workflow.plans as plans
+
+    args = parse_args([])
+    args.artifacts = tmp_path
+    args.prefill_order = "layer_major"
+    directory = tmp_path / "plans"
+    directory.mkdir()
+    (directory / "PLANS.json").write_text(
+        json.dumps(
+            dict(
+                version=2,
+                ar_len=128,
+                capacity=args.decode_capacity,
+                max_prefill_tokens=args.model_settings.context.max_prefill_tokens,
+                prefill_order=args.prefill_order,
+                prefill_pte="prefill.pte",
+                model_configuration=args.model_settings.to_dict(),
+            )
+        )
+    )
+    monkeypatch.setattr(
+        plans, "check_plan", lambda *args, **kwargs: {"plan_tokens": 128}
+    )
+    with pytest.raises(ValueError, match="prefill workspace bound differs"):
+        plans.load_prefill_bundle(args)

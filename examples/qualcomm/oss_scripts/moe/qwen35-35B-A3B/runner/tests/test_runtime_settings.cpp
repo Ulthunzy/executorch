@@ -66,13 +66,14 @@ int main() {
   std::filesystem::create_directories(root / "prefill/plans");
   std::filesystem::create_directories(root / "decode");
   std::ofstream(root / "prefill/plans/PLANS.json") << nlohmann::json{
-      {"version", 1},
+      {"version", 2},
+      {"prefill_pte", "prefill.pte"},
       {"ar_len", 128},
       {"capacity", 2048},
       {"max_prefill_tokens", 1024},
       {"prefill_order", "chunk_major"},
       {"model_configuration", config}};
-  std::ofstream(root / "prefill/plans/prefill-128.pte") << "plan";
+  std::ofstream(root / "prefill/plans/prefill.pte") << "plan";
   std::string directory = root.string();
   const char* arguments[] = {
       "runner",

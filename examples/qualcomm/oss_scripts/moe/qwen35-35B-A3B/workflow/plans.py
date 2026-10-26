@@ -36,14 +36,29 @@ def check_plan(path, args, phase, expected_tokens=None):
             f"{path}: prefill cache encodings differ; run export.py for matching decode PTEs"
         )
     if phase == "prefill":
+        limit = metadata.get("plan_tokens")
+        if (
+            metadata.get("dynamic_sequence") is not True
+            or metadata.get("ar_len") != 128
+            or type(limit) is not int
+            or not 128 <= limit <= args.model_settings.context.max_prefill_tokens
+            or limit % 128
+        ):
+            raise ValueError(
+                f"{path}: invalid dynamic prefill workspace; re-export the single PTE"
+            )
         if metadata.get("prefill_order") != args.prefill_order:
             raise ValueError(
                 f"{path}: prefill order differs; run export.py for the selected schedule"
             )
-        expected = expected_tokens or (
-            args.prompt_tokens if args.prefill_order == "layer_major" else 128
+        expected = (
+            expected_tokens
+            if expected_tokens is not None
+            else (args.prompt_tokens if args.prefill_order == "layer_major" else 128)
         )
-        if expected is not None and metadata["plan_tokens"] != expected:
+        if expected is not None and (
+            expected < 128 or expected % 128 or expected > limit
+        ):
             raise ValueError(
                 f"{path}: plan length does not match the prompt and prefill order"
             )
@@ -57,10 +72,7 @@ def select_plans(args):
     for phase in phases:
         current = args.local_decode_pte if phase == "decode" else args.local_prefill_pte
         if current is None:
-            length = args.prompt_tokens if args.prefill_order == "layer_major" else 128
-            filename = (
-                "decode.pte" if phase == "decode" else f"prefill-{length or 128}.pte"
-            )
+            filename = f"{phase}.pte"
             current = args.artifacts / "plans" / filename
         plans[phase] = check_plan(current, args, phase)
         if phase == "decode":
@@ -80,26 +92,29 @@ def load_prefill_bundle(args):
             f"{manifest}: missing exported plan bundle; run export.py first"
         )
     metadata = json.loads(manifest.read_text())
-    expected = (
-        list(range(128, args.model_settings.context.max_prefill_tokens + 1, 128))
-        if args.prefill_order == "layer_major"
-        else [128]
-    )
     if (
-        metadata.get("version") != 1
+        metadata.get("version") != 2
         or metadata.get("ar_len") != 128
         or metadata.get("capacity") != args.decode_capacity
         or metadata.get("max_prefill_tokens")
         != args.model_settings.context.max_prefill_tokens
         or metadata.get("prefill_order") != args.prefill_order
-        or metadata.get("lengths") != expected
+        or metadata.get("prefill_pte") != "prefill.pte"
     ):
         raise ValueError(
             f"{manifest}: context or schedule differs; export matching PTEs with export.py"
         )
     args.model_settings.target.check_manifest(metadata["model_configuration"])
-    for length in expected:
-        check_plan(
-            directory / f"prefill-{length}.pte", args, "prefill", expected_tokens=length
+    expected_limit = (
+        args.model_settings.context.max_prefill_tokens
+        if args.prefill_order == "layer_major"
+        else 128
+    )
+    plan = check_plan(
+        directory / "prefill.pte", args, "prefill", expected_tokens=expected_limit
+    )
+    if plan["plan_tokens"] != expected_limit:
+        raise ValueError(
+            f"{manifest}: prefill workspace bound differs from the schedule"
         )
     return directory

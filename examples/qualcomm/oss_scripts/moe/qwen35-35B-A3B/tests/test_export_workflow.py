@@ -169,7 +169,7 @@ def child_runner(pipeline, calls, fail=None, real_pack=False):
         calls.append(stage.name)
         if stage.name == fail:
             return subprocess.CompletedProcess(command, 37)
-        if real_pack and stage.name in ("prefill-128", "decode"):
+        if real_pack and stage.name in ("prefill", "decode"):
             from export.program import main as pack_plan
 
             pack_plan(list(command[3:]))
@@ -335,7 +335,7 @@ def test_pte_plans_really_serialize_both_phases(tmp_path, monkeypatch):
     pipeline = ExportPipeline(config)
     monkeypatch.setattr(subprocess, "run", child_runner(pipeline, [], real_pack=True))
     pipeline.run()
-    for phase, filename in (("prefill", "prefill-128"), ("decode", "decode")):
+    for phase, filename in (("prefill", "prefill"), ("decode", "decode")):
         path = config.output / f"plans/{filename}.pte"
         program = deserialize_pte_binary(path.read_bytes()).program
         plan = program.execution_plan[0]
@@ -345,6 +345,8 @@ def test_pte_plans_really_serialize_both_phases(tmp_path, monkeypatch):
         assert {d.id for d in plan.delegates} == {expected}
         metadata = json.loads(path.with_suffix(".json").read_text())
         assert metadata["weight_mode"] == "external_shared"
+        assert len(list((config.output / "plans").glob("prefill*.pte"))) == 1
+        assert metadata["dynamic_sequence"] == (phase == "prefill")
         assert (
             metadata["compile_settings"]
             == load_model_config(config.model_config).compile_settings()

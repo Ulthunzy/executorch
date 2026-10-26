@@ -272,34 +272,32 @@ class ExportPipeline:
                     outputs,
                 )
             for phase in c.phases:
-                lengths = (
-                    range(128, self.settings.context.max_prefill_tokens + 1, 128)
+                workspace_tokens = (
+                    self.settings.context.max_prefill_tokens
                     if phase == "prefill"
                     and self.settings.schedule.prefill_order == "layer_major"
-                    else (128,)
+                    else 128
                 )
-                for length in lengths:
-                    name = f"prefill-{length}" if phase == "prefill" else "decode"
-                    path = out / "plans" / f"{name}.pte"
-                    stage(
-                        name,
-                        "export/program.py",
-                        (
-                            *common,
-                            "--quiet",
-                            "--phase",
-                            phase,
-                            "--shared-model",
-                            out / "shared-model",
-                            "--output",
-                            path,
-                            "--prefill-tokens",
-                            length,
-                            "--cache-encoding",
-                            out / "shared-model/cache-encoding.bin",
-                        ),
-                        (path, path.with_suffix(".json")),
-                    )
+                path = out / "plans" / f"{phase}.pte"
+                stage(
+                    phase,
+                    "export/program.py",
+                    (
+                        *common,
+                        "--quiet",
+                        "--phase",
+                        phase,
+                        "--shared-model",
+                        out / "shared-model",
+                        "--output",
+                        path,
+                        "--prefill-tokens",
+                        workspace_tokens,
+                        "--cache-encoding",
+                        out / "shared-model/cache-encoding.bin",
+                    ),
+                    (path, path.with_suffix(".json")),
+                )
         return stages
 
     def describe(self):
@@ -588,20 +586,15 @@ class ExportPipeline:
             for name in ("cache-encoding.bin", "cos.f32", "sin.f32"):
                 shutil.copy2(out / "qnn-shared" / name, out / "assets" / name)
         if "prefill" in c.phases and "text" in c.components and c.format == "pte":
-            lengths = (
-                list(range(128, self.settings.context.max_prefill_tokens + 1, 128))
-                if self.settings.schedule.prefill_order == "layer_major"
-                else [128]
-            )
             write_json(
                 out / "plans/PLANS.json",
                 dict(
-                    version=1,
+                    version=2,
                     ar_len=128,
                     capacity=self.settings.context.max_seq_len,
                     max_prefill_tokens=self.settings.context.max_prefill_tokens,
                     prefill_order=self.settings.schedule.prefill_order,
-                    lengths=lengths,
+                    prefill_pte="prefill.pte",
                     model_configuration=self.settings.to_dict(),
                 ),
             )
