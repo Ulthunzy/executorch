@@ -1,0 +1,14 @@
+{
+  "upstream": "https://github.com/meta-pytorch/tokenizers.git",
+  "commit": "32af6c1b623639515a08ab9b2b4580ffe570c42a",
+  "records": 12724,
+  "all_ids_exact": true,
+  "mismatches": [],
+  "pretokenizer_tests": 32,
+  "hf_bytelevel_test": true,
+  "cpp17_syntax_host_android": true,
+  "scope": "Tokenizer-only; NFC input normalization preserved. No model inference or benchmark rerun.",
+  "reference_sha256": "1b550d46dba03adb6d97804f4730ad04fb2ac29a5431906d24ea4709570caa75",
+  "actual_sha256": "1b550d46dba03adb6d97804f4730ad04fb2ac29a5431906d24ea4709570caa75",
+  "artifacts": "llama-output/qwen35-tokenizer-upstream-20261026"
+}

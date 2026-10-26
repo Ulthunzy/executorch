@@ -8,6 +8,10 @@
 
 当前保留的完整导出位于 `llama-output/qwen35-moe-from-safetensors-gptq-20261024`，默认模型配方与设备配置均已对齐这套全矩阵 GPTQ 产物。编译 binding、WikiText 校准语料、两张校准图片及设备运行库已迁入该目录；历史导出的权重、PTE 和中间文件清理，报告归档到其中的 `history-reports/`。下文历史命令用于说明当时测试口径，当前运行请使用上面的默认配置及 `CONFIGURATION.md` 中的命令。
 
+分词器继续使用原有 `meta-pytorch/tokenizers` 子模块，锁定上游正式提交 `32af6c1b623639515a08ab9b2b4580ffe570c42a`（上游 PR #198，支持 `ByteLevel use_regex=false`），无需额外的自定义分词器仓库。拉取源码后执行 `git submodule update --init --recursive`。更新版本后应重建对应 Android 分词器静态库，再重新链接 runner/JNI，保证头文件与静态库匹配。
+
+该上游版本的32项 pre-tokenizer 测试及1项 HF ByteLevel 回归通过，主机和 Android C++17 编译兼容性检查通过；对冻结评测的12724条 NFC 输入，token ID 与保存的原设备结果逐项一致。[分词验证记录](docs/tokenizer-upstream-20261026.json)保留版本与输出哈希；本次未重跑模型推理，原129题评测结果继续保留。
+
 ## 2026-10-26：2048 上下文图文连续负载测试
 
 设备终端 C++ runner 实测完整40层，统一总上下文2048、prefill AR128、`layer_major`；每层32/64槽LRU，真实Top8不变。Embedding INT4/group32、Router/shared GPTQ W8A16、专家W2/N4×A8、KV/GDN/conv UINT16。每组生成指定数量的输出；图文输入长度包含模板和196个视觉token。同一输入的32/64槽生成ID全部一致。
