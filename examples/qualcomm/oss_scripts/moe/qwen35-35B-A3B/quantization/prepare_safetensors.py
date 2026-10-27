@@ -18,7 +18,8 @@ def prepare_data(args, settings):
 
     checkpoint = Checkpoint(args.model)
     tokenizer = AutoTokenizer.from_pretrained(args.model, local_files_only=True)
-    lines = [json.loads(line)["text"] for line in args.corpus.read_text().splitlines()]
+    with args.corpus.open() as stream:
+        lines = [json.loads(line)["text"] for line in stream]
     sequences, sources = [], []
     offsets = [
         0,
@@ -61,7 +62,7 @@ def prepare_data(args, settings):
             reference_calibration=embedded[:8],
             reference_heldout=embedded[8:],
         ),
-        args.output / "INPUTS.pt",
+        args.output / "INPUTS-fp32.pt",
     )
     cos, sin = rope_tables(checkpoint.config, max(2048, settings.context.max_seq_len))
     (args.output / "assets").mkdir(exist_ok=True)
@@ -99,7 +100,7 @@ def quantized_embedding_inputs(args):
     import numpy as np
     import torch
 
-    data = torch.load(args.output / "INPUTS.pt", weights_only=True, mmap=True)
+    data = torch.load(args.output / "INPUTS-fp32.pt", weights_only=True, mmap=True)
     ids = torch.cat((data["tokens"], data["heldout_ids"])).numpy()
     table = np.memmap(
         args.output / "embedding.int4",

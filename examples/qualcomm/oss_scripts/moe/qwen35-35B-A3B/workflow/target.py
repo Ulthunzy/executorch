@@ -59,10 +59,9 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--soc-model", choices=SOC_MODELS, required=True)
-    parser.add_argument("--dsp-arch", choices=DSP_ARCHES)
     args = parser.parse_args()
     try:
-        target = TargetConfig.resolve(args.soc_model, args.dsp_arch)
+        target = TargetConfig.resolve(args.soc_model)
         print(int(HtpArch[target.dsp_arch.upper()]))
     except ValueError as error:
         parser.error(str(error))

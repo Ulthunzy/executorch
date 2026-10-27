@@ -1,7 +1,6 @@
 """Serial export stages, configuration snapshots and restart checkpoints."""
 
 from dataclasses import dataclass
-import fcntl
 import hashlib
 import json
 import os
@@ -12,6 +11,7 @@ import sys
 import time
 
 from .export_config import REPO, ROOT, ExportConfig
+from .checkpoint import StageCheckpoint, artifact_stamps, remove_path, write_json
 
 
 @dataclass(frozen=True)
@@ -28,13 +28,6 @@ def file_stamp(path):
     if path.is_file() and stat.st_size <= 1024 * 1024:
         stamp["sha256"] = hashlib.sha256(path.read_bytes()).hexdigest()
     return stamp
-
-
-def write_json(path, data):
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(path.name + ".tmp")
-    temporary.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n")
-    temporary.replace(path)
 
 
 class ExportPipeline:
@@ -98,6 +91,21 @@ class ExportPipeline:
                     c.calibration_dir / "QUANTIZATION_COMPLETE.json",
                     c.calibration_dir / "cold-experts.i32",
                     c.calibration_dir / "embedding.int4",
+                    c.calibration_dir / "head/head-qdq.pt2",
+                    *(
+                        c.calibration_dir / f"layers/layer{layer}/{name}"
+                        for layer in range(40)
+                        for name in (
+                            "front-qdq.pt2",
+                            "decode-qdq.pt2",
+                            "moe-constants.npz",
+                        )
+                    ),
+                    *(
+                        c.calibration_dir / f"router/layer{layer}/{name}"
+                        for layer in range(40)
+                        for name in ("router-ar128-qdq.pt2", "router-ar1-qdq.pt2")
+                    ),
                     *(
                         c.calibration_dir / f"banks/layer{layer}/{name}"
                         for layer in range(40)
@@ -482,6 +490,8 @@ class ExportPipeline:
         inputs = [
             c.model / "config.json",
             c.model / "model.safetensors.index.json",
+            c.model / "tokenizer.json",
+            c.model / "generation_config.json",
             *c.images,
         ]
         inputs += self.checkpoint_shards()
@@ -608,7 +618,6 @@ class ExportPipeline:
             profile = dict(
                 model_config=str(out / "MODEL_CONFIG.json"),
                 soc_model=c.soc_model,
-                dsp_arch=c.dsp_arch,
                 device=c.device,
                 model=str(c.model),
                 artifacts=str(out),
@@ -647,64 +656,45 @@ class ExportPipeline:
 
     def run(self, resume=True):
         self.check()
-        out = self.config.output
-        out.mkdir(parents=True, exist_ok=True)
-        with (out / ".export.lock").open("a") as lock:
-            try:
-                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except BlockingIOError as error:
-                raise RuntimeError(
-                    "An export is already running in this directory"
-                ) from error
-            identity = self.identity()
-            record = out / "EXPORT_STATE.json"
-            if not record.exists() and any(
-                p.name != ".export.lock" for p in out.iterdir()
-            ):
-                raise ValueError(
-                    "Output is not an empty export workspace; use a new directory"
+        c = self.config
+        out = c.output
+        protected = [
+            REPO,
+            c.model,
+            c.model_config,
+            c.calibration_dir,
+            *c.images,
+            *[
+                p
+                for p in (
+                    c.corpus,
+                    c.qnn_binding,
+                    c.qnn_sdk_root,
+                    c.hexagon_sdk_root,
+                    c.android_ndk_root,
                 )
-            if (
-                not record.exists()
-                and self.config.source == "safetensors"
-                and "text" in self.config.components
-                and self.config.calibration_dir.exists()
-                and any(self.config.calibration_dir.iterdir())
-            ):
-                raise ValueError(
-                    "Raw preparation requires a new calibration_dir; use source=calibrated to reuse existing weights"
-                )
-            state = (
-                json.loads(record.read_text())
-                if record.exists()
-                else dict(identity=identity, stages={})
-            )
-            if state["identity"] != identity:
-                raise ValueError(
-                    "Export inputs/configuration/code changed; use a new output directory"
-                )
+                if p
+            ],
+        ]
+        with StageCheckpoint(
+            out, self.identity(), "EXPORT_STATE.json", protected
+        ) as cache:
             write_json(out / "MODEL_CONFIG.json", self.settings.to_dict())
             write_json(out / "EXPORT_PLAN.json", json.loads(self.describe()))
-            dirty = not resume
+            cache.dirty = not resume
             for stage in self.stages:
-                previous = state["stages"].get(stage.name, {})
-                valid = previous.get("status") == "complete" and all(
-                    p.is_file() for p in stage.outputs
-                )
-                if valid:
-                    valid = previous["outputs"] == {
-                        str(p): file_stamp(p) for p in stage.outputs
-                    }
-                if not dirty and valid:
+                if cache.reusable(stage.name, stage.outputs):
                     print("EXPORT_REUSED", stage.name, flush=True)
                     continue
-                dirty = True
                 (out / "EXPORT.json").unlink(missing_ok=True)
+                if stage.name != "quantize":
+                    for path in (*stage.outputs, *stage.cleanup):
+                        if path.is_relative_to(out):
+                            remove_path(path)
                 log = out / "logs" / f"{stage.name}.log"
                 log.parent.mkdir(exist_ok=True)
                 started = time.monotonic()
-                state["stages"][stage.name] = dict(status="running", log=str(log))
-                write_json(record, state)
+                cache.update(stage.name, status="running", log=str(log))
                 print("EXPORT_START", stage.name, "log=" + str(log), flush=True)
                 try:
                     with log.open("w") as stream:
@@ -714,7 +704,7 @@ class ExportPipeline:
                             env=self.environment(),
                             stdout=stream,
                             stderr=subprocess.STDOUT,
-                            pass_fds=(lock.fileno(),),
+                            pass_fds=(cache.lock.fileno(),),
                         )
                     if result.returncode:
                         raise RuntimeError(
@@ -726,20 +716,44 @@ class ExportPipeline:
                         )
                     for path in stage.cleanup:
                         path.unlink(missing_ok=True)
-                    state["stages"][stage.name] = dict(
+                    cache.update(
+                        stage.name,
                         status="complete",
                         seconds=time.monotonic() - started,
-                        outputs={str(p): file_stamp(p) for p in stage.outputs},
+                        outputs=artifact_stamps(stage.outputs),
                         log=str(log),
                     )
-                    write_json(record, state)
                 except BaseException as error:
-                    state["stages"][stage.name].update(
-                        status="failed", error=str(error)
+                    cache.update(
+                        stage.name, status="failed", error=str(error), log=str(log)
                     )
-                    write_json(record, state)
                     raise
                 print("EXPORT_DONE", stage.name, flush=True)
-            write_json(out / "EXPORT.json", self.finish())
+            report = self.finish()
+            if c.format == "pte":
+                package = out / "model.pte"
+                if not cache.reusable("package", (package,)):
+                    from .model_package import pack_export
+
+                    print("EXPORT_START package", flush=True)
+                    cache.update("package", status="running")
+                    try:
+                        pack_export(c)
+                        cache.update(
+                            "package",
+                            status="complete",
+                            outputs=artifact_stamps((package,)),
+                        )
+                    except BaseException as error:
+                        cache.update("package", status="failed", error=str(error))
+                        raise
+                    print("EXPORT_DONE package", flush=True)
+                else:
+                    print("EXPORT_REUSED package", flush=True)
+                report["model_pte"] = str(package)
+                report["delivery"] = (
+                    "single PTE; model resources are embedded as named data"
+                )
+            write_json(out / "EXPORT.json", report)
         print("EXPORT_COMPLETE", out, flush=True)
         return out / "EXPORT.json"

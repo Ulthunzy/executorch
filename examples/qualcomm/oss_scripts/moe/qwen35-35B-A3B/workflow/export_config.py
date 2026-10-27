@@ -17,7 +17,6 @@ DEFAULT_EXPORT_CONFIG = ROOT / "configs/export_sm8975.json"
 @dataclass(frozen=True)
 class ExportConfig:
     soc_model: str
-    dsp_arch: str
     model_settings: ModelConfig
     model_config: Path
     model: Path
@@ -46,8 +45,13 @@ class ExportConfig:
     image_height: int
     image_width: int
 
+    @property
+    def dsp_arch(self):
+        return self.model_settings.target.dsp_arch
+
     def to_dict(self):
         data = asdict(self)
+        data["dsp_arch"] = self.dsp_arch
         data["model_settings"] = self.model_settings.to_dict()
         return json.loads(json.dumps(data, default=str))
 
@@ -58,11 +62,12 @@ def load_export_config(
     *,
     device=None,
     soc_model=None,
-    dsp_arch=None,
 ):
     path = Path(path).resolve()
     data = json.loads(path.read_text())
-    allowed = set(ExportConfig.__dataclass_fields__) - {"model_settings"}
+    allowed = (set(ExportConfig.__dataclass_fields__) - {"model_settings"}) | {
+        "dsp_arch"
+    }
     if (
         not isinstance(data, dict)
         or type(data.get("version")) is not int
@@ -87,7 +92,7 @@ def load_export_config(
         raise ValueError("model_config must name the numerical recipe")
     settings = load_model_config(config_path)
     selected_soc = soc_model or data.get("soc_model", settings.target.soc_model)
-    selected_arch = dsp_arch or (data.get("dsp_arch") if soc_model is None else None)
+    selected_arch = data.get("dsp_arch") if soc_model is None else None
     settings = replace(
         settings, target=TargetConfig.resolve(selected_soc, selected_arch)
     ).validate()
@@ -203,7 +208,6 @@ def load_export_config(
         )
     config = ExportConfig(
         soc_model=settings.target.soc_model,
-        dsp_arch=settings.target.dsp_arch,
         model_settings=settings,
         model_config=config_path,
         model=location("model"),
@@ -248,8 +252,8 @@ def load_export_config(
         raise ValueError(
             "Use a separate output directory to preserve calibration artifacts"
         )
-    if config.source == "calibrated" and config.output.is_relative_to(
+    if config.output.is_relative_to(
         config.calibration_dir
-    ):
-        raise ValueError("Put export output outside the calibrated source directory")
+    ) or config.calibration_dir.is_relative_to(config.output):
+        raise ValueError("Use non-overlapping export and calibration directories")
     return config

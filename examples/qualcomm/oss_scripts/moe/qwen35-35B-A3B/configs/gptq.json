@@ -31,8 +31,7 @@
     "prefill_order": "layer_major"
   },
   "target": {
-    "soc_model": "SM8975",
-    "dsp_arch": "v85"
+    "soc_model": "SM8975"
   },
   "generation": {
     "temperature": 0,

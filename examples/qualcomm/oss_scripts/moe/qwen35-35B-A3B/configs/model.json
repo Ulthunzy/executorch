@@ -29,7 +29,7 @@
     "max_prefill_tokens": 1024
   },
   "generation": {
-    "enable_thinking": false,
+    "enable_thinking": true,
     "system_prompt": "你是一个有帮助的人工智能助手。",
     "max_new_tokens": 128,
     "temperature": 0,
@@ -51,7 +51,6 @@
     "context_load_mode": "auto"
   },
   "target": {
-    "soc_model": "SM8975",
-    "dsp_arch": "v85"
+    "soc_model": "SM8975"
   }
 }

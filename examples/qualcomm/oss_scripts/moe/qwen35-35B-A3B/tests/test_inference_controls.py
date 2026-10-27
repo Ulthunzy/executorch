@@ -44,7 +44,9 @@ def test_target_reaches_export_and_runtime(soc, arch):
 
 def test_mismatched_target_cannot_run_or_export():
     with pytest.raises(ValueError, match="requires v79"):
-        load_export_config(soc_model="SM8750", dsp_arch="v85")
+        TargetConfig("SM8750").check_manifest(
+            {"target": {"soc_model": "SM8750", "dsp_arch": "v85"}}
+        )
     with pytest.raises(ValueError, match="Artifact target"):
         TargetConfig("SM8750").check_manifest({})
     TargetConfig().check_manifest({})
@@ -58,6 +60,10 @@ def test_target_architecture_comes_from_backend_schema(monkeypatch):
     info = _soc_info_table[QcomChipset.SM8850]
     monkeypatch.setattr(info.htp_info, "htp_arch", HtpArch.V85)
     assert TargetConfig.resolve("SM8850").dsp_arch == "v85"
+    config = load_export_config(soc_model="SM8850")
+    assert config.dsp_arch == "v85"
+    assert ExportPipeline(config).environment()["MOE_DSP_ARCH"] == "85"
+    assert parse_args(["--soc-model", "SM8850"]).dsp_arch == "v85"
     with pytest.raises(ValueError, match="requires v85"):
         TargetConfig.resolve("SM8850", "v81")
     with pytest.raises(ValueError, match="requires an HTP architecture"):
@@ -101,6 +107,20 @@ def test_deployment_commands_cannot_consume_chat_input(monkeypatch):
     monkeypatch.setattr("workflow.device.subprocess.run", run)
     AndroidDevice("phone").adb("shell", "mkdir -p /data/local/tmp/chat")
     assert calls[0]["stdin"] == subprocess.DEVNULL
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_thinking_flag_overrides_model_settings(tmp_path, enabled):
+    data = json.loads((ROOT / "configs/model.json").read_text())
+    data["generation"]["enable_thinking"] = not enabled
+    config = tmp_path / "model.json"
+    config.write_text(json.dumps(data))
+    flag = "--enable-thinking" if enabled else "--no-enable-thinking"
+    args = parse_args(["--model-config", str(config), flag])
+    assert args.enable_thinking is enabled
+    assert args.model_settings.generation.enable_thinking is enabled
+    command = session_command(args, DevicePaths("/tmp/model", "/tmp/shared"), "")
+    assert flag in shlex.split(command.split(" && ", 1)[1])
 
 
 def test_missing_expert_payload_is_rejected_before_deployment(monkeypatch):

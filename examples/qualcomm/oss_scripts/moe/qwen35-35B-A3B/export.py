@@ -5,7 +5,7 @@ from pathlib import Path
 
 from workflow.export_config import DEFAULT_EXPORT_CONFIG, load_export_config
 from workflow.export_pipeline import ExportPipeline
-from workflow.target import DSP_ARCHES, SOC_MODELS
+from workflow.target import SOC_MODELS
 
 
 def main(argv=None):
@@ -14,7 +14,6 @@ def main(argv=None):
     parser.add_argument("--output", type=Path, help="Override the output directory")
     parser.add_argument("--device", help="ADB serial used for shared-weight capture")
     parser.add_argument("--soc-model", "--soc_model", choices=SOC_MODELS)
-    parser.add_argument("--dsp-arch", choices=DSP_ARCHES)
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--print-plan", action="store_true")
     mode.add_argument("--check", action="store_true", help="Check local prerequisites")
@@ -27,7 +26,6 @@ def main(argv=None):
                 args.output,
                 device=args.device,
                 soc_model=args.soc_model,
-                dsp_arch=args.dsp_arch,
             )
         )
         if args.print_plan:

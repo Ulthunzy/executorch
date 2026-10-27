@@ -5,7 +5,7 @@ from pathlib import Path, PurePosixPath
 import re
 
 from workflow.model_config import DEFAULT_MODEL_CONFIG, load_model_config
-from workflow.target import DSP_ARCHES, SOC_MODELS, TargetConfig
+from workflow.target import SOC_MODELS, TargetConfig
 
 ROOT = Path(__file__).resolve().parents[1]
 REPO = ROOT.parents[4]
@@ -24,9 +24,17 @@ def parse_args(argv=None):
     defaults = json.loads(selection.config.read_text())
     if selection.weights_path:
         weights = selection.weights_path.resolve()
+        packaged = weights.is_file()
+        if packaged:
+            from workflow.model_package import PackageReader
+
+            weights = PackageReader(weights).extract()
+            selection.weights_path = weights
         exported_profile = weights / "device.json"
         if exported_profile.is_file():
             defaults.update(json.loads(exported_profile.read_text()))
+        if packaged:
+            defaults["model"] = str(weights)
         defaults.update(
             artifacts=str(weights),
             shared_model=str(
@@ -72,7 +80,6 @@ def parse_args(argv=None):
             else defaults.get("soc_model", settings.target.soc_model)
         ),
     )
-    parser.add_argument("--dsp-arch", choices=DSP_ARCHES)
     parser.add_argument("--model", type=Path, default=Path(defaults["model"]))
     parser.add_argument(
         "--build-dir",
@@ -309,7 +316,7 @@ def parse_args(argv=None):
         else REPO / defaults["artifacts"]
     )
     try:
-        target = TargetConfig.resolve(args.soc_model, args.dsp_arch)
+        target = TargetConfig.resolve(args.soc_model)
     except ValueError as error:
         parser.error(str(error))
     args.dsp_arch = target.dsp_arch

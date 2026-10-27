@@ -11,6 +11,5 @@
   "runtime_device_dir": "/data/local/tmp/qwen35-sharing-corrected-model/prefill",
   "remote_weights": "/data/local/tmp/qwen35-raw-gptq-20261024/weights",
   "remote_root": "/data/local/tmp/qwen35-raw-gptq-20261024/runtime",
-  "soc_model": "SM8975",
-  "dsp_arch": "v85"
+  "soc_model": "SM8975"
 }

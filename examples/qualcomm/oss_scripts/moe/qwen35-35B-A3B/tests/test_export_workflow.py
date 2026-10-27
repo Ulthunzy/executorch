@@ -37,6 +37,8 @@ def make_config(tmp_path, **changes):
         ).encode(),
     )
     write(model / "model.safetensors.index.json", b'{"weight_map": {}}')
+    write(model / "tokenizer.json", b'{"fixture": true}')
+    write(model / "generation_config.json", b'{"eos_token_id": 248046}')
     numerical = json.loads((ROOT / "configs/model.json").read_text())
     numerical["context"].update(max_seq_len=1024, max_prefill_tokens=128)
     model_config = tmp_path / "model-config.json"
@@ -163,14 +165,21 @@ def test_decode_selection_preserves_shared_compile_but_only_packs_decode(tmp_pat
             assert len(stage.command[start:end]) == 4
 
 
-def child_runner(pipeline, calls, fail=None, real_pack=False):
+def child_runner(pipeline, calls, fail=None):
     def run(command, **kwargs):
         stage = next(s for s in pipeline.stages if s.command == command)
         calls.append(stage.name)
         if stage.name == fail:
             return subprocess.CompletedProcess(command, 37)
-        if real_pack and stage.name in ("prefill", "decode"):
-            from export.program import main as pack_plan
+        if stage.name in ("prefill", "decode"):
+            import importlib.util
+
+            spec = importlib.util.spec_from_file_location(
+                "moe_pack_plan", ROOT / "export/program.py"
+            )
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            pack_plan = module.main
 
             pack_plan(list(command[3:]))
             return subprocess.CompletedProcess(command, 0)
@@ -251,14 +260,17 @@ def test_failed_stage_resumes_without_repeating_completed_groups(tmp_path, monke
     assert not (config.output / "EXPORT.json").exists()
 
 
-def test_recipe_and_existing_output_are_not_overwritten(tmp_path):
+def test_invalid_output_is_rebuilt_without_deleting_calibration(tmp_path, monkeypatch):
     config = load_export_config(make_config(tmp_path))
     config.output.mkdir()
     write(config.output / "user-file", b"keep")
     pipeline = ExportPipeline(config)
-    with pytest.raises(ValueError, match="not an empty export workspace"):
-        pipeline.run()
-    assert (config.output / "user-file").read_bytes() == b"keep"
+    calls = []
+    monkeypatch.setattr(subprocess, "run", child_runner(pipeline, calls))
+    pipeline.run()
+    assert not (config.output / "user-file").exists()
+    assert (config.calibration_dir / "layers/layer0/front-qdq.pt2").exists()
+    assert (config.output / "model.pte").is_file()
     source = config.calibration_dir / "MODEL_CONFIG.json"
     old = json.loads(source.read_text())
     old["cache"]["kv_dtype"] = "uint8"
@@ -267,7 +279,9 @@ def test_recipe_and_existing_output_are_not_overwritten(tmp_path):
         pipeline.check()
 
 
-def test_raw_preparation_is_selected_and_cannot_overwrite_calibration(tmp_path):
+def test_raw_preparation_is_selected_and_reuses_verified_calibration(
+    tmp_path, monkeypatch
+):
     corpus = tmp_path / "corpus.jsonl"
     write(corpus, b'{"text":"calibration fixture"}\n')
     config = load_export_config(
@@ -277,11 +291,14 @@ def test_raw_preparation_is_selected_and_cannot_overwrite_calibration(tmp_path):
     pipeline.check()
     assert pipeline.stages[0].name == "quantize"
     assert "--corpus" in pipeline.stages[0].command
-    with pytest.raises(ValueError, match="new calibration_dir"):
-        pipeline.run()
+    calls = []
+    monkeypatch.setattr(subprocess, "run", child_runner(pipeline, calls))
+    pipeline.run()
+    pipeline.run()
+    assert calls.count("quantize") == 1
 
 
-def test_resume_rejects_changed_inputs(tmp_path, monkeypatch):
+def test_resume_rebuilds_changed_inputs(tmp_path, monkeypatch):
     pipeline = ExportPipeline(load_export_config(make_config(tmp_path)))
     calls = []
     monkeypatch.setattr(
@@ -294,9 +311,10 @@ def test_resume_rejects_changed_inputs(tmp_path, monkeypatch):
         b"changed calibration",
     )
     count = len(calls)
-    with pytest.raises(ValueError, match="changed"):
-        pipeline.run()
-    assert len(calls) == count
+    monkeypatch.setattr(subprocess, "run", child_runner(pipeline, calls))
+    pipeline.run()
+    assert len(calls) > count
+    assert calls.count("head") == 2
 
 
 def test_calibrated_export_rejects_another_checkpoint(tmp_path):
@@ -330,10 +348,11 @@ def test_checkpoint_provenance_rejects_modified_or_unrecorded_shards(tmp_path):
 
 def test_pte_plans_really_serialize_both_phases(tmp_path, monkeypatch):
     from executorch.exir._serialize._program import deserialize_pte_binary
+    from workflow.model_package import PackageReader
 
     config = load_export_config(make_config(tmp_path))
     pipeline = ExportPipeline(config)
-    monkeypatch.setattr(subprocess, "run", child_runner(pipeline, [], real_pack=True))
+    monkeypatch.setattr(subprocess, "run", child_runner(pipeline, []))
     pipeline.run()
     for phase, filename in (("prefill", "prefill"), ("decode", "decode")):
         path = config.output / f"plans/{filename}.pte"
@@ -351,6 +370,30 @@ def test_pte_plans_really_serialize_both_phases(tmp_path, monkeypatch):
             metadata["compile_settings"]
             == load_model_config(config.model_config).compile_settings()
         )
+    package = PackageReader(config.output / "model.pte")
+    combined = deserialize_pte_binary(
+        (config.output / "model.pte").read_bytes()
+    ).program
+    assert [p.name for p in combined.execution_plan] == [
+        "prefill_forward",
+        "decode_forward",
+    ]
+    extracted = package.extract(tmp_path / "cache")
+    assert (extracted / "model/decode/cache-encoding.bin").read_bytes() == (
+        config.output / "assets/cache-encoding.bin"
+    ).read_bytes()
+    snapshot = extracted / "model/prefill/pte-0-layer0-cache0.u16"
+    snapshot.write_bytes(b"current recurrent state")
+    assert (
+        extracted / "model/decode/cache-prefill/layer0-cache0.u16"
+    ).read_bytes() == snapshot.read_bytes()
+    from workflow.config import parse_args
+
+    args = parse_args(["--weights-path", str(config.output / "model.pte")])
+    assert args.weights_path.is_file()
+    assert args.model == args.artifacts
+    assert args.model_config == args.artifacts / "MODEL_CONFIG.json"
+    assert args.local_decode_pte == args.artifacts / "plans/decode.pte"
 
 
 def test_shared_weight_layout_round_trips_the_opaque_context(tmp_path):

@@ -9,5 +9,8 @@ task_build=$(cd "$task_build" && pwd)
 : "${HEXAGON_SDK_ROOT:?Set HEXAGON_SDK_ROOT}"
 : "${HEXAGON_TOOLS_ROOT:?Set HEXAGON_TOOLS_ROOT}"
 : "${ANDROID_NDK_ROOT:?Set ANDROID_NDK_ROOT}"
+task_arch=$(PYTHONPATH="$task_repo/..${PYTHONPATH:+:$PYTHONPATH}" \
+  "${MOE_PYTHON:-python}" "$moe_root/workflow/target.py" \
+  --soc-model "${MOE_SOC_MODEL:-SM8975}")
 make -C "$task_repo/examples/qualcomm/custom_op/deltanet_op_package_htp/DeltaNetOpPackage" \
-  -f Makefile -f "$moe_root/native/gdn_arch.mk" WORK="$task_build/op-package" MOE_DSP_ARCH="${MOE_DSP_ARCH:-85}" htp_x86 "htp_v${MOE_DSP_ARCH:-85}"
+  -f Makefile -f "$moe_root/native/gdn_arch.mk" WORK="$task_build/op-package" MOE_DSP_ARCH="$task_arch" htp_x86 "htp_v$task_arch"

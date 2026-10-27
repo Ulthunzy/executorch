@@ -45,7 +45,7 @@ class ContextConfig:
 
 @dataclass(frozen=True)
 class GenerationConfig:
-    enable_thinking: bool = False
+    enable_thinking: bool = True
     system_prompt: str = "你是一个有帮助的人工智能助手。"
     max_new_tokens: int = 128
     temperature: float = 0
