@@ -72,6 +72,8 @@ class QnnExecuTorchBackend final
   RuntimeOption qnn_runtime_lpai_affinity_{false, 0};
   RuntimeOption qnn_runtime_lpai_core_selection_{false, 0};
   RuntimeOption qnn_runtime_heap_profiling_path_{false, {}};
+  RuntimeOption qnn_runtime_op_package_directory_{
+      true, std::array<char, runtime::kMaxOptionValueLength>{}};
 };
 
 } // namespace qnn

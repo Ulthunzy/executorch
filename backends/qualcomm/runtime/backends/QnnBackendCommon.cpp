@@ -6,6 +6,7 @@
  * LICENSE file in the root directory of this source tree.
  */
 #include <executorch/backends/qualcomm/runtime/backends/QnnBackendCommon.h>
+#include <executorch/backends/qualcomm/runtime/QnnBackendOptions.h>
 namespace executorch {
 namespace backends {
 namespace qnn {
@@ -46,24 +47,42 @@ void QnnBackend::BackendRegisterOpPackage(
   if (current_platform == QnnExecuTorchOpPackagePlatform::UNKNOWN)
     QNN_EXECUTORCH_LOG_ERROR(
         "Failed to detect the platform. Only support x86_64 or android.");
+  std::string directory;
+  runtime::BackendOption runtime_option;
+  if (get_runtime_option(QNN_RUNTIME_OP_PACKAGE_DIRECTORY, runtime_option) ==
+      Error::Ok) {
+    if (const auto* value =
+            std::get_if<std::array<char, runtime::kMaxOptionValueLength>>(
+                &runtime_option.value)) {
+      directory.assign(
+          value->data(), strnlen(value->data(), value->size()));
+    }
+  }
   for (const auto op_package_info : *op_packages_infos) {
-    if (current_platform != op_package_info->platform() ||
-        op_package_manager_.Has(op_package_info->op_package_path()->c_str()))
+    if (current_platform != op_package_info->platform())
+      continue;
+
+    std::string path = op_package_info->op_package_path()->str();
+    if (!directory.empty()) {
+      // APKs cannot use the exporter workstation's absolute package path.
+      path = directory + "/" + path.substr(path.find_last_of("/\\") + 1);
+    }
+    if (op_package_manager_.Has(path.c_str()))
       continue;
 
     error = qnn_interface.qnn_backend_register_op_package(
         handle_,
-        op_package_info->op_package_path()->c_str(),
+        path.c_str(),
         op_package_info->interface_provider()->c_str(),
         EnumNameQnnExecuTorchOpPackageTarget(op_package_info->target()));
     if (error != QNN_SUCCESS) {
       QNN_EXECUTORCH_LOG_ERROR(
           "Failed to register op package: "
           "%s , error=%d",
-          op_package_info->op_package_path()->c_str(),
+          path.c_str(),
           QNN_GET_ERROR_CODE(error));
     } else {
-      op_package_manager_.Add(op_package_info->op_package_path()->c_str());
+      op_package_manager_.Add(path.c_str());
     }
   }
 }

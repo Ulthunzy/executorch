@@ -26,6 +26,7 @@
 #define QNN_RUNTIME_LPAI_AFFINITY "qnn_runtime_lpai_affinity"
 #define QNN_RUNTIME_LPAI_CORE_SELECTION "qnn_runtime_lpai_core_selection"
 #define QNN_RUNTIME_HEAP_PROFILING_PATH "qnn_runtime_heap_profiling_path"
+#define QNN_RUNTIME_OP_PACKAGE_DIRECTORY "qnn_runtime_op_package_directory"
 
 #if defined(_MSC_VER)
 #if defined(QNN_EXECUTORCH_BUILDING_DLL)

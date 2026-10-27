@@ -279,6 +279,16 @@ executorch::runtime::Error QnnExecuTorchBackend::set_option(
         qnn_runtime_lpai_core_selection_.value = *val;
         qnn_runtime_lpai_core_selection_.is_set = true;
       }
+    } else if (strcmp(option.key, QNN_RUNTIME_OP_PACKAGE_DIRECTORY) == 0) {
+      const auto* val =
+          std::get_if<std::array<char, runtime::kMaxOptionValueLength>>(
+              &option.value);
+      ET_CHECK_OR_RETURN_ERROR(
+          val != nullptr,
+          InvalidArgument,
+          "Op-package directory must be a string");
+      qnn_runtime_op_package_directory_.value = *val;
+      qnn_runtime_op_package_directory_.is_set = true;
     } else if (strcmp(option.key, QNN_RUNTIME_HEAP_PROFILING_PATH) == 0) {
       if (auto* val =
               std::get_if<std::array<char, runtime::kMaxOptionValueLength>>(
@@ -345,6 +355,10 @@ executorch::runtime::Error QnnExecuTorchBackend::get_option(
         strcmp(backend_options[i].key, QNN_RUNTIME_LPAI_CORE_SELECTION) == 0 &&
         qnn_runtime_lpai_core_selection_.is_set) {
       backend_options[i].value = qnn_runtime_lpai_core_selection_.value;
+    } else if (
+        strcmp(backend_options[i].key, QNN_RUNTIME_OP_PACKAGE_DIRECTORY) == 0 &&
+        qnn_runtime_op_package_directory_.is_set) {
+      backend_options[i].value = qnn_runtime_op_package_directory_.value;
     } else if (
         strcmp(backend_options[i].key, QNN_RUNTIME_HEAP_PROFILING_PATH) == 0 &&
         qnn_runtime_heap_profiling_path_.is_set) {
