@@ -40,6 +40,7 @@
 #if defined(EXECUTORCH_BUILD_QNN)
 #include <executorch/examples/qualcomm/oss_scripts/llama/runner/runner.h>
 #include <executorch/extension/android/jni/encrypted_model_loader.h>
+#include <executorch/extension/android/jni/dense/session.h>
 #endif
 
 #if defined(EXECUTORCH_BUILD_MEDIATEK)
@@ -936,8 +937,126 @@ class ExecuTorchLlmJni : public facebook::jni::HybridClass<ExecuTorchLlmJni> {
   }
 };
 
+#if defined(EXECUTORCH_BUILD_QNN)
+class Qwen35DenseStream : public facebook::jni::JavaClass<Qwen35DenseStream> {
+ public:
+  static constexpr const char* kJavaDescriptor =
+      "Lorg/pytorch/executorch/extension/llm/Qwen35DenseModule$Stream;";
+  void onBytes(const std::string& piece) const {
+    static const auto method =
+        javaClassStatic()
+            ->getMethod<void(
+                facebook::jni::local_ref<facebook::jni::JArrayByte>)>(
+                "onBytes");
+    auto bytes = facebook::jni::JArrayByte::newArray(piece.size());
+    bytes->setRegion(
+        0, piece.size(), reinterpret_cast<const jbyte*>(piece.data()));
+    method(self(), bytes);
+  }
+};
+#endif
+
+class Qwen35DenseJni : public facebook::jni::HybridClass<Qwen35DenseJni> {
+ public:
+  static constexpr const char* kJavaDescriptor =
+      "Lorg/pytorch/executorch/extension/llm/Qwen35DenseModule;";
+
+  static bool isAvailable(facebook::jni::alias_ref<jclass>) {
+#if defined(EXECUTORCH_BUILD_QNN)
+    return true;
+#else
+    return false;
+#endif
+  }
+
+#if defined(EXECUTORCH_BUILD_QNN)
+  explicit Qwen35DenseJni(executorch::android::dense::Config config)
+      : session_(std::move(config)) {}
+
+  static facebook::jni::local_ref<jhybriddata> initHybrid(
+      facebook::jni::alias_ref<jclass>,
+      std::string decoder,
+      std::string embedding,
+      std::string encoder,
+      std::string tokenizer,
+      std::string libraries,
+      std::string system,
+      jint capacity,
+      jint height,
+      jint width) {
+    return makeCxxInstance(executorch::android::dense::Config{
+        std::move(decoder),
+        std::move(embedding),
+        std::move(encoder),
+        std::move(tokenizer),
+        std::move(libraries),
+        std::move(system),
+        capacity,
+        height,
+        width});
+  }
+
+  facebook::jni::local_ref<jstring> generate(
+      std::string prompt,
+      std::string image,
+      jint count,
+      jfloat temperature,
+      jboolean thinking,
+      jboolean ignore_eos,
+      facebook::jni::alias_ref<Qwen35DenseStream> callback) {
+    auto stats = session_.generate(
+        prompt,
+        image,
+        count,
+        temperature,
+        thinking,
+        ignore_eos,
+        [&](const std::string& piece) { callback->onBytes(piece); });
+    return facebook::jni::make_jstring(stats);
+  }
+  void stop() {
+    session_.stop();
+  }
+  void prepare() {
+    session_.prepare();
+  }
+  void reset() {
+    session_.reset();
+  }
+#endif
+
+  static void registerNatives() {
+    registerHybrid({
+        makeNativeMethod("isAvailableNative", Qwen35DenseJni::isAvailable),
+#if defined(EXECUTORCH_BUILD_QNN)
+        makeNativeMethod("initHybrid", Qwen35DenseJni::initHybrid),
+        makeNativeMethod("generateNative", Qwen35DenseJni::generate),
+        makeNativeMethod("stopNative", Qwen35DenseJni::stop),
+        makeNativeMethod("prepareNative", Qwen35DenseJni::prepare),
+        makeNativeMethod("resetNative", Qwen35DenseJni::reset),
+#endif
+    });
+  }
+
+ private:
+#if defined(EXECUTORCH_BUILD_QNN)
+  executorch::android::dense::Session session_;
+#endif
+};
+
 } // namespace executorch_jni
 
 void register_natives_for_llm() {
   executorch_jni::ExecuTorchLlmJni::registerNatives();
+  // Older AARs do not contain this optional API; keep their registration
+  // intact.
+  auto env = facebook::jni::Environment::current();
+  auto dense_class =
+      env->FindClass("org/pytorch/executorch/extension/llm/Qwen35DenseModule");
+  if (dense_class) {
+    env->DeleteLocalRef(dense_class);
+    executorch_jni::Qwen35DenseJni::registerNatives();
+  } else {
+    env->ExceptionClear();
+  }
 }

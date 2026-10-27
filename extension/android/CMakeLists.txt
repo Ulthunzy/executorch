@@ -208,6 +208,7 @@ if(EXECUTORCH_BUILD_LLAMA_JNI)
       executorch_jni
       PRIVATE
         jni/encrypted_model_loader.cpp
+        jni/dense/session.cpp
         ${EXECUTORCH_ROOT}/examples/qualcomm/oss_scripts/llama/runner/runner.cpp
         ${EXECUTORCH_ROOT}/examples/qualcomm/oss_scripts/llama/runner/decoder_runner.cpp
         ${EXECUTORCH_ROOT}/examples/qualcomm/oss_scripts/llama/runner/prompt_processor.cpp
@@ -216,6 +217,15 @@ if(EXECUTORCH_BUILD_LLAMA_JNI)
         ${EXECUTORCH_ROOT}/examples/qualcomm/oss_scripts/llama/runner/attention_sink_rope_runner.cpp
         ${EXECUTORCH_ROOT}/examples/qualcomm/oss_scripts/llama/runner/rpc_mem.cpp
         ${EXECUTORCH_ROOT}/examples/qualcomm/oss_scripts/llama/runner/kv_manager.cpp
+        ${EXECUTORCH_ROOT}/examples/qualcomm/oss_scripts/llama/runner/multimodal_runner/multimodal_runner.cpp
+        ${EXECUTORCH_ROOT}/examples/qualcomm/oss_scripts/llama/runner/multimodal_runner/multimodal_embedding_merger.cpp
+        ${EXECUTORCH_ROOT}/examples/qualcomm/oss_scripts/llama/runner/multimodal_runner/encoder.cpp
+        ${EXECUTORCH_ROOT}/examples/qualcomm/oss_scripts/llama/runner/multimodal_runner/tok_embedding_runner.cpp
+        ${EXECUTORCH_ROOT}/examples/qualcomm/oss_scripts/llama/runner/multimodal_runner/tok_embedding_processor.cpp
+        ${EXECUTORCH_ROOT}/examples/qualcomm/oss_scripts/llama/runner/multimodal_runner/multimodal_prompt_processor.cpp
+        ${EXECUTORCH_ROOT}/examples/qualcomm/oss_scripts/llama/runner/multimodal_runner/multimodal_token_generator.cpp
+        ${EXECUTORCH_ROOT}/examples/qualcomm/oss_scripts/llama/runner/multimodal_runner/multimodal_lhd_token_generator.cpp
+        ${EXECUTORCH_ROOT}/examples/qualcomm/oss_scripts/llama/runner/multimodal_runner/qwen_image.cpp
     )
 
     target_include_directories(

@@ -45,3 +45,7 @@
 # Qwen35 MoE has a separate JNI DSO and a private streaming byte callback.
 -keep class org.pytorch.executorch.extension.llm.Qwen35MoeModule { *; }
 -keep class org.pytorch.executorch.extension.llm.Qwen35MoeModule$Stream { *; }
+
+# Dense QNN methods and UTF-8 byte callbacks are looked up from JNI.
+-keep class org.pytorch.executorch.extension.llm.Qwen35DenseModule { *; }
+-keep class org.pytorch.executorch.extension.llm.Qwen35DenseModule$* { *; }
