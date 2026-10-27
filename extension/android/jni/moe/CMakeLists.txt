@@ -44,6 +44,7 @@ add_library(
   ${_prefill}
   ${_common}
   ${_chat}
+  "${_repo}/examples/qualcomm/oss_scripts/llama/runner/multimodal_runner/qwen_image.cpp"
   "${_moe}/runner/shared/graph_binding.cpp"
   "${MOE_BUILD_DIR}/native-prefill/integer_rpc_stub.o"
 )

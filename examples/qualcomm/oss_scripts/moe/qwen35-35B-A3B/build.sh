@@ -90,7 +90,8 @@ for stage in prefill decode; do
       "$runtime_build/lib/libsentencepiece.a" "$runtime_build/lib/libre2.a"
       "$runtime_build/lib/libpcre2-8.a" "$runtime_build/lib/"libabsl_*.a)
     "${host_compile[@]}" -DMOE_CHAT_RUNNER -fno-emulated-tls -Wl,-rpath,'$ORIGIN' "${host_sources[@]}" \
-      "$moe_root/runner/chat/"*.cpp "$generated/integer_rpc_stub.o" \
+      "$moe_root/runner/chat/"*.cpp \
+      "$task_repo/examples/qualcomm/oss_scripts/llama/runner/multimodal_runner/qwen_image.cpp" "$generated/integer_rpc_stub.o" \
       -Wl,--whole-archive "$runtime_build/lib/libregex_lookahead.a" -Wl,--no-whole-archive \
       -Wl,--start-group "${runtime_libraries[@]}" "${tokenizer_libraries[@]}" \
       "$runtime_build/lib/libextension_llm_sampler.a" -Wl,--end-group \
