@@ -75,7 +75,9 @@ static inline void deltanetQhpiCopyStateU16(
     uint16_t* destination,
     const uint16_t* source,
     size_t elements) {
-#if defined(__hexagon__) && __HVX_ARCH__ == 81
+#if defined(__hexagon__) && __HVX_ARCH__ >= 81
+  // Keep VTCM state copies vectorized on V85 as well as V81; the scalar
+  // memcpy fallback adds substantial overhead to single-token recurrence.
   const uintptr_t addresses = reinterpret_cast<uintptr_t>(destination) |
       reinterpret_cast<uintptr_t>(source);
   if (addresses % 128 == 0 && elements % kQUint16HvxValuesPerVec == 0) {

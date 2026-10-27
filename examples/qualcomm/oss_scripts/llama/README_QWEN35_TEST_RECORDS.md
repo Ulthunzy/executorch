@@ -8808,3 +8808,19 @@ Native均值下降10.78%，完整decode下降6.62%，平均吞吐提高7.09%。�
 四轮各169份输出与原参考逐字节一致；逐层Top8/LRU及全部读取分块核对通过。均命中34105/40640（83.919783%），需求读取5594378240字节/127步（42.009566MiB/token）。读取调用45745→26140，总读量不变。5080层命令仍使用16次服务RPC和1个ARM服务线程，循环内context、内存注册及RPC buffer生命周期计数均为0。临时bank总buffer由13705216降至8192字节，VTCM仍为2MiB。
 
 实际聊天入口另完成8-token自由生成，与原版相同模板/输入的169份结果逐字节一致。两版该W2 GPTQ样本均输出`endah.endah.endah.endah.end`，已有质量问题不由本次性能优化解决；本次没有重测PPL。该短自由生成的吞吐与127步固定输入性能分开记录。手工cache清理、yield、睡眠/计数器退让、资源单线程接管等候选未接入默认。完整消融、源文件、二进制哈希及数值审计见`llama-output/qwen36-native-io-sync-sm8975-20261022/REPORT.md`、RESULTS.json/CSV、SUMMARY.json、MANIFEST.json。
+
+## 2026-10-27：Qwen3.5-2B，SM8850 / SM8975 同接口差异（暂存）
+
+使用同一份 `qwen35_2b_sm8850_s4096_text128_image16_cudagraph` 三个 PTE、
+`llama.py` / `qnn_multimodal_runner`、同一图片和提示，temperature=0、AR128，
+QNN 后端以 SDK 2.48.1 编译，SM8975 使用设备 V85 Stub/Skel。
+SM8850 图文 prefill 791.37 token/s、decode 50.219 token/s；SM8975
+复用已推送文件后 prefill 777.39 token/s、decode 45.5566 token/s。
+两机正常 EOS 的输出长度不同，故此结果不作为固定长度性能对照。
+SM8975 的 decode 仍低约 9.28%，尚未解决；原 PTE 为 SM8850/V81 编译，
+此次未重新导出 V85 图，后续再定位。完整命令、日志和哈希保存在
+`llama-output/qwen35-dense-2b-sm8975-20261027/REPORT.md`。
+
+已确认启动时仅使用工作目录的 `LD_LIBRARY_PATH` / `ADSP_LIBRARY_PATH`；
+加入 `/odm/lib64:/vendor/lib64` 会改变库解析并导致 SM8850 DSP 会话失败。
+V85 初始 UINT16 state 复制已启用 HVX，29 步 AR1 logits 与修改前逐字节一致。

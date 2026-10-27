@@ -136,8 +136,9 @@ htp_x86: $(WORK)/x86_64-linux-clang/$(LIBRARY_NAME)
 htp_aarch64: $(WORK)/aarch64-android/$(LIBRARY_NAME)
 htp_v79: $(WORK)/hexagon-v79/$(HTP_LIBRARY_NAME)
 htp_v81: $(WORK)/hexagon-v81/$(HTP_LIBRARY_NAME)
+htp_v85: $(WORK)/hexagon-v85/$(HTP_LIBRARY_NAME)
 
-$(WORK)/x86_64-linux-clang $(WORK)/aarch64-android $(WORK)/hexagon-v79 $(WORK)/hexagon-v81:
+$(WORK)/x86_64-linux-clang $(WORK)/aarch64-android $(WORK)/hexagon-v79 $(WORK)/hexagon-v81 $(WORK)/hexagon-v85:
 	@mkdir -p $@/ops
 
 # Keep the stamp's mtime unchanged when the effective build configuration agrees.
@@ -184,6 +185,7 @@ endef
 
 $(eval $(call HEXAGON_RULES,79))
 $(eval $(call HEXAGON_RULES,81))
+$(eval $(call HEXAGON_RULES,85))
 
 clean:
 	-rm -rf $(WORK)
@@ -191,7 +193,7 @@ clean:
 FORCE:
 
 # Track local utility headers as well as SDK headers emitted by -MMD.
--include $(foreach target,x86_64-linux-clang aarch64-android hexagon-v79 hexagon-v81,\
+-include $(foreach target,x86_64-linux-clang aarch64-android hexagon-v79 hexagon-v81 hexagon-v85,\
     $(addprefix $(WORK)/$(target)/,$(OTHER_OBJS:.o=.d) $(OP_OBJS:.o=.d)))
 
-.PHONY: all clean FORCE htp_x86 htp_aarch64 htp_v79 htp_v81
+.PHONY: all clean FORCE htp_x86 htp_aarch64 htp_v79 htp_v81 htp_v85
