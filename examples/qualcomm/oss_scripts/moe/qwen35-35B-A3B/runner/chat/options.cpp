@@ -25,10 +25,11 @@ Options parse_options(int argc, char** argv) {
     overrides.insert(flag);
     if (flag == "--help") {
       printf(
-          "qwen35_moe_runner --model-root DIR --tokenizer-path tokenizer.json\n"
+          "qwen35_moe_runner --model-root DIR_OR_PTE [--tokenizer-path tokenizer.json]\n"
+          "  [--package-cache DIR] [--library-directory DIR]\n"
           "  [--prompt TEXT ...] [--interactive] [--system-prompt TEXT]\n"
           "  [--image-path JPG_OR_PNG] (image files are decoded on device)\n"
-          "  [--max-new-tokens 128] [--temperature 0] [--enable-thinking]\n"
+          "  [--max-new-tokens 128] [--temperature 0] [--enable-thinking|--no-enable-thinking]\n"
           "  [--stream|--no-stream] [--vision|--no-vision]\n"
           "  [--prompt-tokens N] [--ignore-eos] (fixed-length performance runs)\n"
           "  [--max-seq-len 1152] [--cache-experts 32] [--shared-model DIR]\n"
@@ -67,6 +68,10 @@ Options parse_options(int argc, char** argv) {
         options.tokenizer_path = value;
       else if (flag == "--shared-model")
         options.shared_model = value;
+      else if (flag == "--package-cache")
+        options.package_cache = value;
+      else if (flag == "--library-directory")
+        options.library_directory = value;
       else if (flag == "--model-config")
         options.model_config = value;
       else if (flag == "--prompt")
@@ -97,6 +102,18 @@ Options parse_options(int argc, char** argv) {
       } else
         throw std::runtime_error("Unknown argument: " + flag);
     }
+  }
+  if (std::filesystem::is_regular_file(options.model_root)) {
+    const auto assets = std::filesystem::path(
+        unpack_model_package(options.model_root, options.package_cache));
+    options.model_root = (assets / "model").string();
+    options.shared_model = (assets / "shared-model").string();
+    options.tokenizer_path = (assets / "tokenizer.json").string();
+    options.package_lock = lock_package_model(options.model_root);
+    if (options.library_directory.empty())
+      options.library_directory =
+          std::filesystem::canonical("/proc/self/exe").parent_path().string();
+    link_model_libraries(options.model_root, options.library_directory);
   }
   if (options.model_root.empty() || options.tokenizer_path.empty())
     throw std::runtime_error("--model-root and --tokenizer-path are required");

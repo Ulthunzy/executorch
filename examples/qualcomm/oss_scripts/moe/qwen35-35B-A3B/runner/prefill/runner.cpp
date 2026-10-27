@@ -456,6 +456,9 @@ static int prefill_main(int argc, char** argv) try {
         throw std::runtime_error(
             "encoded image features were not fully consumed");
       const double loop_ms = elapsed(sequence_begin);
+#ifdef MOE_CHAT_RUNNER
+      moe_chat::initial_prefill_complete(loop_ms);
+#endif
       printf(
           "PREFILL_TOTAL tokens=%d chunks=%d graph_ms=%.6f loop_ms=%.6f tokens_per_second=%.6f direct_bytes=%llu native_calls=%d padded_tokens=%d\n",
           valid_tokens,

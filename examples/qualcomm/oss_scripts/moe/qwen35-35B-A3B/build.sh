@@ -12,12 +12,8 @@ runtime_build=${EXECUTORCH_ANDROID_BUILD:-"$task_repo/build-android"}
 : "${HEXAGON_TOOLS_ROOT:?Set HEXAGON_TOOLS_ROOT}"
 : "${ANDROID_NDK_ROOT:?Set ANDROID_NDK_ROOT}"
 task_soc=${MOE_SOC_MODEL:-SM8975}
-target_args=(--soc-model "$task_soc")
-if [[ -n "${MOE_DSP_ARCH:-}" ]]; then
-  target_args+=(--dsp-arch "v${MOE_DSP_ARCH#v}")
-fi
 task_arch=$(PYTHONPATH="$task_repo/..${PYTHONPATH:+:$PYTHONPATH}" \
-  "${MOE_PYTHON:-python}" "$moe_root/workflow/target.py" "${target_args[@]}")
+  "${MOE_PYTHON:-python}" "$moe_root/workflow/target.py" --soc-model "$task_soc")
 export MOE_SOC_MODEL="$task_soc" MOE_DSP_ARCH="$task_arch"
 ggml_root=${LLAMA_CPP_ROOT:-"$task_repo/../llama.cpp"}
 ggml_htp="$ggml_root/ggml/src/ggml-hexagon/htp"
@@ -82,12 +78,13 @@ for stage in prefill decode; do
     -DET_EVENT_TRACER_ENABLED -DET_ENABLE_DEPRECATED_CONSTANT_BUFFER=0
     -DET_ENABLE_PROGRAM_VERIFICATION=0 -I"$task_repo/.."
     -I"$task_repo/runtime/core/portable_type/c10" -I"$runtime_build/include"
+    -I"$task_repo/third-party/flatbuffers/include" -I"$runtime_build/schema/include"
     -I"$generated" -I"$HEXAGON_SDK_ROOT/incs" -I"$HEXAGON_SDK_ROOT/incs/stddef"
     -I"$QNN_SDK_ROOT/include/QNN")
   "${host_compile[@]}" "${host_flags[@]}" "${host_sources[@]}" \
     "$generated/integer_rpc_stub.o" -Wl,--start-group "${runtime_libraries[@]}" -Wl,--end-group \
     -L"$HEXAGON_SDK_ROOT/ipc/fastrpc/remote/ship/android_aarch64" \
-    -lcdsprpc -ldl -llog -o "$host_output"
+    -lcdsprpc -ldl -llog -lz -o "$host_output"
   if [[ "$stage" == prefill ]]; then
     tokenizer_libraries=("$runtime_build/lib/libtokenizers.a"
       "$runtime_build/lib/libsentencepiece.a" "$runtime_build/lib/libre2.a"
@@ -98,7 +95,7 @@ for stage in prefill decode; do
       -Wl,--start-group "${runtime_libraries[@]}" "${tokenizer_libraries[@]}" \
       "$runtime_build/lib/libextension_llm_sampler.a" -Wl,--end-group \
       -L"$HEXAGON_SDK_ROOT/ipc/fastrpc/remote/ship/android_aarch64" \
-      -lcdsprpc -ldl -llog -o "$task_build/qwen35_moe_runner"
+      -lcdsprpc -ldl -llog -lz -o "$task_build/qwen35_moe_runner"
   fi
 done
 "$compiler" -O3 -std=c++17 -static-libstdc++ -fPIC -shared -fvisibility=hidden \

@@ -19,6 +19,10 @@ std::vector<float> initial_image(VisionEncoder* encoder) {
   return conversation->initial_image(encoder);
 }
 
+void initial_prefill_complete(double milliseconds) {
+  conversation->initial_prefill_complete(milliseconds);
+}
+
 int run_client(Options options, Client& client, PrefillMain prefill) try {
   tokenizer_tls_alignment = 1;
   conversation = std::make_unique<Conversation>(std::move(options), &client);

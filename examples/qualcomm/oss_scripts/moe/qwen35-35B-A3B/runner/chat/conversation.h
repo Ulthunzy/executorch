@@ -5,6 +5,8 @@
 #include "image.h"
 #include "client.h"
 #include "settings.h"
+#include <executorch/extension/llm/runner/stats.h>
+#include "../model_package.h"
 #include <cstdio>
 #include <memory>
 #include <string>
@@ -15,6 +17,8 @@ struct Options {
   std::string model_root, tokenizer_path, shared_model, image_path;
   std::string prefill_order;
   std::string model_config;
+  std::string package_cache, library_directory;
+  std::shared_ptr<ModelPackageLock> package_lock;
   RuntimeSettings runtime;
   std::string system_prompt = "你是一个有帮助的人工智能助手。";
   std::vector<std::string> prompts;
@@ -23,7 +27,7 @@ struct Options {
   int prompt_tokens = 0;
   int prefill_io_workers = 8;
   float temperature = 0;
-  bool interactive = false, thinking = false, tokenize_only = false;
+  bool interactive = false, thinking = true, tokenize_only = false;
   bool ignore_eos = false;
   bool stream = true, vision_enabled = true;
   std::string log_path;
@@ -43,6 +47,7 @@ class Conversation {
   int run(void* library);
   void report_error(const std::string& message);
   std::vector<float> initial_image(VisionEncoder* encoder);
+  void initial_prefill_complete(double milliseconds);
   Options options;
 
  private:
@@ -60,6 +65,9 @@ class Conversation {
   bool ended = false, empty = true;
   Client* client = nullptr;
   bool needs_reset = false;
+  executorch::extension::llm::Stats stats;
+  double initial_prompt_ms = 0;
+  std::string stop_reason;
   int (*open)(const char*, int) = nullptr;
   int (*step)(int64_t, float*, size_t) = nullptr;
   int (*reset)() = nullptr;
@@ -81,7 +89,7 @@ class Conversation {
       const std::vector<uint64_t>& ids,
       const std::vector<float>& features);
   void generate();
-  bool turn(const std::string& text);
+  bool turn(std::string text);
   void reset_context();
   void client_turn(const Request& request);
 };

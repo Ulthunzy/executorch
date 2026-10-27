@@ -11,6 +11,7 @@
 int main() {
   using namespace moe_chat;
   Options options;
+  assert(options.thinking);
   const nlohmann::json config = {
       {"version", 1},
       {"quantization", {{"embedding", "bf16"}}},
@@ -109,6 +110,21 @@ int main() {
   options = parse_options(13, const_cast<char**>(sampling));
   assert(options.temperature == 0.25f && options.stream && !options.ignore_eos);
   assert(!options.interactive && !options.vision_enabled);
+  const std::string disabled = (root / "thinking-disabled.json").string();
+  auto disabled_config = config;
+  disabled_config["generation"]["enable_thinking"] = false;
+  std::ofstream(disabled) << disabled_config;
+  const char* thinking[] = {
+      "runner",
+      "--model-root",
+      directory.c_str(),
+      "--tokenizer-path",
+      "/tmp/tokenizer.json",
+      "--model-config",
+      disabled.c_str(),
+      "--enable-thinking"};
+  options = parse_options(8, const_cast<char**>(thinking));
+  assert(options.thinking);
   std::filesystem::remove_all(root);
   std::cout << "runtime configuration and RoPE bounds tests passed\n";
 }
