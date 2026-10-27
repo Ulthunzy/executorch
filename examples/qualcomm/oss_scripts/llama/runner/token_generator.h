@@ -51,6 +51,7 @@ class TokenGenerator {
   uint64_t last_token() const {
     return last_token_;
   }
+  bool is_eos(uint64_t token) const { return eos_ids_->count(token) != 0; }
   executorch::runtime::Error configure_thinking(
       bool repair_eos,
       bool enable_budget,

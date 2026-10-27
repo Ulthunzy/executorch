@@ -60,7 +60,7 @@ Result<Tensor> EncoderRunner::encode(TensorPtr& image_tensor) {
   encoder_inputs.emplace_back(*tensor_ptr);
 
   auto encoder_result = module_->forward(encoder_inputs);
-  ET_CHECK_MSG(encoder_result.ok(), "Encoder execution failed");
+  ET_CHECK_OK_OR_RETURN_ERROR(encoder_result.error());
 
   encoder_output_ = std::move(encoder_result.get());
   ET_LOG(Info, "Encoder execution completed, got hidden states");
@@ -78,6 +78,16 @@ Result<Tensor> EncoderRunner::encode(const Image& image) {
   std::vector<int32_t> input_sizes(
       input_meta->sizes().begin(), input_meta->sizes().end());
   const ScalarType input_dtype = input_meta->scalar_type();
+  size_t count = 1;
+  for (const auto size : input_meta->sizes())
+    count *= size;
+  ET_CHECK_OR_RETURN_ERROR(
+      (image.is_float() && input_dtype == ScalarType::Float &&
+       image.get_float_data().size() == count) ||
+          (image.is_uint8() && input_dtype == ScalarType::Byte &&
+           image.get_uint8_data().size() == count),
+      InvalidArgument,
+      "Image buffer does not match encoder input metadata");
 
   TensorPtr tensor;
   if (input_dtype == ScalarType::Float) {

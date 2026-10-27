@@ -10,6 +10,7 @@
 
 #pragma once
 
+#include <atomic>
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -98,6 +99,21 @@ class QNNMultimodalRunner
 
   bool is_loaded() const override;
   executorch::runtime::Error load() override;
+  void stop() override;
+  void reset() override;
+  void prepare_generation() {
+    stop_requested_.store(false, std::memory_order_relaxed);
+    generation_prepared_ = true;
+  }
+  int64_t context_position() const {
+    return cur_pos_;
+  }
+  int32_t context_length() const {
+    return context_len_;
+  }
+  bool reached_eos() const {
+    return has_pending_token_ && token_generator_->is_eos(pending_token_);
+  }
 
   executorch::runtime::Error generate(
       const std::vector<executorch::extension::llm::MultimodalInput>& inputs,
@@ -119,6 +135,7 @@ class QNNMultimodalRunner
   inline static const std::string kEncoderForwardName = "forward";
 
   int32_t context_len_{0};
+  int32_t prompt_ar_len_{1};
   int32_t position_id_dim_{1};
 
   int ngram_{0};
@@ -129,6 +146,13 @@ class QNNMultimodalRunner
   // global/local architecture.
   CacheMode cache_mode_{CacheMode::StaticCahce};
   int64_t cur_pos_{0};
+  int32_t position_delta_{0};
+  uint64_t pending_token_{0};
+  bool has_pending_token_{false};
+  bool context_valid_{true};
+  // An owner can publish a request for cancellation before entering generate().
+  bool generation_prepared_{false};
+  std::atomic<bool> stop_requested_{false};
 
   std::string tokenizer_path_;
   std::string performance_output_path_;

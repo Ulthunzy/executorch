@@ -335,6 +335,8 @@ Result<uint64_t> MultimodalPromptProcessor::prefill(
   std::chrono::duration<double, std::milli> execute_time{0};
   std::chrono::duration<double, std::milli> cache_time{0};
   for (int i = 0; i < num_iters; ++i) {
+    ET_CHECK_OR_RETURN_ERROR(
+        !decoder_runner_->is_stop_requested(), InvalidState, "Prefill stopped");
     // Fill in the embedding and position data
     const auto prepare_start = Clock::now();
     prepare_io(
@@ -346,8 +348,9 @@ Result<uint64_t> MultimodalPromptProcessor::prefill(
     const auto step_result = decoder_runner_->step(method_name_, inputs_);
     const auto cache_start = Clock::now();
     execute_time += cache_start - execute_start;
-    ET_CHECK_MSG(
+    ET_CHECK_OR_RETURN_ERROR(
         step_result.ok(),
+        Internal,
         "Prefill execution failed for method %s: 0x%x",
         method_name_.c_str(),
         static_cast<unsigned>(step_result.error()));

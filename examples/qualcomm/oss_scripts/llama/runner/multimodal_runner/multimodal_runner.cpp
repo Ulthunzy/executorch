@@ -307,6 +307,7 @@ Error QNNMultimodalRunner::load() {
   if (is_loaded()) {
     return Error::Ok;
   }
+  stats_.model_load_start_ms = time_in_ms();
 #if ET_QNN_RUNNER_DEV_MEM_LOG
   const dev_mem::RssSample load_before = dev_mem::sample_rss();
   dev_mem::log_proc_status_mem("multimodal load stage: entry");
@@ -378,6 +379,7 @@ Error QNNMultimodalRunner::load() {
   int32_t vocab_size = method_meta->output_tensor_meta(0)->sizes()[2];
   decoder_runner_ = std::make_unique<DecoderRunner>(
       text_decoder_.get(), vocab_size, temperature_, repetition_penalty_);
+  decoder_runner_->set_stop_flag(&stop_requested_);
 
   ET_CHECK_OK_OR_RETURN_ERROR(decoder_runner_->load(method_names));
 
@@ -438,6 +440,7 @@ Error QNNMultimodalRunner::load() {
     max_cache_len = context_len_ -
         std::min(token_generator_ar_len, prompt_processor_ar_len);
   max_ar_len = std::max(token_generator_ar_len, prompt_processor_ar_len);
+  prompt_ar_len_ = prompt_processor_ar_len;
 
   const size_t input_pos_idx = cache_mode_ == CacheMode::HybridCache ? 3 : 2;
   const int32_t token_position_id_dim =
@@ -875,6 +878,7 @@ Error QNNMultimodalRunner::load() {
       dev_mem::bytes_to_mib(total_static_buffers));
 #endif
 
+  stats_.model_load_end_ms = time_in_ms();
   return Error::Ok;
 }
 
@@ -883,13 +887,32 @@ executorch::runtime::Error QNNMultimodalRunner::generate(
     const llm::GenerationConfig& config,
     std::function<void(const std::string&)> token_callback,
     std::function<void(const Stats&)> stats_callback) {
-  ET_CHECK_MSG(!inputs.empty(), "inputs cannot be empty");
+  ET_CHECK_OR_RETURN_ERROR(
+      !inputs.empty(), InvalidArgument, "inputs cannot be empty");
+  ET_CHECK_OR_RETURN_ERROR(
+      context_valid_,
+      InvalidState,
+      "Reset the interrupted context before generating");
+  if (!generation_prepared_)
+    prepare_generation();
+  generation_prepared_ = false;
+  ET_CHECK_OR_RETURN_ERROR(
+      !stop_requested_.load(std::memory_order_relaxed),
+      InvalidState,
+      "Generation stopped");
+  stats_.reset();
   if (!is_loaded()) {
     stats_.model_load_start_ms = time_in_ms();
     ET_CHECK_OK_OR_RETURN_ERROR(load());
     stats_.model_load_end_ms = time_in_ms();
   }
+  ET_CHECK_OR_RETURN_ERROR(
+      !stop_requested_.load(std::memory_order_relaxed),
+      InvalidState,
+      "Generation stopped");
   stats_.inference_start_ms = time_in_ms();
+  ET_CHECK_OK_OR_RETURN_ERROR(
+      decoder_runner_->set_temperature(config.temperature));
   ET_CHECK_OR_RETURN_ERROR(
       !config.repair_think_eos && !config.enable_think_budget,
       NotSupported,
@@ -926,10 +949,20 @@ executorch::runtime::Error QNNMultimodalRunner::generate(
       modality_of(model_version_) == Modality::kVision &&
       image_token_id_ != 0 && !is_qwen35_family_vlm(model_version_);
   std::vector<int32_t> prompt_position_ids;
-  int32_t mrope_pos = 0;
+  int32_t mrope_pos = static_cast<int32_t>(cur_pos_) + position_delta_;
+  const bool had_pending_token = has_pending_token_;
+  std::vector<MultimodalInput> turn_inputs;
+  if (had_pending_token) {
+    turn_inputs.emplace_back(std::vector<uint64_t>{pending_token_});
+  }
+  turn_inputs.insert(turn_inputs.end(), inputs.begin(), inputs.end());
 
   // Process each input and add embeddings to merger
-  for (const MultimodalInput& input : inputs) {
+  for (const MultimodalInput& input : turn_inputs) {
+    ET_CHECK_OR_RETURN_ERROR(
+        !stop_requested_.load(std::memory_order_relaxed),
+        InvalidState,
+        "Generation stopped");
     if (input.is_text() || input.is_tokens()) {
       std::vector<uint64_t> tokens;
       if (input.is_tokens()) {
@@ -942,6 +975,13 @@ executorch::runtime::Error QNNMultimodalRunner::generate(
             encode_res.error(), "failed to encode prompt %s", text.c_str());
         tokens = encode_res.get();
       }
+      if (tokens.empty())
+        continue;
+      ET_CHECK_OR_RETURN_ERROR(
+          cur_pos_ + embedding_merger_->get_total_tokens() + tokens.size() <
+              static_cast<size_t>(seq_len),
+          InvalidArgument,
+          "Prompt exceeds the context capacity");
       tok_embedding_processor_->prefill(tokens);
       const TensorStruct<float>& text_embeddings =
           tok_embedding_processor_->get_prompt_embeddings();
@@ -976,6 +1016,7 @@ executorch::runtime::Error QNNMultimodalRunner::generate(
     } else if (input.is_image()) {
       const Image& image = input.get_image();
       auto encode_res = encoder_runner_->encode(image);
+      ET_CHECK_OK_OR_RETURN_ERROR(encode_res.error());
       executorch::aten::Tensor image_embeddings_tensor = encode_res.get();
 
       // Add image embeddings to merger
@@ -1009,13 +1050,25 @@ executorch::runtime::Error QNNMultimodalRunner::generate(
         prompt_position_ids.size(),
         num_prompt_tokens * position_id_dim_);
   }
-  token_generator_->set_position_delta(
-      use_qwen35_mrope ? mrope_pos - num_prompt_tokens : 0);
+  const int32_t next_position_delta = use_qwen35_mrope
+      ? mrope_pos - static_cast<int32_t>(cur_pos_) - num_prompt_tokens
+      : 0;
+  token_generator_->set_position_delta(next_position_delta);
 
-  ET_CHECK_MSG(num_prompt_tokens >= 1, "Expected at least 1 prompt token");
-  ET_CHECK_MSG(
+  ET_CHECK_OR_RETURN_ERROR(
+      num_prompt_tokens >= 1,
+      InvalidArgument,
+      "Expected at least 1 prompt token");
+  ET_CHECK_OR_RETURN_ERROR(
       cur_pos_ + num_prompt_tokens < seq_len,
+      InvalidArgument,
       "sequence length exceeded - please increase the seq_len value");
+  auto effective_config = config;
+  effective_config.seq_len = seq_len;
+  const int32_t budget = effective_config.resolve_max_new_tokens(
+      context_len_, cur_pos_ + num_prompt_tokens);
+  ET_CHECK_OR_RETURN_ERROR(
+      budget > 0, InvalidArgument, "No room for generated tokens");
 
   if (token_callback && config.echo) {
     token_callback(prompt);
@@ -1024,7 +1077,12 @@ executorch::runtime::Error QNNMultimodalRunner::generate(
 #if ET_QNN_RUNNER_DEV_MEM_LOG
   const dev_mem::RssSample prefill_before = dev_mem::sample_rss();
 #endif
-  decoder_runner_->begin_turn(prompt_tokens, cur_pos_ == 0);
+  auto new_prompt_tokens = prompt_tokens;
+  if (had_pending_token)
+    new_prompt_tokens.erase(new_prompt_tokens.begin());
+  decoder_runner_->begin_turn(new_prompt_tokens, cur_pos_ == 0);
+  // A failed/cancelled prefill may have committed earlier chunks to the state.
+  context_valid_ = false;
   auto prefill_res = prompt_processor_->prefill(
       merged_embeddings,
       cur_pos_,
@@ -1035,6 +1093,8 @@ executorch::runtime::Error QNNMultimodalRunner::generate(
   uint64_t cur_token = prefill_res.get();
   decoder_runner_->record_token(cur_token);
   cur_pos_ += num_prompt_tokens;
+  has_pending_token_ = false;
+  position_delta_ = next_position_delta;
   stats_.first_token_ms = time_in_ms();
   stats_.prompt_eval_end_ms = time_in_ms();
 #if ET_QNN_RUNNER_DEV_MEM_LOG
@@ -1066,7 +1126,7 @@ executorch::runtime::Error QNNMultimodalRunner::generate(
       token_generator_->generate(
           prompt_tokens,
           cur_pos_,
-          seq_len,
+          static_cast<int32_t>(cur_pos_) + budget,
           token_callback,
           dump_logits,
           nullptr,
@@ -1082,12 +1142,15 @@ executorch::runtime::Error QNNMultimodalRunner::generate(
       "RSS after finishing text generation: %f MiB (0 if unsupported)",
       get_rss_bytes() / 1024.0 / 1024.0);
   cur_pos_ += num_generated_tokens;
+  pending_token_ = token_generator_->last_token();
+  has_pending_token_ = true;
+  context_valid_ = true;
   if (cur_pos_ == seq_len) {
     ET_LOG(Info, "Sequence length (%i tokens) reached!", seq_len);
   }
 
-  stats_.num_prompt_tokens = num_prompt_tokens;
-  stats_.num_generated_tokens = num_generated_tokens;
+  stats_.num_prompt_tokens = num_prompt_tokens - (had_pending_token ? 1 : 0);
+  stats_.num_generated_tokens = num_generated_tokens + 1;
   print_report(stats_);
   print_performance_report(stats_, performance_output_path_);
   if (dump_logits) {
@@ -1100,6 +1163,25 @@ executorch::runtime::Error QNNMultimodalRunner::generate(
     stats_callback(stats_);
   }
   return Error::Ok;
+}
+
+void QNNMultimodalRunner::stop() {
+  stop_requested_.store(true, std::memory_order_relaxed);
+}
+
+void QNNMultimodalRunner::reset() {
+  if (kv_manager_)
+    kv_manager_->reset_state(prompt_ar_len_, true);
+  if (decoder_runner_)
+    decoder_runner_->begin_turn({}, true);
+  if (token_generator_)
+    token_generator_->reset();
+  cur_pos_ = 0;
+  position_delta_ = 0;
+  has_pending_token_ = false;
+  context_valid_ = true;
+  generation_prepared_ = false;
+  stop_requested_.store(false, std::memory_order_relaxed);
 }
 
 Result<ModelVersion> QNNMultimodalRunner::get_model_version() {
