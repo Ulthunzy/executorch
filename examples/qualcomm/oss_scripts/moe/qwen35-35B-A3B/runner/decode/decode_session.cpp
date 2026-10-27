@@ -113,8 +113,6 @@ DecodeSession::DecodeSession(const std::string& path, size_t cache_mib)
   check(
       integer_rpc_configure_banks(core.handle, mapped_banks, 41),
       "configure expert bank mapper");
-  if (core.use_mailbox)
-    core.start_service();
   reset();
 }
 
@@ -538,7 +536,7 @@ void DecodeSession::experts(
   if (ready) {
     hit_started = Clock::now();
     try {
-      core.execute();
+      core.execute(true, layer == 39);
     } catch (...) {
       readers->finish();
       throw;
@@ -587,7 +585,7 @@ void DecodeSession::experts(
   metrics.read += elapsed(t) - feedback_ms - io.hit_native;
   if (!ready) {
     t = Clock::now();
-    core.execute();
+    core.execute(true, layer == 39);
     execution_windows.emplace_back(t, Clock::now());
     metrics.execution[layer][2] += elapsed(t);
     metrics.native += elapsed(t);
@@ -608,6 +606,8 @@ void DecodeSession::experts(
 void DecodeSession::project(const float* x, float* logits) {
   if (!in_step || next_layer != 40)
     throw std::runtime_error("incomplete decode graph");
+  if (core.use_mailbox && !core.service_done.load(std::memory_order_acquire))
+    throw std::runtime_error("native forward has not completed");
   auto t = Clock::now();
   core.end_output_read();
   int input = head->index(true, 0), output = head->index(false, 0);

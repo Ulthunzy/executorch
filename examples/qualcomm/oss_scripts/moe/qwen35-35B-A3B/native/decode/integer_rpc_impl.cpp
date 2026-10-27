@@ -585,7 +585,7 @@ extern "C" AEEResult integer_rpc_release_fds(
   return 0;
 }
 
-// One RPC owns the command loop; each command still returns HMX/VTCM to QNN.
+// One RPC covers one forward; its final operator returns the invocation.
 extern "C" AEEResult integer_rpc_serve(remote_handle64 handle, int mailbox_fd) {
   // uncached mailbox 布局与 ARM NativeCore 对齐：0/1 命令、32/33 完成、64
   // 状态、96 描述。
@@ -600,6 +600,7 @@ extern "C" AEEResult integer_rpc_serve(remote_handle64 handle, int mailbox_fd) {
     return 84;
   uint32_t generation = 0;
   int result = 0;
+  write(box + 65, 2);
   write(box + 64, 1);
   while (true) {
     const auto idle_start = HAP_perf_get_qtimer_count();
@@ -619,7 +620,7 @@ extern "C" AEEResult integer_rpc_serve(remote_handle64 handle, int mailbox_fd) {
       write(box + 32, generation);
       break;
     }
-    if (command != 0) {
+    if (command != 0 && command != 2) {
       result = 86;
       write(box + 33, result);
       write(box + 32, generation);
@@ -631,7 +632,7 @@ extern "C" AEEResult integer_rpc_serve(remote_handle64 handle, int mailbox_fd) {
     result = integer_rpc_run_mapped(handle, descriptors, 14);
     write(box + 33, result);
     write(box + 32, generation);
-    if (result)
+    if (result || command == 2)
       break;
   }
   write(box + 64, 2);

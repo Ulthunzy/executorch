@@ -29,10 +29,9 @@ struct NativeCore {
   std::condition_variable service_changed;
   bool service_pending = false, service_stopping = false;
   std::atomic<int> service_status{0};
-  uint32_t generation = 0, service_calls = 0;
+  uint32_t generation = 0;
   uint64_t service_invocations = 0, mailbox_commands = 0,
            direct_invocations = 0, service_threads = 0;
-  std::chrono::steady_clock::time_point service_began;
   bool use_mailbox =
       getenv("NATIVE_MAILBOX") && std::string(getenv("NATIVE_MAILBOX")) == "1";
 
@@ -48,7 +47,7 @@ struct NativeCore {
 
   int stop_service();
 
-  int submit(const int* descriptors);
+  int submit(const int* descriptors, bool final_command);
 
   NativeCore(Runtime& r, const std::string&);
 
@@ -70,7 +69,7 @@ struct NativeCore {
 
   void end_output_read();
 
-  void execute(bool read_output = true);
+  void execute(bool read_output = true, bool final_command = false);
 
   void retire_inputs();
 

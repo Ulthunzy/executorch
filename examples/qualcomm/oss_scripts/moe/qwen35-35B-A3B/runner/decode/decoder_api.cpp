@@ -104,7 +104,10 @@ extern "C" int qwen35_decode_export_state(Qwen35SessionState* state) try {
   for (const auto& pending : session->pending)
     if (!pending.empty())
       throw std::runtime_error("unfinished decode expert prefetch");
-  check(session->core.stop_service(), "pause decode mailbox");
+  if (session->core.use_mailbox &&
+      !session->core.service_done.load(std::memory_order_acquire))
+    throw std::runtime_error(
+        "native execution must finish before state export");
   session->core.end_output_read();
   state->position = session->position;
   state->capacity = session->context_capacity;

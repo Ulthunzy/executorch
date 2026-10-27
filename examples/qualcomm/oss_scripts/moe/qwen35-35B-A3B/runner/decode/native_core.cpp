@@ -15,8 +15,7 @@ void NativeCore::await_mailbox(int word, uint32_t expected) {
 }
 
 void NativeCore::start_service() {
-  // ARM 服务线程持有长 RPC；周期性续调只更新调用生命周期，不重建 DSP
-  // 工作线程。
+  // The host thread persists, but each serve invocation covers one forward.
   if (service.joinable() && !service_done.load(std::memory_order_acquire))
     return;
   if (!mailbox)
@@ -45,8 +44,6 @@ void NativeCore::start_service() {
   }
   memset(box(), 0, 4096);
   generation = 0;
-  service_calls = 0;
-  service_began = std::chrono::steady_clock::now();
   service_status.store(0);
   service_done.store(false);
   {
@@ -56,6 +53,11 @@ void NativeCore::start_service() {
   }
   service_changed.notify_all();
   await_mailbox(64, 1);
+  if (__atomic_load_n(box() + 65, __ATOMIC_ACQUIRE) != 2) {
+    stop_service();
+    throw std::runtime_error(
+        "Native mailbox protocol mismatch; update the decode DSP skeleton with the runner");
+  }
 }
 
 int NativeCore::stop_service() {
@@ -72,7 +74,7 @@ int NativeCore::stop_service() {
   return service_status.load();
 }
 
-int NativeCore::submit(const int* descriptors) {
+int NativeCore::submit(const int* descriptors, bool final_command) {
   // word 96 起是 14 个描述字段；word 0 的 generation 递增后 DSP
   // 才读取本次命令。
   start_service();
@@ -80,19 +82,18 @@ int NativeCore::submit(const int* descriptors) {
   for (int i = 0; i < 14; i++)
     __atomic_store_n(
         box() + 96 + i, uint32_t(descriptors[i]), __ATOMIC_RELAXED);
-  __atomic_store_n(box() + 1, 0U, __ATOMIC_RELAXED);
+  __atomic_store_n(box() + 1, final_command ? 2U : 0U, __ATOMIC_RELAXED);
   __atomic_store_n(box(), ++generation, __ATOMIC_RELEASE);
   await_mailbox(32, generation);
   const int result = int(__atomic_load_n(box() + 33, __ATOMIC_ACQUIRE));
-  // The device limits one FastRPC invocation to 10 s. Renew the invocation
-  // after eight tokens or 3 s while retaining context, workers, maps and
-  // buffers.
-  if (++service_calls == 320 ||
-      std::chrono::steady_clock::now() - service_began >
-          std::chrono::seconds(3)) {
-    const int status = stop_service();
-    if (!result)
-      return status;
+  if (final_command) {
+    // The final operator ends the RPC normally; no stop command or state
+    // export is needed at the conversation boundary.
+    std::unique_lock<std::mutex> lock(service_mutex);
+    service_changed.wait(lock, [this] {
+      return service_done.load(std::memory_order_acquire);
+    });
+    return result ? result : service_status.load();
   }
   return result;
 }
@@ -111,8 +112,7 @@ NativeCore::NativeCore(Runtime& r, const std::string&) : runtime(r) {
       uri.find(original), original.size(), "libinteger_decode_rpc_skel.so");
 #endif
   check(
-      integer_rpc_open(
-          (uri + "&_dom=cdsp").c_str(), &handle),
+      integer_rpc_open((uri + "&_dom=cdsp").c_str(), &handle),
       "integer_rpc_open");
   remote_rpc_control_latency latency{RPC_POLL_QOS, 9999};
   check(
@@ -122,6 +122,10 @@ NativeCore::NativeCore(Runtime& r, const std::string&) : runtime(r) {
   for (size_t n : {1 * 2048 * 4, 1 * 8 * 4, 1 * 8 * 4, 1 * 2048 * 4, 32})
     inbuf.push_back(std::make_shared<Buffer>(r, n));
   outbuf.push_back(std::make_shared<Buffer>(r, 1 * 2048 * 4));
+  if (use_mailbox) {
+    mailbox = std::make_shared<Buffer>(r, 4096, Buffer::CachePolicy::Uncached);
+    map_buffer(mailbox);
+  }
   if (mapped)
     sync_buffer(outbuf[0], DMA_BUF_SYNC_END | DMA_BUF_SYNC_WRITE);
 }
@@ -175,7 +179,7 @@ void NativeCore::end_output_read() {
   }
 }
 
-void NativeCore::execute(bool read_output) {
+void NativeCore::execute(bool read_output, bool final_command) {
   if (mapped) {
     if (output_read) {
       sync_buffer(outbuf[0], DMA_BUF_SYNC_END | DMA_BUF_SYNC_READ);
@@ -197,7 +201,7 @@ void NativeCore::execute(bool read_output) {
     if (!use_mailbox)
       ++direct_invocations;
     const int mapped_status = use_mailbox
-        ? submit(descriptors)
+        ? submit(descriptors, final_command)
         : integer_rpc_run_mapped(handle, descriptors, 14);
     if (mapped_status)
       fprintf(stderr, "NATIVE_RESOURCE_FAILURE code=%d\n", mapped_status);
@@ -281,6 +285,12 @@ void NativeCore::release_io() {
 void NativeCore::close() {
   if (!handle)
     return;
+  printf(
+      "NATIVE_DISPATCH direct_rpcs=%llu service_rpcs=%llu mailbox_commands=%llu arm_service_threads=%llu\n",
+      (unsigned long long)direct_invocations,
+      (unsigned long long)service_invocations,
+      (unsigned long long)mailbox_commands,
+      (unsigned long long)service_threads);
   const int service_error = stop_service();
   int profile_error = 0;
   if (getenv("MOE_PROFILE_TOTAL")) {
