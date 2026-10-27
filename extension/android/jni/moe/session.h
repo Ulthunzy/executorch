@@ -28,9 +28,13 @@ class Workspace {
   const std::string& root() const {
     return root_;
   }
+  const std::string& package_root() const {
+    return package_root_;
+  }
 
  private:
   std::string root_;
+  std::string package_root_;
   std::vector<int> handoff_fds_;
 };
 

@@ -61,6 +61,8 @@ target_compile_definitions(
 target_include_directories(
   qwen35_moe_jni
   PRIVATE "${_repo}/.."
+          "${_repo}/third-party/flatbuffers/include"
+          "${EXECUTORCH_ANDROID_BUILD}/schema/include"
           "${_repo}/runtime/core/portable_type/c10"
           "${EXECUTORCH_ANDROID_BUILD}/include"
           "${MOE_BUILD_DIR}/native-prefill"
@@ -101,6 +103,7 @@ target_link_libraries(
     ${_qwen35_cdsprpc}
     dl
     log
+    z
 )
 install(TARGETS qwen35_moe_jni LIBRARY DESTINATION jniLibs/arm64-v8a)
 install(FILES "${MOE_BUILD_DIR}/libmoe_decode.so" DESTINATION jniLibs/arm64-v8a)

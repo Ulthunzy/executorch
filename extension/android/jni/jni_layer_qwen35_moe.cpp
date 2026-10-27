@@ -113,24 +113,30 @@ Java_org_pytorch_executorch_extension_llm_Qwen35MoeModule_createNative(
     auto root = utf8(env, model), cache = utf8(env, workspace);
     auto files = std::make_unique<qwen35_jni::Workspace>(
         root, cache, utf8(env, libraries));
+    const auto packaged = files->package_root();
     std::vector<std::string> args = {
         "qwen35_moe_jni",
         "--model-root",
         files->root(),
         "--shared-model",
-        utf8(env, shared),
+        packaged.empty() ? utf8(env, shared) : packaged + "/shared-model",
         "--tokenizer-path",
-        utf8(env, tokenizer),
+        packaged.empty() ? utf8(env, tokenizer) : packaged + "/tokenizer.json",
         "--system-prompt",
         utf8(env, system),
-        "--max-seq-len",
-        std::to_string(capacity),
-        "--cache-experts",
-        std::to_string(experts),
         "--prompt",
         "JNI initialization"};
+    if (capacity) {
+      args.push_back("--max-seq-len");
+      args.push_back(std::to_string(capacity));
+    }
+    if (experts) {
+      args.push_back("--cache-experts");
+      args.push_back(std::to_string(experts));
+    }
     if (vision)
       args.push_back("--interactive");
+    args.push_back(vision ? "--vision" : "--no-vision");
     std::vector<char*> argv;
     for (auto& arg : args)
       argv.push_back(arg.data());
@@ -166,8 +172,7 @@ Java_org_pytorch_executorch_extension_llm_Qwen35MoeModule_generateNative(
   try {
     auto session = find(handle);
     if (!callback || count < 1 || count > session->capacity() ||
-        !std::isfinite(temperature) ||
-        temperature < 0)
+        !std::isfinite(temperature) || temperature < 0)
       throw std::invalid_argument("Invalid generation settings or callback");
     moe_chat::Request request;
     request.prompt = utf8(env, prompt);

@@ -10,9 +10,9 @@ import java.util.Objects;
 /**
  * Qwen3.5 35B-A3B external-expert runtime. Independent of LlmModule.
  *
- * <p>Generate on a background thread. Callbacks run on that same caller thread.
+ * <p>Construct and generate on a background thread. Callbacks run on that same caller thread.
  * The first generation loads the model; subsequent turns reuse context, KV and
- * experts until close(). Model assets must be ordinary extracted files. Use an
+ * experts until close(). A bundled PTE is extracted and cached internally. Use an
  * app-private cache directory for workspaceDirectory. Only one instance may be
  * open per process; do not run another QNN model concurrently with this runtime.
  */
@@ -36,6 +36,13 @@ public final class Qwen35MoeModule implements AutoCloseable {
       this.tokenizerPath = Objects.requireNonNull(tokenizerPath);
       this.workspaceDirectory = Objects.requireNonNull(workspaceDirectory);
       this.nativeLibraryDirectory = Objects.requireNonNull(nativeLibraryDirectory);
+    }
+
+    /** Load one complete model PTE; infer context and expert slots from its metadata. */
+    public Config(String modelPte, String workspaceDirectory, String nativeLibraryDirectory) {
+      this(modelPte, "", "", workspaceDirectory, nativeLibraryDirectory);
+      this.contextLength = 0;
+      this.expertsPerLayer = 0;
     }
   }
 

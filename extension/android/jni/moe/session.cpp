@@ -106,7 +106,11 @@ Workspace::Workspace(
     const std::string& model,
     const std::string& cache,
     const std::string& libraries) {
-  const auto source = fs::canonical(model);
+  if (fs::is_regular_file(model))
+    package_root_ = unpack_model_package(model, cache);
+  const auto source = fs::canonical(
+      package_root_.empty() ? fs::path(model)
+                            : fs::path(package_root_) / "model");
   const auto parent = fs::canonical(cache);
   std::string pattern = (parent / "qwen35-moe-XXXXXX").string();
   if (!mkdtemp(pattern.data()))
@@ -148,6 +152,8 @@ Workspace::Workspace(
           "prefill-history-ids.i32",
           "prefill-history-stamps.u64"})
       fs::create_symlink(fs::path(root_) / "prefill" / name, decode / name);
+    if (!package_root_.empty())
+      link_model_libraries(root_, libraries);
     // Packaged APK libraries have unique basenames for the two DSP skeletons.
     if (!libraries.empty()) {
       const fs::path libs = fs::canonical(libraries);
