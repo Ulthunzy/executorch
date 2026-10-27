@@ -17,7 +17,7 @@ python examples/qualcomm/oss_scripts/moe/qwen35-35B-A3B/export.py \
 | `source` | `calibrated` 复用已有完整 GPTQ 产物；`safetensors` 从原始 checkpoint 顺序校准 |
 | `model_config` | 相对于导出配置文件的模型配方路径；所有内部阶段使用同一份快照 |
 | `components` | `["text", "vision"]`、仅 `["text"]` 或仅 `["vision"]` |
-| `format` | `pte`：共享图/外部权重、完整40层 host PTE 计划；`qnn`：共享 QNN context，不做设备权重采集或 host PTE 打包 |
+| `format` | `pte`：自动交付单个 `model.pte`，内含完整40层计划、共享图/权重、专家、视觉及 tokenizer；`qnn`：共享 QNN context，不做设备权重采集或 host PTE 打包 |
 | `phases` | `pte` 可选择 `prefill` / `decode` 的执行计划；共享 QNN 组始终同时编译 AR128/AR1 方法，维持两阶段常量和量化网格一致 |
 | `calibration_dir` | 校准产物根目录；从 safetensors 开始时在此生成新的 GPTQ 产物 |
 | `output` | 新的导出目录，与校准目录分开；也可用 `--output` 临时覆盖 |
@@ -28,7 +28,7 @@ python examples/qualcomm/oss_scripts/moe/qwen35-35B-A3B/export.py \
 
 模型、校准/输出/构建目录和图片的相对路径均以仓库根目录为基准；`model_config` 的相对路径以导出配置文件所在目录为基准。现有配置保持已验证的 W4/W8/N2 混合量化及 UINT16 cache，入口整理不改变这些精度。
 
-默认配置复用保留的 GPTQ 校准产物，输出到 `llama-output/qwen35-35B-A3B-export`。改为 `source=safetensors`、把 `calibration_dir` 指向新的目录，仍使用上面同一条命令，即可从头生成。完整文本顺序校准目前需要 CUDA；每次只处理当前层/四层编译组，避免同时加载多个导出进程。
+默认配置使用 `source=safetensors`，从原始权重执行 GPTQ 校准，再完成 QNN 编译和 PTE 打包。当前校准、编译和构建产物分别保存在 `llama-output/qwen35-moe-safetensors-export-20261027/` 的 `calibration/`、`pte/` 和 `build/`。正式导出配置保存在 `configs/`；`llama-output/` 保存产物及其来源记录。需要复用已校准权重时，将 `source` 改为 `calibrated`，并指定对应的 `calibration_dir` 和新的 `output`。完整文本顺序校准目前需要 CUDA；每次只处理当前层/四层编译组，避免同时加载多个导出进程。
 
 导出目录包括：
 
@@ -49,7 +49,7 @@ logs/                    # 各阶段日志
 
 保留符号链接所引用的 `calibration_dir`；部署仍按实际文件读取。Routed MoE 专家保持外部 Native bank，不会因为选择 QNN 格式而变成单一标准 QNN MoE 图。中间 `methods.pte` 在每组 context 提取后删除，避免与编译后的权重重复占用磁盘。
 
-重复执行同一命令会核对检查点并跳过已完成阶段。失败阶段及其后续步骤重新执行；配置、源码或输入变化时要求换用新输出目录。`--no-resume` 只用于相同配置下主动重跑。导出目录的文件锁防止同时启动两个大模型导出。
+`--output DIR` 覆盖配置中的导出工作目录，最终交付文件为 `DIR/model.pte`。目录不存在时创建；有效检查点和产物 SHA256 均一致时跳过阶段，损坏阶段及后续阶段重建。检查点缺失、无效或来源变化时会清理并重建该专用工作目录，不删除源模型、校准数据或 SDK。`calibration_dir` 必须与输出目录相互独立，量化按自己的来源/数值配置/源码与完整文件校验单独恢复；只修改编译或交付配置时，已完成 GPTQ 可以继续复用。`--no-resume` 强制重跑编译流程，量化子流程仍验证并复用完成产物。目录外的文件锁防止并发清理和重复导出。
 
 完整 P/D 导出完成后，主机推理可直接选择生成的配置：
 
@@ -65,7 +65,7 @@ python examples/qualcomm/oss_scripts/moe/qwen35-35B-A3B/run_chat.py \
 
 ### 设备、芯片与架构
 
-目标可以写入导出配置的 `soc_model` / `dsp_arch`，也可以在命令行覆盖：
+目标只需配置 `soc_model`，也可以用命令行 `--soc-model` 覆盖。Hexagon 架构由该 SoC 自动推导：
 
 ```bash
 python examples/qualcomm/oss_scripts/moe/qwen35-35B-A3B/export.py \
@@ -79,7 +79,7 @@ python examples/qualcomm/oss_scripts/moe/qwen35-35B-A3B/export.py \
 | `SM8850` | `v81` | 专家内核交叉编译通过，整模设备验证待做 |
 | `SM8975` | `v85` | 新导出40层模型的文本、图片、采样控制及多轮设备回归通过 |
 
-SoC 枚举及 SoC→HTP 架构关系直接复用 `backends/qualcomm/serialization/qc_schema.py` 的 `QcomChipset`、`HtpArch` 和 `_soc_info_table`，本目录不再维护第二份映射。Native 只筛选 V79/V81/V85；表中的其他同架构芯片可选择，但未完成整模设备验证。Python 配置与 `build.sh` 使用同一解析逻辑，显式 `--dsp-arch` 必须匹配。
+SoC 枚举及 SoC→HTP 架构关系直接复用 `backends/qualcomm/serialization/qc_schema.py` 的 `QcomChipset`、`HtpArch` 和 `_soc_info_table`，本目录不再维护第二份映射。Native 只筛选 V79/V81/V85；表中的其他同架构芯片可选择，但未完成整模设备验证。导出、推理与 `build.sh` 使用同一映射，命令行不再单独指定 `--dsp-arch`。旧产物中的架构字段只用于一致性校验。
 
 目标传递至 Attention/head/视觉/Router 的QNN编译与校准、Native编译、GDN op package和部署库名，生成的 `MODEL_CONFIG.json`、`TARGET.json` 和图元数据记录实际目标。更换SoC必须使用新的导出/构建目录和匹配的设备QNN运行库。新入口在执行前核对 `ro.soc.model`，不会将V85库作为V79部署。
 
@@ -255,10 +255,11 @@ embedding 的 one-hot Hessian 为对角阵，固定网格下 GPTQ 目标退化�
 | `workflow/plans.py` | 推理时只选择并校验导出的计划，不调用导出或序列化代码 |
 | `workflow/vision.py` | 校验视觉元数据，保留离线诊断所需的图片参考处理；正常图片解码在设备C++中完成 |
 
-标准产物为：
+交付文件只有 `output/model.pte`。以下是保留在工作目录中的恢复/诊断中间产物，不需要逐个分发：
 
 ```text
 output/
+├── model.pte           # 唯一模型交付文件
 ├── MODEL_CONFIG.json
 ├── EXPORT.json
 ├── device.json
@@ -276,7 +277,7 @@ output/
 
 Prefill计划的长度表示主机调度的总输入长度，QNN/Native仍执行AR128块；这些小型PTE不复制模型权重。`run_chat.py --weights-path output` 读取 `plans/`，缺失、容量、量化网格、共享IO签名或调度不匹配时提前报错。调整静态配置或prefill顺序后，使用统一导出入口生成对应产物。运行端不再提供自动补打包的路径。
 
-`--local-prefill-pte`、`--local-decode-pte` 只用于选择已有的诊断计划及其JSON；正常聊天使用完整导出目录。
+`--local-prefill-pte`、`--local-decode-pte` 只用于选择已有的诊断计划及其JSON；正常聊天优先使用 `--weights-path output/model.pte`；完整导出目录也继续兼容。
 
 ## Thinking 与生成
 
@@ -290,7 +291,9 @@ python -u "$MOE_ROOT/run_chat.py" \
   --max-new-tokens 128
 ```
 
-`--no-enable-thinking` 显式关闭。文本和图片都通过模型原生 chat template 传递 `enable_thinking`，不是仅修改日志标签。`max_new_tokens` 包含 thinking 产生的 token。正常会话支持temperature采样及EOS开关，诊断链路保持greedy。
+当前默认模型配置开启 thinking，`--no-enable-thinking` 显式关闭；旧 PTE 内保存关闭配置时，可用 `--enable-thinking` 在运行时覆盖，无需重新量化或导出。文本和图片都通过模型原生 chat template 传递 `enable_thinking`，不是仅修改日志标签。终端和 JNI 回调显示输入模板中的 `<think>` 起始标记，后面跟随模型实际生成的内容及 `</think>`；补显起始标记不增加生成 token 数。`max_new_tokens` 同时包含思考和最终答案产生的 token，需给两部分留出预算。正常会话支持temperature采样及EOS开关，诊断链路保持greedy。
+
+每轮原生性能报告之后显示累计 `KV cache`、容量、待写入 token 数和完整上下文长度。缓存长度按有效 token 推进，不含 AR128 尾部填充。最后一个已采样 token（包括 EOS）暂未写回，下一轮输入提交时一起写入；因此完整上下文通常比 KV 已写入长度多 1。JNI 的 `onStats` 返回对应的 `kv_cache_tokens`、`pending_tokens`、`context_tokens`、`context_capacity`、`enable_thinking` 字段。
 
 普通文本尾部使用 inactive padding，不向用户提示插入空白文字；只有 `--prompt-tokens 1024` 等显式性能测试才用真实空白补长。`PROMPT.txt` 保存实际模板内容。`--prefill-token-file` 表示输入已经完成模板编码，不会再套 system/thinking；`RUN.json.input_mode` 与 `template_enable_thinking` 明确记录这一点。
 
@@ -345,7 +348,7 @@ python -u "$MOE_ROOT/run_chat.py" \
 
 量化宽度继续使用已验证的混合配置：Attention 为 W4、GDN K/z 与 depthwise 为 W8，Router/shared 和视觉为 W8，head 与 embedding 为 W4，routed experts 为 N2 存储并在 Native 内展开成 N4×A8。QNN 图包含 Attention、Router/shared、head、视觉；routed experts 生成外部 Native bank。
 
-在 `configs/export_sm8975.json` 中设置 `source` 为 `safetensors`，将 `calibration_dir` 和 `output` 指向新的目录；`corpus`、`images` 指向实际校准数据。仍执行本文开头的同一条 `export.py --config` 命令，无需手动运行 prepare/head/shared/vision/分离/打包。
+`configs/export_sm8975.json` 默认已设置 `source=safetensors`，并分别配置校准与导出目录；`corpus`、`images` 指向实际校准数据。开启新任务时可在该文件中调整目录。仍执行本文开头的同一条 `export.py --config` 命令，无需手动运行 prepare/head/shared/vision/分离/打包。
 
 当前层从 safetensors 读取，按 Attention → Router/shared → 全部256专家的顺序推进；下一层使用上一层实际量化输出。子进程逐阶段释放显存，内部 `prepare_model.py` 的层级检查点与外层导出检查点共同支持续跑。原始 FP32 链路另行传播，拟合、选择和留出序列分离；不更改 GPTQ 配方与数据用途。
 

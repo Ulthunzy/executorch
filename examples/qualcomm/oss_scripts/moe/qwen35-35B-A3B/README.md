@@ -6,6 +6,8 @@
 
 导出、量化和推理各自保留入口，共用 [configs/model.json](configs/model.json) 中的量化、KV/state、上下文、thinking 和调度配置；[configs/sm8975.json](configs/sm8975.json) 只管理本机和设备路径。**完整命令、参数生效位置及支持范围见 [CONFIGURATION.md](CONFIGURATION.md)。**
 
+正式导出配置统一放在 [configs/export_sm8975.json](configs/export_sm8975.json)，默认从原始 safetensors 开始 GPTQ 校准、QNN 编译和 PTE 打包；`llama-output/` 保存量化、构建和导出产物。
+
 校准源保留在 `llama-output/qwen35-moe-from-safetensors-gptq-20261024`，包含全矩阵 GPTQ 权重、binding、WikiText 语料、两张校准图片及运行库。统一入口的新完整导出位于 `llama-output/qwen35-35B-A3B-export`；2026-10-26 已在 SM8975 验证有效长度 AR128、文本/图片及多轮推理。下文历史命令说明当时测试口径，当前运行使用统一导出及 `CONFIGURATION.md` 中的命令。
 
 分词器继续使用原有 `meta-pytorch/tokenizers` 子模块，锁定上游正式提交 `32af6c1b623639515a08ab9b2b4580ffe570c42a`（上游 PR #198，支持 `ByteLevel use_regex=false`），无需额外的自定义分词器仓库。拉取源码后执行 `git submodule update --init --recursive`。更新版本后应重建对应 Android 分词器静态库，再重新链接 runner/JNI，保证头文件与静态库匹配。
@@ -18,7 +20,8 @@
 
 ```bash
 python examples/qualcomm/oss_scripts/moe/qwen35-35B-A3B/export.py \
-  --config examples/qualcomm/oss_scripts/moe/qwen35-35B-A3B/configs/export_sm8975.json
+  --config examples/qualcomm/oss_scripts/moe/qwen35-35B-A3B/configs/export_sm8975.json \
+  --output llama-output/qwen35-moe-export
 ```
 
 导出配置选择文本/视觉组件、PTE/QNN 格式、复用校准产物或从 safetensors 开始，以及输出与工具链路径；引用的 `model.json` 统一管理量化、KV、上下文和调度。`--soc-model` / `--soc_model` 选择 SM8750/V79、SM8850/V81 或 SM8975/V85，`--device` 选择采集设备。内部串行执行构建、量化、分组 QNN 编译、共享权重分离与 PTE 打包，保存检查点以便续跑。`--print-plan` 查看计划，`--check` 检查本地依赖。原分步脚本已移入 `export/`，作为内部实现保留；详细字段、产物格式和推理命令见 [配置说明](CONFIGURATION.md#一条命令导出)。
@@ -27,13 +30,73 @@ python examples/qualcomm/oss_scripts/moe/qwen35-35B-A3B/export.py \
 
 ```bash
 python examples/qualcomm/oss_scripts/moe/qwen35-35B-A3B/run_chat.py \
-  --weights-path llama-output/qwen35-35B-A3B-export \
+  --weights-path llama-output/qwen35-moe-export/model.pte \
   --device A7SR026915000282 --soc-model SM8975 \
   --temperature 0.7 --max-new-tokens 256 \
   --interactive --stream --prompt "请介绍一下自己。"
 ```
 
-图片使用 `--image-path /path/to/image.jpg`，在设备内解码；后续图片使用 `--with-vision` 保留视觉塔。`--ignore-eos` 控制停止条件，`--no-stream` 改为每轮生成完再显示。旧 teacher-forcing / 张量dump仍进入诊断链路。新会话要求配套的新runner和支持有效长度的AR128图，统一导出会同时生成；旧产物不会被自动覆盖。三种架构的专家内核与GDN包已通过交叉编译，V79/V81整模设备验证尚未执行。
+图片使用 `--image-path /path/to/image.jpg`，在设备内解码；后续图片使用 `--with-vision` 保留视觉塔。`--ignore-eos` 控制停止条件，`--no-stream` 改为每轮生成完再显示。旧 teacher-forcing / 张量dump仍进入诊断链路。新会话要求配套的新runner和支持有效长度的AR128图，统一导出会同时生成；复用同一工作目录时，由检查点决定复用或重建；冻结产物应保留在独立目录。三种架构的专家内核与GDN包已通过交叉编译，V79/V81整模设备验证尚未执行。
+
+### 单文件交付与量化缓存
+
+`--output` 指定导出工作目录；省略时使用配置中的 `output`。`format=pte` 最终自动生成 `output/model.pte`：采用 ExecuTorch 原生 named-data segments，包含 prefill/decode 执行计划、共享 QNN 图与权重、全部外存专家、INT4 embedding、视觉编码器、tokenizer 和模型配置。工作目录中的分步文件用于恢复导出，交付时只需复制 `model.pte`，无需手动收集 `.bin`、各层 PTE 或 tokenizer。QNN SDK 和 runner/JNI 属于运行环境，由应用另行提供。
+
+输出目录不存在时自动创建。有完整检查点且文件内容校验通过的阶段直接复用；损坏阶段及其后续阶段重建。没有有效检查点或来源发生变化的工作目录会清理重建。量化使用独立 `calibration_dir` 检查点：根据原始权重来源、校准数据、数值配置、量化源码和产物 SHA256 判断复用，编译或打包重试不会无故重做 GPTQ。两个目录必须独立，使用专用目录，不能包含源模型、校准输入或 SDK。
+
+Python 的 `--weights-path` 和设备终端的 `--model-root` 都接受这个 PTE。首次加载以 8 MiB 分块校验、解包到本地 UFS 缓存，后续复用缓存；专家仍按原调度读取，不会将整包载入 DRAM。首次部署需同时容纳 PTE 和解包缓存。原来的目录加载方式继续支持。
+
+```bash
+# 设备终端：SDK/私有算子库和 runner 已放在当前 runtime 目录
+export LD_LIBRARY_PATH="$PWD:/odm/lib64:$LD_LIBRARY_PATH"
+export ADSP_LIBRARY_PATH="$PWD:/odm/lib64/rfsa"
+./qwen35_moe_runner --model-root /data/local/tmp/model.pte \
+  --package-cache /data/local/tmp/qwen35-cache --library-directory "$PWD" \
+  --prompt "你好，请介绍一下自己。" --max-new-tokens 128 --temperature 0
+```
+
+JNI 可用 `new Qwen35MoeModule.Config(modelPte, workspaceDirectory, nativeLibraryDirectory)`，从包内读取 tokenizer、共享权重、上下文和专家槽数；图片与多轮接口保持原逻辑。首次创建及推理放在后台线程。
+
+终端输入会规范化 CRLF，空行和纯空白不会触发推理，`/exit`、`/reset` 同样支持 CRLF。默认在 `<|im_end|>`/`<|endoftext|>` 停止；`--ignore-eos` 才用于固定输出长度测试，`--no-ignore-eos` 可显式恢复正常停止。
+
+会话生命周期与 `llama/runner::Runner` 一致：模型、module、context、buffer、KV/GDN state 和专家缓存随 session 常驻；每次 forward 的计算请求在返回前完成。Native mailbox 只覆盖一次 forward，最后一层的最终 MoE 命令同时标记本次调用结束，DSP 完成计算后正常返回。host 工作线程和 DSP worker 保留，不跨 token、回调或用户等待保留尚未返回的 RPC。聊天层不在每轮结束导出状态或暂停服务；状态导出仅用于真正的 prefill/decode 数据交接。Native mailbox 协议版本为2，runner、decode DSO 与 decode DSP skeleton 须配套更新。
+
+执行边界回归（2026-10-27）：32-token 同输入两轮对照，原跨调用方案平均11.0099 token/s；逐算子同步方案9.4876 token/s；最终每forward完成方案10.9760 token/s（相差−0.31%，各组生成token ID逐项一致）。31次forward对应31次RPC、1240条MoE命令，host工作线程只创建1次。等待15、30、65秒的四轮对话通过，模型重载为0、decode context创建/释放为0；JNI回调和轮次间各等待12秒后图文、多轮、停止、关闭回归通过。记录：`llama-output/qwen35-rpc-execution-boundary-20261027/RESULTS.json`。
+
+性能统计直接复用 `extension/llm/runner/stats.h` 的 `Stats`、`stats_to_json_string()` 和 `print_report()`，与 `llama/runner/runner.cpp` 使用相同接口和计量口径。每轮在终端显示原生 `PyTorchObserver` JSON、模型加载、prompt evaluation、生成速度、TTFT 和 sampling time；报告期间临时切回终端，结束后恢复模型日志输出。原先新增的 `performance.h/.cpp` 已删除，没有单独维护打印格式或吞吐公式。有效 prompt token 数不含 AR128 补齐；生成数量、prefill/decode 速率遵循原生 Stats。TTFT 按原生口径排除模型加载；后续轮复用上下文，`Model Load Time` 保留首次加载值（原生 `Stats.reset()` 行为）。JNI completion JSON 复用原生序列化并保留 `generation_ms`、`position`、`eos`、`stopped`、`requires_reset` 等已有字段。
+
+2026-10-27 交互回归：旧版 `\r\n` 可复现重复回复；修复后空白输入不增加轮次，真实的第二轮数学问题正常回答。正常模式在第127个生成 token（248046）停止，显式忽略 EOS 才输出满128个 token；JNI 图文、多轮、停止和关闭回归通过。完整记录：`llama-output/qwen35-chat-interactive-fix-20261027/RESULTS.json`。一次 QNN RPC 1003 已单独保留日志，释放会话后复测通过；不将它归为此次交互逻辑问题。
+
+原生统计接口复测：终端直接输出两轮 `PyTorchObserver` 与 `stats.h` 原生报告，CRLF 空白行不触发推理；主机检查及 JNI 图文/多轮/停止/关闭回归通过。记录：`llama-output/qwen35-native-stats-20261027/RESULTS.json`。
+
+
+单文件实测（2026-10-27）：复用已完成的真实40层 GPTQ 产物，306项模型资源、100项内部路径映射合并为 10,919,610,226 字节（约10.17 GiB）的 `model.pte`。SM8975/V85 上，原生终端冷/热加载均正常输出“你好！我是你的AI助手。”；JNI 文本、图片、多轮、停止和关闭回归通过，热加载未改写专家缓存文件。69项Python测试及主机检查通过，Android runner/JNI 编译通过。验证记录保存在 `llama-output/qwen35-moe-safetensors-export-20261027/PACKAGE_VALIDATION.json`；本次没有重新量化权重或启动正式 benchmark。
+
+### 2026-10-27：KV/thinking 显示及 JNI 性能回归
+
+终端每轮原生 Stats 后显示全局 KV 长度、尚未写入的采样 token、两者之和及逻辑容量。开启 thinking 时显示输入模板的 `<think>\n`，模型输出的 `</think>` 保留，其余控制 token 仍过滤；输入前缀不重复计入生成数量。关闭 thinking、忽略 EOS 等开关保持显式控制。
+
+SM8975/v85、QNN2.48.1、1152 总上下文、AR128、每层32槽；同一模型、权重和 bounded RPC 调度，只撤回显示及 thinking 标记解析作为对照。各项新旧各2轮性能均值，固定输出128 token，主表关闭 thinking。JNI 通过真实 Java `generate/generateWithImage` 调用及流式回调测试，不从终端耗时推算。
+
+| 输入 | CLI Prefill 旧→新 token/s | CLI Decode 旧→新 token/s | JNI Prefill 旧→新 token/s | JNI Decode 旧→新 token/s |
+| --- | ---: | ---: | ---: | ---: |
+| 128 文本 | 84.79→86.17 | 11.979→11.963 | 85.40→85.66 | 12.291→12.335 |
+| 1024 文本 | 425.40→434.35 | 11.134→11.098 | 434.91→436.55 | 11.148→11.151 |
+| 256 图文 | 140.62→141.93 | 11.620→11.660 | 137.87→138.08 | 10.572→10.559 |
+
+Prefill 为纯 LLM 执行，不含加载、图片解码或 encoder；decode 取原生 Stats。两路径为各自严格控制的输入对照，填充文本不同，不能用两列绝对速度推断 JNI 开销。补充开启 thinking 的 JNI 128-token 测试：prefill 85.45→85.22、decode 10.719→10.778 token/s。同一实例第二轮生成64 token：11.225→11.227 token/s。JNI 吞吐变化均不足0.6%，未观察到明显回退；各输入对照组输出 token ID 逐项一致，不代表完成了新的 PPL 或正式 benchmark。
+
+| JNI 输入 | 峰值内存旧→新 GiB |
+| --- | ---: |
+| 128 文本 | 3.8897→3.9136 |
+| 1024 文本 | 3.98248→3.98250 |
+| 256 图文 | 4.4606→4.4785 |
+
+内存另跑独立轮次，包括 JVM、CPU PSS、按 inode 去重的 DMA 并减去已计 PSS 的 DMA 映射，以及未映射的交接 memfd 驻留页。普通周期采样会漏掉短暂交接，测试专用 JNI 库在释放80个快照前补一次只读采样，均计入56.875MiB；正式库没有该插桩。128文本的约24.4MiB差异来自峰值帧的CPU PSS，图文的约18.2MiB差异主要为采样时刻DMA占用，两者均不足1%；不能据此声称存在持续增长或节省内存。全部28轮 JNI 性能/内存运行前后热状态为0。
+
+单PTE Java构造接口另外通过中文/emoji、图文、12秒回调及轮间等待、多轮、thinking结束标记、累计KV、坏图恢复、取消、回调异常、并发拒绝、reset及关闭重开回归。JNI `enableVision=false` 显式传递 `--no-vision`，覆盖包内默认值；原有接口签名保留。61项Python回归、主机C++检查及10项padding数值测试通过。设备为 `app_process` 测试，尚非普通APK安装验证；未恢复暂停的173题质量评测。
+
+汇总与库指纹见[持久验证记录](docs/chat-jni-validation-20261027.json)。原始终端和JNI日志、分轮数据及独立内存插桩保留在 `llama-output/qwen35-chat-performance-regression-20261027/` 和 `llama-output/qwen35-jni-performance-regression-20261027/`，不纳入源码提交。
 
 ### 2026-10-26：从 safetensors 完整重导出回归
 
@@ -145,7 +208,21 @@ cd /data/local/tmp/qwen35-raw-gptq-20261024/runtime/w2a8-fused-c1152-p128-cache3
   --max-new-tokens 128
 ```
 
-输入 `/reset` 清空对话，输入 `/exit` 退出。也可用 `--prompt "第一问" --prompt "第二问"` 连续执行多轮；增加 `--interactive` 可继续从终端读取。`--temperature 0` 为 greedy，`--enable-thinking` 开启思考模板，默认关闭。运行日志及逐 token 时间记录在模型目录的 `chat.log`，可用 `--log-path` 修改。
+输入 `/reset` 清空对话，输入 `/exit` 退出。也可用 `--prompt "第一问" --prompt "第二问"` 连续执行多轮；增加 `--interactive` 可继续从终端读取。`--temperature 0` 为 greedy。当前默认模型配置开启 thinking，可用 `--enable-thinking` / `--no-enable-thinking` 显式覆盖；旧 PTE 内的配置可能仍为关闭，使用 `--enable-thinking` 即可，无需重新导出。开启时终端和 JNI 回调包含 `<think>` 标记及模型实际生成的内容；输入中的起始标记只用于显示，不计入生成 token。思考与答案共用 `--max-new-tokens` 预算，可按上下文剩余容量提高该值。运行日志及逐 token 时间记录在模型目录的 `chat.log`，可用 `--log-path` 修改。
+
+每轮仍调用 ExecuTorch 原生性能报告，随后显示 `KV cache: N / capacity tokens; pending: P; context length: N+P`。`N` 是跨轮累计、已实际写入 state/KV 的有效 token 数，`P` 为最后一个已采样但尚未反馈的 token（可能是 EOS）；AR128 的无效 padding 不计入。JNI 返回相同含义的 `kv_cache_tokens`、`pending_tokens`、`context_tokens`、`context_capacity` 和 `enable_thinking` 字段；`/reset` 后从零累计。
+
+2026-10-27 SM8975 实测：thinking 两轮的 KV 长度为 242→473，完整上下文为 243→474，均由 EOS 正常结束；关闭 thinking 时为 41→71，`/reset` 后同一输入回到 41，输出 ID 完全相同。原生 HFTokenizer 的 added-token 过滤原本会隐藏 `</think>`，当前只对两个思考边界保留原样解码；显示修复前后两轮 415 个生成 ID 逐项一致，输入 token 数与 Transformers 模板一致。55 项 Python 测试、主机检查及 10 项 padding 测试通过，JNI 最终 smoke 覆盖思考边界、累计长度、图文、多轮、停止与关闭，结果为 `MOE_JNI_SMOKE_PASS`。模型未重新导出，验证记录见[RESULTS.json](../../../../../llama-output/qwen35-chat-context-thinking-20261027/RESULTS.json)。
+
+同日完成 KV/thinking 显示改动的受控性能回归：同一 SM8975/v85、1152 总上下文、AR128、32 槽/层、同一 PTE/权重和每 forward 一次 RPC 调度，对照版仅撤回本次显示和标记解码改动。固定输出 128 token、忽略 EOS，性能新旧各两轮取均值，内存另测，全部 22 次运行前后 Thermal Status 均为 0。主表 thinking 关闭，prefill 为不含加载和图像处理的纯 LLM 速度，decode 沿用 ExecuTorch 原生 Stats。
+
+| 输入 | Prefill 前→后 token/s | Decode 前→后 token/s | 采样峰值内存前→后 GiB |
+| --- | ---: | ---: | ---: |
+| 128 文本 | 84.79→86.17 | 11.979→11.963 | 3.8219→3.8218 |
+| 1024 文本 | 425.40→434.35 | 11.134→11.098 | 3.9380→3.9377 |
+| 256 图文 | 140.62→141.93 | 11.620→11.660 | 4.4431→4.4432 |
+
+另测 128 文本、两版均开启 thinking：prefill 82.72→86.49、decode 12.527→12.439 token/s（−0.70%），没有观察到明显回退；固定 128 输出不代表思考已经完成。每组全部重复轮和内存轮的输出 ID 逐项一致。主表内存峰值差不足 0.3 MiB；内存按 PSS＋去重 DMA－已计入 PSS 的 DMA 映射统计，初始化/释放期间的 FD 竞争造成少量不完整采样帧，保留原始数据并剔除这些帧，所有用于峰值的样本读取完整。Prefill 小幅均值差与重复轮的 I/O 波动相近，不据此认定显示改动带来计算加速。完整原始数据、有效帧数量、对照补丁和复现脚本见[性能报告](../../../../../llama-output/qwen35-chat-performance-regression-20261027/REPORT.md)。未恢复先前暂停的正式质量评测。
 
 首轮 Attention/Router 使用 AR128，普通请求仅在序列末尾加入无效 padding；显式 `--prompt-tokens` 的定长 benchmark 才向 system-message 填充真实空格。512–1024位置的同层专家 token 在 Native 内归并，HMX tile 仍最多32行；较短输入的 Native 维持 AR128。终端只加载一个 `prefill.pte`，由 C++ 按 AR128 分块，默认按 `layer_major` 让同一层完成全部 AR128 块并复用专家，再进入下一层。顺序来自部署的 `prefill/plans/PLANS.json`，可用 `--prefill-order chunk_major` 显式对照。后续轮将尚未反馈的最后一个生成 token、轮次分隔符及新问题按 AR128 分块追加，仅有效位置更新 state/KV，不重新计算历史；AR1只用于生成。Context、buffer、每层 LRU 和原生服务在会话内常驻；`/reset` 只清空 state/KV 和位置，不重新装载权重或丢弃专家缓存。达到静态上下文容量时拒绝追加，用户可显式 `/reset`。
 

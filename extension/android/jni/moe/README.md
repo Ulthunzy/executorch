@@ -6,6 +6,8 @@
 
 模型目录使用现有 `run_chat.py` 部署生成的布局：`prefill/`、`decode/`、`base-cos.f32`、`base-sin.f32`；图文另需 `VISION.json`、`model-config.json`、`prefill/vision.bin`。共享权重和 tokenizer 分别传入。模型、专家及权重必须解包成普通文件，不能直接传 APK asset URI。App UID 必须能读取这些路径。
 
+导出器现在默认生成单个 `model.pte`，可使用 `new Qwen35MoeModule.Config(modelPte, workspaceDirectory, nativeLibraryDirectory)`，内部校验、缓存解包并定位共享权重和tokenizer；旧的五参数目录构造接口仍保留。解包需要相应磁盘空间。`enableVision=false` 会覆盖包内默认值，纯文本使用此选项可避免加载视觉context。
+
 ```java
 import org.pytorch.executorch.extension.llm.Qwen35MoeModule;
 
@@ -35,9 +37,11 @@ model.close();
 
 JNI 的 prefill/decode cache 快照保存在会话私有 memfd，避免把阶段交接写入 UFS；decode 完成导入后立即关闭这些临时快照，后续轮次直接交接常驻 cache view 与专家 LRU 元数据，不再重复建立快照。模型权重仍通过原有只读文件映射与专家缓存读取。长生成后关闭再在同一进程重新创建曾出现 QNN 5005，完整评测暂采用每题独立进程，并保存运行失败记录；不能把短轮次的关闭重建测试视为长上下文已验证。
 
-快照I/O复用自有memfd句柄，使用pread/pwrite且保持原句柄的偏移和生命周期，适配Android对`/proc/self/fd`路径重开的权限限制。`tests/test_moe_file_io.cpp`在主机和SM8975覆盖普通文件、相对符号链接、截断及只读句柄保护。冻结旧部署已通过中文生成和2920-token首轮输入预检；本次新增 AR128 多轮/尾块路径尚待端侧回归。
+快照I/O复用自有memfd句柄，使用pread/pwrite且保持原句柄的偏移和生命周期，适配Android对`/proc/self/fd`路径重开的权限限制。`tests/test_moe_file_io.cpp`在主机和SM8975覆盖普通文件、相对符号链接、截断及只读句柄保护。冻结旧部署已通过中文生成和2920-token首轮输入预检；新增AR128多轮/尾块路径的1152容量端侧回归见下文，不能外推到全部上下文容量。
 
 `stop()` 在 decode 步之间及后续轮次的 AR128 块之间响应；首次模型初始化和首次 prefill 为同步阶段，完成当前阶段后响应。若在后续轮次的输入提交中取消，返回统计中的 `requires_reset=true`，下轮前应调用 `resetContext()`。统计 `generation_ms` 只包含生成，不包括模型加载和输入提交；端到端耗时需在 Java 调用外测量。EOS 计入 `generated_tokens`，不传给文本回调。
+
+`generate` / `generateWithImage` 的 `thinking=true` 使用原生思考模板，回调先收到模板中的 `<think>\n`，再收到模型生成的思考、`</think>` 和答案；起始标记不计入生成 token。传 `false` 保持直接回答。思考和答案共用 `maxNewTokens` 预算。`onStats` 另含累计 `kv_cache_tokens`（已写入）、`pending_tokens`（最后一个尚未写入的采样 token）、`context_tokens`（两者之和）、`context_capacity` 和 `enable_thinking`，`resetContext()` 后重新累计；AR128 无效 padding 不计入。
 
 同一实例的 generate/reset 并发调用会立即抛异常；close 会停止并等待模型线程。回调异常会取消当前输出并原样返回 Java。BPE 输出经增量 UTF-8 解码，支持中文和补充平面字符，不使用 JNI modified UTF-8 拼接 token。
 
@@ -81,6 +85,20 @@ cmake --install build/moe/qwen35-jni --prefix /path/to/app/src/main
 
 `../tests/Qwen35MoeSmokeTest.java` 使用真实模型，覆盖中文/emoji 分片、文本流式、多轮、图片路径解码、坏图恢复、取消、回调异常、并发拒绝、reset、close 和同进程重开。与其它 JNI 测试一样可编译成 dex 后用 `app_process` 执行；参数为 model、shared、tokenizer、workspace、nativeLibraryDir、imagePath。模型加载必须串行测试。
 
+单PTE回归使用四个参数：`model.pte workspace nativeLibraryDir imagePath`。若JNI与QNN依赖分别放在两个目录，`-Djava.library.path` 和 `LD_LIBRARY_PATH` 均需包含两者；仅设置后者不足以保证Android classloader加载QNN依赖。
+
 2026-10-26 已在 SM8975（A7SR026915000282）通过上述真实模型 Java/JNI 回归，包括在 token 回调内关闭模型、关闭后同进程重开并进行首轮图文 prefill。相同输入下 JNI 与终端 CLI 的 19 个生成 ID 完全一致；现有 Android 显式源码列表测试通过。该轮是 `app_process` 实测，尚未进行普通 APK 安装验证。日志和指纹见 [回归记录](../../../../llama-output/qwen35-moe-from-safetensors-gptq-20261024/android-jni-20261026/REPORT.md)。
 
 后续 benchmark 压力测试补充：首题连续生成512 token后，同进程重开模型仍复现一次共享context映射错误5005。此前短对话的重开回归通过不能外推为长会话压力稳定。当前批量质量评测采用每题独立设备进程；应用侧应优先长期持有模型并用reset清历史，长输出后的close/reopen稳定性仍待修复。
+
+2026-10-27：单PTE真实Java/JNI回归通过，包含12秒token回调等待和12秒轮间等待、累计KV长度、thinking的起止标记与正常EOS、图文、取消、回调异常及关闭重开。Native RPC在每次forward返回前完成，context、buffer和worker保持常驻，等待用户期间不保留未返回的RPC；需配套更新协议2的decode skeleton和DSO。
+
+同模型/量化/调度的旧显示实现与新实现对照，性能各2轮、固定输出128 token、32槽/层；28轮包含性能及独立内存补测，全部运行前后thermal status为0，同组生成ID逐项一致。
+
+| 输入 | Prefill旧→新 token/s | Decode旧→新 token/s | 峰值内存旧→新 GiB |
+| --- | ---: | ---: | ---: |
+| 128文本 | 85.40→85.66 | 12.291→12.335 | 3.8897→3.9136 |
+| 1024文本 | 434.91→436.55 | 11.148→11.151 | 3.98248→3.98250 |
+| 256图文 | 137.87→138.08 | 10.572→10.559 | 4.4606→4.4785 |
+
+Prefill只计LLM，不含加载、图片解码和encoder；decode取原生Stats。开启thinking补充组吞吐变化低于0.6%，同一实例第二轮生成64 token为11.225→11.227 token/s。性能轮无采样器；独立内存测试计入JVM、PSS、去重DMA与短暂交接memfd（56.875MiB），正式JNI库没有测试插桩。峰值差低于1%，未发现明显回退；不视为内存优化或完整质量评测。完整口径与指纹见[验证记录](../../../../examples/qualcomm/oss_scripts/moe/qwen35-35B-A3B/docs/chat-jni-validation-20261027.json)，原始记录保留在 `llama-output/qwen35-jni-performance-regression-20261027/`。本轮仍为 `app_process`，未做普通APK安装测试。
