@@ -8,6 +8,38 @@
 
 导出器现在默认生成单个 `model.pte`，可使用 `new Qwen35MoeModule.Config(modelPte, workspaceDirectory, nativeLibraryDirectory)`，内部校验、缓存解包并定位共享权重和tokenizer；旧的五参数目录构造接口仍保留。解包需要相应磁盘空间。`enableVision=false` 会覆盖包内默认值，纯文本使用此选项可避免加载视觉context。
 
+SM8850/V81 构建默认采用 prefill IO 16、decode IO 8、512 KiB 读取分块，直接加载旧PTE时也生效，无需Python启动参数或重新打包模型。V79/V85保持原调度默认值。
+
+当前SM8850整合版使用 `CMakePresets.json` 的 `sm8850` 入口，从
+`build/moe/qwen35-35B-A3B-sm8850` 安装已验证的Native MoE和GDN库，
+JNI、decode及共享权重提供者从同一份主源码构建，避免混入旧decode缓存ABI。
+SDK固定为2.51.200.261021。Java接口签名不变；旧PTE内可能仍记录32槽，
+需要显式选择本轮验证过的2048上下文和64槽：
+
+```java
+Qwen35MoeModule.Config config = new Qwen35MoeModule.Config(
+    modelPte, context.getCacheDir().getAbsolutePath(),
+    context.getApplicationInfo().nativeLibraryDir);
+config.contextLength = 2048;
+config.expertsPerLayer = 64;
+config.enableVision = false;
+Qwen35MoeModule model = new Qwen35MoeModule(config);
+```
+
+从仓库根目录构建并打包当前8850版本：
+
+```bash
+cmake --preset sm8850 -S extension/android/jni/moe
+cmake --build build/moe/qwen35-jni-sm8850 -j 3
+cmake --install build/moe/qwen35-jni-sm8850 \
+  --prefix build/moe/qwen35-jni-sm8850/install
+```
+
+安装目录 `install/jniLibs/arm64-v8a` 包含本项目的6个库；应用还需部署同一SDK的
+QNN runtime和V81 stub/skel，见下文打包说明。目录构造和单PTE构造都会使用
+`nativeLibraryDirectory` 中的共享权重提供者、decode、GDN和两个DSP skeleton，
+使新JNI的生命周期修复与实际加载的库一致。
+
 ```java
 import org.pytorch.executorch.extension.llm.Qwen35MoeModule;
 
@@ -15,8 +47,8 @@ Qwen35MoeModule.Config config = new Qwen35MoeModule.Config(
     modelDirectory, sharedWeightsDirectory, tokenizerPath,
     context.getCacheDir().getAbsolutePath(),
     context.getApplicationInfo().nativeLibraryDir);
-config.contextLength = 1152; // 必须与导出 PLANS.json 一致，不能只改此数值扩上下文
-config.expertsPerLayer = 32; // 16 / 32 / 64，与现有运行时一致
+config.contextLength = 2048; // 当前8850；必须与实际导出 PLANS.json 一致
+config.expertsPerLayer = 64; // 32 / 64，与现有运行时一致
 config.enableVision = true;
 Qwen35MoeModule model = new Qwen35MoeModule(config);
 
@@ -49,7 +81,9 @@ JNI 的 prefill/decode cache 快照保存在会话私有 memfd，避免把阶段
 
 ## 构建与打包
 
-先用 MoE 的 `build.sh` 构建匹配的 V85 native、decode DSO 和 op package（如前一版本已有构建，也需重建 host 库以包含生命周期修复），随后独立构建本 JNI。使用有效长度 AR128 路径需要重新导出配套 prefill 图；已有 GPTQ 权重可复用，不需要重新量化：
+先用 MoE 的 `build.sh` 构建对应SoC的Native、decode DSO和op package，再独立构建JNI。
+SM8850/V81使用上面的preset；下面保留SM8975/V85的构建示例。
+使用有效长度AR128路径需要配套prefill图；已有GPTQ权重可复用，不需要重新量化：
 
 ```bash
 export QNN_SDK_ROOT=/hunter/qnn_sdk/src/backends/qnn/2.48.1.260715
@@ -82,6 +116,14 @@ cmake --install build/moe/qwen35-jni --prefix /path/to/app/src/main
 设置 `android:extractNativeLibs="true"`，保证 nativeLibraryDir 中有真实文件供 QNN/op package 和 DSP 加载。不要将整个 `/vendor/lib64` 塞进 App 的库搜索路径，否则可能把 vendor 私有依赖错误加载到 App namespace。普通 APK 的具体 DSP 访问权限由设备系统决定；设备 Java 进程验证与实际 APK 安装验证应区分记录。
 
 ## 回归
+
+2026-10-28当前SM8850/V81、SDK2.51整合版已通过真机Java进程短测：目录构造接口、
+文本流式回调、多轮上下文、reset、close及关闭后拒绝调用。上下文为2048、每层64槽；
+三轮分别生成18/10/2 tokens，末轮reset后回答“2”。JNI、decode和共享权重提供者同源构建，
+修复了新JNI搭配旧decode库的缓存ABI不一致；目录接口同时覆盖已安装的共享权重提供者。
+本轮没有重测图片、单PTE构造或普通APK安装。
+库指纹及范围见 [JNI验证记录](../../../../build/moe/qwen35-jni-sm8850/VALIDATION.json)，
+原始日志见 `llama-output/qwen35-sm8850--1028/jni-mainline-20261028/`。
 
 `../tests/Qwen35MoeSmokeTest.java` 使用真实模型，覆盖中文/emoji 分片、文本流式、多轮、图片路径解码、坏图恢复、取消、回调异常、并发拒绝、reset、close 和同进程重开。与其它 JNI 测试一样可编译成 dex 后用 `app_process` 执行；参数为 model、shared、tokenizer、workspace、nativeLibraryDir、imagePath。模型加载必须串行测试。
 

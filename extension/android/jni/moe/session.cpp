@@ -47,6 +47,7 @@ class Environment {
           "HANDOFF_EOS_IDS",
           "PREFILL_TOKENS",
           "PREFILL_VALID_TOKENS",
+          "PREFILL_INITIAL_IMAGE",
           "DECODE_CONTEXT_CAPACITY",
           "EXPERT_CACHE_SLOTS",
           "EMBEDDING_BITS",
@@ -76,6 +77,7 @@ class Environment {
           "EXPERT_STAGE_READY",
           "SAVE_ALL_LOGITS",
           "DEVICE_CHAT",
+          "MOE_PROFILE_TOTAL",
           "CHAT_ROPE_ROOT",
           "VISION_INPUT",
           "BENCH_TOKENS_PATH",
@@ -169,7 +171,9 @@ Workspace::Workspace(
           fs::create_symlink(skel, destination / filename);
         }
         for (const char* name :
-             {"libmoe_decode.so", "libQnnDeltaNetOpPackage_HTP.so"})
+             {"libmoe_decode.so",
+              "libqwen35_shared.so",
+              "libQnnDeltaNetOpPackage_HTP.so"})
           if (fs::exists(libs / name)) {
             fs::remove(destination / name);
             fs::create_symlink(libs / name, destination / name);
