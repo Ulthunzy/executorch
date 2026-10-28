@@ -124,6 +124,13 @@ static void prepare_activations(
 
 // 双缓冲权重 tile，把下一块 DMA 与当前块 HMX 交叠；N2 仅在 VTCM 展开为 N4。
 // 恢复投影实数尺度后，GU 合成 SwiGLU，down 直接写入加权路由结果。
+#if __HEXAGON_ARCH__ == 81
+template <
+    int FixedN = 0,
+    int FixedK = 0,
+    int FixedGrid = 0,
+    bool FixedRouted = false>
+#endif
 static void projection(
     Request* request,
     const uint8_t* codes,
@@ -140,6 +147,14 @@ static void projection(
     const int* token,
     const int* slot,
     const float* scores) {
+#if __HEXAGON_ARCH__ == 81
+  if constexpr (FixedN) {
+    n = FixedN;
+    padded_k = FixedK;
+    grid = FixedGrid;
+    routed = FixedRouted;
+  }
+#endif
   const int groups = (padded_k + grid - 1) / grid;
   const int partials = padded_k / 128;
   const float factor = grid == 1024 ? 32.f : 16.f;
@@ -160,9 +175,11 @@ static void projection(
     const int batch = nb / blocks_per_transfer;
     if (nb % blocks_per_transfer == 0) {
       dma_wait(transfer[batch % 2]);
+#if __HEXAGON_ARCH__ != 81
       n2_expand_in_place(
           weight_buffers + (batch % 2) * transfer_bytes,
           std::min(transfer_bytes, (n / 32 - nb) * block_bytes) / 2);
+#endif
       if (nb + blocks_per_transfer < n / 32)
         dma_start(
             transfer[(batch + 1) % 2],
@@ -172,6 +189,11 @@ static void projection(
                 transfer_bytes,
                 (n / 32 - nb - blocks_per_transfer) * block_bytes) /
                 2);
+#if __HEXAGON_ARCH__ == 81
+      n2_expand_in_place(
+          weight_buffers + (batch % 2) * transfer_bytes,
+          std::min(transfer_bytes, (n / 32 - nb) * block_bytes) / 2);
+#endif
     }
     request->w = weight_buffers + (batch % 2) * transfer_bytes +
         (nb % blocks_per_transfer) * block_bytes;
@@ -292,6 +314,10 @@ uint32_t execute_integer_moe(
   auto* output = static_cast<float*>(qhpi_tensor_raw_data(outputs[0]));
   if (!workspace || !route_output)
     return 21;
+  if constexpr (moe_prefill_vtcm::kCompact)
+    workspace = reinterpret_cast<uint8_t*>(
+        (uintptr_t(workspace) + moe_prefill_vtcm::kWorkspaceAlignment - 1) &
+        ~uintptr_t(moe_prefill_vtcm::kWorkspaceAlignment - 1));
   const uint32_t resource = qhpi_thread_resources(handle);
   if (descriptor[2] == -1) {
     if (resource == QHPI_RESOURCE_HMX) {
@@ -423,11 +449,12 @@ uint32_t execute_integer_moe(
   const uint32_t count = qhpi_num_slices(handle);
   write(&sync->workers, count);
   const uint32_t worker = increment(&sync->arrived);
-  if (count > 8)
+  if (count > unsigned(kWorkers))
     return 23;
   auto* base = reinterpret_cast<uint8_t*>(
-                   (uintptr_t(workspace) + 2047) & ~uintptr_t(2047)) +
-      worker * 458752;
+                   (uintptr_t(workspace) + moe_prefill_vtcm::kWorkspaceAlignment - 1) &
+                   ~uintptr_t(moe_prefill_vtcm::kWorkspaceAlignment - 1)) +
+      worker * moe_prefill_vtcm::kWorkerBytes;
   uint8_t* packed = base;
   float* gu = reinterpret_cast<float*>(base + 131072);
   float* middle = gu;
@@ -459,7 +486,7 @@ uint32_t execute_integer_moe(
   const float* all_scores = tokens_count == 128 ? scores : scores_ddr;
   const uint8_t* bank = sync->bank;
   const auto* offsets = reinterpret_cast<const uint64_t*>(bank + 32);
-  auto* input_codes = workspace + 3670016;
+  auto* input_codes = workspace + moe_prefill_vtcm::inputCodesOffset(tokens_count);
   auto* input_scales = reinterpret_cast<float*>(workspace + 447488);
   const int first_token = worker * (tokens_count / count);
   int local[32];
@@ -618,22 +645,42 @@ uint32_t execute_integer_moe(
         }
       }
       metrics[worker][0] += tick() - stamp;
-      projection(
-          request,
-          expert_data + header[4],
-          reinterpret_cast<const float*>(gu_meta),
-          reinterpret_cast<const int16_t*>(gu_meta + header[6] - header[5]),
-          2 * width,
-          2048,
-          1024,
-          rows,
-          activation_scales,
-          gu,
-          512,
-          false,
-          nullptr,
-          nullptr,
-          nullptr);
+#if __HEXAGON_ARCH__ == 81
+      if (width == 512)
+        projection<1024, 2048, 1024, false>(
+            request,
+            expert_data + header[4],
+            reinterpret_cast<const float*>(gu_meta),
+            reinterpret_cast<const int16_t*>(gu_meta + header[6] - header[5]),
+            2 * width,
+            2048,
+            1024,
+            rows,
+            activation_scales,
+            gu,
+            512,
+            false,
+            nullptr,
+            nullptr,
+            nullptr);
+      else
+#endif
+        projection(
+            request,
+            expert_data + header[4],
+            reinterpret_cast<const float*>(gu_meta),
+            reinterpret_cast<const int16_t*>(gu_meta + header[6] - header[5]),
+            2 * width,
+            2048,
+            1024,
+            rows,
+            activation_scales,
+            gu,
+            512,
+            false,
+            nullptr,
+            nullptr,
+            nullptr);
       // GU consumes gate first, then overwrites it with SwiGLU when the up
       // block arrives. GU and down metadata have disjoint lifetimes and share
       // the same 40 KiB region.
@@ -653,22 +700,42 @@ uint32_t execute_integer_moe(
 #else
       auto* down_output = route_output;
 #endif
-      projection(
-          request,
-          expert_data + header[7],
-          reinterpret_cast<const float*>(down_meta),
-          reinterpret_cast<const int16_t*>(down_meta + header[9] - header[8]),
-          2048,
-          down_k,
-          512,
-          rows,
-          activation_scales,
-          down_output,
-          2048,
-          true,
-          tokens + begin,
-          slots + begin,
-          all_scores);
+#if __HEXAGON_ARCH__ == 81
+      if (width == 512)
+        projection<2048, 512, 512, true>(
+            request,
+            expert_data + header[7],
+            reinterpret_cast<const float*>(down_meta),
+            reinterpret_cast<const int16_t*>(down_meta + header[9] - header[8]),
+            2048,
+            down_k,
+            512,
+            rows,
+            activation_scales,
+            down_output,
+            2048,
+            true,
+            tokens + begin,
+            slots + begin,
+            all_scores);
+      else
+#endif
+        projection(
+            request,
+            expert_data + header[7],
+            reinterpret_cast<const float*>(down_meta),
+            reinterpret_cast<const int16_t*>(down_meta + header[9] - header[8]),
+            2048,
+            down_k,
+            512,
+            rows,
+            activation_scales,
+            down_output,
+            2048,
+            true,
+            tokens + begin,
+            slots + begin,
+            all_scores);
 #if SM_MOE_ACCUMULATE
       stamp = tick();
       for (int m = 0; m < rows; m++) {

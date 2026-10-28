@@ -1,5 +1,6 @@
 #pragma once
 #include "HTP/core/qhpi.h"
+#include "vtcm_layout.h"
 #include <cstdint>
 
 #ifdef NATIVE_RPC
@@ -25,7 +26,7 @@ uint32_t execute_integer_moe(
 #include "HAP_perf.h"
 #include "qurt_pimutex.h"
 
-constexpr int kWorkers = 8;
+constexpr int kWorkers = moe_prefill_vtcm::kWorkers;
 
 struct Request {
   volatile uint32_t ready;

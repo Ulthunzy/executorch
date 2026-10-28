@@ -262,7 +262,7 @@ extern "C" AEEResult integer_rpc_configure_banks(
 extern "C" AEEResult
 integer_rpc_profile(remote_handle64 handle, float* output, int count) {
   auto* state = reinterpret_cast<State*>(uintptr_t(handle));
-  if (count != 96)
+  if (count != 96 && count != 104)
     return 1;
   for (int i = 0; i < 96; i++)
     output[i] = reinterpret_cast<uint64_t*>(state->profile_totals)[i] / 19200.f;
@@ -274,6 +274,10 @@ integer_rpc_profile(remote_handle64 handle, float* output, int count) {
   if (!HAP_power_get(nullptr, &clock))
     output[8 * 8 + 6] = clock.clkFreqHz / 1.e6f;
   output[8 * 8 + 7] = (qurt_hvx_get_units() >> 8) & 255;
+  if (count == 104) {
+    std::fill(output + 96, output + 104, 0.f);
+    output[96] = SM_MOE_PROFILE;
+  }
 
   return 0;
 }

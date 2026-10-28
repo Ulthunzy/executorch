@@ -101,7 +101,8 @@ static int prepare_resources(ComputeResources& resources, unsigned bytes) {
     return 0;
   compute_res_attr_t attributes;
   HAP_compute_res_attr_init(&attributes);
-  HAP_compute_res_attr_set_vtcm_param(&attributes, bytes, 1);
+  HAP_compute_res_attr_set_vtcm_param(
+      &attributes, bytes, moe_prefill_vtcm::kCompact ? 0 : 1);
   HAP_compute_res_attr_set_hmx_param(&attributes, 1);
   if (HAP_compute_res_attr_set_cache_mode(&attributes, 1))
     return 70;
@@ -127,6 +128,7 @@ struct State {
   uint8_t* route = nullptr;
   int capacity = 128;
   ComputeResources grouped, complete, partitioned;
+  uint64_t profile_totals[10][8]{}, profile_calls = 0;
   void* stacks[kWorkers + 1]{};
   qurt_mutex_t token_locks[128];
   PoolEntry entries[kWorkers + 1];
@@ -263,9 +265,9 @@ extern "C" AEEResult integer_rpc_configure(remote_handle64 handle, int tokens) {
     state->capacity = tokens;
   }
   if (tokens > 128)
-    return prepare_resources(state->grouped, 8388608);
-  const int error = prepare_resources(state->complete, 12582912);
-  return error ? error : prepare_resources(state->partitioned, 5242880);
+    return prepare_resources(state->grouped, moe_prefill_vtcm::kGroupedBytes);
+  const int error = prepare_resources(state->complete, moe_prefill_vtcm::kAr128Bytes);
+  return error ? error : prepare_resources(state->partitioned, moe_prefill_vtcm::kPartitionedBytes);
 }
 
 extern "C" AEEResult
@@ -278,11 +280,19 @@ integer_rpc_counts(remote_handle64, int* output, int count) {
 }
 
 extern "C" AEEResult
-integer_rpc_profile(remote_handle64, float* output, int count) {
-  if (count != 80)
+integer_rpc_profile(remote_handle64 handle, float* output, int count) {
+  auto* state = reinterpret_cast<State*>(uintptr_t(handle));
+  if (count != 80 && count != 88)
     return 1;
+  const auto* values = count == 80 ? reinterpret_cast<const uint64_t*>(metrics)
+                                 : reinterpret_cast<const uint64_t*>(state->profile_totals);
   for (int i = 0; i < 80; i++)
-    output[i] = reinterpret_cast<uint64_t*>(metrics)[i] / 19200.f;
+    output[i] = values[i] / 19200.f;
+  if (count == 88) {
+    std::fill(output + 80, output + 88, 0.f);
+    output[80] = SM_MOE_PROFILE;
+    output[81] = state->profile_calls;
+  }
   HAP_power_response_t clock{};
   clock.type = HAP_power_get_clk_Freq;
   if (!HAP_power_get(nullptr, &clock))
@@ -351,7 +361,9 @@ extern "C" AEEResult integer_rpc_run(
       : phase                    ? state->partitioned
                                  : state->complete;
   const int prepared = prepare_resources(
-      resources, tokens > 128 ? 8388608 : (phase ? 5242880 : 12582912));
+      resources, tokens > 128 ? moe_prefill_vtcm::kGroupedBytes
+          : phase ? moe_prefill_vtcm::kPartitionedBytes
+                  : moe_prefill_vtcm::kAr128Bytes);
   if (prepared)
     return prepared;
   const uint32_t context = resources.context;
@@ -369,7 +381,9 @@ extern "C" AEEResult integer_rpc_run(
       {const_cast<int*>(descriptor)}};
   const QHPI_Tensor* in[] = {input, input + 1, input + 2, input + 3, input + 4};
 #if SM_MOE_ROUTE_VTCM
-  void* route = static_cast<uint8_t*>(vtcm) + 4194304;
+  void* route = moe_prefill_vtcm::kRouteInVtcm
+      ? static_cast<uint8_t*>(vtcm) + 4194304
+      : state->route;
 #elif SM_MOE_ACCUMULATE
   void* route = static_cast<uint8_t*>(vtcm) + 9437184 + 2048;
 #else
@@ -382,12 +396,15 @@ extern "C" AEEResult integer_rpc_run(
   Sync sync{};
   sync.token_locks = state->token_locks;
   sync.residual = state->residual;
-  WorkerStart startup(kWorkers + 1);
+  const int workers = moe_prefill_vtcm::workersForTokens(tokens);
+  WorkerStart startup(workers + 1);
   for (int i = 0; i < kWorkers + 1; i++) {
+    if (i >= workers && i != kWorkers)
+      continue;
     auto& entry = state->entries[i];
     entry.job = {
         {uint32_t(i == kWorkers ? QHPI_RESOURCE_HMX : QHPI_RESOURCE_HVX),
-         kWorkers,
+         unsigned(workers),
          uint32_t(i == kWorkers ? 0 : i),
          &sync},
         out,
@@ -400,7 +417,10 @@ extern "C" AEEResult integer_rpc_run(
   metrics[8][1] = tick() - stamp;
   stamp = tick();
   int error = 0;
-  for (auto& entry : state->entries) {
+  for (int i = 0; i < kWorkers + 1; i++) {
+    if (i >= workers && i != kWorkers)
+      continue;
+    auto& entry = state->entries[i];
     qurt_sem_down(&entry.done);
     if (entry.job.status)
       error = entry.job.status;
@@ -419,6 +439,12 @@ extern "C" AEEResult integer_rpc_run(
     state->pending = -1;
     state->assigned = 0;
   }
+#if SM_MOE_PROFILE
+  for (int row = 0; row < 10; ++row)
+    for (int column = 0; column < 8; ++column)
+      state->profile_totals[row][column] += metrics[row][column];
+  ++state->profile_calls;
+#endif
   return error ? error : released;
 }
 
