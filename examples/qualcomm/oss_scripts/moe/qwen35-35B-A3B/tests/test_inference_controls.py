@@ -97,6 +97,47 @@ def test_generation_flags_and_command_are_used():
     assert "--interactive" in tokens and "--vision" in tokens
 
 
+def test_profile_retains_chat_and_requires_a_profiling_build(monkeypatch):
+    args = parse_args(["--profile"])
+    assert args.runner == "chat"
+    command = session_command(args, DevicePaths("/tmp/model", "/tmp/shared"))
+    assert "--profile" in shlex.split(command.split(" && ", 1)[1])
+    monkeypatch.setattr(Path, "is_file", lambda path: False)
+    with pytest.raises(ValueError, match="MOE_NATIVE_PROFILE=1"):
+        check_artifacts(args)
+
+
+def test_chat_prefill_readers_can_differ_from_decode():
+    args = parse_args(["--io-workers", "4", "--prefill-io-workers", "16"])
+    assert args.model_settings.schedule.io_workers == 4
+    command = session_command(args, DevicePaths("/tmp/model", "/tmp/shared"))
+    tokens = shlex.split(command.split(" && ", 1)[1])
+    assert tokens[tokens.index("--prefill-io-workers") + 1] == "16"
+
+
+def test_sm8850_runtime_selects_measured_io_defaults():
+    args = parse_args(["--config", str(ROOT / "configs/sm8850.json")])
+    assert args.cache_experts == 64
+    assert args.prefill_io_workers == 16
+    assert args.model_settings.schedule.io_workers == 8
+    assert args.model_settings.schedule.read_chunk_kib == 512
+
+
+def test_runtime_cache_profile_overrides_model_schedule(tmp_path):
+    profile = json.loads((ROOT / "configs/sm8850.json").read_text())
+    model = json.loads((ROOT / "configs/model_sm8850.json").read_text())
+    model["schedule"]["cache_experts"] = 32
+    model_path = tmp_path / "model.json"
+    model_path.write_text(json.dumps(model))
+    profile["model_config"] = str(model_path)
+    profile_path = tmp_path / "device.json"
+    profile_path.write_text(json.dumps(profile))
+    args = parse_args(["--config", str(profile_path)])
+    assert args.model_settings.schedule.cache_experts == 64
+    args = parse_args(["--config", str(profile_path), "--cache-experts", "32"])
+    assert args.model_settings.schedule.cache_experts == 32
+
+
 def test_deployment_commands_cannot_consume_chat_input(monkeypatch):
     calls = []
 
@@ -126,6 +167,9 @@ def test_thinking_flag_overrides_model_settings(tmp_path, enabled):
 def test_missing_expert_payload_is_rejected_before_deployment(monkeypatch):
     args = parse_args(["--runner", "diagnostic"])
     assert args.deploy_weights
+    monkeypatch.setattr(
+        "workflow.artifacts.runtime_assets", lambda args: args.artifacts / "assets"
+    )
     monkeypatch.setattr(
         Path,
         "is_file",
@@ -167,6 +211,109 @@ def test_weight_root_selects_its_model_configuration(tmp_path):
     assert args.dsp_arch == "v81"
     assert args.temperature == 0.6 and args.ignore_eos and not args.stream
     assert not args.interactive
+
+
+@pytest.fixture
+def packaged_head(tmp_path):
+    import hashlib
+
+    from workflow.model_package import create_package
+
+    source = tmp_path / "source"
+    source.mkdir()
+    context = b"calibrated GPTQ head context"
+    (source / "graph.qnn").write_bytes(b"separated graph")
+    (source / "weights.bin").write_bytes(b"separated weights")
+    (source / "WEIGHTS.json").write_text(
+        json.dumps({"source_sha256": hashlib.sha256(context).hexdigest()})
+    )
+    files = {
+        f"shared-model/head/{name}": source / name
+        for name in ("graph.qnn", "weights.bin", "WEIGHTS.json")
+    }
+    files["MODEL_CONFIG.json"] = ROOT / "configs/model.json"
+    package = tmp_path / "model.pte"
+    create_package(package, files)
+    return parse_args(["--weights-path", str(package)]), context
+
+
+@pytest.mark.parametrize("relative", [False, True])
+def test_packaged_head_retains_manifest_and_needs_no_export_only_files(
+    packaged_head, monkeypatch, relative
+):
+    from workflow.artifacts import check_shared_head
+    from workflow.model_package import PackageReader
+
+    args, _ = packaged_head
+    assert args.package_manifest == PackageReader(args.weights_path).manifest
+    assert not (args.artifacts / "head/HEAD.json").exists()
+    assert not (args.artifacts / "head/head.bin").exists()
+    if relative:
+        monkeypatch.chdir(args.artifacts)
+        args.shared_model = Path("shared-model")
+    check_shared_head(args)
+
+
+@pytest.mark.parametrize("name", ["graph.qnn", "weights.bin", "WEIGHTS.json"])
+def test_packaged_head_rejects_same_size_cache_corruption(packaged_head, name):
+    import os
+
+    from workflow.artifacts import check_shared_head
+
+    args, _ = packaged_head
+    path = args.shared_model / "head" / name
+    before = path.stat()
+    with path.open("r+b") as stream:
+        byte = stream.read(1)
+        stream.seek(0)
+        stream.write(bytes([byte[0] ^ 1]))
+    os.utime(path, ns=(before.st_atime_ns, before.st_mtime_ns))
+    with pytest.raises(ValueError, match="Corrupt packaged head resource"):
+        check_shared_head(args)
+
+
+@pytest.mark.parametrize("name", ["graph.qnn", "weights.bin", "WEIGHTS.json"])
+def test_packaged_head_requires_each_manifest_entry(packaged_head, name):
+    from workflow.artifacts import check_shared_head
+
+    args, _ = packaged_head
+    del args.package_manifest["files"][f"shared-model/head/{name}"]
+    with pytest.raises(ValueError, match="Packaged model is missing head resource"):
+        check_shared_head(args)
+
+
+@pytest.mark.parametrize("missing", [None, "HEAD.json", "head.bin"])
+def test_directory_head_keeps_export_provenance_requirement(packaged_head, missing):
+    from workflow.artifacts import check_shared_head
+
+    args, context = packaged_head
+    args.package_manifest = None
+    head = args.artifacts / "head"
+    head.mkdir()
+    (head / "HEAD.json").write_text(
+        json.dumps(
+            {
+                "target": args.model_settings.target.to_dict(),
+                "quantization": {"method": "all_projection_gptq"},
+            }
+        )
+    )
+    (head / "head.bin").write_bytes(context)
+    if missing:
+        (head / missing).unlink()
+        with pytest.raises(FileNotFoundError):
+            check_shared_head(args)
+    else:
+        check_shared_head(args)
+        (head / "head.bin").write_bytes(context + b"wrong source")
+        with pytest.raises(ValueError, match="calibrated GPTQ head"):
+            check_shared_head(args)
+        (head / "head.bin").write_bytes(context)
+        metadata = json.loads((head / "HEAD.json").read_text())
+        metadata["quantization"]["method"] = "minmax"
+        (head / "HEAD.json").write_text(json.dumps(metadata))
+        with pytest.raises(ValueError, match="calibrated GPTQ head"):
+            check_shared_head(args)
 
 
 def test_python_inference_function_passes_all_controls(monkeypatch):

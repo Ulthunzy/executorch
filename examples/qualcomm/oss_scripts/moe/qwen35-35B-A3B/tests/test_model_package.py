@@ -102,6 +102,45 @@ def test_package_rejects_corrupt_payload_and_unsafe_paths(tmp_path):
         PackageReader(path)
 
 
+def test_package_keeps_separated_head_without_export_only_inputs(tmp_path):
+    import hashlib
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location(
+        "head_weights", ROOT / "export/weights.py"
+    )
+    weights = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(weights)
+
+    source = tmp_path / "raw-head.bin"
+    payload = bytes(range(256)) * 64 + b"context-tail"
+    source.write_bytes(payload)
+    requests = tmp_path / "requests.txt"
+    requests.write_text("4096 4096\n12288 4096\n")
+    head = tmp_path / "shared-model/head"
+    report = weights.separate_context(source, requests, head)
+    package = tmp_path / "model.pte"
+    names = ("graph.qnn", "weights.bin", "WEIGHTS.json")
+    manifest = create_package(
+        package, {f"shared-model/head/{name}": head / name for name in names}
+    )
+    source.unlink()
+
+    reader = PackageReader(package)
+    extracted = reader.extract()
+    assert reader.manifest == manifest
+    assert not (extracted / "head/HEAD.json").exists()
+    assert not (extracted / "head/head.bin").exists()
+    metadata = json.loads((extracted / "shared-model/head/WEIGHTS.json").read_text())
+    assert metadata == json.loads(json.dumps(report))
+    assert metadata["source_sha256"] == hashlib.sha256(payload).hexdigest()
+    for name in names:
+        path = extracted / "shared-model/head" / name
+        info = manifest["files"][f"shared-model/head/{name}"]
+        assert path.stat().st_size == info["bytes"]
+        assert hashlib.sha256(path.read_bytes()).hexdigest() == info["sha256"]
+
+
 def test_quantization_cache_reuses_weights_and_repairs_the_first_bad_layer(
     tmp_path, monkeypatch
 ):

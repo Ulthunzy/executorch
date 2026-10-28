@@ -119,6 +119,12 @@ def make_config(tmp_path, **changes):
         {"format": "onnx"},
         {"format": "qnn", "phases": ["decode"]},
         {"build": "false"},
+        {"deploy_runtime": "true"},
+        {"prefill_gdn_core": "unknown"},
+        {"gdn_state_vtcm": "true"},
+        {"gdn_state_vtcm": True, "prefill_gdn_core": "custom_fp16"},
+        {"gdn_state_vtcm": True, "prefill_gdn_core": "custom_fp32"},
+        {"deploy_runtime": True, "runtime_device_dir": "/system/lib64"},
         {"expert_batch": True},
         {"unknown": 1},
         {"remote_root": "/data/local/tmp/export;rm"},
@@ -151,6 +157,60 @@ def test_component_and_format_selection_avoid_unneeded_device_steps(tmp_path):
     assert not (tmp_path / "export").exists()
 
 
+def test_runtime_is_redeployed_on_resume_without_recompiling_graphs(
+    tmp_path, monkeypatch
+):
+    from workflow.sdk_runtime import runtime_files
+
+    config = load_export_config(make_config(tmp_path, deploy_runtime=True))
+    for path in runtime_files(config.qnn_sdk_root, config.model_settings.target):
+        write(path)
+    pipeline = ExportPipeline(config)
+    calls = []
+    monkeypatch.setattr(subprocess, "run", child_runner(pipeline, calls))
+    pipeline.run()
+    pipeline.run()
+    assert calls.count("runtime") == 2
+    assert calls.count("head") == 1
+    assert calls.count("qnn-group0") == 1
+
+
+@pytest.mark.parametrize("modality", ["image", "text"])
+def test_cold_profile_change_only_repackages_on_resume(tmp_path, monkeypatch, modality):
+    from workflow import image_cold_profile, model_package, text_cold_profile
+
+    config = load_export_config(
+        make_config(tmp_path, soc_model="SM8850", components=["text", "vision"])
+    )
+    write(config.build_dir / "op-package/hexagon-v81/libQnnDeltaNetOpPackage_HTP.so")
+    profile_module = image_cold_profile if modality == "image" else text_cold_profile
+    profile = tmp_path / f"{modality}-cold.json"
+    profile.write_bytes(profile_module.DEFAULT_PROFILE.read_bytes())
+    monkeypatch.setattr(profile_module, "DEFAULT_PROFILE", profile)
+    packages = []
+
+    def pack(current):
+        packages.append(current.output)
+        write(current.output / "model.pte")
+
+    monkeypatch.setattr(model_package, "pack_export", pack)
+    pipeline = ExportPipeline(config)
+    calls = []
+    monkeypatch.setattr(subprocess, "run", child_runner(pipeline, calls))
+    pipeline.run()
+    pipeline.run()
+    assert len(packages) == 1
+    completed = list(calls)
+    profile.write_bytes(profile.read_bytes() + b"\n")
+    pipeline.run()
+    assert len(packages) == 2
+    assert calls == completed
+    state = json.loads((config.output / "EXPORT_STATE.json").read_text())
+    assert state["stages"]["package"][f"{modality}_cold_profile_sha256"] == (
+        hashlib.sha256(profile.read_bytes()).hexdigest()
+    )
+
+
 def test_decode_selection_preserves_shared_compile_but_only_packs_decode(tmp_path):
     pipeline = ExportPipeline(
         load_export_config(make_config(tmp_path, phases=["decode"]))
@@ -163,6 +223,30 @@ def test_decode_selection_preserves_shared_compile_but_only_packs_decode(tmp_pat
             start = stage.command.index("--layers") + 1
             end = stage.command.index("--output")
             assert len(stage.command[start:end]) == 4
+
+
+@pytest.mark.parametrize("mode", ["custom_fp16", "custom_fp32"])
+def test_prefill_core_selection_is_an_export_setting_only(tmp_path, mode):
+    baseline = load_export_config(make_config(tmp_path))
+    selected = load_export_config(make_config(tmp_path, prefill_gdn_core=mode))
+    assert baseline.model_settings == selected.model_settings
+    assert baseline.prefill_gdn_core == "chunked_mixed_fp16"
+    stages = ExportPipeline(selected).stages
+    for stage in stages:
+        if stage.name.startswith("qnn-group"):
+            position = stage.command.index("--prefill-gdn-core")
+            assert stage.command[position + 1] == mode
+
+
+def test_u16_vtcm_export_selection_does_not_change_calibration_recipe(tmp_path):
+    baseline = load_export_config(make_config(tmp_path))
+    selected = load_export_config(
+        make_config(tmp_path, prefill_gdn_core="custom_u16", gdn_state_vtcm=True)
+    )
+    assert baseline.model_settings == selected.model_settings
+    for stage in ExportPipeline(selected).stages:
+        if stage.name.startswith("qnn-group"):
+            assert "--gdn-state-vtcm" in stage.command
 
 
 def child_runner(pipeline, calls, fail=None):
@@ -188,6 +272,7 @@ def child_runner(pipeline, calls, fail=None):
                 group = int(path.parent.name.removeprefix("group"))
                 report = dict(
                     contexts={"context0.bin": "fixture"},
+                    target=pipeline.settings.target.to_dict(),
                     capacity=1024,
                     weight_sharing=True,
                     layers=list(range(group * 4, group * 4 + 4)),
@@ -277,6 +362,27 @@ def test_invalid_output_is_rebuilt_without_deleting_calibration(tmp_path, monkey
     source.write_text(json.dumps(old))
     with pytest.raises(ValueError, match="recipes differ"):
         pipeline.check()
+
+
+def test_fp16_gdn_state_reuses_original_quantized_weights(tmp_path):
+    path = make_config(tmp_path)
+    model_path = tmp_path / "model-config.json"
+    model = json.loads(model_path.read_text())
+    model["cache"]["gdn_state_dtype"] = "float16"
+    model_path.write_text(json.dumps(model))
+    config = load_export_config(path)
+    ExportPipeline(config).check()
+    assert config.model_settings.cache.gdn_state_dtype == "float16"
+    prepared = json.loads((config.calibration_dir / "MODEL_CONFIG.json").read_text())
+    assert prepared["cache"]["gdn_state_dtype"] == "uint16"
+    for field in ("prefill_gdn_core", "gdn_state_vtcm"):
+        data = json.loads(path.read_text())
+        data[field] = "custom_u16" if field == "prefill_gdn_core" else True
+        path.write_text(json.dumps(data))
+        with pytest.raises(ValueError, match="Typed FP16 state requires"):
+            load_export_config(path)
+        data.pop(field)
+        path.write_text(json.dumps(data))
 
 
 def test_raw_preparation_is_selected_and_reuses_verified_calibration(

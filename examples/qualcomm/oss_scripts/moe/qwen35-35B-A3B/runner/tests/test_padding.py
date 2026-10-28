@@ -10,6 +10,7 @@ import executorch.examples.qualcomm.custom_op.deltanet as deltanet
 from export.prefill import padded_prefill_front
 from export.graph_utils import resize_attention
 from export.fp16_attention_core import fp16_attention_core
+from export.gdn_state import fp16_gdn_state
 from executorch.examples.qualcomm.oss_scripts.llama.quantize.generation import (
     replace_prefill_cores,
 )
@@ -28,6 +29,123 @@ class Front(torch.nn.Module):
             q, k, v, decay, beta, state
         )
         return out.flatten(2), x, joined[..., -4:], state
+
+
+class QuantizedFront(torch.nn.Module):
+    def forward(self, x, conv, state):
+        def qdq(value, scale, zero):
+            args = (scale, zero, 0, 65535, torch.int32)
+            codes = torch.ops.quantized_decomposed.quantize_per_tensor.default(
+                value, *args
+            )
+            return torch.ops.quantized_decomposed.dequantize_per_tensor.default(
+                codes, *args
+            )
+
+        small = x[..., :4]
+        joined = torch.cat((conv, small.transpose(1, 2)), dim=-1)
+        out, new_state = torch.ops.qnn_custom_ops.deltanet_core.default(
+            qdq(torch.tanh(small).unsqueeze(2), 0.0001, 32768),
+            qdq(torch.tanh(small * 0.5).unsqueeze(2), 0.0001, 32768),
+            qdq(small.unsqueeze(2), 0.0001, 32768),
+            qdq(torch.full((1, 128, 1), 0.98), 0.00002, 0),
+            qdq(torch.full((1, 128, 1), 0.1), 0.00002, 0),
+            qdq(state, 0.0001, 32768),
+        )
+        out = qdq(out, 0.0001, 32768)
+        new_state = qdq(new_state, 0.0001, 32768)
+        return out.flatten(2), x, joined[..., -4:], new_state
+
+
+@pytest.mark.parametrize("valid", [0, 1, 63, 128])
+def test_fp16_state_chunked_padding_and_interface(front, valid):
+    inputs = front[2]
+    source = torch.export.export(QuantizedFront(), inputs).module()
+    source, inputs = fp16_gdn_state(source, inputs, decode=False)
+    padded, _ = padded_prefill_front(source, inputs, 2048)
+    assert not any("deltanet_core" in str(node.target) for node in padded.graph.nodes)
+    index = torch.tensor([valid - 1], dtype=torch.int32)
+    result = padded(*inputs, index)
+    assert result[2].dtype == torch.float32
+    assert result[3].dtype == torch.float16
+    changed = inputs[0].clone()
+    changed[:, valid:] = 20 * torch.randn_like(changed[:, valid:])
+    alternate = padded(changed, *inputs[1:], index)
+    for left, right in zip(
+        (result[0][:, :valid], *result[2:]), (alternate[0][:, :valid], *alternate[2:])
+    ):
+        torch.testing.assert_close(left, right, rtol=0, atol=0)
+    if valid == 0:
+        torch.testing.assert_close(result[3], inputs[2], rtol=0, atol=0)
+    exported = torch.export.export(padded, (*inputs, index))
+    assert exported.example_inputs[0][2].dtype == torch.float16
+
+
+def test_fp16_state_decode_keeps_projection_and_attention_qdq(front):
+    inputs = front[2]
+    source = torch.export.export(QuantizedFront(), inputs).module()
+    old_core = next(
+        node for node in source.graph.nodes if "deltanet_core" in str(node.target)
+    )
+    old_state = next(user for user in old_core.users if user.args[1] == 1)
+    for node in (old_core, old_state):
+        node.meta["quant_attrs"] = {
+            "scale": 0.0001,
+            "zero_point": 32768,
+            "dtype": torch.int32,
+        }
+    q = torch.ops.quantized_decomposed.quantize_per_tensor.default
+    grids = [node.args[1:] for node in source.graph.nodes if node.target == q]
+    source, inputs = fp16_gdn_state(source, inputs, decode=True)
+    remaining = [node.args[1:] for node in source.graph.nodes if node.target == q]
+    assert remaining == [*grids[:5], grids[6]]
+    core = next(
+        node for node in source.graph.nodes if "deltanet_core" in str(node.target)
+    )
+    assert core.target == torch.ops.qnn_custom_ops.deltanet_core_fp16_state.default
+    assert core.args[5].meta["val"].dtype == torch.float16
+    assert "quant_attrs" not in core.meta
+    assert all(
+        "quant_attrs" not in user.meta for user in core.users if user.args[1] == 1
+    )
+    result = source(*inputs)
+    assert result[0].dtype == torch.float32
+    assert result[3].dtype == torch.float16
+    assert (
+        torch.export.export(source, inputs).module()(*inputs)[3].dtype == torch.float16
+    )
+
+
+def test_fp16_state_removes_inner_and_outer_cache_qdq(front):
+    class DoubleBoundary(torch.nn.Module):
+        def forward(self, x, conv, state):
+            values = QuantizedFront()(x, conv, state)
+            args = (0.0002, 30000, 0, 65535, torch.int32)
+            floating = torch.ops.aten._to_copy.default(values[3], dtype=torch.float32)
+            codes = torch.ops.quantized_decomposed.quantize_per_tensor.default(
+                floating, *args
+            )
+            state = torch.ops.quantized_decomposed.dequantize_per_tensor.default(
+                codes, *args
+            )
+            return (*values[:3], state)
+
+    inputs = front[2]
+    source = torch.export.export(DoubleBoundary(), inputs).module()
+    source, inputs = fp16_gdn_state(source, inputs, decode=True)
+    core = next(
+        node for node in source.graph.nodes if "deltanet_core" in str(node.target)
+    )
+    state = next(user for user in core.users if user.args[1] == 1)
+    assert all("quantize" not in str(user.target) for user in state.users)
+    assert (
+        sum(
+            node.target == torch.ops.quantized_decomposed.quantize_per_tensor.default
+            for node in source.graph.nodes
+        )
+        == 6
+    )
+    assert source(*inputs)[3].dtype == torch.float16
 
 
 @pytest.fixture(scope="module")
@@ -114,6 +232,141 @@ def test_129_tokens_use_two_blocks(front):
     )
     torch.testing.assert_close(second[3], expected_state, rtol=0.03, atol=0.0002)
     torch.testing.assert_close(second[2], small[:, -4:].transpose(1, 2), rtol=0, atol=0)
+
+
+@pytest.fixture(scope="module")
+def custom_front(front):
+    inputs = front[2]
+    source = torch.export.export(Front(), inputs).module()
+    padded, _ = padded_prefill_front(source, inputs, 2048, "custom_fp16")
+    cores = [
+        node
+        for node in padded.graph.nodes
+        if str(node.target) == "qnn_custom_ops.deltanet_core.default"
+    ]
+    assert len(cores) == 1
+    assert all(value.meta["val"].dtype == torch.float16 for value in cores[0].args)
+    return padded, inputs
+
+
+@pytest.mark.parametrize("valid", [1, 63, 127, 128])
+def test_custom_fp16_padding_and_float_boundaries(custom_front, valid):
+    module, inputs = custom_front
+    x, conv, state = inputs
+    index = torch.tensor([valid - 1], dtype=torch.int32)
+    actual = module(*inputs, index)
+    changed = x.clone()
+    changed[:, valid:] = 40 * torch.randn_like(changed[:, valid:])
+    alternate = module(changed, conv, state, index)
+    for left, right in zip(
+        (actual[0][:, :valid], *actual[2:]), (alternate[0][:, :valid], *alternate[2:])
+    ):
+        torch.testing.assert_close(left, right, rtol=0, atol=0)
+    assert all(value.dtype == torch.float32 for value in actual)
+    small = x[:, :valid, :4]
+    output, expected_state = deltanet._deltanet_core_decay_reference(
+        torch.tanh(small).unsqueeze(2).half(),
+        torch.tanh(small * 0.5).unsqueeze(2).half(),
+        small.unsqueeze(2).half(),
+        torch.full((1, valid, 1), 0.98).half(),
+        torch.full((1, valid, 1), 0.1).half(),
+        state.half(),
+    )
+    torch.testing.assert_close(
+        actual[0][:, :valid], output.flatten(2).float(), rtol=0, atol=0
+    )
+    torch.testing.assert_close(actual[3], expected_state.float(), rtol=0, atol=0)
+
+
+def test_custom_fp16_129_tokens_keep_only_valid_state(custom_front):
+    module, (_, conv, state) = custom_front
+    torch.manual_seed(45)
+    x = torch.randn(1, 129, 128) * 0.1
+    first = module(x[:, :128], conv, state, torch.tensor([127], dtype=torch.int32))
+    padded = torch.zeros(1, 128, 128)
+    padded[:, 0] = x[:, 128]
+    actual = module(padded, first[2], first[3], torch.tensor([0], dtype=torch.int32))
+    padded[:, 1:] = 40 * torch.randn_like(padded[:, 1:])
+    changed = module(padded, first[2], first[3], torch.tensor([0], dtype=torch.int32))
+    torch.testing.assert_close(actual[3], changed[3], rtol=0, atol=0)
+    torch.testing.assert_close(
+        actual[2], x[..., :4][:, -4:].transpose(1, 2), rtol=0, atol=0
+    )
+
+
+@pytest.mark.parametrize("valid", [0, 1, 63, 128])
+def test_custom_fp32_keeps_calibrated_boundaries_and_padding(front, valid):
+    inputs = front[2]
+    source = torch.export.export(QuantizedFront(), inputs).module()
+    baseline = copy.deepcopy(source)
+    module, _ = padded_prefill_front(source, inputs, 2048, "custom_fp32")
+    core = next(
+        node
+        for node in module.graph.nodes
+        if str(node.target) == "qnn_custom_ops.deltanet_core.default"
+    )
+    assert all(value.meta["val"].dtype == torch.float32 for value in core.args)
+    index = torch.tensor([valid - 1], dtype=torch.int32)
+    actual = module(*inputs, index)
+    changed = inputs[0].clone()
+    changed[:, valid:] = 40 * torch.randn_like(changed[:, valid:])
+    alternate = module(changed, *inputs[1:], index)
+    torch.testing.assert_close(
+        actual[0][:, :valid], alternate[0][:, :valid], rtol=0, atol=0
+    )
+    torch.testing.assert_close(actual[3], alternate[3], rtol=0, atol=0)
+    if valid == 128:
+        for result, expected in zip(actual, baseline(*inputs)):
+            torch.testing.assert_close(result, expected, rtol=0, atol=0)
+    if valid == 0:
+        params = (0.0001, 32768, 0, 65535, torch.int32)
+        q = torch.ops.quantized_decomposed.quantize_per_tensor.default
+        dq = torch.ops.quantized_decomposed.dequantize_per_tensor.default
+        torch.testing.assert_close(
+            actual[3], dq(q(inputs[2], *params), *params), rtol=0, atol=0
+        )
+
+
+@pytest.mark.parametrize("valid", [1, 63, 128])
+def test_custom_u16_padding_preserves_calibrated_state_grid(front, valid):
+    _, _, inputs = front
+    source = torch.export.export(QuantizedFront(), inputs).module()
+    module, _ = padded_prefill_front(source, inputs, 2048, "custom_u16")
+    core = next(
+        node
+        for node in module.graph.nodes
+        if str(node.target) == "qnn_custom_ops.deltanet_core.default"
+    )
+    assert all(
+        value.target == torch.ops.quantized_decomposed.dequantize_per_tensor.default
+        for value in core.args
+    )
+    assert core.args[5].args[1:] == (0.0001, 32768, 0, 65535, torch.int32)
+    assert core.args[3].args[1] == 1 / 65535
+    assert torch.tensor(65535, dtype=torch.float32) * core.args[3].args[1] == 1
+    assert not any(
+        node.target == torch.ops.aten._to_copy.default
+        and node.kwargs.get("dtype") == torch.float16
+        for node in module.graph.nodes
+    )
+    x, conv, state = inputs
+    index = torch.tensor([valid - 1], dtype=torch.int32)
+    expected = module(x, conv, state, index)
+    altered = x.clone()
+    altered[:, valid:] = 50 * torch.randn_like(altered[:, valid:])
+    actual = module(altered, conv, state, index)
+    torch.testing.assert_close(
+        expected[0][:, :valid], actual[0][:, :valid], rtol=0, atol=0
+    )
+    torch.testing.assert_close(expected[2], actual[2], rtol=0, atol=0)
+    torch.testing.assert_close(expected[3], actual[3], rtol=0, atol=0)
+
+
+def test_custom_u16_requires_calibrated_inputs(front):
+    inputs = front[2]
+    source = torch.export.export(Front(), inputs).module()
+    with pytest.raises(ValueError, match="six calibrated UINT16"):
+        padded_prefill_front(source, inputs, 2048, "custom_u16")
 
 
 def test_context_resize_keeps_hidden_width():
