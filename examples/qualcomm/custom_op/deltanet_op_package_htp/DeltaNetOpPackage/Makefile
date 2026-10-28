@@ -138,6 +138,29 @@ htp_v79: $(WORK)/hexagon-v79/$(HTP_LIBRARY_NAME)
 htp_v81: $(WORK)/hexagon-v81/$(HTP_LIBRARY_NAME)
 htp_v85: $(WORK)/hexagon-v85/$(HTP_LIBRARY_NAME)
 
+test-reduction: $(WORK)/x86_64-linux-clang/test_reduction
+	$<
+
+test-reference-reduction: $(WORK)/x86_64-linux-clang/test_reference_reduction
+	$<
+
+$(WORK)/x86_64-linux-clang/test_reference_reduction: tests/test_reference_reduction.cpp $(OP_SOURCES) $(wildcard src/utils/*.h) $(WORK)/x86_64-linux-clang/.build-config Makefile | $(WORK)/x86_64-linux-clang
+	$(X86_CXX) $(X86_CXX_FLAGS) -DTHIS_PKG_NAME=$(PACKAGE_NAME) -O2 -ffunction-sections -fdata-sections $< -Wl,--gc-sections $(X86_LDFLAGS) -o $@
+
+test-fp16-register: $(WORK)/x86_64-linux-clang/test_fp16_reference $(WORK)/x86_64-linux-clang/test_fp16_register
+	$(WORK)/x86_64-linux-clang/test_fp16_reference $(WORK)/x86_64-linux-clang/fp16-reference.bin
+	$(WORK)/x86_64-linux-clang/test_fp16_register $(WORK)/x86_64-linux-clang/fp16-register.bin
+	cmp $(WORK)/x86_64-linux-clang/fp16-reference.bin $(WORK)/x86_64-linux-clang/fp16-register.bin
+
+$(WORK)/x86_64-linux-clang/test_fp16_reference: tests/test_fp16_register.cpp $(OP_SOURCES) $(wildcard src/utils/*.h) $(WORK)/x86_64-linux-clang/.build-config Makefile | $(WORK)/x86_64-linux-clang
+	$(X86_CXX) $(X86_CXX_FLAGS) -DTHIS_PKG_NAME=$(PACKAGE_NAME) -DDELTANET_FP16_REGISTER_REUSE=0 -UNDEBUG -O2 -ffunction-sections -fdata-sections $< -Wl,--gc-sections $(X86_LDFLAGS) -o $@
+
+$(WORK)/x86_64-linux-clang/test_fp16_register: tests/test_fp16_register.cpp $(OP_SOURCES) $(wildcard src/utils/*.h) $(WORK)/x86_64-linux-clang/.build-config Makefile | $(WORK)/x86_64-linux-clang
+	$(X86_CXX) $(X86_CXX_FLAGS) -DTHIS_PKG_NAME=$(PACKAGE_NAME) -DDELTANET_FP16_REGISTER_REUSE=1 -UNDEBUG -O2 -ffunction-sections -fdata-sections $< -Wl,--gc-sections $(X86_LDFLAGS) -o $@
+
+$(WORK)/x86_64-linux-clang/test_reduction: tests/test_reduction.cpp $(OP_SOURCES) $(wildcard src/utils/*.h) $(WORK)/x86_64-linux-clang/.build-config | $(WORK)/x86_64-linux-clang
+	$(X86_CXX) $(X86_CXX_FLAGS) -DTHIS_PKG_NAME=$(PACKAGE_NAME) -O2 -ffunction-sections -fdata-sections $< -Wl,--gc-sections $(X86_LDFLAGS) -o $@
+
 $(WORK)/x86_64-linux-clang $(WORK)/aarch64-android $(WORK)/hexagon-v79 $(WORK)/hexagon-v81 $(WORK)/hexagon-v85:
 	@mkdir -p $@/ops
 
@@ -196,4 +219,4 @@ FORCE:
 -include $(foreach target,x86_64-linux-clang aarch64-android hexagon-v79 hexagon-v81 hexagon-v85,\
     $(addprefix $(WORK)/$(target)/,$(OTHER_OBJS:.o=.d) $(OP_OBJS:.o=.d)))
 
-.PHONY: all clean FORCE htp_x86 htp_aarch64 htp_v79 htp_v81 htp_v85
+.PHONY: all clean FORCE htp_x86 htp_aarch64 htp_v79 htp_v81 htp_v85 test-reduction test-reference-reduction test-fp16-register

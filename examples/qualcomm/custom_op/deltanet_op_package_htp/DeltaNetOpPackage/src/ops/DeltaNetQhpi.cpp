@@ -5,7 +5,7 @@
 // 实现演化及历史测量见包根目录 README.md；旧实验源码快照已清理。
 // 新 DDR / 新 VTCM 分别实例化 deltanetCoreQhpiRunQUint16Tile<false> / <true>。
 // 最初融合 DDR、寄存器 DDR、新 DDR、新 VTCM 的历史整层耗时为
-// 7.71 / 5.54 / 3.30 / 2.79 ms；当前默认使用保留全部量化位的 radix-16 归约。
+// 7.71 / 5.54 / 3.30 / 2.79 ms；默认保留 radix-16 归约的 FP32 重组顺序。
 // 阅读顺序：deltanetCoreQhpiQUint16 -> deltanetCoreQhpiRunQUint16
 // -> deltanetCoreQhpiRunQUint16Tile -> HvxReduceState / DeltaOutput / UpdateState。
 
@@ -33,6 +33,77 @@
 #include <cstring>
 #include <type_traits>
 
+#ifndef DELTANET_PROFILE_PHASES
+#define DELTANET_PROFILE_PHASES 0
+#endif
+#if DELTANET_PROFILE_PHASES && defined(__hexagon__)
+#include "HAP_farf.h"
+#include "HAP_perf.h"
+#endif
+
+struct DeltaNetPhaseProfile {
+#if DELTANET_PROFILE_PHASES && defined(__hexagon__)
+  uint64_t ticks[5]{};
+  uint64_t started = 0;
+  size_t tasks = 0;
+  size_t vector_reductions = 0;
+  size_t integer_updates = 0;
+
+  void start() {
+    ++tasks;
+    asm volatile("" ::: "memory");
+    started = HAP_perf_get_qtimer_count();
+    asm volatile("" ::: "memory");
+  }
+
+  void record(unsigned phase) {
+    asm volatile("" ::: "memory");
+    const uint64_t now = HAP_perf_get_qtimer_count();
+    asm volatile("" ::: "memory");
+    ticks[phase] += now - started;
+    started = now;
+  }
+
+  void paths(bool vector_reduction, bool integer_update) {
+    vector_reductions += vector_reduction;
+    integer_updates += integer_update;
+  }
+
+  void report(
+      size_t slice,
+      size_t slices,
+      size_t tokens,
+      size_t heads,
+      size_t key_dim,
+      size_t value_dim,
+      bool vtcm) const {
+    FARF(
+        ALWAYS,
+        "GDN_PHASE slice=%u slices=%u tokens=%u heads=%u k=%u v=%u vtcm=%u tasks=%u qtimer_hz=19200000 setup_ticks=%llu reduce_ticks=%llu delta_ticks=%llu update_ticks=%llu copy_ticks=%llu vector_reductions=%u integer_updates=%u",
+        unsigned(slice),
+        unsigned(slices),
+        unsigned(tokens),
+        unsigned(heads),
+        unsigned(key_dim),
+        unsigned(value_dim),
+        unsigned(vtcm),
+        unsigned(tasks),
+        (unsigned long long)ticks[0],
+        (unsigned long long)ticks[1],
+        (unsigned long long)ticks[2],
+        (unsigned long long)ticks[3],
+        (unsigned long long)ticks[4],
+        unsigned(vector_reductions),
+        unsigned(integer_updates));
+  }
+#else
+  void start() {}
+  void record(unsigned) {}
+  void paths(bool, bool) {}
+  void report(size_t, size_t, size_t, size_t, size_t, size_t, bool) const {}
+#endif
+};
+
 #ifndef THIS_PKG_NAME_STR
 #define STRINGIZE_DETAIL(X) #X
 #define STRINGIZE(X) STRINGIZE_DETAIL(X)
@@ -45,7 +116,7 @@ static constexpr size_t kQUint16HvxValuesPerVec = 128 / sizeof(uint16_t);
 // 归约时 state、Q、K 各右移 4 位，乘积的尺度在后面乘 2^8 还原。
 // 这是归约计算的精度取舍；state 的存储格式仍然是 QUInt16。
 static constexpr int kQUint16HvxAccumInputShift = 4;
-// Keep all calibrated bits in the default radix-16 integer reduction. Dropping
+// Keep all calibrated bits in the integer reduction. Dropping
 // the low four bits degrades low-amplitude readouts after RMSNorm.
 #ifndef DELTANET_U16_FULL_PRECISION_REDUCTION
 #define DELTANET_U16_FULL_PRECISION_REDUCTION 0
@@ -55,6 +126,16 @@ static constexpr int kQUint16HvxAccumInputShift = 4;
 #endif
 #ifndef DELTANET_U16_KARATSUBA_REDUCTION
 #define DELTANET_U16_KARATSUBA_REDUCTION 0
+#endif
+#ifndef DELTANET_FP16_REGISTER_REUSE
+#if defined(__hexagon__) && __HVX_ARCH__ == 81
+#define DELTANET_FP16_REGISTER_REUSE 1
+#else
+#define DELTANET_FP16_REGISTER_REUSE 0
+#endif
+#endif
+#ifndef DELTANET_U16_RADIX256_REDUCTION
+#define DELTANET_U16_RADIX256_REDUCTION 0
 #endif
 static constexpr bool kQUint16KaratsubaReduction =
     DELTANET_U16_KARATSUBA_REDUCTION != 0;
@@ -68,7 +149,11 @@ using QUint16StateAccum =
 static constexpr int kQUint16HvxStateUpdateInputShift = 0;
 static constexpr int kQUint16HvxStateUpdateCoeffShift = 7;
 static constexpr int kQUint16StateUpdateShift = 20;
-static constexpr bool kEnableQUint16HvxStateUpdate = true;
+#ifndef DELTANET_U16_INTEGER_STATE_UPDATE
+#define DELTANET_U16_INTEGER_STATE_UPDATE 1
+#endif
+static constexpr bool kEnableQUint16HvxStateUpdate =
+    DELTANET_U16_INTEGER_STATE_UPDATE != 0;
 static constexpr bool kEnableQUint16HvxStateUpdateF32 = true;
 
 static inline void deltanetQhpiCopyStateU16(
@@ -479,14 +564,16 @@ static inline int64_t deltanetQhpiHvxPrepareQkU16(
 
 // 第一遍读取 state：同时归约 K^T*S 和 Q^T*S，每个 lane 对应一个 V 通道。
 // Vectors=1/2 每轮处理 64/128 个 V；Aligned 控制 128 字节对齐访存。
-// 默认缩位后用 int32 累加；完整精度实验将中心化整数转为 FP32 累加。
-// 两者的累加器均跨 K 留在寄存器，归约完成后仅写一次 scratch。
+// 默认使用 radix-16。radix-256 仅供显式实验：整数位完整，但 FP32 重组舍入不同。
+// 累加器跨 K 留在寄存器，归约完成后仅写一次 FP32 scratch。
 template <bool Aligned, size_t Vectors = 1>
 static inline void deltanetQhpiHvxReduceStateU16(
     const uint16_t* prev_state,
     QUint16StateAccum* kv_acc,
     QUint16StateAccum* output_pre_acc,
     int32_t prev_zero_offset,
+    int32_t key_zero_offset,
+    int32_t query_zero_offset,
     const int32_t* key_center,
     const int32_t* query_center,
     size_t key_dim,
@@ -494,6 +581,93 @@ static inline void deltanetQhpiHvxReduceStateU16(
     size_t tile_size) {
   constexpr size_t kHalfValuesPerVector = 128 / sizeof(uint16_t);
   constexpr size_t kWordValuesPerVector = 128 / sizeof(int32_t);
+  if constexpr (
+      DELTANET_U16_RADIX256_REDUCTION && kQUint16FullPrecisionReduction) {
+    if (key_dim <= 128 && key_zero_offset >= 0 && key_zero_offset <= 65535 &&
+        query_zero_offset >= 0 && query_zero_offset <= 65535) {
+      // S=256*Sh+Sl, Q/K=(raw-32768)+(32768-zero). Accumulate the shared
+      // state sum with int16 adds, then correct the Q/K bias outside K.
+      // Integer terms fit int32, but the FP32 combine differs from radix-16.
+      const int key_bias = 32768 - key_zero_offset;
+      const int query_bias = 32768 - query_zero_offset;
+      const auto bias_product = [](HVX_Vector sum, int bias) {
+        const HVX_VectorPair product =
+            Q6_Ww_vmpy_VhRh(sum, Q6_R_combine_RlRl(bias, bias));
+        return bias == 32768 ? Q6_Ww_vsub_WwWw(Q6_W_vzero(), product) : product;
+      };
+      const HVX_Vector zero_hi = Q6_Vh_vsplat_R(prev_zero_offset >> 8);
+      const HVX_Vector zero_lo = Q6_Vh_vsplat_R(prev_zero_offset & 255);
+      const HVX_Vector mask = Q6_Vh_vsplat_R(255);
+      const HVX_Vector scale = op_utils::hvxSplatF32(256.0f);
+      for (size_t offset = 0; offset < tile_size;
+           offset += kHalfValuesPerVector * Vectors) {
+        HVX_VectorPair kv_hi[Vectors], kv_lo[Vectors];
+        HVX_VectorPair out_hi[Vectors], out_lo[Vectors];
+        HVX_Vector sum_hi[Vectors], sum_lo[Vectors];
+        for (size_t v = 0; v < Vectors; ++v) {
+          kv_hi[v] = kv_lo[v] = Q6_W_vzero();
+          out_hi[v] = out_lo[v] = Q6_W_vzero();
+          sum_hi[v] = sum_lo[v] = Q6_V_vzero();
+        }
+        for (size_t k = 0; k < key_dim; ++k) {
+          const int key_signed = key_center[k] - key_bias;
+          const int query_signed = query_center[k] - query_bias;
+          const int key = Q6_R_combine_RlRl(key_signed, key_signed);
+          const int query = Q6_R_combine_RlRl(query_signed, query_signed);
+          for (size_t v = 0; v < Vectors; ++v) {
+            const size_t at =
+                k * state_stride + offset + v * kHalfValuesPerVector;
+            const HVX_Vector raw = Aligned
+                ? *reinterpret_cast<const HVX_Vector*>(prev_state + at)
+                : vmemu(prev_state + at);
+            const HVX_Vector hi =
+                Q6_Vh_vsub_VhVh(Q6_Vuh_vlsr_VuhR(raw, 8), zero_hi);
+            const HVX_Vector lo =
+                Q6_Vh_vsub_VhVh(Q6_V_vand_VV(raw, mask), zero_lo);
+            sum_hi[v] = Q6_Vh_vadd_VhVh(sum_hi[v], hi);
+            sum_lo[v] = Q6_Vh_vadd_VhVh(sum_lo[v], lo);
+            kv_hi[v] = Q6_Ww_vmpyacc_WwVhRh(kv_hi[v], hi, key);
+            kv_lo[v] = Q6_Ww_vmpyacc_WwVhRh(kv_lo[v], lo, key);
+            out_hi[v] = Q6_Ww_vmpyacc_WwVhRh(out_hi[v], hi, query);
+            out_lo[v] = Q6_Ww_vmpyacc_WwVhRh(out_lo[v], lo, query);
+          }
+        }
+        for (size_t v = 0; v < Vectors; ++v) {
+          const size_t at = offset + v * kHalfValuesPerVector;
+          kv_hi[v] =
+              Q6_Ww_vadd_WwWw(kv_hi[v], bias_product(sum_hi[v], key_bias));
+          kv_lo[v] =
+              Q6_Ww_vadd_WwWw(kv_lo[v], bias_product(sum_lo[v], key_bias));
+          out_hi[v] =
+              Q6_Ww_vadd_WwWw(out_hi[v], bias_product(sum_hi[v], query_bias));
+          out_lo[v] =
+              Q6_Ww_vadd_WwWw(out_lo[v], bias_product(sum_lo[v], query_bias));
+          const HVX_VectorPair kh =
+              Q6_W_vshuff_VVR(Q6_V_hi_W(kv_hi[v]), Q6_V_lo_W(kv_hi[v]), -4);
+          const HVX_VectorPair kl =
+              Q6_W_vshuff_VVR(Q6_V_hi_W(kv_lo[v]), Q6_V_lo_W(kv_lo[v]), -4);
+          const HVX_VectorPair qh =
+              Q6_W_vshuff_VVR(Q6_V_hi_W(out_hi[v]), Q6_V_lo_W(out_hi[v]), -4);
+          const HVX_VectorPair ql =
+              Q6_W_vshuff_VVR(Q6_V_hi_W(out_lo[v]), Q6_V_lo_W(out_lo[v]), -4);
+          vmemu(kv_acc + at) = op_utils::hvxAddF32(
+              op_utils::hvxMulF32(Q6_Vsf_equals_Vw(Q6_V_lo_W(kh)), scale),
+              Q6_Vsf_equals_Vw(Q6_V_lo_W(kl)));
+          vmemu(kv_acc + at + kWordValuesPerVector) = op_utils::hvxAddF32(
+              op_utils::hvxMulF32(Q6_Vsf_equals_Vw(Q6_V_hi_W(kh)), scale),
+              Q6_Vsf_equals_Vw(Q6_V_hi_W(kl)));
+          vmemu(output_pre_acc + at) = op_utils::hvxAddF32(
+              op_utils::hvxMulF32(Q6_Vsf_equals_Vw(Q6_V_lo_W(qh)), scale),
+              Q6_Vsf_equals_Vw(Q6_V_lo_W(ql)));
+          vmemu(output_pre_acc + at + kWordValuesPerVector) =
+              op_utils::hvxAddF32(
+                  op_utils::hvxMulF32(Q6_Vsf_equals_Vw(Q6_V_hi_W(qh)), scale),
+                  Q6_Vsf_equals_Vw(Q6_V_hi_W(ql)));
+        }
+      }
+      return;
+    }
+  }
   if constexpr (kQUint16SplitReduction) {
     // S=16*S_hi+S_lo and K=16*K_hi+K_lo. Accumulate the three
     // integer terms separately, then combine 256*A+16*B+C in FP32.
@@ -505,15 +679,20 @@ static inline void deltanetQhpiHvxReduceStateU16(
       constexpr size_t kSplitVectors = kQUint16KaratsubaReduction ? Vectors : 1;
       constexpr int kSplitShift = 4;
       constexpr int kSplitMask = (1 << kSplitShift) - 1;
-      const HVX_Vector v_zero_hi = Q6_Vh_vsplat_R(prev_zero_offset >> kSplitShift);
-      const HVX_Vector v_zero_lo = Q6_Vh_vsplat_R(prev_zero_offset & kSplitMask);
+      const HVX_Vector v_zero_hi =
+          Q6_Vh_vsplat_R(prev_zero_offset >> kSplitShift);
+      const HVX_Vector v_zero_lo =
+          Q6_Vh_vsplat_R(prev_zero_offset & kSplitMask);
       const HVX_Vector v_mask_lo = Q6_Vh_vsplat_R(kSplitMask);
-      const HVX_Vector v_scale_hi = op_utils::hvxSplatF32(1 << (2 * kSplitShift));
+      const HVX_Vector v_scale_hi =
+          op_utils::hvxSplatF32(1 << (2 * kSplitShift));
       const HVX_Vector v_scale_cross = op_utils::hvxSplatF32(1 << kSplitShift);
       for (size_t offset = 0; offset < tile_size;
            offset += kHalfValuesPerVector * kSplitVectors) {
-        HVX_VectorPair kv_hi[kSplitVectors], kv_cross[kSplitVectors], kv_lo[kSplitVectors];
-        HVX_VectorPair out_hi[kSplitVectors], out_cross[kSplitVectors], out_lo[kSplitVectors];
+        HVX_VectorPair kv_hi[kSplitVectors], kv_cross[kSplitVectors],
+            kv_lo[kSplitVectors];
+        HVX_VectorPair out_hi[kSplitVectors], out_cross[kSplitVectors],
+            out_lo[kSplitVectors];
         for (size_t v = 0; v < kSplitVectors; ++v) {
           kv_hi[v] = kv_cross[v] = kv_lo[v] = Q6_W_vzero();
           out_hi[v] = out_cross[v] = out_lo[v] = Q6_W_vzero();
@@ -1451,6 +1630,131 @@ static inline void deltanetQhpiHvxDeltaAndWriteOutputF16(
   }
 }
 
+template <bool Aligned, size_t Vectors = 1, typename Coefficient = Float16>
+static inline void deltanetQhpiHvxReduceStateF16(
+    const Float16* previous,
+    float* kv,
+    float* out,
+    const Coefficient* key,
+    const Coefficient* query,
+    float decay,
+    size_t key_dim,
+    size_t stride,
+    size_t tile_size) {
+  constexpr size_t halfs = 128 / sizeof(Float16);
+  constexpr size_t words = 128 / sizeof(float);
+  const HVX_Vector one = Q6_Vh_vsplat_R(0x3C00);
+  for (size_t offset = 0; offset < tile_size; offset += halfs * Vectors) {
+    HVX_Vector kv_lo[Vectors], kv_hi[Vectors], out_lo[Vectors], out_hi[Vectors];
+    for (size_t k = 0; k < key_dim; ++k) {
+      const HVX_Vector key_scale =
+          op_utils::hvxSplatF32(decay * static_cast<float>(key[k]));
+      const HVX_Vector query_scale =
+          op_utils::hvxSplatF32(decay * static_cast<float>(query[k]));
+      for (size_t v = 0; v < Vectors; ++v) {
+        const size_t at = k * stride + offset + v * halfs;
+        const HVX_Vector raw = Aligned
+            ? *reinterpret_cast<const HVX_Vector*>(previous + at)
+            : vmemu(previous + at);
+        HVX_Vector lo, hi;
+        if constexpr (std::is_same_v<Coefficient, float>) {
+          const HVX_VectorPair expanded = Q6_Wsf_vcvt_Vhf(raw);
+          lo = Q6_V_lo_W(expanded);
+          hi = Q6_V_hi_W(expanded);
+        } else {
+          const HVX_VectorPair expanded = Q6_Wqf32_vmpy_VhfVhf(raw, one);
+          lo = Q6_Vsf_equals_Vqf32(Q6_V_lo_W(expanded));
+          hi = Q6_Vsf_equals_Vqf32(Q6_V_hi_W(expanded));
+        }
+        const HVX_Vector kl = op_utils::hvxMulF32(lo, key_scale);
+        const HVX_Vector kh = op_utils::hvxMulF32(hi, key_scale);
+        const HVX_Vector ql = op_utils::hvxMulF32(lo, query_scale);
+        const HVX_Vector qh = op_utils::hvxMulF32(hi, query_scale);
+        if (k == 0) {
+          kv_lo[v] = kl;
+          kv_hi[v] = kh;
+          out_lo[v] = ql;
+          out_hi[v] = qh;
+        } else {
+          kv_lo[v] = op_utils::hvxAddF32(kv_lo[v], kl);
+          kv_hi[v] = op_utils::hvxAddF32(kv_hi[v], kh);
+          out_lo[v] = op_utils::hvxAddF32(out_lo[v], ql);
+          out_hi[v] = op_utils::hvxAddF32(out_hi[v], qh);
+        }
+      }
+    }
+    for (size_t v = 0; v < Vectors; ++v) {
+      const size_t at = offset + v * halfs;
+      vmemu(kv + at) = kv_lo[v];
+      vmemu(kv + at + words) = kv_hi[v];
+      vmemu(out + at) = out_lo[v];
+      vmemu(out + at + words) = out_hi[v];
+    }
+  }
+}
+
+template <bool Aligned, size_t Vectors = 1, typename Coefficient = Float16>
+static inline void deltanetQhpiHvxUpdateStateTileF16(
+    const Float16* previous,
+    Float16* state,
+    const float* delta,
+    const Coefficient* key,
+    float decay,
+    size_t key_dim,
+    size_t stride,
+    size_t tile_size) {
+  constexpr size_t halfs = 128 / sizeof(Float16);
+  constexpr size_t words = 128 / sizeof(float);
+  const HVX_Vector one = Q6_Vh_vsplat_R(0x3C00);
+  const HVX_Vector decay_scale = op_utils::hvxSplatF32(decay);
+  for (size_t offset = 0; offset < tile_size; offset += halfs * Vectors) {
+    HVX_Vector dl[Vectors], dh[Vectors];
+    for (size_t v = 0; v < Vectors; ++v) {
+      const size_t at = offset + v * halfs;
+      dl[v] = vmemu(delta + at);
+      dh[v] = vmemu(delta + at + words);
+    }
+    for (size_t k = 0; k < key_dim; ++k) {
+      const HVX_Vector key_scale =
+          op_utils::hvxSplatF32(static_cast<float>(key[k]));
+      for (size_t v = 0; v < Vectors; ++v) {
+        const size_t at = k * stride + offset + v * halfs;
+        const HVX_Vector raw = Aligned
+            ? *reinterpret_cast<const HVX_Vector*>(previous + at)
+            : vmemu(previous + at);
+        HVX_Vector lo, hi;
+        if constexpr (std::is_same_v<Coefficient, float>) {
+          const HVX_VectorPair expanded = Q6_Wsf_vcvt_Vhf(raw);
+          lo = Q6_V_lo_W(expanded);
+          hi = Q6_V_hi_W(expanded);
+        } else {
+          const HVX_VectorPair expanded = Q6_Wqf32_vmpy_VhfVhf(raw, one);
+          lo = Q6_Vsf_equals_Vqf32(Q6_V_lo_W(expanded));
+          hi = Q6_Vsf_equals_Vqf32(Q6_V_hi_W(expanded));
+        }
+        const HVX_Vector updated_lo = op_utils::hvxAddF32(
+            op_utils::hvxMulF32(lo, decay_scale),
+            op_utils::hvxMulF32(dl[v], key_scale));
+        const HVX_Vector updated_hi = op_utils::hvxAddF32(
+            op_utils::hvxMulF32(hi, decay_scale),
+            op_utils::hvxMulF32(dh[v], key_scale));
+        // The mixed core uses IEEE nearest-even Half storage, without a
+        // QF32 round trip that changes ties. Preserve the old FP16 operator.
+        const HVX_Vector packed = std::is_same_v<Coefficient, float>
+            ? Q6_Vhf_vcvt_VsfVsf(updated_lo, updated_hi)
+            : Q6_Vhf_equals_Wqf32(
+                  op_utils::hvxF32PairToQF32(updated_lo, updated_hi));
+        if constexpr (Aligned)
+          *reinterpret_cast<HVX_Vector*>(state + at) = packed;
+        else
+          vmemu(state + at) = packed;
+      }
+    }
+  }
+}
+
+
+
 // 普通 FP16 recurrence：一个 (batch,head,V tile) 顺序执行全部 token。
 // state 为 [B,H,K,V]，Q/K/value/y 为 [B,T,H,D]；投影、delta、Q·K 用 FP32。
 // 每步先归约（系数已含 decay）、求 delta/y，再更新 FP16 state；
@@ -1500,29 +1804,62 @@ static inline void deltanetCoreQhpiRunFp16Tile(
     const float beta_value =
         static_cast<float>(beta_data[(b * seq_len + t) * heads + h]);
 
+#if DELTANET_FP16_REGISTER_REUSE
+    const Float16* previous =
+        (t == 0 ? recurrent_state_data : state_data) + state_base + v_begin;
+    const bool aligned =
+        reinterpret_cast<uintptr_t>(previous) % 128 == 0 && value_dim % 64 == 0;
+    if (tile_size % 64 == 0) {
+      if (aligned && tile_size % 128 == 0) {
+        deltanetQhpiHvxReduceStateF16<true, 2>(
+            previous,
+            kv_mem,
+            output_pre,
+            key_row,
+            query_row,
+            decay,
+            key_dim,
+            value_dim,
+            tile_size);
+      } else {
+        deltanetQhpiHvxReduceStateF16<false>(
+            previous,
+            kv_mem,
+            output_pre,
+            key_row,
+            query_row,
+            decay,
+            key_dim,
+            value_dim,
+            tile_size);
+      }
+    } else
+#endif
     {
-      const size_t row_base = state_base + v_begin;
-      const Float16* prev_state =
-          t == 0 ? recurrent_state_data + row_base : state_data + row_base;
-      deltanetQhpiHvxAssignAccumF16(
-          prev_state,
-          kv_mem,
-          output_pre,
-          decay * static_cast<float>(key_row[0]),
-          decay * static_cast<float>(query_row[0]),
-          tile_size);
-    }
-    for (size_t k = 1; k < key_dim; ++k) {
-      const size_t row_base = state_base + k * value_dim + v_begin;
-      const Float16* prev_state =
-          t == 0 ? recurrent_state_data + row_base : state_data + row_base;
-      deltanetQhpiHvxAccumF16(
-          prev_state,
-          kv_mem,
-          output_pre,
-          decay * static_cast<float>(key_row[k]),
-          decay * static_cast<float>(query_row[k]),
-          tile_size);
+      {
+        const size_t row_base = state_base + v_begin;
+        const Float16* prev_state =
+            t == 0 ? recurrent_state_data + row_base : state_data + row_base;
+        deltanetQhpiHvxAssignAccumF16(
+            prev_state,
+            kv_mem,
+            output_pre,
+            decay * static_cast<float>(key_row[0]),
+            decay * static_cast<float>(query_row[0]),
+            tile_size);
+      }
+      for (size_t k = 1; k < key_dim; ++k) {
+        const size_t row_base = state_base + k * value_dim + v_begin;
+        const Float16* prev_state =
+            t == 0 ? recurrent_state_data + row_base : state_data + row_base;
+        deltanetQhpiHvxAccumF16(
+            prev_state,
+            kv_mem,
+            output_pre,
+            decay * static_cast<float>(key_row[k]),
+            decay * static_cast<float>(query_row[k]),
+            tile_size);
+      }
     }
 
     deltanetQhpiHvxDeltaAndWriteOutputF16(
@@ -1535,17 +1872,48 @@ static inline void deltanetCoreQhpiRunFp16Tile(
         key_query_dot,
         tile_size);
 
-    for (size_t k = 0; k < key_dim; ++k) {
-      const size_t row_base = state_base + k * value_dim + v_begin;
-      const Float16* prev_state =
-          t == 0 ? recurrent_state_data + row_base : state_data + row_base;
-      deltanetQhpiHvxUpdateStateF16(
-          prev_state,
-          state_data + row_base,
-          delta,
-          decay,
-          static_cast<float>(key_row[k]),
-          tile_size);
+#if DELTANET_FP16_REGISTER_REUSE
+    if (tile_size % 64 == 0) {
+      if (aligned &&
+          reinterpret_cast<uintptr_t>(state_data + state_base + v_begin) %
+                  128 ==
+              0 &&
+          tile_size % 128 == 0) {
+        deltanetQhpiHvxUpdateStateTileF16<true, 2>(
+            previous,
+            state_data + state_base + v_begin,
+            delta,
+            key_row,
+            decay,
+            key_dim,
+            value_dim,
+            tile_size);
+      } else {
+        deltanetQhpiHvxUpdateStateTileF16<false>(
+            previous,
+            state_data + state_base + v_begin,
+            delta,
+            key_row,
+            decay,
+            key_dim,
+            value_dim,
+            tile_size);
+      }
+    } else
+#endif
+    {
+      for (size_t k = 0; k < key_dim; ++k) {
+        const size_t row_base = state_base + k * value_dim + v_begin;
+        const Float16* prev_state =
+            t == 0 ? recurrent_state_data + row_base : state_data + row_base;
+        deltanetQhpiHvxUpdateStateF16(
+            prev_state,
+            state_data + row_base,
+            delta,
+            decay,
+            static_cast<float>(key_row[k]),
+            tile_size);
+      }
     }
   }
 }
@@ -2014,7 +2382,8 @@ static inline void deltanetCoreQhpiRunQUint16Tile(
     int32_t* delta_update_fixed32,
     float* delta_value_scratch,
     int32_t* key_center,
-    int32_t* query_center) {
+    int32_t* query_center,
+    DeltaNetPhaseProfile& profile) {
   const size_t tile_size = v_end - v_begin;
   if (tile_size == 0) {
     return;
@@ -2024,6 +2393,7 @@ static inline void deltanetCoreQhpiRunQUint16Tile(
   const size_t h = row % heads;
   const size_t state_base = row * key_dim * value_dim;
 
+  profile.start();
   // VTCM 入口把初始 state 的原始 U16 code 拷入常驻输出区一次。
   // 此处没有重量化；首 token 仍按 recurrent_state_q 解释这些 code。
   // H=16,K=V=128 时整个 state 占 512 KiB，每 head 32 KiB。
@@ -2044,6 +2414,7 @@ static inline void deltanetCoreQhpiRunQUint16Tile(
     }
   }
 
+  profile.record(4);
   const bool bounded_qk = op_utils::hasU16ZeroOffset(key_q) &&
       op_utils::hasU16ZeroOffset(query_q);
   const double delta_update_scale = key_q.stepsize / state_q.stepsize;
@@ -2121,6 +2492,7 @@ static inline void deltanetCoreQhpiRunQUint16Tile(
                        static_cast<int64_t>(state_q.zero_offset)
                        << state_update_final_shift);
     }
+    profile.record(0);
     // P1：一遍 state 同时得到 kv_acc=K^T*S、output_pre_acc=Q^T*S。
     // 64 通道整块走寄存器归约；不满足条件则走逐 K scratch/int64 路径。
     if (hvx_accum && tile_size % kQUint16HvxValuesPerVec == 0) {
@@ -2135,6 +2507,8 @@ static inline void deltanetCoreQhpiRunQUint16Tile(
               kv_projection,
               output_pre_projection,
               prev_q.zero_offset,
+              key_q.zero_offset,
+              query_q.zero_offset,
               key_center,
               query_center,
               key_dim,
@@ -2146,6 +2520,8 @@ static inline void deltanetCoreQhpiRunQUint16Tile(
               kv_projection,
               output_pre_projection,
               prev_q.zero_offset,
+              key_q.zero_offset,
+              query_q.zero_offset,
               key_center,
               query_center,
               key_dim,
@@ -2158,6 +2534,8 @@ static inline void deltanetCoreQhpiRunQUint16Tile(
             kv_projection,
             output_pre_projection,
             prev_q.zero_offset,
+              key_q.zero_offset,
+              query_q.zero_offset,
             key_center,
             query_center,
             key_dim,
@@ -2216,6 +2594,7 @@ static inline void deltanetCoreQhpiRunQUint16Tile(
       }
     }
 
+    profile.record(1);
     // P2：计算 delta 和本 token 的输出；尚未覆盖旧 state。
     // 完整精度归约无需补偿，旧版缩位路径乘 2^(4+4)=256。
     const double hvx_accum_scale =
@@ -2287,6 +2666,10 @@ static inline void deltanetCoreQhpiRunQUint16Tile(
           delta_value * output_delta_scale);
     }
 
+    profile.record(2);
+    profile.paths(
+        hvx_accum && tile_size % kQUint16HvxValuesPerVec == 0,
+        hvx_update);
     // P3：第二遍 state，S_new=decay*S_old+key*delta^T，写成 state_q 的 code。
     // 非负整数系数用 unsigned halfword 快速路径；整数条件失败走 F32 tile。
     // 负整数系数/非整块使用下面的逐行路径，不能误用 unsigned 乘法。
@@ -2453,6 +2836,7 @@ static inline void deltanetCoreQhpiRunQUint16Tile(
         }
       }
     }
+    profile.record(3);
   }
 }
 
@@ -2498,6 +2882,7 @@ static void deltanetCoreQhpiRunQUint16(
   int32_t key_center[kMaxDeltaNetDim] __attribute__((aligned(128)));
   int32_t query_center[kMaxDeltaNetDim] __attribute__((aligned(128)));
 
+  DeltaNetPhaseProfile profile;
   const size_t total_rows = batch * heads;
   if (value_tile_count <= 1) {
     const size_t row_begin = op_utils::divUp(total_rows * slice, num_slices);
@@ -2538,8 +2923,11 @@ static void deltanetCoreQhpiRunQUint16(
           delta_update_fixed32,
           delta_value_scratch,
           key_center,
-          query_center);
+          query_center,
+          profile);
     }
+    profile.report(
+        slice, num_slices, seq_len, heads, key_dim, value_dim, StateResident);
     return;
   }
 
@@ -2583,8 +2971,11 @@ static void deltanetCoreQhpiRunQUint16(
         delta_update_fixed32,
         delta_value_scratch,
         key_center,
-        query_center);
+        query_center,
+        profile);
   }
+  profile.report(
+      slice, num_slices, seq_len, heads, key_dim, value_dim, StateResident);
 }
 
 // 按 token -> V 列处理的实验路径：将一个 V 通道的全部 K 个 state 读入小缓冲区，
@@ -2768,13 +3159,13 @@ static uint32_t deltanetCoreQhpiFp16(
     uint32_t num_inputs,
     const QHPI_Tensor* const* inputs) {
   if (num_inputs != 6 || num_outputs != 2) {
-    return QHPI_ErrorFatal;
+    return QHPI_ERROR_FATAL;
   }
 
   const QHPI_Shape query_shape = qhpi_tensor_shape(inputs[0]);
   const QHPI_Shape value_shape = qhpi_tensor_shape(inputs[2]);
   if (query_shape.rank != 4 || value_shape.rank != 4) {
-    return QHPI_ErrorFatal;
+    return QHPI_ERROR_FATAL;
   }
 
   const size_t batch = query_shape.dims[0];
@@ -2785,7 +3176,7 @@ static uint32_t deltanetCoreQhpiFp16(
   if (batch == 0 || seq_len == 0 || heads == 0 || key_dim == 0 ||
       value_dim == 0 || key_dim > kMaxDeltaNetDim ||
       value_dim > kMaxDeltaNetDim) {
-    return QHPI_Unsupported;
+    return QHPI_UNSUPPORTED;
   }
 
   const uint32_t num_slices = std::max<uint32_t>(qhpi_num_slices(handle), 1);
@@ -2809,8 +3200,10 @@ static uint32_t deltanetCoreQhpiFp16(
       slice,
       num_slices,
       value_tile_count);
-  return QHPI_Success;
+  return QHPI_SUCCESS;
 }
+
+#include "DeltaNetFp16State.h"
 
 // QHPI 的 FP32 kernel 入口：检查输入/输出数及主要维度，提取 FP32 指针，
 // 取得 worker slice 和 V 分块数，转交 RunFp32 执行递推。
@@ -2821,13 +3214,13 @@ static uint32_t deltanetCoreQhpiFp32(
     uint32_t num_inputs,
     const QHPI_Tensor* const* inputs) {
   if (num_inputs != 6 || num_outputs != 2) {
-    return QHPI_ErrorFatal;
+    return QHPI_ERROR_FATAL;
   }
 
   const QHPI_Shape query_shape = qhpi_tensor_shape(inputs[0]);
   const QHPI_Shape value_shape = qhpi_tensor_shape(inputs[2]);
   if (query_shape.rank != 4 || value_shape.rank != 4) {
-    return QHPI_ErrorFatal;
+    return QHPI_ERROR_FATAL;
   }
 
   const size_t batch = query_shape.dims[0];
@@ -2838,7 +3231,7 @@ static uint32_t deltanetCoreQhpiFp32(
   if (batch == 0 || seq_len == 0 || heads == 0 || key_dim == 0 ||
       value_dim == 0 || key_dim > kMaxDeltaNetDim ||
       value_dim > kMaxDeltaNetDim) {
-    return QHPI_Unsupported;
+    return QHPI_UNSUPPORTED;
   }
 
   const uint32_t num_slices = std::max<uint32_t>(qhpi_num_slices(handle), 1);
@@ -2862,7 +3255,7 @@ static uint32_t deltanetCoreQhpiFp32(
       slice,
       num_slices,
       value_tile_count);
-  return QHPI_Success;
+  return QHPI_SUCCESS;
 }
 
 // QHPI 的 QUInt16 kernel 入口：校验六输入/两输出的形状、gate 布局和量化参数，
@@ -2876,7 +3269,7 @@ static uint32_t deltanetCoreQhpiQUint16(
     uint32_t num_inputs,
     const QHPI_Tensor* const* inputs) {
   if (num_inputs != 6 || num_outputs != 2) {
-    return QHPI_ErrorFatal;
+    return QHPI_ERROR_FATAL;
   }
 
   const QHPI_Shape query_shape = qhpi_tensor_shape(inputs[0]);
@@ -2889,7 +3282,7 @@ static uint32_t deltanetCoreQhpiQUint16(
       value_shape.rank != 4 || recurrent_shape.rank != 4 ||
       (decay_shape.rank != 3 && decay_shape.rank != 4) ||
       (beta_shape.rank != 3 && beta_shape.rank != 4)) {
-    return QHPI_ErrorFatal;
+    return QHPI_ERROR_FATAL;
   }
 
   const size_t batch = query_shape.dims[0];
@@ -2900,7 +3293,7 @@ static uint32_t deltanetCoreQhpiQUint16(
   if (batch == 0 || seq_len == 0 || heads == 0 || key_dim == 0 ||
       value_dim == 0 || key_dim > kMaxDeltaNetDim ||
       value_dim > kMaxDeltaNetDim) {
-    return QHPI_Unsupported;
+    return QHPI_UNSUPPORTED;
   }
   if (key_shape.dims[0] != batch || key_shape.dims[1] != seq_len ||
       key_shape.dims[2] != heads || key_shape.dims[3] != key_dim ||
@@ -2911,7 +3304,7 @@ static uint32_t deltanetCoreQhpiQUint16(
       recurrent_shape.dims[3] != value_dim ||
       !op_utils::hasTimeHeadLayout(decay_shape, batch, seq_len, heads) ||
       !op_utils::hasTimeHeadLayout(beta_shape, batch, seq_len, heads)) {
-    return QHPI_ErrorFatal;
+    return QHPI_ERROR_FATAL;
   }
 
   const QHPI_Quant_Parameters query_q = qhpi_tensor_quant_parameters(inputs[0]);
@@ -2933,7 +3326,7 @@ static uint32_t deltanetCoreQhpiQUint16(
       !op_utils::isValidQuant(recurrent_state_q) ||
       !op_utils::isValidQuant(output_q) ||
       !op_utils::isValidQuant(state_q)) {
-    return QHPI_ErrorFatal;
+    return QHPI_ERROR_FATAL;
   }
 
   const uint32_t num_slices = std::max<uint32_t>(qhpi_num_slices(handle), 1);
@@ -2967,7 +3360,7 @@ static uint32_t deltanetCoreQhpiQUint16(
       slice,
       num_slices,
       value_tile_count);
-  return QHPI_Success;
+  return QHPI_SUCCESS;
 }
 
 // QHPI 的 Stream kernel 入口：校验 [B,H,V,K] state、gate 布局和量化参数。
@@ -2979,7 +3372,7 @@ static uint32_t deltanetCoreQhpiQUint16Stream(
     uint32_t num_inputs,
     const QHPI_Tensor* const* inputs) {
   if (num_inputs != 6 || num_outputs != 2) {
-    return QHPI_ErrorFatal;
+    return QHPI_ERROR_FATAL;
   }
   const QHPI_Shape query_shape = qhpi_tensor_shape(inputs[0]);
   const QHPI_Shape key_shape = qhpi_tensor_shape(inputs[1]);
@@ -2991,7 +3384,7 @@ static uint32_t deltanetCoreQhpiQUint16Stream(
       value_shape.rank != 4 || recurrent_shape.rank != 4 ||
       (decay_shape.rank != 3 && decay_shape.rank != 4) ||
       (beta_shape.rank != 3 && beta_shape.rank != 4)) {
-    return QHPI_ErrorFatal;
+    return QHPI_ERROR_FATAL;
   }
   const size_t batch = query_shape.dims[0];
   const size_t seq_len = query_shape.dims[1];
@@ -3001,7 +3394,7 @@ static uint32_t deltanetCoreQhpiQUint16Stream(
   if (batch == 0 || seq_len == 0 || heads == 0 || key_dim == 0 ||
       value_dim == 0 || key_dim > kMaxDeltaNetDim ||
       value_dim > kMaxDeltaNetDim) {
-    return QHPI_Unsupported;
+    return QHPI_UNSUPPORTED;
   }
   if (key_shape.dims[0] != batch || key_shape.dims[1] != seq_len ||
       key_shape.dims[2] != heads || key_shape.dims[3] != key_dim ||
@@ -3011,7 +3404,7 @@ static uint32_t deltanetCoreQhpiQUint16Stream(
       recurrent_shape.dims[3] != key_dim ||
       !op_utils::hasTimeHeadLayout(decay_shape, batch, seq_len, heads) ||
       !op_utils::hasTimeHeadLayout(beta_shape, batch, seq_len, heads)) {
-    return QHPI_ErrorFatal;
+    return QHPI_ERROR_FATAL;
   }
   const QHPI_Quant_Parameters query_q = qhpi_tensor_quant_parameters(inputs[0]);
   const QHPI_Quant_Parameters key_q = qhpi_tensor_quant_parameters(inputs[1]);
@@ -3032,7 +3425,7 @@ static uint32_t deltanetCoreQhpiQUint16Stream(
       !op_utils::isValidQuant(recurrent_state_q) ||
       !op_utils::isValidQuant(output_q) ||
       !op_utils::isValidQuant(state_q)) {
-    return QHPI_ErrorFatal;
+    return QHPI_ERROR_FATAL;
   }
   const uint32_t num_slices = std::max<uint32_t>(qhpi_num_slices(handle), 1);
   deltanetCoreQhpiRunQUint16Stream(
@@ -3047,7 +3440,7 @@ static uint32_t deltanetCoreQhpiQUint16Stream(
       query_q, key_q, value_q, decay_q, beta_q, recurrent_state_q, output_q,
       state_q, decay_shape, beta_shape, batch, seq_len, heads, key_dim,
       value_dim, qhpi_slice_number(handle), num_slices);
-  return QHPI_Success;
+  return QHPI_SUCCESS;
 }
 
 // QHPI 的纯 FP16 累加入口：检查输入/输出数及主要维度，设置 head/V 分块调度。
@@ -3059,13 +3452,13 @@ static uint32_t deltanetCoreQhpiFp16AccumF16(
     uint32_t num_inputs,
     const QHPI_Tensor* const* inputs) {
   if (num_inputs != 6 || num_outputs != 2) {
-    return QHPI_ErrorFatal;
+    return QHPI_ERROR_FATAL;
   }
 
   const QHPI_Shape query_shape = qhpi_tensor_shape(inputs[0]);
   const QHPI_Shape value_shape = qhpi_tensor_shape(inputs[2]);
   if (query_shape.rank != 4 || value_shape.rank != 4) {
-    return QHPI_ErrorFatal;
+    return QHPI_ERROR_FATAL;
   }
 
   const size_t batch = query_shape.dims[0];
@@ -3076,7 +3469,7 @@ static uint32_t deltanetCoreQhpiFp16AccumF16(
   if (batch == 0 || seq_len == 0 || heads == 0 || key_dim == 0 ||
       value_dim == 0 || key_dim > kMaxDeltaNetDim ||
       value_dim > kMaxDeltaNetDim) {
-    return QHPI_Unsupported;
+    return QHPI_UNSUPPORTED;
   }
 
   const uint32_t num_slices = std::max<uint32_t>(qhpi_num_slices(handle), 1);
@@ -3100,64 +3493,64 @@ static uint32_t deltanetCoreQhpiFp16AccumF16(
       slice,
       num_slices,
       value_tile_count);
-  return QHPI_Success;
+  return QHPI_SUCCESS;
 }
 
 // 以下输入 signature 的顺序均为 Q,K,V,decay,beta,S_initial；Direct 表示直接访问缓冲区。
 // 普通 FP16 和 Fp16AccumF16 共用 FP16 存储 signature，计算精度由各自 kernel 决定。
 static QHPI_Tensor_Signature_v1 deltanet_core_fp16_inputs[] = {
-    {QHPI_Float16, QHPI_Layout_Any, QHPI_Storage_Direct_OR_Indirect, QHPI_MemLoc_DDR_OR_TCM},
-    {QHPI_Float16, QHPI_Layout_Any, QHPI_Storage_Direct_OR_Indirect, QHPI_MemLoc_DDR_OR_TCM},
-    {QHPI_Float16, QHPI_Layout_Any, QHPI_Storage_Direct_OR_Indirect, QHPI_MemLoc_DDR_OR_TCM},
-    {QHPI_Float16, QHPI_Layout_Any, QHPI_Storage_Direct_OR_Indirect, QHPI_MemLoc_DDR_OR_TCM},
-    {QHPI_Float16, QHPI_Layout_Any, QHPI_Storage_Direct_OR_Indirect, QHPI_MemLoc_DDR_OR_TCM},
-    {QHPI_Float16, QHPI_Layout_Any, QHPI_Storage_Direct_OR_Indirect, QHPI_MemLoc_DDR_OR_TCM},
+    {QHPI_FLOAT16, QHPI_LAYOUT_FLAT_4, QHPI_STORAGE_DIRECT, QHPI_MEM_LOC_DDR_ONLY},
+    {QHPI_FLOAT16, QHPI_LAYOUT_FLAT_4, QHPI_STORAGE_DIRECT, QHPI_MEM_LOC_DDR_ONLY},
+    {QHPI_FLOAT16, QHPI_LAYOUT_FLAT_4, QHPI_STORAGE_DIRECT, QHPI_MEM_LOC_DDR_ONLY},
+    {QHPI_FLOAT16, QHPI_LAYOUT_FLAT_4, QHPI_STORAGE_DIRECT, QHPI_MEM_LOC_DDR_ONLY},
+    {QHPI_FLOAT16, QHPI_LAYOUT_FLAT_4, QHPI_STORAGE_DIRECT, QHPI_MEM_LOC_DDR_ONLY},
+    {QHPI_FLOAT16, QHPI_LAYOUT_FLAT_4, QHPI_STORAGE_DIRECT, QHPI_MEM_LOC_DDR_ONLY},
 };
 
 // 两输出依次为 y [B,T,H,V]、最终 state [B,H,K,V]，均为 DDR 中的 FP16。
 static QHPI_Tensor_Signature_v1 deltanet_core_fp16_outputs[] = {
-    {QHPI_Float16, QHPI_Layout_Any, QHPI_Storage_Direct_OR_Indirect, QHPI_MemLoc_DDR_OR_TCM},
-    {QHPI_Float16, QHPI_Layout_Any, QHPI_Storage_Direct_OR_Indirect, QHPI_MemLoc_DDR_OR_TCM},
+    {QHPI_FLOAT16, QHPI_LAYOUT_FLAT_4, QHPI_STORAGE_DIRECT, QHPI_MEM_LOC_DDR_ONLY},
+    {QHPI_FLOAT16, QHPI_LAYOUT_FLAT_4, QHPI_STORAGE_DIRECT, QHPI_MEM_LOC_DDR_ONLY},
 };
 
 // FP32 六输入的 dtype/布局/存储位置约束：直接读取 DDR 缓冲区。
 static QHPI_Tensor_Signature_v1 deltanet_core_fp32_inputs[] = {
-    {QHPI_Float32, QHPI_Layout_Any, QHPI_Storage_Direct_OR_Indirect, QHPI_MemLoc_DDR_OR_TCM},
-    {QHPI_Float32, QHPI_Layout_Any, QHPI_Storage_Direct_OR_Indirect, QHPI_MemLoc_DDR_OR_TCM},
-    {QHPI_Float32, QHPI_Layout_Any, QHPI_Storage_Direct_OR_Indirect, QHPI_MemLoc_DDR_OR_TCM},
-    {QHPI_Float32, QHPI_Layout_Any, QHPI_Storage_Direct_OR_Indirect, QHPI_MemLoc_DDR_OR_TCM},
-    {QHPI_Float32, QHPI_Layout_Any, QHPI_Storage_Direct_OR_Indirect, QHPI_MemLoc_DDR_OR_TCM},
-    {QHPI_Float32, QHPI_Layout_Any, QHPI_Storage_Direct_OR_Indirect, QHPI_MemLoc_DDR_OR_TCM},
+    {QHPI_FLOAT32, QHPI_LAYOUT_FLAT_4, QHPI_STORAGE_DIRECT, QHPI_MEM_LOC_DDR_ONLY},
+    {QHPI_FLOAT32, QHPI_LAYOUT_FLAT_4, QHPI_STORAGE_DIRECT, QHPI_MEM_LOC_DDR_ONLY},
+    {QHPI_FLOAT32, QHPI_LAYOUT_FLAT_4, QHPI_STORAGE_DIRECT, QHPI_MEM_LOC_DDR_ONLY},
+    {QHPI_FLOAT32, QHPI_LAYOUT_FLAT_4, QHPI_STORAGE_DIRECT, QHPI_MEM_LOC_DDR_ONLY},
+    {QHPI_FLOAT32, QHPI_LAYOUT_FLAT_4, QHPI_STORAGE_DIRECT, QHPI_MEM_LOC_DDR_ONLY},
+    {QHPI_FLOAT32, QHPI_LAYOUT_FLAT_4, QHPI_STORAGE_DIRECT, QHPI_MEM_LOC_DDR_ONLY},
 };
 
 // FP32 输出 y 和最终 state 均使用 Flat4 布局并存放在 DDR。
 static QHPI_Tensor_Signature_v1 deltanet_core_fp32_outputs[] = {
-    {QHPI_Float32, QHPI_Layout_Any, QHPI_Storage_Direct_OR_Indirect, QHPI_MemLoc_DDR_OR_TCM},
-    {QHPI_Float32, QHPI_Layout_Any, QHPI_Storage_Direct_OR_Indirect, QHPI_MemLoc_DDR_OR_TCM},
+    {QHPI_FLOAT32, QHPI_LAYOUT_FLAT_4, QHPI_STORAGE_DIRECT, QHPI_MEM_LOC_DDR_ONLY},
+    {QHPI_FLOAT32, QHPI_LAYOUT_FLAT_4, QHPI_STORAGE_DIRECT, QHPI_MEM_LOC_DDR_ONLY},
 };
 
 // 量化 core 的六输入均为 DDR 中的 QUInt16，各自零点和尺度从 tensor 元数据读取。
 static QHPI_Tensor_Signature_v1 deltanet_core_quint16_inputs[] = {
-    {QHPI_QUInt16, QHPI_Layout_Flat4, QHPI_Storage_Direct, QHPI_MemLoc_DDR_Only},
-    {QHPI_QUInt16, QHPI_Layout_Flat4, QHPI_Storage_Direct, QHPI_MemLoc_DDR_Only},
-    {QHPI_QUInt16, QHPI_Layout_Flat4, QHPI_Storage_Direct, QHPI_MemLoc_DDR_Only},
-    {QHPI_QUInt16, QHPI_Layout_Flat4, QHPI_Storage_Direct, QHPI_MemLoc_DDR_Only},
-    {QHPI_QUInt16, QHPI_Layout_Flat4, QHPI_Storage_Direct, QHPI_MemLoc_DDR_Only},
-    {QHPI_QUInt16, QHPI_Layout_Flat4, QHPI_Storage_Direct, QHPI_MemLoc_DDR_Only},
+    {QHPI_QUINT16, QHPI_LAYOUT_FLAT_4, QHPI_STORAGE_DIRECT, QHPI_MEM_LOC_DDR_ONLY},
+    {QHPI_QUINT16, QHPI_LAYOUT_FLAT_4, QHPI_STORAGE_DIRECT, QHPI_MEM_LOC_DDR_ONLY},
+    {QHPI_QUINT16, QHPI_LAYOUT_FLAT_4, QHPI_STORAGE_DIRECT, QHPI_MEM_LOC_DDR_ONLY},
+    {QHPI_QUINT16, QHPI_LAYOUT_FLAT_4, QHPI_STORAGE_DIRECT, QHPI_MEM_LOC_DDR_ONLY},
+    {QHPI_QUINT16, QHPI_LAYOUT_FLAT_4, QHPI_STORAGE_DIRECT, QHPI_MEM_LOC_DDR_ONLY},
+    {QHPI_QUINT16, QHPI_LAYOUT_FLAT_4, QHPI_STORAGE_DIRECT, QHPI_MEM_LOC_DDR_ONLY},
 };
 
 // DDR 量化输出 signature：y 和最终 state 均为 QUInt16。
 // Stream 也复用此 dtype/存储约束，但它的 state 维度顺序为 [B,H,V,K]。
 static QHPI_Tensor_Signature_v1 deltanet_core_quint16_outputs[] = {
-    {QHPI_QUInt16, QHPI_Layout_Flat4, QHPI_Storage_Direct, QHPI_MemLoc_DDR_Only},
-    {QHPI_QUInt16, QHPI_Layout_Flat4, QHPI_Storage_Direct, QHPI_MemLoc_DDR_Only},
+    {QHPI_QUINT16, QHPI_LAYOUT_FLAT_4, QHPI_STORAGE_DIRECT, QHPI_MEM_LOC_DDR_ONLY},
+    {QHPI_QUINT16, QHPI_LAYOUT_FLAT_4, QHPI_STORAGE_DIRECT, QHPI_MEM_LOC_DDR_ONLY},
 };
 
 // 只有 final_state 放入 VTCM；y 和所有输入仍在 DDR。
 // QNN 分配完整常驻 state 并管理图输出传输，本 kernel 未实现手动 DMA。
 static QHPI_Tensor_Signature_v1 deltanet_core_quint16_vtcm_outputs[] = {
-    {QHPI_QUInt16, QHPI_Layout_Flat4, QHPI_Storage_Direct, QHPI_MemLoc_DDR_Only},
-    {QHPI_QUInt16, QHPI_Layout_Flat4, QHPI_Storage_Direct, QHPI_MemLoc_TCM_Only},
+    {QHPI_QUINT16, QHPI_LAYOUT_FLAT_4, QHPI_STORAGE_DIRECT, QHPI_MEM_LOC_DDR_ONLY},
+    {QHPI_QUINT16, QHPI_LAYOUT_FLAT_4, QHPI_STORAGE_DIRECT, QHPI_MEM_LOC_TCM_ONLY},
 };
 
 // 同一 DeltaNetCore 按 signature 选择普通 FP16、FP32 或 QUInt16 DDR 实现。
@@ -3285,6 +3678,15 @@ static QHPI_Kernel_v1 deltanet_core_fp16_accum_kernels[] = {
 // 四个对外算子名称与 kernel 表的绑定。rewrite/build_tile 等回调为空，
 // 任务切分由上述 self-sliced 入口通过 QHPI worker slice 自行完成。
 static QHPI_OpInfo_v1 deltanet_qhpi_ops[] = {
+    {.name = THIS_PKG_NAME_STR "::DeltaNetCoreFp16State",
+     .num_kernels = sizeof(deltanet_core_fp16_state_kernels) /
+         sizeof(deltanet_core_fp16_state_kernels[0]),
+     .kernels = deltanet_core_fp16_state_kernels,
+     .early_rewrite = nullptr,
+     .shape_required = nullptr,
+     .shape_legalized = nullptr,
+     .build_tile = nullptr,
+     .late_rewrite = nullptr},
     {.name = THIS_PKG_NAME_STR "::DeltaNetCoreStream",
      .num_kernels = sizeof(deltanet_core_stream_kernels) /
          sizeof(deltanet_core_stream_kernels[0]),

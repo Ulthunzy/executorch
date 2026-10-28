@@ -133,6 +133,17 @@ delta_net_lib.define(
     ") -> (Tensor, Tensor)"
 )
 delta_net_lib.define(
+    "deltanet_core_fp16_state("
+    "Tensor query, Tensor key, Tensor value, Tensor decay, Tensor beta, "
+    "Tensor recurrent_state) -> (Tensor, Tensor)"
+)
+delta_net_lib.define(
+    "deltanet_core_fp16_state.out("
+    "Tensor query, Tensor key, Tensor value, Tensor decay, Tensor beta, "
+    "Tensor recurrent_state, *, Tensor(a!) core_attn_out, "
+    "Tensor(b!) new_recurrent_state) -> (Tensor(a!), Tensor(b!))"
+)
+delta_net_lib.define(
     "deltanet_core_fp16_accum("
     "Tensor query, "
     "Tensor key, "
@@ -450,6 +461,49 @@ def deltanet_core_stream_impl(
 
 
 @impl(
+    delta_net_lib,
+    "deltanet_core_fp16_state",
+    dispatch_key="CompositeExplicitAutograd",
+)
+def deltanet_core_fp16_state_impl(query, key, value, decay, beta, recurrent_state):
+    if recurrent_state.dtype != torch.float16:
+        raise ValueError("DeltaNetCoreFp16State requires a float16 recurrent state")
+    query, key, value, decay, beta = (
+        tensor.float() for tensor in (query, key, value, decay, beta)
+    )
+    state = recurrent_state.float()
+    outputs = []
+    for i in range(query.shape[1]):
+        q, k, v = query[:, i], key[:, i], value[:, i]
+        d, b = decay[:, i].unsqueeze(-1), beta[:, i].unsqueeze(-1)
+        delta = (v - (state * k.unsqueeze(-1)).sum(-2) * d) * b
+        outputs.append(
+            (state * q.unsqueeze(-1)).sum(-2) * d
+            + (q * k).sum(-1, keepdim=True) * delta
+        )
+        state = (state * d.unsqueeze(-1) + k.unsqueeze(-1) * delta.unsqueeze(-2))
+        state = state.half().float()
+    return torch.stack(outputs, dim=1), state.half()
+
+
+@impl(
+    delta_net_lib,
+    "deltanet_core_fp16_state.out",
+    dispatch_key="CompositeExplicitAutograd",
+)
+def deltanet_core_fp16_state_out_impl(
+    query, key, value, decay, beta, recurrent_state, *,
+    core_attn_out, new_recurrent_state,
+):
+    ref_out, ref_state = deltanet_core_fp16_state_impl(
+        query, key, value, decay, beta, recurrent_state
+    )
+    core_attn_out.copy_(ref_out)
+    new_recurrent_state.copy_(ref_state)
+    return core_attn_out, new_recurrent_state
+
+
+@impl(
     delta_net_lib, "deltanet_core_fp16_accum", dispatch_key="CompositeExplicitAutograd"
 )
 def deltanet_core_fp16_accum_impl(
@@ -653,6 +707,20 @@ class CustomOpDeltaNetCore(BaselineDeltaNet):
         )
 
 
+class CustomOpDeltaNetCoreOnly(torch.nn.Module):
+    def forward(self, query, key, value, decay, beta, recurrent_state):
+        return torch.ops.qnn_custom_ops.deltanet_core.default(
+            query, key, value, decay, beta, recurrent_state
+        )
+
+
+class CustomOpDeltaNetCoreFp16State(torch.nn.Module):
+    def forward(self, query, key, value, decay, beta, recurrent_state):
+        return torch.ops.qnn_custom_ops.deltanet_core_fp16_state.default(
+            query, key, value, decay, beta, recurrent_state
+        )
+
+
 class CustomOpDeltaNetCoreFp16Accum(BaselineDeltaNet):
     def forward(
         self,
@@ -804,6 +872,8 @@ def make_model(
         return CustomOpDeltaNetPacked(scaling, epsilon).eval()
     if variant == "core":
         return CustomOpDeltaNetCore(scaling, epsilon).eval()
+    if variant == "core_only":
+        return CustomOpDeltaNetCoreOnly().eval()
     if variant == "core_fp16accum":
         return CustomOpDeltaNetCoreFp16Accum(scaling, epsilon).eval()
     if variant == "core_stream":
@@ -1100,6 +1170,28 @@ def deltanet_quant_annotations(
     return (annotate_shared_state,)
 
 
+def deltanet_fp16_state_quant_annotations(
+    quant_dtype=QuantDtype.use_16a4w, *, act_observer=None
+):
+    if quant_dtype not in {
+        QuantDtype.use_16a4w,
+        QuantDtype.use_16a4w_block,
+        QuantDtype.use_16a8w,
+        QuantDtype.use_16a16w,
+    }:
+        raise ValueError("DeltaNetCoreFp16State requires U16 activation quantization")
+    config = quant_config_for_dtype(quant_dtype, act_observer=act_observer)
+    annotator = CustomOpsQuantAnnotator()
+    annotator.register_annotation(
+        torch.ops.qnn_custom_ops.deltanet_core_fp16_state.default,
+        IOQuantConfig(
+            input_quant_specs={index: config.input_activation for index in range(5)},
+            output_quant_specs={0: config.output_activation, 1: None},
+        ),
+    )
+    return (annotator.build_annotation_fn(),)
+
+
 def make_deltanet_quantizer(args, quant_dtype: Optional[QuantDtype]):
     if quant_dtype is None:
         return None
@@ -1141,6 +1233,10 @@ def setup_op_package(
 
     workspace = args.workspace
     custom_op_map = [
+        (
+            str(torch.ops.qnn_custom_ops.deltanet_core_fp16_state.default),
+            "DeltaNetCoreFp16State",
+        ),
         (
             str(torch.ops.qnn_custom_ops.deltanet_core.default),
             "DeltaNetCoreVtcm" if state_vtcm else "DeltaNetCore",
@@ -1231,6 +1327,10 @@ def read_outputs(
 ) -> List[Dict[str, object]]:
     output_info = []
     output_files = sorted(output_dir.glob("*.raw"))
+    if len(output_files) != len(refs):
+        raise RuntimeError(
+            f"Expected {len(refs)} outputs in {output_dir}, got {len(output_files)}"
+        )
     for output_file, ref in zip(output_files, refs):
         expected_numel = ref.numel()
         raw_size = output_file.stat().st_size
@@ -1276,6 +1376,19 @@ def run_one(
 ) -> Dict[str, object]:
     qname = quant_name(quant_dtype)
     model = make_model(variant, args.scaling, args.epsilon, args.input_dtype)
+    if variant == "core_only":
+        dataset = [
+            (
+                _l2norm(inputs[0].float(), args.epsilon)
+                .mul(args.scaling)
+                .to(inputs[0].dtype),
+                _l2norm(inputs[1].float(), args.epsilon).to(inputs[1].dtype),
+                inputs[2],
+                inputs[3].float().exp().to(inputs[3].dtype),
+                *inputs[4:],
+            )
+            for inputs in dataset
+        ]
     if variant == "core_stream":
         dataset = [(*inputs[:5], inputs[5].transpose(-1, -2)) for inputs in dataset]
     sample_input = dataset[0]
@@ -1296,6 +1409,7 @@ def run_one(
     logging.info("Building %s quant=%s", variant, qname)
     uses_op_package = variant in {
         "core",
+        "core_only",
         "core_stream",
         "core_fp16accum",
     }
@@ -1326,6 +1440,7 @@ def run_one(
         "head_k_dim": args.head_k_dim,
         "head_v_dim": args.head_v_dim,
         "input_dtype": args.input_dtype,
+        "warm_up": args.warm_up,
     }
     if args.compile_only:
         return result
@@ -1346,6 +1461,7 @@ def run_one(
         inputs=[sample_input],
         files=op_package_paths if uses_op_package else None,
     )
+    adb.extra_cmds += f" --warm_up {args.warm_up}"
     adb.execute(output_callback=capture_output, iteration=args.iteration)
     (case_dir / "runner.log").write_text(runner_output["text"])
     adb.pull(host_output_path=str(case_dir))
@@ -1357,10 +1473,16 @@ def run_one(
 
 def main(args) -> None:
     variants = [variant.strip() for variant in args.variants.split(",") if variant]
-    supported_variants = {"baseline", "core", "core_stream", "core_fp16accum"}
+    supported_variants = {
+        "baseline",
+        "core",
+        "core_only",
+        "core_stream",
+        "core_fp16accum",
+    }
     if not variants or set(variants) - supported_variants:
         raise ValueError(
-            "--variants supports baseline,core,core_stream,core_fp16accum; "
+            "--variants supports baseline,core,core_only,core_stream,core_fp16accum; "
             "the legacy DeltaNet.cpp kernels have been removed"
         )
     qnn_config = QnnConfig.load_config(args.config_file if args.config_file else args)
@@ -1376,13 +1498,13 @@ def main(args) -> None:
     os.makedirs(args.artifact, exist_ok=True)
 
     if args.state_vtcm and (
-        args.variants != "core"
+        args.variants not in {"core", "core_only"}
         or any(
             dtype is None or not dtype.name.startswith("use_16a")
             for dtype in parse_quant_dtypes(args.quant_dtypes)
         )
     ):
-        raise ValueError("--state_vtcm requires --variants core and 16-bit activations")
+        raise ValueError("--state_vtcm requires core/core_only and 16-bit activations")
     op_package_options, op_package_paths = setup_op_package(
         args,
         state_vtcm=args.state_vtcm,
@@ -1454,12 +1576,13 @@ if __name__ == "__main__":
     parser.add_argument("--scaling", default=_DELTA_NET_SCALING, type=float)
     parser.add_argument("--epsilon", default=_DELTA_NET_EPS, type=float)
     parser.add_argument("--iteration", default=50, type=int)
+    parser.add_argument("--warm_up", default=5, type=int)
     parser.add_argument("--calibration_samples", default=4, type=int)
     parser.add_argument(
         "--variants",
         default="baseline,core",
         type=str,
-        help="Comma-separated variants: baseline,core,core_stream,core_fp16accum.",
+        help="Comma-separated variants: baseline,core,core_only,core_stream,core_fp16accum.",
     )
     parser.add_argument(
         "--quant_dtypes",
