@@ -441,6 +441,13 @@ static int prefill_main(int argc, char** argv) try {
         m.missing_native,
         m.ready_calls,
         m.missing_calls);
+    if (getenv("MOE_PROFILE_TOTAL") &&
+        std::string(getenv("MOE_PROFILE_TOTAL")) == "1")
+      printf(
+          "MOE_PHASE_PROFILE phase=prefill chunk=%d tokens=%d total_ms=%.6f gdn_attention_ms=%.6f full_attention_ms=%.6f attention_ms=%.6f router_ms=%.6f native_ms=%.6f read_ms=%.6f io_wall_ms=%.6f io_overlap_ms=%.6f io_wait_ms=%.6f direct_bytes=%llu\n",
+          chunk, active_tokens, total_ms, m.gdn_attention, m.full_attention, m.attention, m.router,
+          m.native, m.read, m.io_wall, m.io_overlap, m.io_wait,
+          (unsigned long long)m.direct);
     printf(
         "PREFILL_COPY seed_wait_ms=%.6f seed_overlap_ms=%.6f retained_wait_ms=%.6f retained_overlap_ms=%.6f retained_prepare_ms=%.6f input_io_overlap_ms=%.6f router_io_overlap_ms=%.6f attention_io_overlap_ms=%.6f\n",
         m.seed_wait,

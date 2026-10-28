@@ -3,11 +3,14 @@
 #include <cstddef>
 #include <cstdint>
 
+enum class CacheDType : uint32_t { AffineUint16 = 0, Float16 = 1 };
+
 struct QuantizedCacheView {
   uint16_t* data;
   size_t elements;
   float scale;
   int32_t offset;
+  CacheDType dtype = CacheDType::AffineUint16;
 };
 
 enum class CacheLayout { State, Key, Value };

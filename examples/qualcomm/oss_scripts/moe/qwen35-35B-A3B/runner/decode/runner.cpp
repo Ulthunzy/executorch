@@ -63,12 +63,21 @@ class DecodeBackend final : public BackendInterface {
            (aux_offset > processed->size() ||
             aux_size > processed->size() - aux_offset)))
         return Error::DelegateInvalidCompatibility;
+      if (kind == 0) {
+        if (aux_size)
+          return Error::DelegateInvalidCompatibility;
+        auto current = bytes(model_root + "/cache-encoding.bin");
+        try {
+          validate_cache_encoding_payload(current, p + 128, size);
+        } catch (const std::exception& error) {
+          fprintf(stderr, "backend cache compatibility: %s\n", error.what());
+          return Error::DelegateInvalidCompatibility;
+        }
+        cache_encoding = std::move(current);
+        return static_cast<DelegateHandle*>(new Stage{kind, layer});
+      }
       if (version == 3) {
-        if (kind == 0) {
-          if (size != 1296 || aux_size)
-            return Error::DelegateInvalidCompatibility;
-          cache_encoding = bytes(model_root + "/cache-encoding.bin");
-        } else if (kind == 1) {
+        if (kind == 1) {
           if (size || aux_size < 8 || aux_size % 4)
             return Error::DelegateInvalidCompatibility;
           layer_io[layer].resize(aux_size / 4);
@@ -78,11 +87,7 @@ class DecodeBackend final : public BackendInterface {
         return static_cast<DelegateHandle*>(new Stage{kind, layer});
       }
       const auto base = model_root + "/layer" + std::to_string(layer);
-      if (kind == 0) {
-        cache_encoding = bytes(model_root + "/cache-encoding.bin");
-        if (size != 1296)
-          return Error::DelegateInvalidCompatibility;
-      } else if (kind == 1) {
+      if (kind == 1) {
         if (!size || aux_size < 8 || aux_size % 4)
           return Error::DelegateInvalidCompatibility;
         if (layer % 4 == 3) {

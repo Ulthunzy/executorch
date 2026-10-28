@@ -1,4 +1,5 @@
 #include "attention.h"
+#include "../qnn_cache.h"
 
 Attention::Attention(
     Runtime& runtime,
@@ -22,19 +23,13 @@ Attention::Attention(
     state[c] = graph.inbuf[target];
     if (!linear)
       history = Graph::elements(graph.inputs[target]) / 512;
-    CacheEncoding source;
-    memcpy(
-        &source,
-        cache_encoding.data() + 16 + (layer * 2 + c) * sizeof(source),
-        sizeof(source));
+    const auto source = read_cache_encoding(cache_encoding, layer * 2 + c);
     auto old = bytes(
         root + "/cache-prefill/layer" + std::to_string(layer) + "-cache" +
         std::to_string(c) + ".u16");
-    if (old.size() != source.elements * 2 || !std::isfinite(source.scale) ||
-        source.scale <= 0)
+    if (old.size() != source.elements * 2)
       throw std::runtime_error("prefill cache metadata");
-    const auto q =
-        FIELD(graph.inputs[target], quantizeParams).scaleOffsetEncoding;
+    const auto destination = qnn_cache_view(graph.inputs[target], nullptr);
     state_elements[c] = Graph::elements(graph.inputs[target]);
     const int source_window = linear ? 0 : source.elements / 512;
     initial_tokens = getenv("PREFILL_VALID_TOKENS")
@@ -58,8 +53,9 @@ Attention::Attention(
         {reinterpret_cast<uint16_t*>(old.data()),
          source.elements,
          source.scale,
-         source.offset},
-        {initial[c].data(), initial[c].size(), q.scale, q.offset},
+         source.offset, source.dtype},
+        {initial[c].data(), initial[c].size(), destination.scale,
+         destination.offset, destination.dtype},
         linear ? CacheLayout::State
                : (c ? CacheLayout::Value : CacheLayout::Key),
         linear ? 0 : source_window - initial_tokens,
@@ -67,7 +63,7 @@ Attention::Attention(
         linear ? source.elements : initial_tokens);
     maps[c] = grid_map(graph.outputs[output[c + 2]], graph.inputs[target]);
     identity[c] = true;
-    for (int i = 0; i < 65536; i++)
+    for (size_t i = 0; i < maps[c].size(); i++)
       if (maps[c][i] != i) {
         identity[c] = false;
         break;
@@ -78,14 +74,8 @@ Attention::Attention(
 QuantizedCacheView Attention::cache_view(int c) {
   if (c < 0 || c >= 2)
     throw std::runtime_error("Invalid cache index");
-  const auto encoding =
-      FIELD(graph.inputs[input[c + (linear ? 1 : 4)]], quantizeParams)
-          .scaleOffsetEncoding;
-  return {
-      static_cast<uint16_t*>(state[c]->data),
-      state_elements[c],
-      encoding.scale,
-      encoding.offset};
+  return qnn_cache_view(
+      graph.inputs[input[c + (linear ? 1 : 4)]], state[c]->data);
 }
 
 void Attention::reset() {
@@ -97,7 +87,7 @@ void Attention::reset() {
         {initial[c].data(),
          initial[c].size(),
          destination.scale,
-         destination.offset},
+         destination.offset, destination.dtype},
         destination,
         linear ? CacheLayout::State
                : (c ? CacheLayout::Value : CacheLayout::Key),

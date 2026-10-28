@@ -29,6 +29,7 @@ struct Options {
   float temperature = 0;
   bool interactive = false, thinking = true, tokenize_only = false;
   bool ignore_eos = false;
+  bool profile = false;
   bool stream = true, vision_enabled = true;
   std::string log_path;
 };

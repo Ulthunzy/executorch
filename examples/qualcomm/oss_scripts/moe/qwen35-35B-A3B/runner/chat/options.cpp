@@ -34,9 +34,11 @@ Options parse_options(int argc, char** argv) {
           "  [--prompt-tokens N] [--ignore-eos] (fixed-length performance runs)\n"
           "  [--max-seq-len 1152] [--cache-experts 32] [--shared-model DIR]\n"
           "  [--prefill-order layer_major|chunk_major]\n"
-          "  [--prefill-io-workers 8]\n"
-          "  [--model-config FILE] (defaults to the deployed plan settings)\n"
+          "  [--prefill-io-workers N] [--decode-io-workers 4|8|16]\n"
+          "  [--read-chunk-kib 64|128|256|512|1024]\n"
+          "  [--model-config FILE] (deployed plan settings; V81 defaults to IO 16/8, chunk 512)\n"
           "  [--log-path FILE] [--tokenize-only]\n"
+          "  [--profile] (cumulative DSP timings; requires a profiling build)\n"
           "Interactive commands: /image PATH QUESTION, /reset, /exit.\n");
       std::exit(0);
     }
@@ -52,6 +54,8 @@ Options parse_options(int argc, char** argv) {
       options.tokenize_only = true;
     else if (flag == "--ignore-eos")
       options.ignore_eos = true;
+    else if (flag == "--profile")
+      options.profile = true;
     else if (flag == "--no-ignore-eos")
       options.ignore_eos = false;
     else if (flag == "--stream" || flag == "--no-stream")
@@ -94,6 +98,10 @@ Options parse_options(int argc, char** argv) {
         options.cache_experts = integer_option(value);
       else if (flag == "--prefill-io-workers")
         options.prefill_io_workers = integer_option(value);
+      else if (flag == "--decode-io-workers")
+        options.runtime.decode_io_workers = integer_option(value);
+      else if (flag == "--read-chunk-kib")
+        options.runtime.read_chunk_kib = integer_option(value);
       else if (flag == "--temperature") {
         size_t used = 0;
         options.temperature = std::stof(value, &used);
@@ -142,6 +150,17 @@ Options parse_options(int argc, char** argv) {
       std::filesystem::is_regular_file(
           options.model_root + "/prefill/embedding.bf16"))
     options.runtime.embedding_bits = 16;
+#if defined(SM_MOE_DSP_ARCH) && SM_MOE_DSP_ARCH == 81
+  if (!overrides.count("--model-config")) {
+    if (!overrides.count("--prefill-io-workers"))
+      options.prefill_io_workers = 16;
+    if (!overrides.count("--decode-io-workers"))
+      options.runtime.decode_io_workers = 8;
+    if (!overrides.count("--read-chunk-kib"))
+      options.runtime.read_chunk_kib = 512;
+  }
+#endif
+  validate_runtime_settings(options.runtime);
   if (plans.at("version") != 2 ||
       plans.value("prefill_pte", "") != "prefill.pte" ||
       plans.at("ar_len") != 128 || plans.at("capacity") != options.capacity)
@@ -257,7 +276,9 @@ void configure_environment(
            {"EXPERT_STAGE_READY", "0"},
            {"SAVE_ALL_LOGITS", "0"},
            {"DEVICE_CHAT", "1"},
+           {"MOE_PROFILE_TOTAL", o.profile ? "1" : "0"},
            {"CHAT_ROPE_ROOT", o.model_root},
+           {"PREFILL_INITIAL_IMAGE", o.image_path.empty() ? "0" : "1"},
            {"VISION_INPUT", vision_enabled ? "1" : "0"}})
     if (setenv(item.first.c_str(), item.second.c_str(), 1))
       throw std::runtime_error("Cannot set " + item.first);

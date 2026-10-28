@@ -7,7 +7,7 @@ task_build=${MOE_BUILD_DIR:-"$task_repo/build/moe/qwen35-35B-A3B"}
 mkdir -p "$task_build"
 task_build=$(cd "$task_build" && pwd)
 runtime_build=${EXECUTORCH_ANDROID_BUILD:-"$task_repo/build-android"}
-: "${QNN_SDK_ROOT:?Set QNN_SDK_ROOT to the QNN 2.48.1 SDK}"
+: "${QNN_SDK_ROOT:?Set QNN_SDK_ROOT to the SDK used to export the model}"
 : "${HEXAGON_SDK_ROOT:?Set HEXAGON_SDK_ROOT}"
 : "${HEXAGON_TOOLS_ROOT:?Set HEXAGON_TOOLS_ROOT}"
 : "${ANDROID_NDK_ROOT:?Set ANDROID_NDK_ROOT}"
@@ -75,6 +75,7 @@ for stage in prefill decode; do
     "$runtime_build/extension/flat_tensor/libextension_flat_tensor.a"
     "$runtime_build/extension/named_data_map/libextension_named_data_map.a")
   host_compile=("$compiler" -O3 -std=c++17 -static-libstdc++ -DC10_USING_CUSTOM_GENERATED_MACROS
+    -DSM_MOE_DSP_ARCH="$task_arch"
     -DET_EVENT_TRACER_ENABLED -DET_ENABLE_DEPRECATED_CONSTANT_BUFFER=0
     -DET_ENABLE_PROGRAM_VERIFICATION=0 -I"$task_repo/.."
     -I"$task_repo/runtime/core/portable_type/c10" -I"$runtime_build/include"
@@ -109,10 +110,10 @@ done
   "$moe_root/tools/capture_weights.cpp" "$moe_root/runner/decode/qnn_front.cpp" \
   "$moe_root/runner/runtime_utils.cpp" \
   "$moe_root/runner/shared/graph_binding.cpp" -ldl -o "$task_build/capture_weights"
-if [[ "${MOE_BUILD_NATIVE:-1}" == 1 ]]; then
+if [[ "${MOE_BUILD_NATIVE:-1}" == 1 && "${MOE_BUILD_OP_PACKAGE:-1}" == 1 ]]; then
   "$moe_root/native/build_op_package.sh"
 fi
 echo "Built runners and Native MoE libraries in $task_build"
 cat > "$task_build/TARGET.json" <<EOF
-{"target":{"soc_model":"$task_soc","dsp_arch":"v$task_arch"},"chat_controls":1}
+{"target":{"soc_model":"$task_soc","dsp_arch":"v$task_arch"},"chat_controls":1,"native_profile":${MOE_NATIVE_PROFILE:-0}}
 EOF

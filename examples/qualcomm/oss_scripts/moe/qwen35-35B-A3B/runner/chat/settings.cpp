@@ -5,6 +5,24 @@
 #include <stdexcept>
 
 namespace moe_chat {
+void validate_runtime_settings(const RuntimeSettings& runtime) {
+  if ((!runtime.prefill_async_io && runtime.startup_prefetch != "none") ||
+      (runtime.ready_io && !runtime.hit_first) ||
+      (runtime.startup_prefetch != "none" &&
+       runtime.startup_prefetch != "sync" &&
+       runtime.startup_prefetch != "overlap") ||
+      runtime.startup_io_workers < 1 || runtime.startup_io_workers > 16 ||
+      (runtime.decode_io_workers != 4 && runtime.decode_io_workers != 8 &&
+       runtime.decode_io_workers != 16) ||
+      (runtime.read_chunk_kib != 64 && runtime.read_chunk_kib != 128 &&
+       runtime.read_chunk_kib != 256 && runtime.read_chunk_kib != 512 &&
+       runtime.read_chunk_kib != 1024) ||
+      (runtime.context_load_mode != "auto" &&
+       runtime.context_load_mode != "async" &&
+       runtime.context_load_mode != "serial"))
+    throw std::runtime_error("Invalid expert IO or cache schedule");
+}
+
 void apply_model_settings(
     Options& options,
     const nlohmann::json& config,
@@ -28,35 +46,26 @@ void apply_model_settings(
       quant.value("expert_down_group", 512) != 512)
     throw std::runtime_error(
         "Native experts require N2/A8 with groups 1024/512");
-  for (const char* field : {"kv_dtype", "gdn_state_dtype", "conv_state_dtype"})
+  for (const char* field : {"kv_dtype", "conv_state_dtype"})
     if (cache.value(field, "uint16") != "uint16")
-      throw std::runtime_error("Native KV/GDN/conv interfaces require UINT16");
+      throw std::runtime_error("Native KV/conv interfaces require UINT16");
+  const auto gdn_dtype = cache.value("gdn_state_dtype", "uint16");
+  if (gdn_dtype != "uint16" && gdn_dtype != "float16")
+    throw std::runtime_error("GDN state requires UINT16 or typed FP16");
   runtime.kv_append_only = cache.value("append_only", true);
   runtime.state_swap = cache.value("state_swap", true);
   runtime.prefill_async_io = schedule.value("prefill_async_io", true);
   runtime.startup_prefetch = schedule.value("startup_prefetch", "overlap");
   runtime.startup_io_workers = schedule.value("startup_io_workers", 4);
-  runtime.decode_io_workers = schedule.value("io_workers", 8);
-  runtime.read_chunk_kib = schedule.value("read_chunk_kib", 256);
+  if (!overrides.count("--decode-io-workers"))
+    runtime.decode_io_workers = schedule.value("io_workers", 8);
+  if (!overrides.count("--read-chunk-kib"))
+    runtime.read_chunk_kib = schedule.value("read_chunk_kib", 256);
   runtime.hit_first = schedule.value("decode_hit_first", true);
   runtime.ready_io = schedule.value("decode_ready_io", true);
   runtime.overlap_feedback = schedule.value("overlap_feedback", true);
   runtime.context_load_mode = schedule.value("context_load_mode", "auto");
-  if ((!runtime.prefill_async_io && runtime.startup_prefetch != "none") ||
-      (runtime.ready_io && !runtime.hit_first) ||
-      (runtime.startup_prefetch != "none" &&
-       runtime.startup_prefetch != "sync" &&
-       runtime.startup_prefetch != "overlap") ||
-      runtime.startup_io_workers < 1 || runtime.startup_io_workers > 16 ||
-      (runtime.decode_io_workers != 4 && runtime.decode_io_workers != 8 &&
-       runtime.decode_io_workers != 16) ||
-      (runtime.read_chunk_kib != 64 && runtime.read_chunk_kib != 128 &&
-       runtime.read_chunk_kib != 256 && runtime.read_chunk_kib != 512 &&
-       runtime.read_chunk_kib != 1024) ||
-      (runtime.context_load_mode != "auto" &&
-       runtime.context_load_mode != "async" &&
-       runtime.context_load_mode != "serial"))
-    throw std::runtime_error("Invalid expert IO or cache schedule");
+  validate_runtime_settings(runtime);
   if (!overrides.count("--max-seq-len"))
     options.capacity = context.value("max_seq_len", options.capacity);
   if (!overrides.count("--prefill-order"))

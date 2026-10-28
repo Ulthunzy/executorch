@@ -39,6 +39,7 @@ struct Metrics {
          retained_overlap = 0, retained_prepare = 0, input_io_overlap = 0;
   double router_io_overlap = 0;
   double attention_io_overlap = 0;
+  double gdn_attention = 0, full_attention = 0;
 };
 
 // 完整 40 层 AR128 调度；多块计划逐层处理整段输入，复用当前层的临时权重。

@@ -89,6 +89,25 @@ int main() {
     rejected = true;
   }
   assert(rejected);
+  std::vector<uint16_t> half_source(65536), half_destination(65536);
+  for (size_t i = 0; i < half_source.size(); ++i)
+    half_source[i] = uint16_t(i);
+  QuantizedCacheView half_from{half_source.data(), half_source.size(), 0, 0, CacheDType::Float16};
+  QuantizedCacheView half_to{half_destination.data(), half_destination.size(), 0, 0, CacheDType::Float16};
+  copy_cache_range(half_from, half_to, CacheLayout::State, 0, 0, half_source.size());
+  assert(half_source == half_destination);
+  clear_cache(half_to);
+  assert(std::all_of(half_destination.begin(), half_destination.end(), [](auto value) { return value == 0; }));
+  for (const auto kind : {0, 1, 2}) {
+    rejected = false;
+    try {
+      auto invalid = half_to;
+      if (kind == 0) invalid.dtype = CacheDType::AffineUint16;
+      if (kind == 1) invalid.scale = 1;
+      copy_cache_range(half_from, invalid, kind == 2 ? CacheLayout::Key : CacheLayout::State, 0, 0, 1);
+    } catch (const std::runtime_error&) { rejected = true; }
+    assert(rejected);
+  }
   std::cout
       << "padded KV, compact prefix, calibrated grids and descriptor tests passed\n";
 }

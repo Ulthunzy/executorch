@@ -1,4 +1,7 @@
 #include "System/QnnSystemInterface.h"
+#include "../runner/cache_encoding.h"
+#include "../runner/qnn_cache.h"
+#include <algorithm>
 #include <dlfcn.h>
 #include <cstdio>
 #include <fstream>
@@ -50,9 +53,7 @@ int main(int argc, char** argv) try {
     throw std::runtime_error("system provider missing");
   auto system = providers[0]->QNN_SYSTEM_INTERFACE_VER_NAME;
   std::ofstream output(argv[3], std::ios::binary);
-  output.write("Q36CACHE", 8);
-  const uint32_t header[] = {1, uint32_t(groups * 4)};
-  output.write(reinterpret_cast<const char*>(header), sizeof(header));
+  std::vector<CacheEncoding> encodings;
   for (int group = 0; group < groups; group++) {
     const auto root = std::string(argv[2]) + "/group" + std::to_string(group);
     const auto binary = read(root + "/context0.bin");
@@ -96,11 +97,9 @@ int main(int argc, char** argv) try {
           const auto& t = selected->graphInputs[index];
           if (std::string(FIELD(t, name)).rfind(prefix, 0))
             continue;
-          const auto q = FIELD(t, quantizeParams);
-          if (q.quantizationEncoding !=
-                  QNN_QUANTIZATION_ENCODING_SCALE_OFFSET ||
-              FIELD(t, dataType) != QNN_DATATYPE_UFIXED_POINT_16)
-            throw std::runtime_error("cache encoding type");
+          const auto view = qnn_cache_view(t, nullptr);
+          if (view.dtype == CacheDType::Float16 && (layer % 4 == 3 || cache != 1))
+            throw std::runtime_error("Only GDN recurrent state may use FP16 cache");
           uint64_t elements = 1;
           for (unsigned dim = 0; dim < FIELD(t, rank); dim++)
             elements *= FIELD(t, dimensions)[dim];
@@ -112,11 +111,7 @@ int main(int argc, char** argv) try {
               throw std::runtime_error("empty KV history");
             elements += elements / history * 128;
           }
-          output.write(
-              reinterpret_cast<const char*>(&q.scaleOffsetEncoding.scale), 4);
-          output.write(
-              reinterpret_cast<const char*>(&q.scaleOffsetEncoding.offset), 4);
-          output.write(reinterpret_cast<const char*>(&elements), 8);
+          encodings.push_back({view.scale, view.offset, elements, view.dtype});
           found = true;
         }
         if (!found)
@@ -124,6 +119,21 @@ int main(int argc, char** argv) try {
       }
     }
     check(system.systemContextFree(context));
+  }
+  const bool typed = std::any_of(encodings.begin(), encodings.end(), [](const auto& e) {
+    return e.dtype != CacheDType::AffineUint16;
+  });
+  output.write("Q36CACHE", 8);
+  const uint32_t header[] = {typed ? 2U : 1U, uint32_t(groups * 4)};
+  output.write(reinterpret_cast<const char*>(header), sizeof(header));
+  for (const auto& encoding : encodings) {
+    output.write(reinterpret_cast<const char*>(&encoding.scale), 4);
+    output.write(reinterpret_cast<const char*>(&encoding.offset), 4);
+    output.write(reinterpret_cast<const char*>(&encoding.elements), 8);
+    if (typed) {
+      const uint32_t extra[] = {uint32_t(encoding.dtype), 0};
+      output.write(reinterpret_cast<const char*>(extra), sizeof(extra));
+    }
   }
   if (!output)
     throw std::runtime_error("write cache metadata");

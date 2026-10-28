@@ -7,9 +7,7 @@ DecodeSession::DecodeSession(const std::string& path, size_t cache_mib)
   if (!core.mapped || !core.fuse_residual)
     throw std::runtime_error("native mapped residual required");
 
-  if (cache_encoding.size() != 16 + 40 * 2 * sizeof(CacheEncoding) ||
-      memcmp(cache_encoding.data(), "Q36CACHE", 8))
-    throw std::runtime_error("source cache encodings");
+  cache_encoding_version(cache_encoding);
   check(
       runtime.q.backendRegisterOpPackage(
           runtime.backend,

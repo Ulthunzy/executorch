@@ -8,7 +8,14 @@
 
 namespace {
 void validate(const QuantizedCacheView& view) {
-  if (!view.data || !view.elements || !std::isfinite(view.scale) ||
+  if (!view.data || !view.elements)
+    throw std::runtime_error("Invalid cache storage");
+  if (view.dtype == CacheDType::Float16) {
+    if (view.scale != 0 || view.offset != 0)
+      throw std::runtime_error("FP16 cache must not carry affine encoding");
+    return;
+  }
+  if (view.dtype != CacheDType::AffineUint16 || !std::isfinite(view.scale) ||
       view.scale <= 0 || view.offset > 0 || view.offset < -65535)
     throw std::runtime_error("Invalid UINT16 cache view");
 }
@@ -16,7 +23,8 @@ void validate(const QuantizedCacheView& view) {
 
 void clear_cache(const QuantizedCacheView& cache) {
   validate(cache);
-  std::fill(cache.data, cache.data + cache.elements, uint16_t(-cache.offset));
+  std::fill(cache.data, cache.data + cache.elements,
+            cache.dtype == CacheDType::Float16 ? uint16_t(0) : uint16_t(-cache.offset));
 }
 
 void copy_cache_range(
@@ -28,6 +36,10 @@ void copy_cache_range(
     size_t count) {
   validate(source);
   validate(destination);
+  if (source.dtype != destination.dtype)
+    throw std::runtime_error("Cache transfer requires matching storage dtypes");
+  if (source.dtype == CacheDType::Float16 && layout != CacheLayout::State)
+    throw std::runtime_error("FP16 cache is supported only for GDN state");
   const size_t width = layout == CacheLayout::State ? 1 : 512;
   if (source.elements % width || destination.elements % width ||
       source_begin > source.elements / width ||
@@ -85,7 +97,7 @@ void append_prefill_kv(
     CacheLayout layout,
     size_t valid_tokens) {
   validate(history);
-  if (history.elements % 512 || !block || !encoding || !handoff ||
+  if (history.dtype != CacheDType::AffineUint16 || history.elements % 512 || !block || !encoding || !handoff ||
       layout == CacheLayout::State || valid_tokens < 1 || valid_tokens > 128)
     throw std::runtime_error("invalid padded KV block");
   const size_t width = layout == CacheLayout::Key ? 1 : 256;

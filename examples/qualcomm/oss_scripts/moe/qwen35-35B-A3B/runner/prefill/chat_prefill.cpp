@@ -1,4 +1,5 @@
 #include "prefill_session.h"
+#include "../qnn_cache.h"
 
 void PrefillSession::prepare_decode() {
   finish_memo_copy();
@@ -76,12 +77,7 @@ void PrefillSession::append(
     auto& a = *attention[layer];
     for (int c = 0; c < 2; ++c) {
       const auto& tensor = a.cache_owner().inputs[a.cache_input[c]];
-      const auto q = FIELD(tensor, quantizeParams).scaleOffsetEncoding;
-      QuantizedCacheView destination{
-          static_cast<uint16_t*>(a.cache_data(c)),
-          Graph::elements(tensor),
-          q.scale,
-          q.offset};
+      auto destination = qnn_cache_view(tensor, a.cache_data(c));
       clear_cache(destination);
       const auto& source = state.layer[layer].cache[c];
       const auto layout = a.linear ? CacheLayout::State
@@ -136,7 +132,16 @@ void PrefillSession::append(
     if (metrics.calls[1] != 40 || metrics.calls[3] != 40 ||
         metrics.assignments != valid_tokens * 8 * 40)
       throw std::runtime_error("incomplete AR128 prefill append");
-    total_ms += elapsed(started);
+    const double block_ms = elapsed(started);
+    total_ms += block_ms;
+    if (getenv("MOE_PROFILE_TOTAL") &&
+        std::string(getenv("MOE_PROFILE_TOTAL")) == "1")
+      printf(
+          "MOE_PHASE_PROFILE phase=prefill_append chunk=%zu tokens=%d total_ms=%.6f gdn_attention_ms=%.6f full_attention_ms=%.6f attention_ms=%.6f router_ms=%.6f native_ms=%.6f read_ms=%.6f io_wall_ms=%.6f io_overlap_ms=%.6f io_wait_ms=%.6f direct_bytes=%llu\n",
+          offset / 128, valid_tokens, block_ms, metrics.gdn_attention, metrics.full_attention,
+          metrics.attention, metrics.router, metrics.native, metrics.read,
+          metrics.io_wall, metrics.io_overlap, metrics.io_wait,
+          (unsigned long long)metrics.direct);
   }
   if (image_cursor != image_features.size())
     throw std::runtime_error("unconsumed prefill image features");
@@ -146,12 +151,8 @@ void PrefillSession::append(
     auto& a = *attention[layer];
     for (int c = 0; c < 2; ++c) {
       const auto& tensor = a.cache_owner().inputs[a.cache_input[c]];
-      const auto q = FIELD(tensor, quantizeParams).scaleOffsetEncoding;
-      QuantizedCacheView source{
-          static_cast<uint16_t*>(a.export_data(c)),
-          a.export_bytes(c) / 2,
-          q.scale,
-          q.offset};
+      auto source = qnn_cache_view(tensor, a.export_data(c));
+      source.elements = a.export_bytes(c) / 2;
       auto destination = state.layer[layer].cache[c];
       const auto layout = a.linear ? CacheLayout::State
           : c                      ? CacheLayout::Value
@@ -161,7 +162,8 @@ void PrefillSession::append(
         std::vector<uint16_t> old(
             destination.data, destination.data + destination.elements);
         copy_cache_range(
-            {old.data(), old.size(), destination.scale, destination.offset},
+            {old.data(), old.size(), destination.scale, destination.offset,
+             destination.dtype},
             destination,
             layout,
             state.capacity - 1 - begin,

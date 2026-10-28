@@ -556,6 +556,10 @@ bool Conversation::turn(std::string text) {
 }
 
 int Conversation::run(void* library) {
+  const auto state_size = reinterpret_cast<size_t (*)(size_t)>(
+      dlsym(library, "qwen35_decode_session_state_size"));
+  if (!state_size || state_size(sizeof(Qwen35SessionState)) != sizeof(Qwen35SessionState))
+    throw std::runtime_error("Decode cache ABI differs; install the matching runner and decode library");
   open = reinterpret_cast<decltype(open)>(dlsym(library, "qwen35_decode_open"));
   step = reinterpret_cast<decltype(step)>(dlsym(library, "qwen35_decode_step"));
   reset =

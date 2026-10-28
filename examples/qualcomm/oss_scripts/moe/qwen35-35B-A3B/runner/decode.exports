@@ -4,5 +4,6 @@
           qwen35_decode_error;
           qwen35_decode_set_inputs;
           qwen35_decode_export_state; qwen35_decode_import_state;
+          qwen35_decode_session_state_size;
   local: *;
 };

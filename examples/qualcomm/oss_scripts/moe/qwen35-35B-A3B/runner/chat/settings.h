@@ -23,6 +23,8 @@ struct RuntimeSettings {
   std::string context_load_mode = "auto";
 };
 
+void validate_runtime_settings(const RuntimeSettings& runtime);
+
 void apply_model_settings(
     Options& options,
     const nlohmann::json& config,

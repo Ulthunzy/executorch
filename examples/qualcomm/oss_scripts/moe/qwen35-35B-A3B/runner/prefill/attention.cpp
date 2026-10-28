@@ -48,7 +48,7 @@ Attention::Attention(
     cache_maps[i] = remap(
         graph.outputs[output[i + 2]], cache_owner().inputs[cache_input[i]]);
     identity[i] = true;
-    for (int j = 0; j < 65536; j++)
+    for (size_t j = 0; j < cache_maps[i].size(); j++)
       if (cache_maps[i][j] != j) {
         identity[i] = false;
         break;

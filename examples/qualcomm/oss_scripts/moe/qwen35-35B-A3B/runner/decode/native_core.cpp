@@ -4,9 +4,12 @@ void NativeCore::await_mailbox(int word, uint32_t expected) {
   const auto start = std::chrono::steady_clock::now();
   unsigned polls = 0;
   while (__atomic_load_n(box() + word, __ATOMIC_ACQUIRE) != expected) {
-    if (service_done.load(std::memory_order_acquire))
-      throw std::runtime_error(
-          "native service exited: " + std::to_string(service_status.load()));
+    if (service_done.load(std::memory_order_acquire)) {
+      if (__atomic_load_n(box() + word, __ATOMIC_ACQUIRE) != expected)
+        throw std::runtime_error(
+            "native service exited: " + std::to_string(service_status.load()));
+      break;
+    }
     if ((++polls & 4095) == 0 &&
         std::chrono::steady_clock::now() - start > std::chrono::seconds(20))
       throw std::runtime_error("native mailbox timeout");
@@ -293,16 +296,26 @@ void NativeCore::close() {
       (unsigned long long)service_threads);
   const int service_error = stop_service();
   int profile_error = 0;
-  if (getenv("MOE_PROFILE_TOTAL")) {
-    float values[96];
-    profile_error = integer_rpc_profile(handle, values, 96);
-    if (!profile_error)
+  if (getenv("MOE_PROFILE_TOTAL") &&
+      std::string(getenv("MOE_PROFILE_TOTAL")) == "1") {
+    float values[104];
+    profile_error = integer_rpc_profile(handle, values, 104);
+    if (!profile_error) {
       for (int row = 0; row < 12; ++row) {
         printf("CHAT_MOE_PROFILE_TOTAL row=%d", row);
         for (int column = 0; column < 8; ++column)
           printf(" %.6f", values[row * 8 + column]);
         printf("\n");
       }
+      double dma_ms = 0;
+      for (int worker = 0; worker < 8; ++worker)
+        dma_ms += values[88 + worker];
+      printf(
+          "MOE_NATIVE_PROFILE phase=decode enabled=%d hmx_busy_ms=%.6f hmx_loop_ms=%.6f hvx_io_wait_critical_sum_ms=%.6f hvx_hmx_wait_critical_sum_ms=%.6f hvx_prepare_critical_sum_ms=%.6f hvx_swiglu_critical_sum_ms=%.6f hvx_dequant_critical_sum_ms=%.6f weight_dma_worker_sum_ms=%.6f acquire_ms=%.6f launch_ms=%.6f join_ms=%.6f release_ms=%.6f rpc_body_ms=%.6f dsp_mhz=%.0f hmx_mhz=%.0f hvx_units=%.0f\n",
+          int(values[96]), values[72], values[74], values[75], values[76],
+          values[77], values[78], values[79], dma_ms, values[64], values[65],
+          values[66], values[67], values[68], values[69], values[70], values[71]);
+    }
   }
   if (service.joinable()) {
     {

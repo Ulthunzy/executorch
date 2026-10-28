@@ -4,15 +4,9 @@
 #include "cache_utils.h"
 #include "../runtime_utils.h"
 #include "../cache_transfer.h"
+#include "../cache_encoding.h"
 #include <array>
 #include <cmath>
-
-// 从 prefill 图保存的原始编码；QNN 的实数值为 (code + offset) * scale。
-struct CacheEncoding {
-  float scale;
-  int32_t offset;
-  uint64_t elements;
-};
 
 extern std::vector<uint8_t> cache_encoding;
 extern std::array<std::vector<uint32_t>, 40> layer_io;

@@ -12,6 +12,7 @@ std::unique_ptr<executorch::extension::Module> module;
 std::string last_error;
 bool failed = false;
 bool prefill_interrupted = false;
+bool cache_abi_checked = false;
 std::array<uint64_t, 6> lifetime{};
 
 std::array<uint64_t, 6> resources() {
@@ -25,6 +26,11 @@ std::array<uint64_t, 6> resources() {
       rt.buffer_frees};
 }
 } // namespace
+
+extern "C" size_t qwen35_decode_session_state_size(size_t caller_size) {
+  cache_abi_checked = caller_size == sizeof(Qwen35SessionState);
+  return sizeof(Qwen35SessionState);
+}
 
 extern "C" const char* qwen35_decode_error() {
   return last_error.c_str();
@@ -57,6 +63,8 @@ extern "C" void qwen35_decode_close() {
 }
 
 extern "C" int qwen35_decode_open(const char* root, int cache_mib) try {
+  if (!cache_abi_checked)
+    throw std::runtime_error("Decode cache ABI was not negotiated; install the matching runner and decode library");
   if (session || module) {
     last_error = "decode session is already open";
     return 1;

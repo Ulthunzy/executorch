@@ -1,5 +1,6 @@
 #include "native_core.h"
 #include "../../native/prefill/expert_stream.h"
+#include "../../native/prefill/vtcm_layout.h"
 
 NativeCore::NativeCore(Runtime& r, const std::string&, int tokens)
     : runtime(r) {
@@ -14,6 +15,14 @@ NativeCore::NativeCore(Runtime& r, const std::string&, int tokens)
       "integer_rpc_open");
   const int configured = integer_rpc_configure(handle, tokens);
   if (configured) {
+    float profile[80]{};
+    const int queried = integer_rpc_profile(handle, profile, 80);
+    fprintf(
+        stderr,
+        "NATIVE_VTCM_CONFIG_FAILED tokens=%d requested_bytes=%u total_mib=%.3f available_mib=%.3f hardware_threads=%.0f query_status=%d configure_status=%d\n",
+        tokens,
+        unsigned(tokens > 128 ? moe_prefill_vtcm::kGroupedBytes : moe_prefill_vtcm::kAr128Bytes),
+        profile[76], profile[77], profile[75], queried, configured);
     integer_rpc_close(handle);
     handle = 0;
     check(configured, "integer_rpc_configure");
@@ -169,6 +178,18 @@ void NativeCore::close() {
   if (!handle)
     return;
   end_output_read();
+  int profile_error = 0;
+  if (getenv("MOE_PROFILE_TOTAL") &&
+      std::string(getenv("MOE_PROFILE_TOTAL")) == "1") {
+    float values[88];
+    profile_error = integer_rpc_profile(handle, values, 88);
+    if (!profile_error)
+      printf(
+          "MOE_NATIVE_PROFILE phase=prefill enabled=%d calls=%.0f hmx_busy_ms=%.6f hmx_loop_ms=%.6f hmx_io_blocked_ms=%.6f hvx_io_wait_worker_sum_ms=%.6f acquire_ms=%.6f launch_ms=%.6f join_ms=%.6f release_ms=%.6f rpc_body_ms=%.6f dsp_mhz=%.0f hmx_mhz=%.0f hvx_units=%.0f\n",
+          int(values[80]), values[81], values[72], values[74], values[78], values[79],
+          values[64], values[65], values[66], values[67], values[68],
+          values[69], values[70], values[71]);
+  }
   const int close_status = integer_rpc_close(handle);
   handle = 0;
   int unmap_status = 0;
@@ -186,6 +207,7 @@ void NativeCore::close() {
   io_mappings.clear();
   check(close_status, "integer_rpc_close");
   check(unmap_status, "native fastrpc_munmap");
+  check(profile_error, "integer_rpc_profile totals");
 }
 
 NativeCore::~NativeCore() {

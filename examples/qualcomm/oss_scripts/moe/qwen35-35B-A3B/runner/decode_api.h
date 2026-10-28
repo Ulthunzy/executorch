@@ -14,6 +14,7 @@ using DecodeMain = decltype(&qwen35_decode_run);
 // The prefill owner must outlive this API: its shared contexts and expert
 // buffers are borrowed by decode for the entire conversation.
 extern "C" {
+__attribute__((visibility("default"))) size_t qwen35_decode_session_state_size(size_t caller_size);
 __attribute__((visibility("default"))) int qwen35_decode_open(
     const char* root,
     int cache_mib);

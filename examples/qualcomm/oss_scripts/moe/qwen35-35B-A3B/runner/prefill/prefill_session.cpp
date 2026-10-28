@@ -1,4 +1,5 @@
 #include "prefill_session.h"
+#include "cold_start.h"
 #include "../../native/prefill/expert_stream.h"
 
 PrefillSession::PrefillSession(const std::string& path, int plan_tokens)
@@ -92,7 +93,14 @@ PrefillSession::PrefillSession(const std::string& path, int plan_tokens)
   if (startup_policy != "none") {
     if (!async_io)
       throw std::runtime_error("startup preload requires pipeline");
-    const auto table = bytes(root + "/cold-experts.i32");
+    const char* initial_image = getenv("PREFILL_INITIAL_IMAGE");
+    const bool has_initial_image = initial_image && std::string(initial_image) == "1";
+    const auto table_path = cold_start_table(root, has_initial_image);
+    printf(
+        "STARTUP_COLD_PROFILE kind=%s table=%s\n",
+        has_initial_image ? "image" : "text",
+        table_path.c_str());
+    const auto table = bytes(table_path);
     // 启动 profile 仍有每层 64 个候选，仅加载当前容量对应的前缀。
     if (table.size() != 40 * kMaxExpertSlots * 4)
       throw std::runtime_error("cold table dimensions");
@@ -354,7 +362,12 @@ void PrefillSession::attend(
   memcpy(norm, a.hidden(), 128 * 2048 * 4);
   memcpy(residual, a.residual(), 128 * 2048 * 4);
   const auto done = Clock::now();
-  metrics.attention += elapsed(t);
+  const double attention_ms = elapsed(t);
+  metrics.attention += attention_ms;
+  if (a.linear)
+    metrics.gdn_attention += attention_ms;
+  else
+    metrics.full_attention += attention_ms;
   metrics.calls[1]++;
   if (!route_reads.empty())
     attention_io_spans.emplace_back(t, done);
