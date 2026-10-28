@@ -2,6 +2,12 @@
 
 本文对应本目录当前的 `export.py`、`build.sh` 和 `run_chat.py`。首次使用按第1～6节操作；已经准备好相同源码、Python环境和SDK的基础库后，日常导出只需修改配置并执行一次 `export.py`。
 
+SM8850当前整合版的入口为 `configs/sm8850.json`，构建目录为
+`build/moe/qwen35-35B-A3B-sm8850`，使用SDK2.51.200.261021及已验证的U16状态模型。
+64槽、prefill IO16、decode IO8、512 KiB读取块及现有PTE的直接运行命令见
+[当前版本说明](docs/SM8850_OPTIMIZATION.md#current-integrated-version)。运行配置中的
+`cache_experts`可覆盖旧包内的槽数默认值，显式 `--cache-experts`仍优先。
+
 先明确构建和导出的关系：
 
 | 入口 | 做什么 | 需要提前准备什么 |
@@ -90,6 +96,12 @@ python -c 'from executorch.backends.qualcomm.python import PyQnnManagerAdaptor a
 本目录 `build.sh` 默认链接仓库的 `build-android`。若使用其他基础库目录，设置 `EXECUTORCH_ANDROID_BUILD` 指向该构建根目录。它需要上述实际库与头文件，仅有一个通用 `executor_runner` 可执行文件不够。
 
 导出JSON的 `build=true` 会自动构建本项目，不必再手动运行一次本目录 `build.sh`。设为 `false` 则完全复用 `build_dir`，其中必须已有匹配的runner、Native skeleton、共享库、采集工具和op package；`op_package_host` 默认也是这个目录下的 `op-package/x86_64-linux-clang/libQnnDeltaNetOpPackage.so`。更换源码、SDK、SoC或RPC协议后，不能沿用未匹配的旧构建。
+
+`prefill_gdn_core` 是导出设置，支持默认 `chunked_mixed_fp16`，以及实验性的 `custom_fp16` / `custom_u16`。FP16核心接回原缓存QDQ；U16核心保留原Q/K/V/beta/state网格，decay改用scale=1/65535、zero-point=0以精确表示padding所需的1，并在FP32中屏蔽无效token。U16递推含额外逐token量化，需独立验证误差。各实现应输出到独立目录；层组和PTE sidecar记录选择，同一模型禁止混组。
+
+`gdn_state_vtcm` 默认 `false`；设为 `true` 将同一共享context中的custom GDN映射为 `DeltaNetCoreVtcm`，同时影响decode。该选项不适用于 `custom_fp16`，AR128与AR1应分别计时。
+
+`MOE_NATIVE_PROFILE=1` 构建DSP计时版本，建议使用独立 `MOE_BUILD_DIR`。推理加 `--profile` 才读取累计计数；`TARGET.json` 会验证该构建标记。`MOE_BUILD_OP_PACKAGE=0` 可跳过GDN包构建以复用已验证的同架构算子，默认仍构建完整依赖。分析工具为 `tools/moe_profile.py`，常规吞吐测试应使用无插桩版本。
 
 ## 3. 修改原始 safetensors 路径和导出配置
 
@@ -204,7 +216,9 @@ Qwen3.5-35B-A3B/
 
 当前 **完整文本 `format=pte`** 流程在真机通过SDK的 `contextCreateFromBinaryWithCallback` 恢复context，记录公共权重请求区间，随后分离 `graph.qnn` 与 `weights.bin`。因此配置加载时就要求 `device` 和 `runtime_device_dir`，不是只在最后推理时使用。
 
-`export/capture.py` 自动上传新编译的 `capture_weights`、GDN设备包和待采集context，但 **不上传/安装QNN运行库**。新设备必须先准备 `runtime_device_dir`。
+导出配置设置 `deploy_runtime=true` 时，统一流程按 `qnn_sdk_root` 和目标架构自动上传 Android HTP/System/Prepare、stub 及 DSP skel 到 `runtime_device_dir`，并记录文件 SHA256 到 `build_dir/QNN_RUNTIME.json`。恢复导出时仍会同步运行库，随后复用内容校验通过的编译阶段。SM8850 配置已开启此选项，使用 SDK 2.51.200.261021 与独立的 V81 设备目录。
+
+`deploy_runtime` 默认为 `false`，适合已有正确运行库的设备。此时 `export/capture.py` 只上传新编译的 `capture_weights`、GDN设备包和待采集context，新设备需按下面步骤先准备 `runtime_device_dir`。运行库、编译用SDK及Python QNN binding 必须匹配。
 
 ```bash
 adb devices -l
@@ -217,7 +231,7 @@ adb -s "$MOE_DEVICE" shell getprop ro.soc.model
 | SoC | Hexagon架构 | 当前验证范围 |
 | --- | --- | --- |
 | `SM8750` | `v79` | 专家内核交叉编译通过，整模设备验证待做 |
-| `SM8850` | `v81` | 专家内核交叉编译通过，整模设备验证待做 |
+| `SM8850` | `v81` | SDK2.51.200整模导出通过，32/64槽、256/512/1024输入输出的16次真机验证通过，8192个生成token与基线一致 |
 | `SM8975` | `v85` | 当前40层文本、图文、多轮及JNI回归使用的目标 |
 
 换SoC需重编译目标图、Native和GDN包，使用新的导出/构建目录及匹配设备库。入口会核对 `ro.soc.model`。
@@ -414,7 +428,7 @@ python -u "$MOE_ROOT/run_chat.py" \
 | `--image-path` | 初始图片的主机路径 |
 | `--with-vision` / `--no-with-vision` | 是否保留视觉塔支持后续 `/image`，初始图片自动开启 |
 | `--remote-weights` | 设备UFS专家bank/index路径 |
-| `--deploy-weights` / `--no-deploy-weights` | 默认同步专家，只有设备文件完整匹配时才关闭 |
+| `--deploy-weights` / `--no-deploy-weights` | 默认同步权重；关闭时复用已有专家、embedding 和共享图，embedding、head 与各组 graph/weights/metadata/IO 必须与本机文件 SHA256 相同，缺失或不匹配会拒绝运行 |
 | `--runner diagnostic` | 张量dump、teacher-forcing与诊断链路，固定greedy、不做交互 |
 
 CLI生成控制覆盖模型JSON的 `generation`。每次结果保存 `console.log`、`runner.log` 和 `RUN.json`。Python也可调用 `run_chat.py` 的 `run_inference(config=None, weights_path=None, device=None, soc_model=None, prompt=..., temperature=None, ignore_eos=None, image_path=None, with_vision=None, interactive=None, stream=None, enable_thinking=None, max_new_tokens=None)`；省略项继承配置，交互模式阻塞至 `/exit`，返回结果目录。
@@ -454,6 +468,8 @@ export ADSP_LIBRARY_PATH="$PWD;/odm/lib64/rfsa;/vendor/dsp/cdsp;/vendor/lib/rfsa
 `--library-directory` 为包内解出的阶段目录链接共享库及正确prefill/decode skeleton。本例明确用 `--no-vision` 运行纯文本；要使用图片，将它替换为 `--vision`，先把图片放到设备，再加 `--image-path /data/local/tmp/test.jpg`，或在后续轮输入 `/image "设备图片路径" 问题`。`/reset` 清历史、保留模型资源，`/exit` 统一释放。
 
 JNI可用 `new Qwen35MoeModule.Config(modelPte, workspaceDirectory, nativeLibraryDirectory)`；图片接口、线程和APK打包要求见[JNI说明](../../../../../extension/android/jni/moe/README.md)。
+
+SM8850/V81 构建直接加载模型包时，原生 runner/JNI 使用 prefill IO 16、decode IO 8、512 KiB 读取分块；旧包内的导出调度不会使这一路径退回8/256。原生 runner 显式指定 `--model-config` 时保留配置选择，`--prefill-io-workers`、`--decode-io-workers`、`--read-chunk-kib` 的显式参数优先。其他SoC保留原行为。无需为此重做GPTQ、QNN导出或PTE打包。
 
 ## 7. 量化、KV/state和上下文
 
@@ -510,6 +526,7 @@ JNI可用 `new Qwen35MoeModule.Config(modelPte, workspaceDirectory, nativeLibrar
 | `prefill_async_io` / `--prefill-async-io` | `true` | 专家读取与计算重叠 |
 | `startup_prefetch` / `--startup-prefetch` | `overlap` | `overlap` / `sync` / `none`，候选profile不代表永久锁定热专家 |
 | `io_workers` / `--io-workers` | `8` | 读取worker支持4/8/16 |
+| `--prefill-io-workers` | 跟随`io_workers` | chat中独立设置prefill读取worker；SM8850运行配置默认16 |
 | `startup_io_workers` / `--startup-io-workers` | `4` | 启动预取worker |
 | `read_chunk_kib` / `--read-chunk-kib` | `256` | 单次专家读取块大小 |
 | `decode_hit_first` / `--decode-hit-first` | `true` | 命中专家先算，缺失专家同时读 |
@@ -518,6 +535,10 @@ JNI可用 `new Qwen35MoeModule.Config(modelPte, workspaceDirectory, nativeLibrar
 | `context_load_mode` / `--decode-context-load-mode` | `auto` | 共享模式统一恢复常驻context，不用 `serial` 做当前共享文本导出 |
 
 布尔参数均有 `--no-...`。关闭prefill异步读时还需 `--startup-prefetch none`。四层分组用于共享及编译，十组和head随session常驻，不按四层卸载/重建context。专家buffer跨阶段交接，缺失专家从UFS加载、LRU更新，不改变真实Top8路由。当前未接入跨token预测预取。
+
+SM8850 含视觉塔的PTE额外打包 `cold-experts-image.i32` 与来源清单 `cold-experts-image.json`，默认表保存在 `configs/sm8850_image_cold.json`。仅首轮实际传入图片时从该表选择32/64槽前缀。文本导出同时打包 `cold-experts-text.i32/json`，默认profile为 `configs/sm8850_text_cold.json`，首轮无图片时使用，包括仅开启 `--with-vision` 的文本请求。V79/V85或旧包缺当前模态可选表时使用原 `cold-experts.i32`。预载数量及总字节数不变。
+
+现有目录或旧PTE可分别用 `tools/image_cold_profile.py --output-dir <导出目录或PTE所在目录>`、`tools/text_cold_profile.py --output-dir <相同目录>` 添加sidecar；Python入口在旧PTE父目录查找两组可选资产，原生CLI/JNI单PTE需重新打包。表与来源清单必须成对存在。文本固定profile包含三段独立自然正文及SHA、256-token/零额外空格条件、两种预注册排名的留一分数；原基准和独立验证正文均不参与训练。文本工具的可选 `--collection` 从这三段独立校准路由重建并校验输入token SHA。更新任一固定profile只使package检查点失效。`STARTUP_COLD_PROFILE` 日志记录实际所选表。
 
 模型、context、buffer、cache和worker跨用户等待保留；Native RPC在每次forward返回前完成，不跨用户等待保留未返回调用。runner、decode DSO和协议2 DSP skeleton要配套更新。
 

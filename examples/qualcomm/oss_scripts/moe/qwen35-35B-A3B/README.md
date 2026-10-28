@@ -1,12 +1,97 @@
-# Qwen3.5-35B-A3B MoE，SM8975/V85
+# Qwen3.5-35B-A3B MoE，SM8750 / SM8850 / SM8975
 
-本目录维护已验证的 40 层 MoE 推理、融合图导出及专家重构代码。独立于 `llama.py`。默认使用融合后的 Attention＋Router/shared、AR128 prefill、AR1 decode、每层 32 槽 LRU（可用 `--cache-experts 64` 切换）、命中专家先计算与缺失专家异步读取。
+本目录维护已验证的 40 层 MoE 推理、融合图导出及专家重构代码。独立于 `llama.py`。使用 AR128 prefill、AR1 decode；prefill 分别执行 Attention/GDN、Router/shared 和 Native MoE，decode 融合 Attention＋Router/shared。通用配置使用每层32槽LRU，SM8850整合配置使用64槽，可通过 `--cache-experts 32/64` 覆盖；命中专家先计算，缺失专家异步读取。
+
+**当前 SM8850 整合版**使用 [configs/sm8850.json](configs/sm8850.json)，主构建目录为 `build/moe/qwen35-35B-A3B-sm8850`。保留本轮实测的 U16 GDN state 模型、修正后的 GDN 累加顺序、N2 unroll4、V81 compact VTCM 和512维投影专用化；运行参数为64槽、prefill IO16、decode IO8、512 KiB读取块。PPL与原始三问的结果、代码分工及运行命令见 [当前版本说明](docs/SM8850_OPTIMIZATION.md#current-integrated-version)，版本及库指纹见 [sm8850-current.json](docs/sm8850-current.json)。
 
 当前默认使用 P/D 共享常量、外部权重文件与公共 head；11 个共享 context 在整个会话中常驻，图片输入或显式 `--with-vision` 另保留 1 个视觉 context。Router/shared 为 GPTQ W8A16，embedding 为 group-32 INT4，专家缓存跨阶段交接复用。历史独立权重版本的测试记录仍保留在下文。
 
 导出、量化和推理各自保留入口，共用 [configs/model.json](configs/model.json) 中的量化、KV/state、上下文、thinking 和调度配置；[configs/sm8975.json](configs/sm8975.json) 只管理本机和设备路径。**完整命令、参数生效位置及支持范围见 [CONFIGURATION.md](CONFIGURATION.md)。**
 
 正式导出配置统一放在 [configs/export_sm8975.json](configs/export_sm8975.json)，默认从原始 safetensors 开始 GPTQ 校准、QNN 编译和 PTE 打包；`llama-output/` 保存量化、构建和导出产物。
+
+SM8850 使用 [configs/export_sm8850.json](configs/export_sm8850.json) 和 [configs/model_sm8850.json](configs/model_sm8850.json)：SDK 固定为 `/hunter/qnn_sdk/src/backends/qnn/2.51.200.261021`，V81、2048 总上下文、AR128、W2/Top8 专家及每层64槽缓存。配置开启 `deploy_runtime`，导出时部署该 SDK 的 Android runtime、V81 stub/skel，再使用当前 GDN 源码编译的算子包分离共享权重；SM8975 的历史二进制不能直接复用。需使用按同一 SDK 构建的 Python QNN binding。下面的历史性能表仍来自 SM8975，SM8850 性能以真机复测结果为准。
+
+推荐 SM8850 新导出显式选择 [FP16 GDN state 配置](configs/export_sm8850_gdn_fp16state.json)。它使用 `source=calibrated`，复用配置中原U16校准目录的W2/GPTQ权重和QDQ，仅转换GDN state接口并重新编译、打包；文本导出不运行GPU校准或GPTQ。必须重建host、重编包含30个GDN层的共享图及PTE，旧U16 PTE不能仅靠替换算子so切换state类型。此配置使用独立build和设备目录，旧U16默认和SM8750兼容路径保留。自定义输出目录的命令如下；追加`--print-plan`或`--check`可只做本机预检，完整PTE导出还需连接SM8850进行SDK权重分离。
+
+FP16 state 的8窗PPL为 **7.904025→7.695833**，logits SQNR为 **8.17008→8.47914 dB**。6格24轮文本吞吐的最小观测变化为−0.90%，按用户接受小于1%的标准保留，尚未统计证明差异来自设备噪声；这组输出长度不同于历史SM8975表。正式CLI的文本、白色长角牛图片和原始三问回放均已执行；第三问83个token后自然EOS且无原连续1111，前两轮介绍仍逐字重复。正常CLI峰值内存、完整样本和剩余精度差距见 [FP16 state 实测报告](../../../../../llama-output/qwen35-sm8850--1028/gdn-tradeoff-20261028/REPORT.md)。
+
+```bash
+CUDA_VISIBLE_DEVICES="" PYTHONPATH="$PWD/.." /home/hunter/anaconda3/envs/et_npu/bin/python \
+  examples/qualcomm/oss_scripts/moe/qwen35-35B-A3B/export.py \
+  --config examples/qualcomm/oss_scripts/moe/qwen35-35B-A3B/configs/export_sm8850_gdn_fp16state.json \
+  --output /your/custom/output
+```
+
+该可选配置默认只导出文本。需要图文包时使用 `--components text vision`；配置中的 `vision_source` 指向已经完成的 SM8850 视觉目录，要求包含 `VISION.json`、`vision.bin` 和 `vision.pte`。复用前检查目标芯片、原模型 config 签名、W8A16/GPTQ 配方和输入输出形状；当前资源为 448×448、196 个图像 token。此路径直接复用原视觉文件，不运行视觉 GPU 校准或 QNN 编译，原目录必须保留。需要更换来源时修改 `vision_source`；未提供该字段的视觉导出继续使用原始权重和校准图片生成视觉产物。
+
+```bash
+CUDA_VISIBLE_DEVICES="" PYTHONPATH="$PWD/.." /home/hunter/anaconda3/envs/et_npu/bin/python \
+  examples/qualcomm/oss_scripts/moe/qwen35-35B-A3B/export.py \
+  --config examples/qualcomm/oss_scripts/moe/qwen35-35B-A3B/configs/export_sm8850_gdn_fp16state.json \
+  --components text vision --output /your/custom/vlm-output --print-plan
+```
+
+将 `--print-plan` 换成 `--check` 可检查本地依赖；去掉只读选项后执行导出，文本共享权重分离仍需连接设备。正常图文推理使用 `run_chat.py --image-path test.jpg --with-vision`。设备已有相同视觉二进制时，可追加 `--runtime-vision-bin /data/local/tmp/existing/vision.bin`：部署时先核对 SHA256，再为新会话建立链接，避免再次复制视觉权重；省略该参数则照常上传。
+
+本轮推理对照显式使用 `--prefill-io-workers 16 --io-workers 8 --read-chunk-kib 512`。可选模型 JSON 保留原有调度字段，复现实测时需要传入这组参数。
+
+SM8850 冻结的 R4 优化版以新固定输入完成12种条件、16次完整输出测试，24项中位吞吐指标均超过图中SM8975数值，全部decode达标。64槽1024→1024纯文本prefill为516.661 token/s，相对旧版428.145提升20.67%；完整8192个生成token与该固定输入基线一致。图文256/64两轮中位119.4065，仅比119.20高0.173%，首轮未达标；图文收益未稳定建立。图文计时包含CPU预处理、视觉编码和LLM。时间拆分、全部条件、输入范围与回退项见 [SM8850优化记录](docs/SM8850_OPTIMIZATION.md)。
+
+2026-10-28 数值修正：V81 的 radix-256 GDN 归约改变了 FP32 重组舍入，用户多轮自由生成出现连续206个 `1`。当前默认恢复参考归约，保留 N2、grouped8、IO 调度和 FP16 寄存器复用。相同原始对话在 `temperature=0` 下恢复为200个 token 后正常 EOS，全部输出 token 和82份数值快照与旧 GDN 基线相同。无需重新导出模型；更新算子包即可。[修复及回放证据](../../../../../llama-output/qwen35-sm8850--1028/diagnostics/repetition-20261028/FIX_REPORT.md)。
+
+修复版使用用户当前新导出图完成12种条件、16轮真机测试，23/24项吞吐超过图中SM8975数值，全部decode达标。唯一未达标项为图文256/64的prefill：115.5515 vs119.20 token/s。64槽1024纯文本prefill/decode为503.393/13.8838，图文为380.952/16.9164 token/s。8192个生成ID、8176次AR1、327040条mailbox命令全部通过独立核对；两轮256取中位数，512/1024各一轮。当前导出共享图和部分运行库与历史R4不同，不能把全部时间差异归因于GDN修复。[修复版完整性能表及全部单轮](../../../../../llama-output/qwen35-sm8850--1028/performance-gdn-corrected-20261028/REPORT.md)。
+
+2026-10-28 精度和内存补测：当前修正版本在64槽、8段WikiText-test、7168个预测位置上，原权重FP32参考PPL为 **5.747885**，NPU为 **7.904025**（增加 **37.51%**）；原始logits/最终residual hidden SQNR为 **8.1701/7.0277 dB**，不能视为相对浮点无损。参考使用原BF16权重值执行仓库FP32实现，已静态核对原架构，尚未运行独立HF端到端基准；这是6篇文章的抽样结果，不是完整测试集PPL，也不覆盖视觉精度。另跑12轮不保留全量logits的正常CLI，256/512/1024输入及等长输出的文本峰值为32槽 **3.5925/3.6342/3.6869 GiB**、64槽 **4.6342/4.6601/4.7125 GiB**；图文为32槽 **4.1607/4.2216/4.2519 GiB**、64槽 **5.2095/5.2434/5.2772 GiB**。这些是PSS加去重DMA并扣重复映射的进程采样峰值，目标间隔200ms，实际最大237.4ms；SwapPSS为0，生成ID与性能轮一致。分窗精度、采样覆盖、旧算子对照和原始记录见[本轮报告](../../../../../llama-output/qwen35-sm8850--1028/quality-memory-20261028/REPORT.md)。
+
+同批目标的真实next-token Top1命中率为FP32 **60.10%** → NPU **54.63%**，下降5.47个百分点。使用完全相同量化模型和896个预测目标，旧GDN＋旧N2与当前算子 **167份原始token、hidden、logits和状态缓存文件逐字节一致**，PPL均为6.010410136；该对照未发现本次算子优化额外引入的精度损失。这个结论仅覆盖对照窗口，不能把整体FP32差距全归因于某个量化组件，也不能替代完整测试集评估。
+
+```bash
+python examples/qualcomm/oss_scripts/moe/qwen35-35B-A3B/export.py \
+  --config examples/qualcomm/oss_scripts/moe/qwen35-35B-A3B/configs/export_sm8850.json --check
+python examples/qualcomm/oss_scripts/moe/qwen35-35B-A3B/export.py \
+  --config examples/qualcomm/oss_scripts/moe/qwen35-35B-A3B/configs/export_sm8850.json
+python examples/qualcomm/oss_scripts/moe/qwen35-35B-A3B/run_chat.py \
+  --config examples/qualcomm/oss_scripts/moe/qwen35-35B-A3B/configs/sm8850.json \
+  --weights-path llama-output/qwen35-moe-sm8850-sdk251-20261027/pte/model.pte \
+  --device 3B15AK00GLW00000 --soc-model SM8850 --cache-experts 32 \
+  --no-enable-thinking --ignore-eos --max-new-tokens 256
+```
+
+同图比较时分别使用32/64槽，文本与图文各测256→256、512→512、1024→1024，保持相同输入和生成设置。两张配置内的图片仅用于启动视觉校准，正式精度评测应固定并记录校准集。
+
+轻量分析使用 `run_chat.py --profile --build-dir .../build-profile`，保持原生 chat 调度及输出。该构建目录需用 `MOE_NATIVE_PROFILE=1` 编译；常规速度测试继续使用未插桩的构建。分析记录 prefill 的 GDN/full-attention、专家IO重叠，以及 decode 的融合 GDN 图、专家读取、native、状态反馈和 head。会话关闭时仅采集一次累计 DSP 计数，包含 HMX busy/service-loop、HVX 等待及资源获取/释放；不在每层额外调用RPC。
+
+```bash
+python examples/qualcomm/oss_scripts/moe/qwen35-35B-A3B/tools/moe_profile.py \
+  candidate/runner.log --baseline baseline/runner.log --output comparison.json
+```
+
+`hmx_service_duty_fraction` 是HMX忙时占服务循环的比例，不是峰值算力利用率；各worker耗时与IO重叠，不能直接相加。`read_chunk_kib` 只影响decode分块读取；prefill使用完整专家读取。SM8850经真机筛选后默认prefill IO 16、decode IO 8、decode读取块512KiB；`--prefill-io-workers` 可独立覆盖prefill。相同输入的反序复测中，512KiB相对256KiB的decode提升约7%，prefill IO 16相对8的ABBA中位数提升6.95%。本模型N2 reader上限840KiB，1024KiB无效。细分数据与测量范围见 [SM8850优化记录](docs/SM8850_OPTIMIZATION.md)。
+
+SM8850/V81 构建的原生 runner 和 JNI 也默认使用 prefill IO 16、decode IO 8、512 KiB 分块，包括直接加载旧 PTE 的情况。原生 runner 显式传入 `--model-config` 时保留该配置的调度；`--prefill-io-workers`、`--decode-io-workers`、`--read-chunk-kib` 可逐项覆盖。V79/V85 保持原默认设置。
+
+SM8850 图文导出还会打包 [独立图片冷启动专家表](configs/sm8850_image_cold.json)。仅首轮实际带图片时启用；纯文本按下面的文本表选择规则加载，其他SoC及缺少可选表的旧包继续使用原表。冷表只改变相同32/64槽中的预载专家，不改变模型路由或计算。现有导出目录可添加sidecar后直接推理，无需重做GPTQ或QNN编译：
+
+```bash
+python examples/qualcomm/oss_scripts/moe/qwen35-35B-A3B/tools/image_cold_profile.py \
+  --output-dir llama-output/qwen35-moe-sm8850-sdk251-20261027/pte
+```
+
+Python入口同时支持旧 `model.pte` 旁的sidecar；原生CLI/JNI单文件交付须将可选表重新打包进PTE。JNI构建从 `MOE_BUILD_DIR/TARGET.json` 读取V79/V81/V85并选择对应GDN包。冷表由三张独立图片生成，测试图片不参与排名或策略选择；留一验证、重建命令和实测IO收益见优化记录。
+
+SM8850 文本导出默认打包 [独立自然文本冷表](configs/sm8850_text_cold.json)，对应 `cold-experts-text.i32` 和 `cold-experts-text.json`。首轮无图片时使用，包括仅开启 `--with-vision` 的文本请求；实际带图片时仍选择图片表。旧包可在同一个PTE父目录添加文本sidecar：
+
+```bash
+python examples/qualcomm/oss_scripts/moe/qwen35-35B-A3B/tools/text_cold_profile.py \
+  --output-dir /path/to/export-or-pte-directory
+```
+
+文本profile保留三段独立训练正文、来源SHA、每段256-token/零补空格条件及留一验证结果；原基准和第四段自然验证文本均未参与排名。工具可用 `--collection /path/to/COLLECTION.json` 从这三段文本的路由重建排名，并核对实际输入token SHA。文本与图片sidecar共用旧PTE父目录；缺少当前模态可选表时回退原 `cold-experts.i32`，只存在表或清单之一则报错。更新固定profile仅使打包检查点失效，不重新量化模型。
+
+prefill 默认仍用 `chunked_mixed_fp16`，因此 UINT16 GDN 算子优化主要影响decode。导出JSON可设置 `prefill_gdn_core="custom_fp16"` 或 `"custom_u16"` 进行独立实验。FP16核心输出接回原缓存QDQ；U16核心保留原Q/K/V/beta/state网格，decay使用能精确表示1的网格，并在FP32中屏蔽无效token。U16逐token量化与浮点递推的数值不同，速度、误差及整模质量需分别验证。图和PTE sidecar记录实际实现，禁止混组；选项不改变量化校准配方。
+
+`gdn_state_vtcm=true` 可实验U16 state的VTCM驻留，默认关闭。该映射覆盖同一共享context中的custom GDN，decode也会改变，不能据AR128核心的收益推断AR1收益；不适用于 `custom_fp16`。SM8850 native专家采用独立VTCM布局及多页分配，避免沿用SM8975的12MiB单页请求；已通过128/256/1024文本prefill及decode交接功能验证。
 
 校准源保留在 `llama-output/qwen35-moe-from-safetensors-gptq-20261024`，包含全矩阵 GPTQ 权重、binding、WikiText 语料、两张校准图片及运行库。统一入口的新完整导出位于 `llama-output/qwen35-35B-A3B-export`；2026-10-26 已在 SM8975 验证有效长度 AR128、文本/图片及多轮推理。下文历史命令说明当时测试口径，当前运行使用统一导出及 `CONFIGURATION.md` 中的命令。
 
@@ -36,7 +121,7 @@ python examples/qualcomm/oss_scripts/moe/qwen35-35B-A3B/run_chat.py \
   --interactive --stream --prompt "请介绍一下自己。"
 ```
 
-图片使用 `--image-path /path/to/image.jpg`，在设备内解码；后续图片使用 `--with-vision` 保留视觉塔。`--ignore-eos` 控制停止条件，`--no-stream` 改为每轮生成完再显示。旧 teacher-forcing / 张量dump仍进入诊断链路。新会话要求配套的新runner和支持有效长度的AR128图，统一导出会同时生成；复用同一工作目录时，由检查点决定复用或重建；冻结产物应保留在独立目录。三种架构的专家内核与GDN包已通过交叉编译，V79/V81整模设备验证尚未执行。
+图片使用 `--image-path /path/to/image.jpg`，在设备内解码；后续图片使用 `--with-vision` 保留视觉塔。`--ignore-eos` 控制停止条件，`--no-stream` 改为每轮生成完再显示。旧 teacher-forcing / 张量dump仍进入诊断链路。新会话要求配套的新runner和支持有效长度的AR128图，统一导出会同时生成；复用同一工作目录时，由检查点决定复用或重建；冻结产物应保留在独立目录。三种架构的专家内核与GDN包已通过交叉编译，V81文本及图文整模功能验证通过，V79尚未进行整模真机验证。
 
 ### 单文件交付与量化缓存
 

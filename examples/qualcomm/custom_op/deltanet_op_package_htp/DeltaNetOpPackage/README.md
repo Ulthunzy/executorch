@@ -1,5 +1,120 @@
 # DeltaNet HTP Custom Op Benchmark
 
+## Optional typed FP16 recurrent state
+
+`DeltaNetCoreFp16State` accepts affine QUInt16 Q/K/value/decay/beta and a
+genuinely typed Float16 recurrent state. It returns QUInt16 attention and
+Float16 state, with FP32 scratch arithmetic and Half feedback after each
+token. The Python alias is `qnn_custom_ops.deltanet_core_fp16_state`.
+This opt-in alias does not change existing kernels or model defaults. It
+requires matching Float16 cache metadata and correct output-name binding;
+an existing QUInt16 state cache cannot be reinterpreted as Float16.
+
+On SM8850/v81, aligned K=V=128 projections use a fixed-dimension inline
+call to the existing FP32 reduction helper. Constant dimensions let the
+compiler specialize addressing and register allocation without changing
+the accumulation order or per-token Half feedback. Other shapes and
+v79/v85 retain the generic path. The selected implementation was verified
+with profiling disabled; the outlined variant performed better only with
+instrumentation and was rejected. See the
+[focused reduction results](../../../../../llama-output/qwen35-sm8850--1028/gdn-tradeoff-20261028/gdn-reduce-optimized/REPORT.md).
+
+## SM8850 / SDK 2.51.200.261021 (2026-10-27)
+
+The production v81 build retains the radix-16 FP32 reconstruction. On
+2026-10-28, the experimental radix-256 reduction reproduced a multi-turn
+generation regression: after `你好,你是谁`, `你是qwen3.6吗`, and
+`深圳到北京的距离是多少`, greedy decoding repeated `1` 206 times. Only
+replacing the GDN library removed the loop while retaining optimized N2.
+The radix-256 reduction is now disabled by default on all architectures.
+Integer decomposition alone does not preserve the original FP32 rounding.
+`make test-reference-reduction` checks 153600 projection lanes bit-for-bit
+against the original radix-16 combine, including the endpoint/random inputs
+that exposed this difference. The remaining FP16 register, N2, and IO changes
+are retained. The isolated-core figures below describe the frozen experimental
+libraries and have not been remeasured for this correction. The corrected
+complete-model package subsequently completed 16 rounds: 23/24 rates exceed
+the supplied SM8975 screenshot, with image256/64 prefill below its reference.
+[Corrected full-model results](../../../../../llama-output/qwen35-sm8850--1028/performance-gdn-corrected-20261028/REPORT.md)
+retain every measured round and the changed-export comparison limits.
+
+The experimental radix-256 state reduction applies to `K <= 128`.
+It writes `S = 256*Sh + Sl` and centers each Q/K coefficient as
+`(raw - 32768) + (32768 - zero)`. The shared state sums supply the bias
+correction after the K loop. This retains every calibrated integer bit while
+reducing the Q/K projection from six to four multiply-accumulates per state
+vector. The bounds `128*255 = 32640` and `128*255*65535 = 2139062400` keep
+the state sums in signed int16 and the projection terms in signed int32.
+The final FP32 reconstruction can round differently from radix-16.
+
+The v79/SM8750 and v85/SM8975 builds retain the previous reduction. Other K
+sizes and unsupported zero points use the previous fallback. Define
+`DELTANET_U16_RADIX256_REDUCTION=1` in `HEXAGON_CPPFLAGS` only to reproduce
+the rejected experiment; it changes FP32 reconstruction and is unsuitable
+for production generation. QHPI enum spellings now match SDK 2.48 through 2.51; FP16/FP32
+signatures specify contiguous Flat4, Direct, DDR tensors, as required by the
+raw-pointer implementation and the SDK 2.51 tensor generator.
+
+Paired SM8850 measurements use the same serialized graph and shared recurrent
+state quantization, swapping only the DSP library. Both libraries use the
+existing MoE `-O3` and `DELTANET_U16_KARATSUBA_REDUCTION=1` flags. For
+B=1, H=32, K=V=128, five DDR rounds of 1000 iterations and three VTCM
+rounds of 400 iterations, each after five warmups, gave:
+
+| State placement | Tokens | Original median ms | Radix-256 median ms | Speedup |
+| --- | ---: | ---: | ---: | ---: |
+| DDR | 1 | 0.450665 | 0.447267 | 1.008x |
+| DDR | 128 | 3.739388 | 3.481400 | 1.074x |
+| VTCM | 1 | 0.461938 | 0.462728 | 0.998x |
+| VTCM | 128 | 3.084865 | 2.695968 | 1.144x |
+
+The one-token difference is within dispatch variability. Internal phase
+timings are needed to distinguish kernel changes from launch overhead.
+Final-state tensors were byte-identical; maximum attention differences were 8.62e-7 and 1.06e-6.
+The 128-token attention SQNR against the FP32 reference remained 64.44 dB.
+These isolated graph times include graph dispatch and boundary conversions;
+they are not complete linear-attention or MoE model throughput. The MoE
+prefill path currently uses ChunkGDN, so this table does not establish a
+prefill model speedup.
+
+Reproducible paired measurements are provided by
+[gdn_benchmark.py](../../../oss_scripts/moe/qwen35-35B-A3B/tools/gdn_benchmark.py).
+Artifacts and rejected experiment source snapshots are under
+`llama-output/gdn-sm8850-sdk251-20261027/` in the repository workspace.
+With the QNN and Hexagon SDK environment variables set, run
+`make test-reduction` for the native HVX numerical checks. They cover aligned and
+unaligned state, K=1/16/64/128, K=256 fallback, V=64/128/192/256, endpoint
+codes, random codes, and asymmetric Q/K/state zero points against int64 dots.
+
+`DELTANET_PROFILE_PHASES=1` enables per-worker `GDN_PHASE` logs for the
+QUInt16 core and typed FP16-state core: setup,
+state reduction, delta/output, state update and state copy using the 19.2 MHz
+hardware counter. It does not modify tensor outputs. Leave this flag disabled
+for performance comparisons; logical traffic estimates alone cannot show DDR
+or compute saturation.
+
+The v81 FP16 core also retains the Q/K projections in FP32 registers across
+K, sharing the FP16 state load and conversion, and retains delta vectors
+across state updates. Multiplication and addition keep their previous order;
+state still rounds to FP16 after every token. This is enabled only on v81 by
+`DELTANET_FP16_REGISTER_REUSE=1`; v79/v85 keep the original implementation.
+Non-vector tails retain the original path. Define the macro as zero to rebuild
+the v81 FP16 baseline.
+
+On the same SM8850 layer-0 context, inputs and ExecuTorch driver, three rounds
+of 200 executions gave median 8.591355 ms for the original FP16 core and
+6.924430 ms with register reuse (1.241x); all four layer outputs were
+byte-identical and repeatable. ChunkGDN remained faster at 2.880585 ms, so the
+MoE prefill default remains ChunkGDN. These are layer timings, not complete
+model throughput. Evidence is under
+`llama-output/qwen35-moe-sm8850-sdk251-20261027/pilot-layer0/executor-unified-ab/`.
+
+Run `make test-fp16-register` for native HVX bit checks: FP32 projection scratch
+and FP16 updates match the original helpers, and complete recurrence outputs
+and final states match builds with reuse disabled over 240 cases. They cover
+K=1/16/128/256, V=1/63/64/65/127/128/129/192/193/256, different initial/output
+alignments, nonzero initial state, three recurrent tokens and V partitions.
+
 > 2026-10-15 清理说明：本文件归档原 `DeltaNet_benchmark.md` 的算子测试记录。历史独立 benchmark 脚本、实验源码/库副本、日志和 PTE 已清理；下方历史命令仅记录当时参数，实验路径不代表当前可用产物。当前集成导出和验证结果见[llama README](../../../oss_scripts/llama/README.md#validation-record-2026-10-15)，完整模型测试历史见[测试记录归档](../../../oss_scripts/llama/README_QWEN35_TEST_RECORDS.md)。
 
 
