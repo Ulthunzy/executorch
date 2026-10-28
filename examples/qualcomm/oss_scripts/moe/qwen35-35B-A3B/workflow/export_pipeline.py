@@ -12,6 +12,7 @@ import time
 
 from .export_config import REPO, ROOT, ExportConfig
 from .checkpoint import StageCheckpoint, artifact_stamps, remove_path, write_json
+from .sdk_runtime import runtime_files
 
 
 @dataclass(frozen=True)
@@ -69,6 +70,24 @@ class ExportPipeline:
                         )
                     ),
                 )
+            )
+        if c.deploy_runtime:
+            stage(
+                "runtime",
+                "workflow/sdk_runtime.py",
+                (
+                    "--sdk",
+                    c.qnn_sdk_root,
+                    "--soc-model",
+                    c.soc_model,
+                    "--device",
+                    c.device,
+                    "--remote",
+                    c.runtime_device_dir,
+                    "--manifest",
+                    c.build_dir / "QNN_RUNTIME.json",
+                ),
+                (c.build_dir / "QNN_RUNTIME.json",),
             )
         text = "text" in c.components
         if text and c.source == "safetensors":
@@ -160,6 +179,9 @@ class ExportPipeline:
                         c.op_package_host,
                         "--op-package-device",
                         c.op_package_device,
+                        "--prefill-gdn-core",
+                        c.prefill_gdn_core,
+                        *(("--gdn-state-vtcm",) if c.gdn_state_vtcm else ()),
                         *binding,
                     ),
                     (
@@ -199,29 +221,46 @@ class ExportPipeline:
                 ),
             )
         if "vision" in c.components:
+            vision_arguments = (
+                "--model-config",
+                snapshot,
+                "--model",
+                c.model,
+                "--output",
+                out / "vision",
+                "--image-height",
+                c.image_height,
+                "--image-width",
+                c.image_width,
+            )
             stage(
                 "vision",
-                "export/vision.py",
+                "workflow/reuse_vision.py" if c.vision_source else "export/vision.py",
                 (
-                    *common,
-                    "--model",
-                    c.model,
-                    "--output",
-                    out / "vision",
-                    "--calib-images",
-                    *c.images,
-                    "--calibration-device",
-                    c.calibration_device,
-                    "--image-height",
-                    c.image_height,
-                    "--image-width",
-                    c.image_width,
-                    *binding,
+                    (*vision_arguments, "--source", c.vision_source)
+                    if c.vision_source
+                    else (
+                        *common,
+                        "--model",
+                        c.model,
+                        "--output",
+                        out / "vision",
+                        "--calib-images",
+                        *c.images,
+                        "--calibration-device",
+                        c.calibration_device,
+                        "--image-height",
+                        c.image_height,
+                        "--image-width",
+                        c.image_width,
+                        *binding,
+                    )
                 ),
                 (
                     out / "vision/VISION.json",
                     out / "vision/vision.bin",
                     *((out / "vision/vision.pte",) if c.format == "pte" else ()),
+                    *((out / "vision/VISION_REUSE.json",) if c.vision_source else ()),
                 ),
                 (out / "vision/vision.pte",) if c.format == "qnn" else (),
             )
@@ -330,7 +369,10 @@ class ExportPipeline:
         raw_text = (
             self.config.source == "safetensors" and "text" in self.config.components
         )
-        if not raw_text and "vision" not in self.config.components:
+        raw_vision = (
+            "vision" in self.config.components and self.config.vision_source is None
+        )
+        if not raw_text and not raw_vision:
             return []
         weights = json.loads(
             (self.config.model / "model.safetensors.index.json").read_text()
@@ -352,6 +394,8 @@ class ExportPipeline:
             c.qnn_sdk_root / "lib/x86_64-linux-clang/libQnnSystem.so",
             c.qnn_sdk_root / "lib/x86_64-linux-clang/libQnnHtp.so",
         ]
+        if c.deploy_runtime:
+            required.extend(runtime_files(c.qnn_sdk_root, self.settings.target))
         if c.qnn_binding:
             required.append(c.qnn_binding)
         if c.build and "text" in c.components:
@@ -370,7 +414,7 @@ class ExportPipeline:
                     c.build_dir
                     / f"op-package/hexagon-{c.dsp_arch}/libQnnDeltaNetOpPackage_HTP.so",
                 ]
-        if "vision" in c.components:
+        if "vision" in c.components and c.vision_source is None:
             required.extend(c.images)
             required.append(c.model / "model.safetensors.index.json")
         if "text" in c.components:
@@ -421,6 +465,12 @@ class ExportPipeline:
         missing = [str(p) for p in required if not p.is_file()]
         if missing:
             raise FileNotFoundError("Missing export inputs:\n" + "\n".join(missing))
+        if "vision" in c.components and c.vision_source:
+            from .reuse_vision import validate_vision_source
+
+            validate_vision_source(
+                c.vision_source, c.model, self.settings, c.image_height, c.image_width
+            )
         missing = [str(p) for p in self.checkpoint_shards() if not p.is_file()]
         if missing:
             raise FileNotFoundError("Missing checkpoint shards:\n" + "\n".join(missing))
@@ -450,6 +500,11 @@ class ExportPipeline:
                 prepared["cache"][key] != value
                 for key, value in self.settings.to_dict()["cache"].items()
                 if key.endswith("dtype")
+                and not (
+                    key == "gdn_state_dtype"
+                    and value == "float16"
+                    and prepared["cache"][key] == "uint16"
+                )
             ):
                 raise ValueError(
                     "Calibrated weight/cache recipes differ from model_config; prepare matching weights"
@@ -495,6 +550,11 @@ class ExportPipeline:
             *c.images,
         ]
         inputs += self.checkpoint_shards()
+        if "vision" in c.components and c.vision_source:
+            inputs += [
+                c.vision_source / name
+                for name in ("VISION.json", "vision.bin", "vision.pte")
+            ]
         if c.source == "safetensors":
             if c.corpus:
                 inputs.append(c.corpus)
@@ -507,6 +567,8 @@ class ExportPipeline:
                 and p.relative_to(c.calibration_dir).parts[0]
                 in ("layers", "router", "head")
             ]
+            if c.deploy_runtime:
+                inputs.extend(runtime_files(c.qnn_sdk_root, self.settings.target))
             inputs += [
                 c.calibration_dir / name
                 for name in (
@@ -672,6 +734,7 @@ class ExportPipeline:
                     c.qnn_sdk_root,
                     c.hexagon_sdk_root,
                     c.android_ndk_root,
+                    c.vision_source,
                 )
                 if p
             ],
@@ -683,7 +746,9 @@ class ExportPipeline:
             write_json(out / "EXPORT_PLAN.json", json.loads(self.describe()))
             cache.dirty = not resume
             for stage in self.stages:
-                if cache.reusable(stage.name, stage.outputs):
+                reusable = cache.reusable(stage.name, stage.outputs)
+                # A local checkpoint cannot confirm that device libraries still exist.
+                if reusable and stage.name != "runtime":
                     print("EXPORT_REUSED", stage.name, flush=True)
                     continue
                 (out / "EXPORT.json").unlink(missing_ok=True)
@@ -732,7 +797,28 @@ class ExportPipeline:
             report = self.finish()
             if c.format == "pte":
                 package = out / "model.pte"
-                if not cache.reusable("package", (package,)):
+                image_cold_profile_sha256 = None
+                text_cold_profile_sha256 = None
+                if c.soc_model == "SM8850" and "vision" in c.components:
+                    from .image_cold_profile import DEFAULT_PROFILE
+
+                    image_cold_profile_sha256 = hashlib.sha256(
+                        DEFAULT_PROFILE.read_bytes()
+                    ).hexdigest()
+                if c.soc_model == "SM8850" and "text" in c.components:
+                    from .text_cold_profile import DEFAULT_PROFILE
+
+                    text_cold_profile_sha256 = hashlib.sha256(
+                        DEFAULT_PROFILE.read_bytes()
+                    ).hexdigest()
+                previous_profiles = cache.state["stages"].get("package", {})
+                if (
+                    previous_profiles.get("image_cold_profile_sha256")
+                    != image_cold_profile_sha256
+                    or previous_profiles.get("text_cold_profile_sha256")
+                    != text_cold_profile_sha256
+                    or not cache.reusable("package", (package,))
+                ):
                     from .model_package import pack_export
 
                     print("EXPORT_START package", flush=True)
@@ -743,6 +829,8 @@ class ExportPipeline:
                             "package",
                             status="complete",
                             outputs=artifact_stamps((package,)),
+                            image_cold_profile_sha256=image_cold_profile_sha256,
+                            text_cold_profile_sha256=text_cold_profile_sha256,
                         )
                     except BaseException as error:
                         cache.update("package", status="failed", error=str(error))

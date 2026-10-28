@@ -27,6 +27,9 @@ class ExportConfig:
     phases: tuple[str, ...]
     format: str
     build: bool
+    deploy_runtime: bool
+    prefill_gdn_core: str
+    gdn_state_vtcm: bool
     build_dir: Path
     qnn_binding: Path | None
     op_package_host: Path
@@ -44,6 +47,7 @@ class ExportConfig:
     expert_batch: int
     image_height: int
     image_width: int
+    vision_source: Path | None = None
 
     @property
     def dsp_arch(self):
@@ -62,6 +66,7 @@ def load_export_config(
     *,
     device=None,
     soc_model=None,
+    components=None,
 ):
     path = Path(path).resolve()
     data = json.loads(path.read_text())
@@ -99,7 +104,11 @@ def load_export_config(
     required = ("model", "calibration_dir", "output", "build_dir")
     if any(not data.get(key) for key in required):
         raise ValueError(f"Export requires paths: {', '.join(required)}")
-    components = data.get("components", ["text", "vision"])
+    components = (
+        components
+        if components is not None
+        else data.get("components", ["text", "vision"])
+    )
     phases = data.get("phases", ["prefill", "decode"])
     for name, values, supported in (
         ("components", components, {"text", "vision"}),
@@ -127,6 +136,30 @@ def load_export_config(
     build = data.get("build", True)
     if type(build) is not bool:
         raise ValueError("build must be a JSON boolean")
+    deploy_runtime = data.get("deploy_runtime", False)
+    if type(deploy_runtime) is not bool:
+        raise ValueError("deploy_runtime must be a JSON boolean")
+    prefill_gdn_core = data.get("prefill_gdn_core", "chunked_mixed_fp16")
+    if prefill_gdn_core not in (
+        "chunked_mixed_fp16",
+        "custom_fp16",
+        "custom_fp32",
+        "custom_u16",
+    ):
+        raise ValueError("Unsupported prefill_gdn_core")
+    gdn_state_vtcm = data.get("gdn_state_vtcm", False)
+    if type(gdn_state_vtcm) is not bool:
+        raise ValueError("gdn_state_vtcm must be a JSON boolean")
+    if gdn_state_vtcm and prefill_gdn_core in ("custom_fp16", "custom_fp32"):
+        raise ValueError("GDN VTCM layout requires a UINT16 core")
+    if settings.cache.gdn_state_dtype == "float16" and (
+        source != "calibrated"
+        or prefill_gdn_core != "chunked_mixed_fp16"
+        or gdn_state_vtcm
+    ):
+        raise ValueError(
+            "Typed FP16 state requires calibrated weights, chunked prefill and DDR state"
+        )
     calibration_device = data.get("calibration_device", "cuda")
     if calibration_device not in ("cuda", "cpu"):
         raise ValueError("calibration_device must be cuda or cpu")
@@ -162,7 +195,8 @@ def load_export_config(
         not isinstance(p, str) or not p for p in images
     ):
         raise ValueError("images must contain calibration image paths")
-    if "vision" in components and not images:
+    vision_source = location("vision_source")
+    if "vision" in components and not images and vision_source is None:
         raise ValueError("Vision export requires calibration images")
     build_dir = location("build_dir")
     device = device if device is not None else data.get("device")
@@ -206,6 +240,10 @@ def load_export_config(
         raise ValueError(
             "External shared PTE export requires device and runtime_device_dir for SDK weight capture"
         )
+    if deploy_runtime and (not device or not runtime):
+        raise ValueError("Runtime deployment requires device and runtime_device_dir")
+    if deploy_runtime and not runtime.startswith("/data/local/tmp/"):
+        raise ValueError("Use a dedicated runtime_device_dir under /data/local/tmp")
     config = ExportConfig(
         soc_model=settings.target.soc_model,
         model_settings=settings,
@@ -218,6 +256,9 @@ def load_export_config(
         phases=tuple(phases),
         format=format_name,
         build=build,
+        deploy_runtime=deploy_runtime,
+        prefill_gdn_core=prefill_gdn_core,
+        gdn_state_vtcm=gdn_state_vtcm,
         build_dir=build_dir,
         qnn_binding=location("qnn_binding"),
         op_package_host=location(
@@ -247,6 +288,7 @@ def load_export_config(
         expert_batch=batch,
         image_height=dimensions["image_height"],
         image_width=dimensions["image_width"],
+        vision_source=vision_source,
     )
     if config.output == config.calibration_dir:
         raise ValueError(

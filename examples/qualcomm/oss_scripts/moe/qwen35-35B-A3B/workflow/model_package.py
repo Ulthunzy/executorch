@@ -231,12 +231,25 @@ class PackageReader:
 def pack_export(config):
     out = config.output
     files = {"MODEL_CONFIG.json": out / "MODEL_CONFIG.json"}
+    image_cold = ()
+    if (
+        config.model_settings.target.soc_model == "SM8850"
+        and "vision" in config.components
+    ):
+        from .image_cold_profile import ensure_image_cold_profile
+
+        image_cold = ensure_image_cold_profile(out)
     if (out / "device.json").is_file():
         files["device.json"] = out / "device.json"
     links = {}
     plans = []
     text = "text" in config.components
     if text:
+        text_cold = ()
+        if config.model_settings.target.soc_model == "SM8850":
+            from .text_cold_profile import ensure_text_cold_profile
+
+            text_cold = ensure_text_cold_profile(out)
         for name in ("tokenizer.json", "config.json", "generation_config.json"):
             files[name] = config.model / name
         for name in ("tokenizer_config.json", "preprocessor_config.json"):
@@ -273,6 +286,9 @@ def pack_export(config):
         )
         for name in (embedding, "cold-experts.i32"):
             files[name] = out / name
+        for asset in (*image_cold, *text_cold):
+            files[asset.name] = asset
+            links[f"model/prefill/{asset.name}"] = "../../" + asset.name
         for stage in ("prefill", "decode"):
             for name, source in (
                 ("indices", "indices"),

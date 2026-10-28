@@ -22,13 +22,18 @@ def parse_args(argv=None):
     )
     selection, _ = config_parser.parse_known_args(argv)
     defaults = json.loads(selection.config.read_text())
+    image_cold_profile_dir = None
+    package_manifest = None
     if selection.weights_path:
         weights = selection.weights_path.resolve()
         packaged = weights.is_file()
         if packaged:
             from workflow.model_package import PackageReader
 
-            weights = PackageReader(weights).extract()
+            image_cold_profile_dir = weights.parent
+            package = PackageReader(weights)
+            weights = package.extract()
+            package_manifest = package.manifest
             selection.weights_path = weights
         exported_profile = weights / "device.json"
         if exported_profile.is_file():
@@ -59,6 +64,8 @@ def parse_args(argv=None):
     model_configuration = selection.model_config or Path(
         defaults.get("model_config", DEFAULT_MODEL_CONFIG)
     )
+    if selection.model_config is None and not model_configuration.is_absolute():
+        model_configuration = REPO / model_configuration
     config_parser.set_defaults(model_config=model_configuration)
     try:
         settings = load_model_config(model_configuration)
@@ -171,6 +178,10 @@ def parse_args(argv=None):
         / defaults.get("vision_artifacts", defaults["artifacts"] + "/vision"),
     )
     parser.add_argument(
+        "--runtime-vision-bin",
+        help="Reuse this existing device vision.bin after checking its SHA256",
+    )
+    parser.add_argument(
         "--max-seq-len",
         "--decode-capacity",
         dest="decode_capacity",
@@ -261,7 +272,7 @@ def parse_args(argv=None):
         "--cache-experts",
         type=int,
         choices=[32, 64],
-        default=schedule.cache_experts,
+        default=defaults.get("cache_experts", schedule.cache_experts),
         help="Resident LRU expert slots per layer, shared by prefill and decode",
     )
     parser.add_argument("--prefill-token-file", type=Path)
@@ -273,15 +284,27 @@ def parse_args(argv=None):
     )
     parser.add_argument("--save-all-logits", action="store_true")
     parser.add_argument("--trace-layers", action="store_true")
+    parser.add_argument(
+        "--profile",
+        action="store_true",
+        help="Report graph/IO and cumulative DSP timings; requires a MOE_NATIVE_PROFILE=1 build",
+    )
     parser.add_argument("--text-only", action="store_true")
     parser.add_argument(
         "--io-workers", type=int, choices=[4, 8, 16], default=schedule.io_workers
     )
     parser.add_argument(
+        "--prefill-io-workers",
+        type=int,
+        choices=[4, 8, 16],
+        default=defaults.get("prefill_io_workers"),
+        help="Override chat prefill readers independently of decode",
+    )
+    parser.add_argument(
         "--read-chunk-kib",
         type=int,
         choices=[64, 128, 256, 512, 1024],
-        default=schedule.read_chunk_kib,
+        default=defaults.get("read_chunk_kib", schedule.read_chunk_kib),
     )
     parser.add_argument(
         "--check",
@@ -294,6 +317,8 @@ def parse_args(argv=None):
         help="Print effective model settings without loading artifacts or using ADB",
     )
     args = parser.parse_args(argv)
+    args.image_cold_profile_dir = image_cold_profile_dir
+    args.package_manifest = package_manifest
     if args.runner is None:
         args.runner = (
             "diagnostic"
@@ -310,6 +335,8 @@ def parse_args(argv=None):
     args.with_vision = (
         bool(args.image_path) if args.with_vision is None else args.with_vision
     )
+    if args.runtime_vision_bin and not args.with_vision:
+        parser.error("--runtime-vision-bin requires --with-vision or --image-path")
     args.artifacts = (
         selection.weights_path.resolve()
         if selection.weights_path
@@ -388,6 +415,7 @@ def parse_args(argv=None):
         args.remote_root,
         args.remote_weights,
         *([args.runtime_device_dir] if args.runtime_device_dir else []),
+        *([args.runtime_vision_bin] if args.runtime_vision_bin else []),
     ]:
         if (
             not re.fullmatch(r"/[A-Za-z0-9_./-]+", value)

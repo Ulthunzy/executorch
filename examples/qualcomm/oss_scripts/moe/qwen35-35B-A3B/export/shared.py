@@ -27,9 +27,24 @@ def main():
     parser.add_argument("--qnn-binding", type=Path)
     parser.add_argument("--op-package-host", type=Path, required=True)
     parser.add_argument("--op-package-device", required=True)
+    parser.add_argument(
+        "--prefill-gdn-core",
+        choices=("chunked_mixed_fp16", "custom_fp16", "custom_fp32", "custom_u16"),
+        default="chunked_mixed_fp16",
+    )
+    parser.add_argument("--gdn-state-vtcm", action="store_true")
     args = parser.parse_args()
+    if args.gdn_state_vtcm and args.prefill_gdn_core in ("custom_fp16", "custom_fp32"):
+        parser.error("GDN VTCM layout requires a UINT16 core")
     args.layers = args.layers or [0, 1, 2, 3]
     settings = load_model_config(args.model_config)
+    fp16_state = settings.cache.gdn_state_dtype == "float16"
+    if fp16_state and (
+        args.prefill_gdn_core != "chunked_mixed_fp16" or args.gdn_state_vtcm
+    ):
+        parser.error(
+            "Typed FP16 GDN state currently requires chunked prefill and DDR state"
+        )
     args.capacity = args.capacity or settings.context.max_seq_len
     settings = replace(
         settings, context=replace(settings.context, max_seq_len=args.capacity)
@@ -72,6 +87,7 @@ def main():
     from export.fp16_attention_core import fp16_attention_core
     from export.graph_utils import resize_attention
     from export.prefill import padded_prefill_front
+    from export.gdn_state import fp16_gdn_state
     from export.model import FusedFront, MoeFront, QuantizedFusedFront
     from export.quantization import validate_router_graph, validate_router_source
 
@@ -98,13 +114,19 @@ def main():
             for node in prefill.graph.nodes
             if node.op == "placeholder"
         )
+        if fp16_state and layer % 4 != 3:
+            prefill, prefill_inputs = fp16_gdn_state(
+                prefill, prefill_inputs, decode=False
+            )
         prefill, prefill_inputs = padded_prefill_front(
-            prefill, prefill_inputs, args.capacity
+            prefill, prefill_inputs, args.capacity, args.prefill_gdn_core
         )
         decode = torch.export.load(
             args.decode_source / f"layer{layer}/decode-qdq.pt2"
         ).module()
         decode_inputs = resize_attention(decode, args.capacity)
+        if fp16_state and layer % 4 != 3:
+            decode, decode_inputs = fp16_gdn_state(decode, decode_inputs, decode=True)
         if layer % 4 == 3:
             fp16_attention_core(decode, decode_inputs)
         constants = args.prefill_source / f"layer{layer}/moe-constants.npz"
@@ -148,7 +170,7 @@ def main():
         op_package_name="DeltaNetOpPackage",
         interface_provider="DeltaNetOpPackageInterfaceProvider",
         custom_op_name=str(torch.ops.qnn_custom_ops.deltanet_core.default),
-        qnn_op_type_name="DeltaNetCore",
+        qnn_op_type_name="DeltaNetCoreVtcm" if args.gdn_state_vtcm else "DeltaNetCore",
     )
     package = QnnExecuTorchOpPackageOptions(
         op_package_infos=[
@@ -166,6 +188,30 @@ def main():
             ),
         ]
     )
+    if fp16_state:
+        mixed = dict(
+            fields,
+            custom_op_name=str(
+                torch.ops.qnn_custom_ops.deltanet_core_fp16_state.default
+            ),
+            qnn_op_type_name="DeltaNetCoreFp16State",
+        )
+        package.op_package_infos.extend(
+            [
+                QnnExecuTorchOpPackageInfo(
+                    **mixed,
+                    op_package_path=str(args.op_package_host.resolve()),
+                    target=QnnExecuTorchOpPackageTarget.CPU,
+                    platform=QnnExecuTorchOpPackagePlatform.X86_64,
+                ),
+                QnnExecuTorchOpPackageInfo(
+                    **mixed,
+                    op_package_path=args.op_package_device,
+                    target=QnnExecuTorchOpPackageTarget.HTP,
+                    platform=QnnExecuTorchOpPackagePlatform.AARCH64_ANDROID,
+                ),
+            ]
+        )
     specs = generate_qnn_executorch_compiler_spec(
         QcomChipset[settings.target.soc_model],
         generate_htp_compiler_spec(use_fp16=False, use_weight_sharing=True),
@@ -181,6 +227,12 @@ def main():
 
     def tag(node):
         value = node.meta.get("val")
+        if (
+            fp16_state
+            and isinstance(value, torch.Tensor)
+            and tuple(value.shape) == (1, 32, 128, 128)
+        ):
+            return None
         if (
             isinstance(value, torch.Tensor)
             and tuple(value.shape) in state_shapes
@@ -246,7 +298,9 @@ def main():
         router="w8a16_gptq" if args.router_qdq else "fp16",
         router_calibration=router_calibration,
         weight_sharing=True,
-        prefill_core="chunked_mixed_fp16",
+        prefill_core=args.prefill_gdn_core,
+        gdn_state_dtype=settings.cache.gdn_state_dtype,
+        gdn_state_vtcm=args.gdn_state_vtcm,
         prefill_valid_length=True,
         prefill_history=args.capacity,
         io_order="QNN input_N_/output_N_ name IDs; resolve against runtime tensor metadata",

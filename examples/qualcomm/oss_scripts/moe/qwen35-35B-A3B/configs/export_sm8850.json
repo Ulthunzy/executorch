@@ -1,0 +1,39 @@
+{
+  "version": 1,
+  "model_config": "model_sm8850.json",
+  "model": "/hunter/model/Qwen/Qwen3.6-35B-A3B",
+  "source": "safetensors",
+  "calibration_dir": "llama-output/qwen35-moe-sm8850-sdk251-20261027/calibration",
+  "output": "llama-output/qwen35-sm8850--1028",
+  "components": [
+    "text",
+    "vision"
+  ],
+  "phases": [
+    "prefill",
+    "decode"
+  ],
+  "format": "pte",
+  "build": true,
+  "build_dir": "build/moe/qwen35-35B-A3B-sm8850",
+  "qnn_binding": "build/qnn251-host/backends/qualcomm/PyQnnManagerAdaptor.cpython-311-x86_64-linux-gnu.so",
+  "qnn_sdk_root": "/hunter/qnn_sdk/src/backends/qnn/2.51.200.261021",
+  "hexagon_sdk_root": "/hunter/qnn_sdk/hexagon/6.7.0.0",
+  "hexagon_tools_root": "/hunter/qnn_sdk/hexagon/6.7.0.0/tools/HEXAGON_Tools/21.0.04/Tools",
+  "android_ndk_root": "/hunter/android-ndk/android-ndk-r28c",
+  "op_package_device": "/data/local/tmp/qwen35-sm8850-sdk251/export/runtime/decode/libQnnDeltaNetOpPackage_HTP.so",
+  "device": "3B15AK00GLW00000",
+  "runtime_device_dir": "/data/local/tmp/qwen35-sm8850-sdk251/qnn-runtime",
+  "remote_root": "/data/local/tmp/qwen35-sm8850-sdk251/export",
+  "corpus": "llama-output/qwen35-moe-sm8850-sdk251-20261027/inputs/wikitext-2-raw-v1-train.jsonl",
+  "images": [
+    "test.jpg",
+    "docs/source/_static/img/demo_ios_xcode.jpg"
+  ],
+  "calibration_device": "cuda",
+  "expert_batch": 8,
+  "image_height": 448,
+  "image_width": 448,
+  "soc_model": "SM8850",
+  "deploy_runtime": true
+}

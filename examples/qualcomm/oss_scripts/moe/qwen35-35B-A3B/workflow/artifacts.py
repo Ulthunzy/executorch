@@ -28,6 +28,34 @@ def check_io_order(path, inputs, outputs):
         raise ValueError(f"{path}: incompatible graph IO order")
 
 
+def check_shared_head(args):
+    if args.package_manifest is not None:
+        for name in ("graph.qnn", "weights.bin", "WEIGHTS.json"):
+            path = args.shared_model / "head" / name
+            resource = path.resolve().relative_to(args.artifacts.resolve()).as_posix()
+            expected = args.package_manifest["files"].get(resource)
+            if expected is None:
+                raise ValueError(f"Packaged model is missing head resource: {resource}")
+            with path.open("rb") as file:
+                digest = hashlib.file_digest(file, "sha256").hexdigest()
+            if (
+                path.stat().st_size != expected["bytes"]
+                or digest != expected["sha256"]
+            ):
+                raise ValueError(f"Corrupt packaged head resource: {resource}")
+        return
+    head = json.loads((args.artifacts / "head/HEAD.json").read_text())
+    args.model_settings.target.check_manifest(head)
+    provenance = json.loads((args.shared_model / "head/WEIGHTS.json").read_text())
+    with (args.artifacts / "head/head.bin").open("rb") as file:
+        digest = hashlib.file_digest(file, "sha256").hexdigest()
+    if (
+        head["quantization"]["method"] != "all_projection_gptq"
+        or digest != provenance["source_sha256"]
+    ):
+        raise ValueError("Shared head does not match the calibrated GPTQ head")
+
+
 def check_artifacts(args):
     if (
         args.model_settings.quantization.embedding == "int4_g32"
@@ -55,11 +83,26 @@ def check_artifacts(args):
         raise ValueError(
             "Shared contexts require batched initialization; serial loading is unsupported"
         )
+    from .image_cold_profile import image_cold_assets
+    from .text_cold_profile import text_cold_assets
+
+    image_cold_assets(
+        args.artifacts,
+        args.model_settings.target.soc_model,
+        args.image_cold_profile_dir,
+    )
+    text_cold_assets(
+        args.artifacts,
+        args.model_settings.target.soc_model,
+        args.image_cold_profile_dir,
+    )
     target_file = args.build_dir / "TARGET.json"
     build_metadata = (
         json.loads(target_file.read_text()) if target_file.is_file() else {}
     )
     args.model_settings.target.check_manifest(build_metadata)
+    if args.profile and build_metadata.get("native_profile") != 1:
+        raise ValueError("--profile requires a runner built with MOE_NATIVE_PROFILE=1")
     if args.runner == "chat" and build_metadata.get("chat_controls") != 1:
         raise ValueError(
             "Rebuild the native chat runner with this version of build.sh (the unified export builds it automatically)"
@@ -124,11 +167,15 @@ def check_artifacts(args):
     validate_rope(runtime_assets(args), args.decode_capacity)
     if args.shared_model:
         covered = set()
+        prefill_cores = set()
+        gdn_layouts = set()
         for group in range(10):
             manifest = json.loads(
                 (args.shared_model / f"group{group}/GRAPHS.json").read_text()
             )
             args.model_settings.target.check_manifest(manifest)
+            prefill_cores.add(manifest.get("prefill_core"))
+            gdn_layouts.add(manifest.get("gdn_state_vtcm", False))
             if args.runner == "chat" and not manifest.get("prefill_valid_length"):
                 raise ValueError(
                     "Re-export the shared graphs for native chat: AR128 valid-length input is required"
@@ -138,7 +185,8 @@ def check_artifacts(args):
                 manifest["layers"] != expected
                 or manifest["capacity"] != args.decode_capacity
                 or not manifest["weight_sharing"]
-                or manifest.get("prefill_core") != "chunked_mixed_fp16"
+                or manifest.get("prefill_core")
+                not in {"chunked_mixed_fp16", "custom_fp16", "custom_u16"}
                 or manifest["router"] != args.model_settings.quantization.router_shared
             ):
                 raise ValueError(f"Shared group {group}: layer/capacity mismatch")
@@ -173,19 +221,14 @@ def check_artifacts(args):
             covered.update(manifest["layers"])
         if covered != set(range(40)):
             raise ValueError("Shared model must contain all 40 layers")
-        if args.model_settings.quantization.head == "w4a16_gptq":
-            head = json.loads((args.artifacts / "head/HEAD.json").read_text())
-            args.model_settings.target.check_manifest(head)
-            provenance = json.loads(
-                (args.shared_model / "head/WEIGHTS.json").read_text()
+        if len(prefill_cores) != 1:
+            raise ValueError(
+                "Shared groups must use the same prefill GDN implementation"
             )
-            with (args.artifacts / "head/head.bin").open("rb") as file:
-                digest = hashlib.file_digest(file, "sha256").hexdigest()
-            if (
-                head["quantization"]["method"] != "all_projection_gptq"
-                or digest != provenance["source_sha256"]
-            ):
-                raise ValueError("Shared head does not match the calibrated GPTQ head")
+        if len(gdn_layouts) != 1:
+            raise ValueError("Shared groups must use the same GDN state layout")
+        if args.model_settings.quantization.head == "w4a16_gptq":
+            check_shared_head(args)
     if args.embedding_table:
         with args.embedding_table.open("rb") as handle:
             header = handle.read(24)

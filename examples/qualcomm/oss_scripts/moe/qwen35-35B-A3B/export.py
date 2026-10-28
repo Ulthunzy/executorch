@@ -14,6 +14,12 @@ def main(argv=None):
     parser.add_argument("--output", type=Path, help="Override the output directory")
     parser.add_argument("--device", help="ADB serial used for shared-weight capture")
     parser.add_argument("--soc-model", "--soc_model", choices=SOC_MODELS)
+    parser.add_argument(
+        "--components",
+        nargs="+",
+        choices=("text", "vision"),
+        help="Override the components selected by the export configuration",
+    )
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--print-plan", action="store_true")
     mode.add_argument("--check", action="store_true", help="Check local prerequisites")
@@ -26,6 +32,7 @@ def main(argv=None):
                 args.output,
                 device=args.device,
                 soc_model=args.soc_model,
+                components=args.components,
             )
         )
         if args.print_plan:

@@ -151,9 +151,13 @@ class ModelConfig:
             raise ValueError(
                 "GPTQ damping must be positive and reconstruction_steps nonnegative"
             )
-        if (c.kv_dtype, c.gdn_state_dtype, c.conv_state_dtype) != ("uint16",) * 3:
+        if (
+            c.kv_dtype != "uint16"
+            or c.conv_state_dtype != "uint16"
+            or c.gdn_state_dtype not in {"uint16", "float16"}
+        ):
             raise ValueError(
-                "This MoE runner has UINT16 KV/GDN/conv interfaces; UINT8 requires new calibration and runner support"
+                "KV/conv caches require UINT16; GDN state supports UINT16 or typed FP16"
             )
         if (
             not 1024 <= x.max_seq_len <= 32768

@@ -68,11 +68,15 @@ def main(argv=None):
         parser.error("Invalid prefill length for the selected context and schedule")
     if args.phase == "decode" and args.cache_encoding is None:
         parser.error("Decode packing requires --cache-encoding")
+    prefill_cores = set()
+    gdn_layouts = set()
     for group in range(10):
         manifest = json.loads(
             (args.shared_model / f"group{group}/GRAPHS.json").read_text()
         )
         settings.target.check_manifest(manifest)
+        prefill_cores.add(manifest.get("prefill_core", "chunked_mixed_fp16"))
+        gdn_layouts.add(manifest.get("gdn_state_vtcm", False))
         if (
             manifest["capacity"] != settings.context.max_seq_len
             or manifest["router"] != settings.quantization.router_shared
@@ -83,6 +87,17 @@ def main(argv=None):
             parser.error(
                 f"Shared group {group}: compiled quantization/KV/context mismatch"
             )
+    if len(prefill_cores) != 1 or not prefill_cores <= {
+        "chunked_mixed_fp16",
+        "custom_fp16",
+        "custom_fp32",
+        "custom_u16",
+    }:
+        parser.error(
+            "Shared groups must select one supported prefill GDN implementation"
+        )
+    if len(gdn_layouts) != 1:
+        parser.error("Shared groups must select one GDN state layout")
     from executorch.exir._serialize._program import (
         PTEFile,
         serialize_pte_binary,
@@ -250,6 +265,8 @@ def main(argv=None):
                 dynamic_sequence=not decode,
                 requested_prefill_tokens=args.prefill_tokens,
                 prefill_order=settings.schedule.prefill_order,
+                prefill_core=next(iter(prefill_cores)),
+                gdn_state_vtcm=next(iter(gdn_layouts)),
                 compile_settings=settings.compile_settings(),
                 shared_signature=shared_model_signature(args.shared_model),
                 cache_encoding_sha256=(

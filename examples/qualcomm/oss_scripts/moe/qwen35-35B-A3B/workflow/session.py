@@ -37,6 +37,10 @@ def session_command(args, paths, image=None):
     ]
     if args.prompt_tokens is not None:
         command += ["--prompt-tokens", str(args.prompt_tokens)]
+    if args.prefill_io_workers is not None:
+        command += ["--prefill-io-workers", str(args.prefill_io_workers)]
+    if args.profile:
+        command.append("--profile")
     command.append("--interactive" if args.interactive else "--no-interactive")
     if image is not None:
         command += ["--image-path", image]
@@ -59,6 +63,11 @@ def run_session(args):
         weights=str(args.artifacts),
         image=str(args.image_path) if args.image_path else None,
         vision_enabled=args.with_vision,
+        prefill_io_workers=(
+            args.prefill_io_workers
+            if args.prefill_io_workers is not None
+            else args.model_settings.schedule.io_workers
+        ),
         exit_code=None,
     )
     print("RESULTS", directory, flush=True)
