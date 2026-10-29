@@ -13,7 +13,7 @@ import operator
 import torch
 import torchao.quantization.pt2e.quantize_pt2e  # noqa: F401
 
-from executorch.examples.qualcomm.oss_scripts.llama.model.chunk_gdn import ChunkGDN
+from executorch.examples.qualcomm.custom_op.deltanet_support.chunk import ChunkGDN
 from torch._subclasses.fake_tensor import FakeTensorMode
 
 

@@ -118,25 +118,7 @@ static constexpr size_t kQUint16HvxValuesPerVec = 128 / sizeof(uint16_t);
 static constexpr int kQUint16HvxAccumInputShift = 4;
 // Keep all calibrated bits in the integer reduction. Dropping
 // the low four bits degrades low-amplitude readouts after RMSNorm.
-#ifndef DELTANET_U16_FULL_PRECISION_REDUCTION
-#define DELTANET_U16_FULL_PRECISION_REDUCTION 0
-#endif
-#ifndef DELTANET_U16_SPLIT_REDUCTION
-#define DELTANET_U16_SPLIT_REDUCTION 1
-#endif
-#ifndef DELTANET_U16_KARATSUBA_REDUCTION
-#define DELTANET_U16_KARATSUBA_REDUCTION 0
-#endif
-#ifndef DELTANET_FP16_REGISTER_REUSE
-#if defined(__hexagon__) && __HVX_ARCH__ == 81
-#define DELTANET_FP16_REGISTER_REUSE 1
-#else
-#define DELTANET_FP16_REGISTER_REUSE 0
-#endif
-#endif
-#ifndef DELTANET_U16_RADIX256_REDUCTION
-#define DELTANET_U16_RADIX256_REDUCTION 0
-#endif
+#include "DeltaNetArch.h"
 static constexpr bool kQUint16KaratsubaReduction =
     DELTANET_U16_KARATSUBA_REDUCTION != 0;
 static constexpr bool kQUint16SplitReduction =
@@ -149,9 +131,6 @@ using QUint16StateAccum =
 static constexpr int kQUint16HvxStateUpdateInputShift = 0;
 static constexpr int kQUint16HvxStateUpdateCoeffShift = 7;
 static constexpr int kQUint16StateUpdateShift = 20;
-#ifndef DELTANET_U16_INTEGER_STATE_UPDATE
-#define DELTANET_U16_INTEGER_STATE_UPDATE 1
-#endif
 static constexpr bool kEnableQUint16HvxStateUpdate =
     DELTANET_U16_INTEGER_STATE_UPDATE != 0;
 static constexpr bool kEnableQUint16HvxStateUpdateF32 = true;
@@ -160,7 +139,7 @@ static inline void deltanetQhpiCopyStateU16(
     uint16_t* destination,
     const uint16_t* source,
     size_t elements) {
-#if defined(__hexagon__) && __HVX_ARCH__ >= 81
+#if defined(__hexagon__) && (QCOM_HTP_V81 || QCOM_HTP_V85)
   // Keep VTCM state copies vectorized on V85 as well as V81; the scalar
   // memcpy fallback adds substantial overhead to single-token recurrence.
   const uintptr_t addresses = reinterpret_cast<uintptr_t>(destination) |

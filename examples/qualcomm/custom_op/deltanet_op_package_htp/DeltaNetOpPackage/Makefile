@@ -38,7 +38,7 @@ OTHER_SOURCES := $(wildcard $(SRC_DIR)/*.cpp)
 OP_OBJS := $(patsubst $(SRC_DIR)/%,%,$(patsubst %.cpp,%.o,$(OP_SOURCES)))
 OTHER_OBJS := $(patsubst $(SRC_DIR)/%,%,$(patsubst %.cpp,%.o,$(OTHER_SOURCES)))
 
-HFILES := $(wildcard $(QNN_INCLUDE)/*.h)
+HFILES := $(wildcard $(QNN_INCLUDE)/*.h) ../../htp_arch.h $(wildcard $(OP_SRC_DIR)/*.h)
 HFILES += $(wildcard $(QNN_INCLUDE)/HTP/*.h)
 HFILES += $(wildcard $(QNN_INCLUDE)/HTP/core/*.h)
 
@@ -76,7 +76,7 @@ X86_LDFLAGS += -Wl,--no-whole-archive -lpthread
 
 HEXAGON_CXX := $(HEXAGON_TOOLS_DIR)/bin/hexagon-clang++
 HEXAGON_BASE_FLAGS := $(COMMON_CXX_FLAGS) -mhvx -mhvx-length=128B -mhmx
-HEXAGON_BASE_FLAGS += -DUSE_OS_QURT -O2 -Wno-reorder -DPREPARE_DISABLED
+HEXAGON_BASE_FLAGS += -DUSE_OS_QURT -O3 -Wno-reorder -DPREPARE_DISABLED
 HEXAGON_BASE_FLAGS += $(HEXAGON_CPPFLAGS)
 HEXAGON_LDFLAGS := -nostdlib++ -Wl,-Bstatic -lc++ -lc++abi -Wl,-Bdynamic
 
@@ -194,12 +194,15 @@ $(WORK)/hexagon-v$(1)/.build-config: FORCE | $(WORK)/hexagon-v$(1)
 	@python3 write_build_config.py "$$@" HEXAGON_BUILD_CONFIG arch=$(1)
 
 $(WORK)/hexagon-v$(1)/%.o: $(SRC_DIR)/%.cpp $(WORK)/hexagon-v$(1)/.build-config Makefile | $(WORK)/hexagon-v$(1)
-	$$(HEXAGON_CXX) $$(HEXAGON_BASE_FLAGS) -mv$(1) -I$$(HEXAGON_SDK_ROOT)/rtos/qurt/computev$(1)/include/qurt -I$$(HEXAGON_SDK_ROOT)/rtos/qurt/computev$(1)/include/posix -I$$(HEXAGON_SDK_ROOT)/incs -I$$(HEXAGON_SDK_ROOT)/incs/stddef -DTHIS_PKG_NAME=$$(PACKAGE_NAME) -MMD -c $$< -o $$@
+	$$(HEXAGON_CXX) $$(HEXAGON_BASE_FLAGS) -mv$(1) -DQCOM_HTP_ARCH=$(1) -I$$(HEXAGON_SDK_ROOT)/rtos/qurt/computev$(1)/include/qurt -I$$(HEXAGON_SDK_ROOT)/rtos/qurt/computev$(1)/include/posix -I$$(HEXAGON_SDK_ROOT)/incs -I$$(HEXAGON_SDK_ROOT)/incs/stddef -DTHIS_PKG_NAME=$$(PACKAGE_NAME) -MMD -c $$< -o $$@
 
 $(WORK)/hexagon-v$(1)/ops/%.o: $(OP_SRC_DIR)/%.cpp $(WORK)/hexagon-v$(1)/.build-config Makefile | $(WORK)/hexagon-v$(1)
-	$$(HEXAGON_CXX) $$(HEXAGON_BASE_FLAGS) -mv$(1) -I$$(HEXAGON_SDK_ROOT)/rtos/qurt/computev$(1)/include/qurt -I$$(HEXAGON_SDK_ROOT)/rtos/qurt/computev$(1)/include/posix -I$$(HEXAGON_SDK_ROOT)/incs -I$$(HEXAGON_SDK_ROOT)/incs/stddef -DTHIS_PKG_NAME=$$(PACKAGE_NAME) -MMD -c $$< -o $$@
+	$$(HEXAGON_CXX) $$(HEXAGON_BASE_FLAGS) -mv$(1) -DQCOM_HTP_ARCH=$(1) -I$$(HEXAGON_SDK_ROOT)/rtos/qurt/computev$(1)/include/qurt -I$$(HEXAGON_SDK_ROOT)/rtos/qurt/computev$(1)/include/posix -I$$(HEXAGON_SDK_ROOT)/incs -I$$(HEXAGON_SDK_ROOT)/incs/stddef -DTHIS_PKG_NAME=$$(PACKAGE_NAME) -MMD -c $$< -o $$@
 
 $(WORK)/hexagon-v$(1)/$(LIBRARY_NAME): $$(addprefix $(WORK)/hexagon-v$(1)/,$$(OTHER_OBJS) $$(OP_OBJS)) $(WORK)/hexagon-v$(1)/.build-config Makefile | $$(HFILES)
+	$$(HEXAGON_CXX) -mv$(1) -fPIC -std=c++17 -g -shared -o $$@ $$(filter %.o,$$^) $$(HEXAGON_LDFLAGS)
+
+$(WORK)/hexagon-v$(1)/libet_qnnop.so: $$(addprefix $(WORK)/hexagon-v$(1)/,$$(OTHER_OBJS) $$(OP_OBJS)) $$(NATIVE_OBJECTS) $(WORK)/hexagon-v$(1)/.build-config Makefile | $$(HFILES)
 	$$(HEXAGON_CXX) -mv$(1) -fPIC -std=c++17 -g -shared -o $$@ $$(filter %.o,$$^) $$(HEXAGON_LDFLAGS)
 
 $(WORK)/hexagon-v$(1)/$(HTP_LIBRARY_NAME): $(WORK)/hexagon-v$(1)/$(LIBRARY_NAME)

@@ -333,3 +333,14 @@ python3 examples/qualcomm/custom_op/custom_ops_2.py \
   --build_op_package \
   --enable_x86_64
 ```
+
+
+## Reusable low-bit and DeltaNet implementations
+
+[`lowbit/`](lowbit/README.md) owns the low-bit HVX/HMX compute kernels.
+FastRPC services, DSP workers and expert bank mapping belong to
+[`oss_scripts/moe/runner/native/`](../oss_scripts/moe/runner/native/).
+[`deltanet_support/`](deltanet_support/) owns reusable GDN graph computation,
+precision boundaries and package registration; the HTP kernel remains in
+`deltanet_op_package_htp`. Model adapters consume these implementations.
+Architecture definitions are centralized in `htp_arch.h`.
