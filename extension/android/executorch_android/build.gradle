@@ -24,6 +24,7 @@ spotless {
 def qnnVersion = System.properties['qnnVersion']
 def execuTorchVersion = System.properties['execuTorchVersion']
 def flavor = System.properties['flavor']
+def qwen35Modules = providers.gradleProperty('executorchQwen35Modules').orNull
 
 def cryptoNotices = tasks.register('copyCryptoNotices', Copy) {
     from('../../../third-party/boringssl/LICENSE') {
@@ -67,6 +68,19 @@ android {
 }
 
 tasks.named('preBuild').configure { dependsOn(cryptoNotices) }
+
+if (qwen35Modules) {
+    tasks.matching { it.name == 'bundleReleaseAar' }.configureEach {
+        doLast {
+            project.exec {
+                commandLine(['python3',
+                    project.file('../jni/tests/check_qwen35_aar.py').absolutePath,
+                    project.layout.buildDirectory.file('outputs/aar/executorch_android-release.aar').get().asFile.absolutePath,
+                    '--arch', '81', '--modules'] + qwen35Modules.split(',').collect { it.trim() })
+            }
+        }
+    }
+}
 
 task copyTestRes(type: Exec) {
     commandLine 'bash', 'android_test_setup.sh'

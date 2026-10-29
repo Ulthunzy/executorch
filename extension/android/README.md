@@ -115,6 +115,34 @@ The staging directory should contain e.g. `arm64-v8a/libexecutorch.so`,
 `libqnn_executorch_backend.so`, and the matching QNN runtime libraries. Only
 include ABIs whose JNI library has been rebuilt.
 
+### SM8850 Qwen35 Dense and MoE AAR
+
+The combined SM8850 release uses QNN SDK `2.51.200.261021` and V81 libraries.
+Its staging directory must contain `libexecutorch.so`,
+`libqnn_executorch_backend.so`, `libQnnDeltaNetOpPackage.so`,
+`libQnnDeltaNetOpPackage_HTP.so`, `libet_infer.so`, `libet_qnnop.so`, and the
+matching QNN runtime libraries. The MoE runtime keeps its two-library layout;
+the combined AAR also carries the separate Dense runtime.
+
+Build from that complete staging directory with native-content validation:
+
+```bash
+./extension/android/gradlew -p extension/android \
+  :executorch_android:assembleRelease \
+  -PexecutorchJniLibsDir="$PWD/llama-output/qwen35-sm8850-aar/jniLibs" \
+  -PexecutorchQwen35Modules=dense,moe
+```
+
+The additional property checks both Java APIs, required native libraries and
+ARM64/Hexagon ELF types, and rejects V79/V85 runtime libraries. It catches a
+MoE-only staging directory before the combined release is accepted.
+
+When consuming a local AAR file, retain the application's `fbjni:0.7.0` and
+`nativeloader:0.10.5` dependencies, plus Kotlin stdlib. The fbjni dependency
+supplies `libfbjni.so` and `libc++_shared.so`; these are not duplicated in the
+combined AAR. The app must extract its DSP libraries as described in the
+[Dense JNI](jni/dense/README.md) and [MoE JNI](jni/moe/README.md) instructions.
+
 Compare a new AAR against an app's existing one:
 
 ```bash
