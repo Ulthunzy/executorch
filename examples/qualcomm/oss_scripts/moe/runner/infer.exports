@@ -1,0 +1,8 @@
+{
+  global:
+    JNI_OnLoad;
+    Java_*;
+    et_infer_*;
+  local:
+    *;
+};

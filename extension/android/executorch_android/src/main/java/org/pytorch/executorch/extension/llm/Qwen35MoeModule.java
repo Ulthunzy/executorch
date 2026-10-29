@@ -18,15 +18,16 @@ import java.util.Objects;
  */
 public final class Qwen35MoeModule implements AutoCloseable {
   static {
-    System.loadLibrary("qwen35_moe_jni");
+    System.loadLibrary("et_infer");
   }
 
   public static final class Config {
     public final String modelDirectory, sharedWeightsDirectory, tokenizerPath;
     public final String workspaceDirectory, nativeLibraryDirectory;
     public String systemPrompt = "你是一个有帮助的人工智能助手。";
-    public int contextLength = 1152;
-    public int expertsPerLayer = 32;
+    /** Zero inherits the exported model metadata; positive values override it. */
+    public int contextLength = 0;
+    public int expertsPerLayer = 0;
     public boolean enableVision = true;
 
     public Config(String modelDirectory, String sharedWeightsDirectory, String tokenizerPath,
@@ -41,8 +42,6 @@ public final class Qwen35MoeModule implements AutoCloseable {
     /** Load one complete model PTE; infer context and expert slots from its metadata. */
     public Config(String modelPte, String workspaceDirectory, String nativeLibraryDirectory) {
       this(modelPte, "", "", workspaceDirectory, nativeLibraryDirectory);
-      this.contextLength = 0;
-      this.expertsPerLayer = 0;
     }
   }
 

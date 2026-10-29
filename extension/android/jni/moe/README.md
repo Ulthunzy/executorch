@@ -1,6 +1,12 @@
 # Qwen3.5 35B-A3B JNI
 
-新增独立的 `Qwen35MoeModule` 和 `libqwen35_moe_jni.so`，不修改 `LlmModule`、原 QNN runner 或已有 JNI 注册。复用 MoE 目录中的真实 40 层 PTE、外部专家、共享常量、INT4 embedding、分词器、采样器和 Android 图片解码。没有 subprocess、stdin 协议或 stdout/stderr 重定向。
+`Qwen35MoeModule` 加载统一的 `libet_infer.so`，不修改 `LlmModule`、原 QNN runner 或已有 JNI 注册。复用 MoE 目录中的真实 40 层 PTE、外部专家、共享常量、INT4 embedding、分词器、采样器和 Android 图片解码。没有 subprocess、stdin 协议或 stdout/stderr 重定向。
+
+## 共享 Runner
+
+JNI 入口位于本目录 `jni_layer.cpp`，只转换 Java 参数、UTF-8 与回调。会话、取消、状态和 Workspace 由 `examples/qualcomm/oss_scripts/moe/runner/runner.{h,cpp}` 统一实现，`Runner` 继承 `IRunner`。JNI CMake 复用 MoE 根 CMake 的 `et_infer` 目标，与 CLI 共用 Prefill、Decode、QNN 和模型工厂代码。本目录不再维护独立的 session 实现。
+
+Java 方法签名保持不变，库加载名为 `System.loadLibrary("et_infer")`。项目交付两个自研库：ARM64 的 `libet_infer.so` 包含 JNI、Runner、Prefill/Decode、专家管理和共享 context；Hexagon 的 `libet_qnnop.so` 包含 GDN、低 bit 内核和两套独立命名的 FastRPC 服务。源码仍按算子、调度和 JNI 分目录维护。DSP 架构从 Native 构建的 `TARGET.json` 读取，支持 V79/V81/V85 配套构建。QNN SDK 运行库继续单独提供。
 
 ## Android 调用
 
@@ -8,11 +14,13 @@
 
 导出器现在默认生成单个 `model.pte`，可使用 `new Qwen35MoeModule.Config(modelPte, workspaceDirectory, nativeLibraryDirectory)`，内部校验、缓存解包并定位共享权重和tokenizer；旧的五参数目录构造接口仍保留。解包需要相应磁盘空间。`enableVision=false` 会覆盖包内默认值，纯文本使用此选项可避免加载视觉context。
 
+两种构造方式的 `contextLength` 与 `expertsPerLayer` 默认均为 `0`，表示读取导出元数据。现有旧包若嵌入32槽，可显式设置 `expertsPerLayer=64`。
+
 SM8850/V81 构建默认采用 prefill IO 16、decode IO 8、512 KiB 读取分块，直接加载旧PTE时也生效，无需Python启动参数或重新打包模型。V79/V85保持原调度默认值。
 
 当前SM8850整合版使用 `CMakePresets.json` 的 `sm8850` 入口，从
 `build/moe/qwen35-35B-A3B-sm8850` 安装已验证的Native MoE和GDN库，
-JNI、decode及共享权重提供者从同一份主源码构建，避免混入旧decode缓存ABI。
+JNI、Prefill、Decode 和共享 context 链接进同一个 ARM64 库，统一缓存 ABI。
 SDK固定为2.51.200.261021。Java接口签名不变；旧PTE内可能仍记录32槽，
 需要显式选择本轮验证过的2048上下文和64槽：
 
@@ -35,10 +43,7 @@ cmake --install build/moe/qwen35-jni-sm8850 \
   --prefix build/moe/qwen35-jni-sm8850/install
 ```
 
-安装目录 `install/jniLibs/arm64-v8a` 包含本项目的6个库；应用还需部署同一SDK的
-QNN runtime和V81 stub/skel，见下文打包说明。目录构造和单PTE构造都会使用
-`nativeLibraryDirectory` 中的共享权重提供者、decode、GDN和两个DSP skeleton，
-使新JNI的生命周期修复与实际加载的库一致。
+安装目录 `install/jniLibs/arm64-v8a` 只包含本项目的 `libet_infer.so` 和 `libet_qnnop.so`。原六库安装中的旧文件会在安装时清理。应用另外部署同一 SDK 的 QNN runtime 和设备匹配的 HTP stub/skel。目录构造和单 PTE 构造都从 `nativeLibraryDirectory` 定位两个自研库。
 
 ```java
 import org.pytorch.executorch.extension.llm.Qwen35MoeModule;
@@ -65,7 +70,9 @@ model.resetContext();
 model.close();
 ```
 
-构造函数检查部署并创建独立会话目录；**首次 generate 才加载模型并执行 AR128 prefill**，后续复用所有 context/state/专家缓存，`close()` 统一释放。`resetContext()` 清理历史而不卸载模型。新导出支持后续轮次按 AR128 分块：不足 128 的尾块补齐，通过有效长度屏蔽 padding 的 GDN/conv/KV 更新，位置只按真实 token 推进；AR1 用于输出生成。此功能需要重新导出带 `last_token_index` 的 prefill 图并重新构建 Native skeleton，旧部署不会自动获得该语义。图片解码/encoder 始终在内部完成。首轮输入上限取自 `PLANS.json` 的 `max_prefill_tokens`，旧部署默认为 1024（包含模板和图片 token，padding 不计入逻辑上下文），并需给输出留出上下文空间。输出长度按实际 context capacity 校验。更长首轮输入需重新编译 full-attention 的 cache/mask 并打包 chunk_major 计划，不能仅修改 Java 配置或 JSON。
+构造函数检查部署并创建独立会话目录；**首次 generate 才加载模型并执行 AR128 prefill**，后续复用所有 context/state/专家缓存，`close()` 统一释放。`resetContext()` 清理历史而不卸载模型。首轮和后续轮都支持任意有效输入长度，实际输入加输出预算不能超过模型的上下文容量。超过单次 PTE 工作区的长输入重复执行 AR128；不足 128 的尾块补齐，通过有效长度屏蔽 padding 的 GDN/conv/KV 更新，位置只按真实 token 推进；AR1 用于输出生成。`PLANS.json` v3 的 `workspace_tokens` 仅为工作区大小，旧 v2 的 `max_prefill_tokens` 也只按工作区解释，不再限制整段输入。短输入保留原有批处理优化。图片解码/encoder 始终在内部完成。旧图如果没有完整上下文 KV/mask 或 GDN `last_token_index`，仍需重新导出；更新 Java 配置无法补齐这些图接口。
+
+单 PTE 构造函数首次调用还会同步解包，应在后台线程调用。除原始 PTE 外，工作目录需要容纳解包资源及 1 GiB 余量；解包前按未缓存资源核算空间，写入各资源前再次检查。完整缓存可直接复用，空间不足会抛异常，部分已完成资源可在后续继续使用。
 
 JNI 的 prefill/decode cache 快照保存在会话私有 memfd，避免把阶段交接写入 UFS；decode 完成导入后立即关闭这些临时快照，后续轮次直接交接常驻 cache view 与专家 LRU 元数据，不再重复建立快照。模型权重仍通过原有只读文件映射与专家缓存读取。长生成后关闭再在同一进程重新创建曾出现 QNN 5005，完整评测暂采用每题独立进程，并保存运行失败记录；不能把短轮次的关闭重建测试视为长上下文已验证。
 
@@ -81,17 +88,17 @@ JNI 的 prefill/decode cache 快照保存在会话私有 memfd，避免把阶段
 
 ## 构建与打包
 
-先用 MoE 的 `build.sh` 构建对应SoC的Native、decode DSO和op package，再独立构建JNI。
+MoE 的 `build.sh` 一次构建两个自研库，已经包含 JNI 入口。可直接安装该构建树；独立 JNI CMake 入口复用同一套目标。
 SM8850/V81使用上面的preset；下面保留SM8975/V85的构建示例。
 使用有效长度AR128路径需要配套prefill图；已有GPTQ权重可复用，不需要重新量化：
 
 ```bash
-export QNN_SDK_ROOT=/hunter/qnn_sdk/src/backends/qnn/2.48.1.260715
+export QNN_SDK_ROOT=/hunter/qnn_sdk/src/backends/qnn/2.51.200.261021
 export HEXAGON_SDK_ROOT=/hunter/qnn_sdk/hexagon/6.7.0.0
 export HEXAGON_TOOLS_ROOT=$HEXAGON_SDK_ROOT/tools/HEXAGON_Tools/21.0.04/Tools
 export ANDROID_NDK_ROOT=/hunter/android-ndk/android-ndk-r28c
 export MOE_BUILD_DIR=$PWD/build/moe/qwen35-35B-A3B
-bash examples/qualcomm/oss_scripts/moe/qwen35-35B-A3B/build.sh
+bash examples/qualcomm/oss_scripts/moe/build.sh
 
 cmake -S extension/android/jni/moe -B build/moe/qwen35-jni -G Ninja \
   -DCMAKE_TOOLCHAIN_FILE="$ANDROID_NDK_ROOT/build/cmake/android.toolchain.cmake" \
@@ -105,7 +112,7 @@ cmake --install build/moe/qwen35-jni --prefix /path/to/app/src/main
 
 也可在原 Android CMake 配置中显式开启 `EXECUTORCH_BUILD_QWEN35_MOE_JNI=ON`，默认关闭。新增 DSO 使用独立的 ExecuTorch/backend 注册表及隐藏符号，避免与原 `libexecutorch.so` 中的 runner 同名符号互相覆盖。
 
-安装输出 `jniLibs/arm64-v8a/` 包含 JNI、decode、共享权重提供者、GDN 包及两阶段 DSP skel。两个 native MoE skel 在 APK 中重命名为 `libqwen35_prefill_skel.so` / `libqwen35_decode_skel.so`；会话目录分别映射回各阶段所需的 `libinteger_rpc_skel.so`。Java 类在 Android 工程源码中；对应 ProGuard 保留规则已经加入。
+安装输出 `jniLibs/arm64-v8a/` 包含两个自研库。`libet_qnnop.so` 由 DSP 加载，Java 只加载 `et_infer`。Prefill 和 Decode 的 RPC 接口分别为 `et_prefill_rpc`、`et_decode_rpc`，都定位到同一个 DSP 文件。Java 类在 Android 工程源码中；对应 ProGuard 保留规则已经加入。
 
 另需部署与设备兼容的 `libQnnHtp.so`、`libQnnSystem.so`、V85 stub，以及设备侧 V85 HTP skel（该测试机已在 `/odm/lib64/rfsa` 提供）。SDK 2.48.1 没有 V85 stub 时应使用此前已验证的设备匹配版本。**SDK 用于链接的 `libcdsprpc.so` 是 stub，不能打进 APK 充当设备 FastRPC 实现。** 使用系统公开的 vendor 库，target SDK 31 及以上在 application 内声明：
 
@@ -116,6 +123,10 @@ cmake --install build/moe/qwen35-jni --prefix /path/to/app/src/main
 设置 `android:extractNativeLibs="true"`，保证 nativeLibraryDir 中有真实文件供 QNN/op package 和 DSP 加载。不要将整个 `/vendor/lib64` 塞进 App 的库搜索路径，否则可能把 vendor 私有依赖错误加载到 App namespace。普通 APK 的具体 DSP 访问权限由设备系统决定；设备 Java 进程验证与实际 APK 安装验证应区分记录。
 
 ## 回归
+
+2026-10-29 重构 Review：最终 JNI、decode 和共享 provider 同源构建，SM8850 Java 进程的目录接口通过文本、多轮、元数据默认值、加载前后 reset、回调取消、回调异常原样返回、并发 reset 拒绝、单活跃会话限制、禁用图片检查、幂等 close 和关闭后重开；重开时另验证了从元数据默认 32 槽切换到显式 64 槽。`../tests/Qwen35MoeLifecycleTest.java` 支持 `model.pte workspace nativeLibraryDir` 或 `model shared tokenizer workspace nativeLibraryDir` 两种参数形式。
+
+本轮完整 PTE 首次解包遇到设备空间耗尽、进程被终止，尚未完成此路径的推理验证；已清理本次副本并补上空间检查。普通 APK 两种安装方式均返回 `Failure [-99]`，未通过安装验证。目录 Java 进程测试不能证明普通 APK 的 namespace/DSP 权限可用。CLI 的 64 槽文本 1024→1024、图文 256→256 性能及独立内存对照见 [Review 验收记录](../../../../examples/qualcomm/oss_scripts/moe/docs/review-validation-20261029.json)。
 
 2026-10-28当前SM8850/V81、SDK2.51整合版已通过真机Java进程短测：目录构造接口、
 文本流式回调、多轮上下文、reset、close及关闭后拒绝调用。上下文为2048、每层64槽；
@@ -143,4 +154,4 @@ cmake --install build/moe/qwen35-jni --prefix /path/to/app/src/main
 | 1024文本 | 434.91→436.55 | 11.148→11.151 | 3.98248→3.98250 |
 | 256图文 | 137.87→138.08 | 10.572→10.559 | 4.4606→4.4785 |
 
-Prefill只计LLM，不含加载、图片解码和encoder；decode取原生Stats。开启thinking补充组吞吐变化低于0.6%，同一实例第二轮生成64 token为11.225→11.227 token/s。性能轮无采样器；独立内存测试计入JVM、PSS、去重DMA与短暂交接memfd（56.875MiB），正式JNI库没有测试插桩。峰值差低于1%，未发现明显回退；不视为内存优化或完整质量评测。完整口径与指纹见[验证记录](../../../../examples/qualcomm/oss_scripts/moe/qwen35-35B-A3B/docs/chat-jni-validation-20261027.json)，原始记录保留在 `llama-output/qwen35-jni-performance-regression-20261027/`。本轮仍为 `app_process`，未做普通APK安装测试。
+Prefill只计LLM，不含加载、图片解码和encoder；decode取原生Stats。开启thinking补充组吞吐变化低于0.6%，同一实例第二轮生成64 token为11.225→11.227 token/s。性能轮无采样器；独立内存测试计入JVM、PSS、去重DMA与短暂交接memfd（56.875MiB），正式JNI库没有测试插桩。峰值差低于1%，未发现明显回退；不视为内存优化或完整质量评测。完整口径与指纹见[验证记录](../../../../examples/qualcomm/oss_scripts/moe/docs/chat-jni-validation-20261027.json)，原始记录保留在 `llama-output/qwen35-jni-performance-regression-20261027/`。本轮仍为 `app_process`，未做普通APK安装测试。

@@ -1,4 +1,4 @@
-#include "executorch/examples/qualcomm/oss_scripts/moe/qwen35-35B-A3B/runner/runtime_utils.h"
+#include "executorch/examples/qualcomm/oss_scripts/moe/runner/runtime_utils.h"
 
 #include <cassert>
 #include <fcntl.h>
