@@ -1,0 +1,16 @@
+{
+  "model_family": "qwen35",
+  "device": "A7SR026915000282",
+  "model": "/hunter/model/Qwen/Qwen3.6-35B-A3B",
+  "artifacts": "llama-output/qwen35-35B-A3B-export",
+  "build_dir": "build/moe/qwen35-35B-A3B-export",
+  "shared_model": "llama-output/qwen35-35B-A3B-export/shared-model",
+  "embedding_table": "llama-output/qwen35-35B-A3B-export/embedding.int4",
+  "vision_artifacts": "llama-output/qwen35-35B-A3B-export/vision",
+  "prefill_pte": "/data/local/tmp/qwen35-sharing-corrected-model/prefill/prefill-seq128.pte",
+  "decode_pte": "/data/local/tmp/qwen35-sharing-corrected-model/decode/decode.pte",
+  "runtime_device_dir": "/data/local/tmp/qwen35-sharing-corrected-model/prefill",
+  "remote_weights": "/data/local/tmp/qwen35-raw-gptq-20261024/weights",
+  "remote_root": "/data/local/tmp/qwen35-raw-gptq-20261024/runtime",
+  "soc_model": "SM8975"
+}

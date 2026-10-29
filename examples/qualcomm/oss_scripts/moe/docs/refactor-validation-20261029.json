@@ -1,0 +1,81 @@
+{
+  "date": "2026-10-29",
+  "target": "SM8850/V81",
+  "sdk": "2.51.200.261021",
+  "python_checks": {
+    "passed": 229
+  },
+  "host_runtime": {
+    "architectures": [
+      "V79",
+      "V81",
+      "V85"
+    ],
+    "padding_tests_passed": 29
+  },
+  "builds": {
+    "native_moe": [
+      "V79",
+      "V81",
+      "V85"
+    ],
+    "gdn": [
+      "x86_64",
+      "V81"
+    ],
+    "android_cli": true,
+    "android_jni_decode_provider": true
+  },
+  "gdn_numerics": {
+    "reduction": true,
+    "reference_reduction": true,
+    "fp16_register_bitwise_equivalence": true
+  },
+  "jni": {
+    "exit_code": 0,
+    "coverage": [
+      "text",
+      "followup",
+      "reset",
+      "close",
+      "closed-state rejection"
+    ],
+    "baseline_answers_identical": true,
+    "turns": [
+      {
+        "label": "first",
+        "answer": "你好！我是一个人工智能助手，旨在为你提供准确、清晰且有益的信息与帮助。",
+        "generated_tokens": 18,
+        "context_tokens": 47
+      },
+      {
+        "label": "followup",
+        "answer": "你刚才问了我如何用一句话介绍自己。",
+        "generated_tokens": 10,
+        "context_tokens": 80
+      },
+      {
+        "label": "reset",
+        "answer": "2",
+        "generated_tokens": 2,
+        "context_tokens": 34
+      }
+    ],
+    "libraries_sha256": {
+      "libQnnDeltaNetOpPackage_HTP.so": "caeb0977a597412bae27f2e6b5e83e03e0e61d2dd18f7ce392cb3b7b899e5c9f",
+      "libmoe_decode.so": "6e63b81bdfdb5064630ebd29b05951e5e8779810e9b81cdc9b875543319c1f60",
+      "libqwen35_decode_skel.so": "fddc9fdb16e0f6b78e9826a496c430c6b4a27259825971eae3d1315d1cd65ad2",
+      "libqwen35_moe_jni.so": "4d43cecb8dd7e91a9fb4a6c8098b933dbb8492d088360979a57e5ff0c89a4016",
+      "libqwen35_prefill_skel.so": "49b669e3eeb70e487cdaec7971ae1627c92cd1f0fa4e2e075588b4cc75ea1c82",
+      "libqwen35_shared.so": "aa7c6a82ef82cea01288e1bf45d1d6af78e06fa175b7e155f62910f423f8b48a"
+    },
+    "reused_validated_operator_libraries": true
+  },
+  "full_model_ppl_rerun": false,
+  "full_model_performance_matrix_rerun": false,
+  "real_model_adapters": [
+    "qwen35"
+  ],
+  "multi_model_concurrency_validated": false,
+  "validated_release_artifacts_replaced": false
+}

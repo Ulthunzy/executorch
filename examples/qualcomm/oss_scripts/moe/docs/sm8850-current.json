@@ -1,0 +1,111 @@
+{
+  "version": "sm8850-u16-native512-20261028",
+  "target": {
+    "soc_model": "SM8850",
+    "dsp_arch": "v81"
+  },
+  "sdk": "2.51.200.261021",
+  "runtime_profile": "configs/sm8850.json",
+  "model_profile": "configs/model_sm8850.json",
+  "export_profile": "configs/export_sm8850.json",
+  "build_dir": "build/moe/qwen35-35B-A3B-sm8850",
+  "state_dtype": "uint16",
+  "context": 2048,
+  "prefill_ar": 128,
+  "decode_ar": 1,
+  "expert_bits": 2,
+  "cache_experts": 64,
+  "prefill_io_workers": 16,
+  "decode_io_workers": 8,
+  "read_chunk_kib": 512,
+  "verified_libraries": {
+    "native-prefill/libinteger_rpc_skel.so": "49b669e3eeb70e487cdaec7971ae1627c92cd1f0fa4e2e075588b4cc75ea1c82",
+    "op-package/hexagon-v81/libQnnDeltaNetOpPackage_HTP.so": "caeb0977a597412bae27f2e6b5e83e03e0e61d2dd18f7ce392cb3b7b899e5c9f",
+    "qwen35_moe_runner": "b945caaf93161410107e99c1cb5426bf87587604e65abf3fd0ddf5bc03970f23"
+  },
+  "quality": {
+    "kind": "fixed-wikitext-test-window",
+    "prefix_tokens": 1024,
+    "predicted_tokens": 256,
+    "ppl_before": 5.5612606857700495,
+    "ppl_after": 5.5612606857700495,
+    "fp32_ppl": 4.667211698004229,
+    "logits_sqnr_db": 9.50029120768596,
+    "all_seven_raw_files_bit_exact": true
+  },
+  "conversation": {
+    "original_digit_loop_reproduced": false,
+    "last_turn_tokens": 200,
+    "last_turn_eos": true,
+    "identity_answer_reuse": "Both identity questions return the same51 tokens, unchanged from corrected baseline"
+  },
+  "fp16_state": "separate opt-in export; not this validated model",
+  "rebuild_performance": "Full relink has not reproduced the frozen binary performance; retain separate build outputs when evaluating a rebuild.",
+  "toolchain": {
+    "hexagon_sdk": "6.7.0.0",
+    "hexagon_tools": "21.0.04",
+    "android_ndk": "r28c"
+  },
+  "jni": {
+    "preset": "extension/android/jni/moe/CMakePresets.json:sm8850",
+    "build_dir": "build/moe/qwen35-jni-sm8850",
+    "install_dir": "build/moe/qwen35-jni-sm8850/install/jniLibs/arm64-v8a",
+    "sdk": "2.51.200.261021",
+    "target": "SM8850/v81",
+    "context_length": 2048,
+    "cache_experts": 64,
+    "prefill_io_workers": 16,
+    "decode_io_workers": 8,
+    "read_chunk_kib": 512,
+    "java_signatures_changed": false,
+    "jni_decode_shared_provider_built_together": true,
+    "coverage": [
+      "text callbacks",
+      "followup context",
+      "resetContext",
+      "close",
+      "closed-state rejection"
+    ],
+    "ordinary_apk_install_tested": false,
+    "image_path_retested": false,
+    "raw_directory_constructor_tested": true,
+    "single_pte_constructor_retested_on_this_soc": false,
+    "libraries_sha256": {
+      "libmoe_decode.so": "7af735109ecb95c8c4187ea39dab6c597754d47bb7e854fcab067ecf9c397a52",
+      "libQnnDeltaNetOpPackage_HTP.so": "caeb0977a597412bae27f2e6b5e83e03e0e61d2dd18f7ce392cb3b7b899e5c9f",
+      "libqwen35_decode_skel.so": "fddc9fdb16e0f6b78e9826a496c430c6b4a27259825971eae3d1315d1cd65ad2",
+      "libqwen35_moe_jni.so": "3c2d889e09cd75b3f864858813d9687f1c071cd53b8c25456ba371a0cb457a1f",
+      "libqwen35_shared.so": "5aba25220cf9262331ac9cfea2b845ff94886c21fa084d5b20e3f52e882b23db",
+      "libqwen35_prefill_skel.so": "49b669e3eeb70e487cdaec7971ae1627c92cd1f0fa4e2e075588b4cc75ea1c82"
+    },
+    "turns": [
+      {
+        "label": "first",
+        "generated_tokens": 18,
+        "context_tokens": 47,
+        "answer": "你好！我是一个人工智能助手，旨在为你提供准确、清晰且有益的信息与帮助。"
+      },
+      {
+        "label": "followup",
+        "generated_tokens": 10,
+        "context_tokens": 80,
+        "answer": "你刚才问了我如何用一句话介绍自己。"
+      },
+      {
+        "label": "reset",
+        "generated_tokens": 2,
+        "context_tokens": 34,
+        "answer": "2"
+      }
+    ]
+  },
+  "source_refactor": {
+    "date": "2026-10-29",
+    "architecture": "examples/qualcomm/oss_scripts/moe/ARCHITECTURE.md",
+    "validation": "examples/qualcomm/oss_scripts/moe/docs/refactor-validation-20261029.json",
+    "model_root": "examples/qualcomm/oss_scripts/moe/models/qwen35",
+    "operator_root": "examples/qualcomm/custom_op",
+    "runtime_root": "examples/qualcomm/oss_scripts/moe/runtime",
+    "validated_release_artifacts_replaced": false
+  }
+}

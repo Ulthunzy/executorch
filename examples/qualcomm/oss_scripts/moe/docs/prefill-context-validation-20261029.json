@@ -1,0 +1,52 @@
+{
+  "date": "2026-10-29",
+  "device": "3B15AK00GLW00000",
+  "soc_model": "SM8850",
+  "qnn_sdk": "/hunter/qnn_sdk/src/backends/qnn/2.51.200.261021",
+  "model_pte": "/hunter/cpp_code/ET/npu/executorch/llama-output/qwen35-sm8850--1028/model.pte",
+  "tested_context_capacity": 2048,
+  "export_plan_context_capacity": 8192,
+  "device_8192_tested": false,
+  "source_plan_bundle_version": 2,
+  "cases": [
+    {
+      "prompt_tokens": 1501,
+      "ar128_blocks": 12,
+      "tail_valid_tokens": 93,
+      "generated_tokens": 3,
+      "output": "收到。",
+      "dynamic_plan_tokens": 128,
+      "loop_context_memory_rpc_allocations": 0,
+      "prompt_sha256": "1aae5562f5bf158e352bcdec0cd6fc66ca0d18d71ca06da33dcc719478000070"
+    },
+    {
+      "prompt_tokens": 2047,
+      "ar128_blocks": 16,
+      "tail_valid_tokens": 127,
+      "generated_tokens": 1,
+      "output": "收到",
+      "dynamic_plan_tokens": 128,
+      "loop_context_memory_rpc_allocations": 0,
+      "prompt_sha256": "9b36289b7321c01e78fcb75b4ca128713f84eaa7885ae0056845c973caf03fa9"
+    }
+  ],
+  "over_capacity": {
+    "prompt_tokens": 2047,
+    "max_new_tokens": 2,
+    "rejected": true
+  },
+  "builds": {
+    "cli": "build/moe/qwen35-layout-sm8850",
+    "jni": "build/moe/qwen35-layout-jni-sm8850",
+    "host_architectures": [
+      "v79",
+      "v81",
+      "v85"
+    ]
+  },
+  "notes": [
+    "Existing PTE reused without recompiling QNN graphs.",
+    "These are functional tests with short generation; throughput, PPL and process peak RSS were not benchmarked.",
+    "The 1024-token workspace is an internal Native batching bound, not a prompt length limit."
+  ]
+}

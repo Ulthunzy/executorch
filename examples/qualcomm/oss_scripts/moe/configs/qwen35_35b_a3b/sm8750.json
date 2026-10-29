@@ -1,0 +1,21 @@
+{
+  "model_family": "qwen35",
+  "device": "SET_SM8750_DEVICE_SERIAL",
+  "model": "/hunter/model/Qwen/Qwen3.6-35B-A3B",
+  "artifacts": "llama-output/qwen35-sm8750--1028",
+  "build_dir": "build/moe/qwen35-35B-A3B-sm8750",
+  "shared_model": "llama-output/qwen35-sm8750--1028/shared-model",
+  "embedding_table": "llama-output/qwen35-sm8750--1028/embedding.int4",
+  "vision_artifacts": "llama-output/qwen35-sm8750--1028/vision",
+  "prefill_pte": "/data/local/tmp/qwen35-sm8750-sdk251/export/model/prefill/prefill.pte",
+  "decode_pte": "/data/local/tmp/qwen35-sm8750-sdk251/export/model/decode/decode.pte",
+  "runtime_device_dir": "/data/local/tmp/qwen35-sm8750-sdk251/qnn-runtime",
+  "remote_weights": "/data/local/tmp/qwen35-sm8750-sdk251/export/weights",
+  "remote_root": "/data/local/tmp/qwen35-sm8750-sdk251/export/runtime",
+  "soc_model": "SM8750",
+  "cache_experts": 64,
+  "prefill_io_workers": 8,
+  "read_chunk_kib": 512,
+  "model_config": "examples/qualcomm/oss_scripts/moe/configs/qwen35_35b_a3b/model_sm8750.json",
+  "local_decode_pte": "llama-output/qwen35-sm8750--1028/plans/decode.pte"
+}

@@ -1,0 +1,98 @@
+{
+  "date": "2026-10-29",
+  "scope": "shared-export two-library build and runtime review",
+  "soc_model": "SM8850",
+  "sdk": "/hunter/qnn_sdk/src/backends/qnn/2.51.200.261021",
+  "findings": [
+    {
+      "severity": "P1",
+      "issue": "CLI and JNI could enter process-global model state concurrently",
+      "fix": "Shared session lease across C entry points and Runner lifetime; permits closing on another thread",
+      "status": "fixed"
+    },
+    {
+      "severity": "P1",
+      "issue": "MOE_BUILD_NATIVE=0 could relabel DSP and RPC artifacts for a different ISA, SDK or profiling configuration",
+      "fix": "Native provenance and artifact hashes checked before configuring ARM and JNI builds",
+      "status": "fixed"
+    },
+    {
+      "severity": "P2",
+      "issue": "TARGET.json was published before ARM compilation succeeded",
+      "fix": "Invalidate incomplete build metadata; serialize build writes and atomically publish successful paired-library hashes",
+      "status": "fixed"
+    },
+    {
+      "severity": "P2",
+      "issue": "Changes to the linker export map did not trigger relinking",
+      "fix": "LINK_DEPENDS tracks infer.exports; export cache also tracks CMake validation scripts",
+      "status": "fixed"
+    },
+    {
+      "severity": "P2",
+      "issue": "Public inference header was invalid C and C entry points accepted null argv",
+      "fix": "Guard C++ linkage, validate arguments and return errors across the C boundary",
+      "status": "fixed"
+    },
+    {
+      "severity": "P1",
+      "issue": "C entry point --help terminated the host process",
+      "fix": "Return a help_requested option and complete the entry call normally",
+      "status": "fixed"
+    },
+    {
+      "severity": "P2",
+      "issue": "C entry point left stdout and stderr redirected after returning",
+      "fix": "Reuse ScopedConsoleOutput to restore original descriptors on normal and exceptional return",
+      "status": "fixed"
+    }
+  ],
+  "validation": {
+    "python_tests_passed": 105,
+    "arm_and_dsp_build_passed": true,
+    "standalone_jni_build_passed": true,
+    "install_library_count": 2,
+    "paired_artifact_hashes_valid": true,
+    "existing_pte_reused": true,
+    "jni_device_mode": "app_process64",
+    "jni_text_history_reset_close_reopen_passed": true,
+    "c_header_c_and_cpp_compilation_passed": true,
+    "c_api_device_arguments_and_retry_passed": true,
+    "shared_only_post_revert_tests_passed": 19
+  },
+  "kernel_math_changed": false,
+  "performance_remeasured": false,
+  "notes": [
+    "This review ran focused regressions, not the full performance or PPL matrix.",
+    "Earlier performance results belong to the binaries and hashes in the earlier validation report.",
+    "Shared export is a system prerequisite; non-shared PTE support is outside scope and was not classified as a bug."
+  ],
+  "build_artifacts": {
+    "qwen35_moe_runner": "4c82214d87b773ae32b734c8e17ea7e4773082b0d6cbd746fcd326bf140d7556",
+    "prefill_handoff_runner": "121bd0fc6ef41c21005b15167d4dcd0a1743a0ef8d9093e64624471bf365cd38",
+    "libet_infer.so": "091e3c44cdd814e30e14b4625cc38c5604687172f5979a9756668c8b0b1a06d5",
+    "libet_qnnop.so": "abd0edf1b55fa26522726068ef7697eccb8f0c0dd52bcab79ccbb5771579b113"
+  },
+  "native_manifest_sha256": "d3033ea90d37b5462d1e108d73705a92759acf774ea374cdfb6e79925474f65f",
+  "follow_up_entry_review": {
+    "scope": "shared export and its public C entry points",
+    "device": "3B15AK00GLW00000",
+    "before": {
+      "help_returned_to_caller": false,
+      "stdio_restored": false
+    },
+    "after": {
+      "help_returned_to_caller": true,
+      "help_return_code": 0,
+      "stdio_restored_consecutive_calls": 2
+    },
+    "host_checks": {
+      "terminal_output_normal_and_exceptional_return": true,
+      "help_return_v79_v81_v85": true,
+      "padding_cases_passed": 31,
+      "model_session_and_cache_abi_cases_passed": 2
+    },
+    "model_inference_rerun": false,
+    "kernel_math_changed": false
+  }
+}

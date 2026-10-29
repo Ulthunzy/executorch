@@ -1,0 +1,118 @@
+{
+  "date": "2026-10-29",
+  "device": "3B15AK00GLW00000",
+  "soc_model": "SM8850",
+  "sdk": "/hunter/qnn_sdk/src/backends/qnn/2.51.200.261021",
+  "layout": "two_libraries",
+  "arm_library": "libet_infer.so",
+  "dsp_library": "libet_qnnop.so",
+  "embedded_dso_payloads": false,
+  "pte_reexported": false,
+  "token_ids_identical": true,
+  "compared_tokens": 1024,
+  "measurements": {
+    "baseline": {
+      "prefill_token_per_sec": 542.086,
+      "decode_token_per_sec": 13.8285,
+      "prompt_tokens": 1024,
+      "generated_tokens": 1024,
+      "memory_prompt_tokens": 1024,
+      "memory_generated_tokens": 8,
+      "peak_complete_bytes": 5059749888,
+      "peak_complete_GiB": 4.712259292602539,
+      "memory_samples": 48,
+      "complete_memory_samples": 22,
+      "raw_peak_audited": true
+    },
+    "candidate": {
+      "prefill_token_per_sec": 543.524,
+      "decode_token_per_sec": 14.4768,
+      "prompt_tokens": 1024,
+      "generated_tokens": 1024,
+      "memory_prompt_tokens": 1024,
+      "memory_generated_tokens": 8,
+      "peak_complete_bytes": 5060141056,
+      "peak_complete_GiB": 4.712623596191406,
+      "memory_samples": 48,
+      "complete_memory_samples": 25,
+      "raw_peak_audited": true
+    }
+  },
+  "memory_peak_difference_MiB": 0.373046875,
+  "builds": {
+    "79": {
+      "libet_infer.so": {
+        "path": "/hunter/cpp_code/ET/npu/executorch/build/moe/qwen35-two-libs-v79/libet_infer.so",
+        "sha256": "125f2f3f65d19ae9b4078b56006608c8e62068bde9a901f27c9ffe69aec669eb",
+        "bytes": 48970704
+      },
+      "libet_qnnop.so": {
+        "path": "/hunter/cpp_code/ET/npu/executorch/build/moe/qwen35-two-libs-v79/libet_qnnop.so",
+        "sha256": "17eb91e65ee8f85a79af4e909e990a7b5ae5539080712604d45a0436940a4a2c",
+        "bytes": 1176616
+      }
+    },
+    "81": {
+      "libet_infer.so": {
+        "path": "/hunter/cpp_code/ET/npu/executorch/build/moe/qwen35-two-libs-sm8850/libet_infer.so",
+        "sha256": "2d96fa487536904814cc9a0e0bfb49ebd57c0328ed5da1535ad713174e61ad70",
+        "bytes": 49031216
+      },
+      "libet_qnnop.so": {
+        "path": "/hunter/cpp_code/ET/npu/executorch/build/moe/qwen35-two-libs-sm8850/libet_qnnop.so",
+        "sha256": "a698c235112827635e1fa78afb1b5de78e711ac7f337a95369571816d27ee799",
+        "bytes": 1184840
+      }
+    },
+    "85": {
+      "libet_infer.so": {
+        "path": "/hunter/cpp_code/ET/npu/executorch/build/moe/qwen35-two-libs-v85/libet_infer.so",
+        "sha256": "e9885401a205c9a55d9a6832cc38d133ff5ec88e8f1a7b3aa1e67ef216a9be8b",
+        "bytes": 48970704
+      },
+      "libet_qnnop.so": {
+        "path": "/hunter/cpp_code/ET/npu/executorch/build/moe/qwen35-two-libs-v85/libet_qnnop.so",
+        "sha256": "3cdcf83667f1c9c10b7e86adc247bbba3b5f51d281fc8634b6845075fd8e2e3b",
+        "bytes": 1176616
+      }
+    }
+  },
+  "install_only_two_libraries": true,
+  "install_removes_legacy_libraries": true,
+  "jni": {
+    "mode": "app_process64",
+    "text": true,
+    "history": true,
+    "reset": true,
+    "close": true,
+    "apk_tested": false
+  },
+  "diagnostic": {
+    "prompt_tokens": 1024,
+    "generated_tokens": 8,
+    "passed": true
+  },
+  "long_prefill": {
+    "prompt_tokens": 1501,
+    "ar128_blocks": 12,
+    "tail_valid_tokens": 93,
+    "passed": true
+  },
+  "notes": [
+    "Single performance comparison, not a statistical claim of speedup.",
+    "Memory uses 1024 input and 8 generated tokens, sampled at 200 ms with raw snapshot audit."
+  ],
+  "checks": {
+    "python_cases_passed": 263,
+    "python_scope": "257 passed in the full run; six QNN-loader fixture-link errors were fixed and all six then passed.",
+    "host_architectures": [
+      "v79",
+      "v81",
+      "v85"
+    ],
+    "padding_cases_passed": 31,
+    "worker_start_recovery_groups": 163,
+    "jni_cmake_build": true,
+    "git_diff_check": true
+  }
+}

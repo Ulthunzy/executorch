@@ -1,0 +1,824 @@
+{
+  "date": "2026-10-29",
+  "baseline_commit": "a2bfa27a81",
+  "target": "SM8850/V81",
+  "sdk": "2.51.200.261021",
+  "model": {
+    "path": "llama-output/qwen35-sm8850--1028/model.pte",
+    "bytes": 10922203865,
+    "package_id": "c6aab15308070cd24d216f3a76ddbebdce30fbefbde5beb2852928aa7277de10",
+    "reexported": false,
+    "requantized": false,
+    "context": 2048,
+    "prefill_ar": 128
+  },
+  "review_fixes": [
+    "Catch malformed configuration and invalid model-family errors in both CLI entry points.",
+    "Stamp factory-selected C++ model identity and reject null sessions.",
+    "Check QNN symbols, provider arrays and compatible API versions before dereferencing SDK interfaces.",
+    "Infer Java context length and expert slots from exported metadata by default.",
+    "Reject model-family and compiled DSP architecture mismatches before SDK loading.",
+    "Move Qwen shared graph names and layer/group layout into its model resolver.",
+    "Discover shared context directories rather than assuming ten groups and a head.",
+    "Make callback weight loading an explicit Graph option rather than a vision filename heuristic.",
+    "Check JNI vision_enabled before image requests reach the worker.",
+    "Normalize shared roots once and avoid filesystem parsing in model graph resolution.",
+    "Compile context providers with section garbage collection to remove unused graph code and its mapped pages.",
+    "Check total missing package resources and per-file free space before extraction, retaining 1 GiB. Fully populated caches remain usable under low space."
+  ],
+  "checks": {
+    "python_passed": 250,
+    "host_runtime_architectures": [
+      "V79",
+      "V81",
+      "V85"
+    ],
+    "host_padding_passed": 29,
+    "android_cli_built": true,
+    "android_jni_decode_provider_built_together": true,
+    "full_ppl_rerun": false,
+    "full_sqnr_rerun": false,
+    "full_quality_claim": false,
+    "native_package_space_tests_passed": 2
+  },
+  "settings": {
+    "expert_slots": 64,
+    "prefill_io_workers": 16,
+    "decode_io_workers": 8,
+    "read_chunk_kib": 512,
+    "temperature": 0,
+    "ignore_eos": true,
+    "thinking": false
+  },
+  "performance": {
+    "protocol": "Unsampled CLI execution; memory collected in separate runs. Prefill includes prompt submission; image CHAT_STATS includes image preparation. PREFILL_TOTAL separately reports LLM-only execution.",
+    "full_text_consecutive_pair": {
+      "baseline": {
+        "label": "baseline-text1024-perf-r2",
+        "log": "llama-output/qwen35-sm8850--1028/refactor-review-20261029/baseline-text1024-perf-r2/20261029-020346-404887-chat/runner.log",
+        "prefill_token_per_sec": 519.007,
+        "decode_token_per_sec": 13.813,
+        "prompt_tokens": 1024,
+        "generated_tokens": 1024,
+        "generated_ids_sha256": "899466c486cd78ea9ca6688ecc04955798b3f9e37392e006ff26e6de02bdaf82",
+        "prefill_total": {
+          "tokens": 1024.0,
+          "chunks": 8.0,
+          "graph_ms": 1969.433854,
+          "loop_ms": 1973.318697,
+          "tokens_per_second": 518.922768,
+          "direct_bytes": 3196542976.0,
+          "native_calls": 40.0,
+          "padded_tokens": 1024.0
+        },
+        "prefill_profile": {
+          "batch_setup_ms": 0.828286,
+          "batch_wait_ms": 2.996561,
+          "io_wall_ms": 1490.389114,
+          "io_overlap_ms": 299.661301,
+          "seed_copy_ms": 79.48709,
+          "retained_copy_ms": 85.556927,
+          "input_copy_sync_ms": 43.988849,
+          "pread_worker_ms": 18178.247857,
+          "payload_copy_worker_ms": 245.160702,
+          "ready_native_ms": 0.0,
+          "missing_native_ms": 471.09979,
+          "ready_calls": 0.0,
+          "missing_calls": 40.0
+        },
+        "prefill_copy": {
+          "seed_wait_ms": 53.580627,
+          "seed_overlap_ms": 29.516307,
+          "retained_wait_ms": 2.833177,
+          "retained_overlap_ms": 51.713908,
+          "retained_prepare_ms": 4.951773,
+          "input_io_overlap_ms": 43.986143,
+          "router_io_overlap_ms": 121.037341,
+          "attention_io_overlap_ms": 782.024117
+        },
+        "lifecycle": [
+          "DECODE_LIFECYCLE context_creates=0 context_frees=0 memory_registers=432 memory_deregisters=432",
+          "PTE_LIFECYCLE context_creates=0 context_frees=0 memory_registers=502 memory_deregisters=502"
+        ]
+      },
+      "candidate": {
+        "label": "candidate-text1024-perf-gc-r2",
+        "log": "llama-output/qwen35-sm8850--1028/refactor-review-20261029/candidate-text1024-perf-gc-r2/20261029-020537-668673-chat/runner.log",
+        "prefill_token_per_sec": 517.172,
+        "decode_token_per_sec": 13.7475,
+        "prompt_tokens": 1024,
+        "generated_tokens": 1024,
+        "generated_ids_sha256": "899466c486cd78ea9ca6688ecc04955798b3f9e37392e006ff26e6de02bdaf82",
+        "prefill_total": {
+          "tokens": 1024.0,
+          "chunks": 8.0,
+          "graph_ms": 1976.67375,
+          "loop_ms": 1980.595156,
+          "tokens_per_second": 517.01631,
+          "direct_bytes": 3196542976.0,
+          "native_calls": 40.0,
+          "padded_tokens": 1024.0
+        },
+        "prefill_profile": {
+          "batch_setup_ms": 0.83255,
+          "batch_wait_ms": 3.007604,
+          "io_wall_ms": 1491.913695,
+          "io_overlap_ms": 302.234947,
+          "seed_copy_ms": 80.256512,
+          "retained_copy_ms": 85.033229,
+          "input_copy_sync_ms": 43.047862,
+          "pread_worker_ms": 18106.207087,
+          "payload_copy_worker_ms": 234.136479,
+          "ready_native_ms": 0.0,
+          "missing_native_ms": 481.468175,
+          "ready_calls": 0.0,
+          "missing_calls": 40.0
+        },
+        "prefill_copy": {
+          "seed_wait_ms": 50.81156,
+          "seed_overlap_ms": 29.95151,
+          "retained_wait_ms": 2.837549,
+          "retained_overlap_ms": 51.676718,
+          "retained_prepare_ms": 4.802814,
+          "input_io_overlap_ms": 43.045411,
+          "router_io_overlap_ms": 119.876657,
+          "attention_io_overlap_ms": 778.112666
+        },
+        "lifecycle": [
+          "DECODE_LIFECYCLE context_creates=0 context_frees=0 memory_registers=432 memory_deregisters=432",
+          "PTE_LIFECYCLE context_creates=0 context_frees=0 memory_registers=502 memory_deregisters=502"
+        ]
+      },
+      "prefill_delta_pct": -0.3535597785771505,
+      "decode_delta_pct": -0.4741909795120569
+    },
+    "image_256": {
+      "baseline": {
+        "label": "baseline-image256-perf-r1",
+        "log": "llama-output/qwen35-sm8850--1028/refactor-review-20261029/baseline-image256-perf-r1/20261029-013515-559532-chat/runner.log",
+        "prefill_token_per_sec": 88.215,
+        "decode_token_per_sec": 14.4919,
+        "prompt_tokens": 256,
+        "generated_tokens": 256,
+        "generated_ids_sha256": "2af87dcafa4abf2ebf901cb57c7aa7d274ac71376c0b5ca92320eae8690689fe",
+        "prefill_total": {
+          "tokens": 256.0,
+          "chunks": 2.0,
+          "graph_ms": 2075.116406,
+          "loop_ms": 2081.015468,
+          "tokens_per_second": 123.016866,
+          "direct_bytes": 4331683840.0,
+          "native_calls": 80.0,
+          "padded_tokens": 256.0
+        },
+        "prefill_profile": {
+          "batch_setup_ms": 1.721819,
+          "batch_wait_ms": 2.935153,
+          "io_wall_ms": 1754.857034,
+          "io_overlap_ms": 1551.649116,
+          "seed_copy_ms": 96.674274,
+          "retained_copy_ms": 69.229945,
+          "input_copy_sync_ms": 12.137547,
+          "pread_worker_ms": 26055.326479,
+          "payload_copy_worker_ms": 281.433163,
+          "ready_native_ms": 0.0,
+          "missing_native_ms": 1579.634168,
+          "ready_calls": 0.0,
+          "missing_calls": 80.0
+        },
+        "prefill_copy": {
+          "seed_wait_ms": 66.604267,
+          "seed_overlap_ms": 29.564891,
+          "retained_wait_ms": 3.207554,
+          "retained_overlap_ms": 59.104631,
+          "retained_prepare_ms": 6.071203,
+          "input_io_overlap_ms": 12.13281,
+          "router_io_overlap_ms": 21.082503,
+          "attention_io_overlap_ms": 133.082189
+        },
+        "lifecycle": [
+          "DECODE_LIFECYCLE context_creates=0 context_frees=0 memory_registers=432 memory_deregisters=432",
+          "PTE_LIFECYCLE context_creates=1 context_frees=1 memory_registers=504 memory_deregisters=504"
+        ]
+      },
+      "candidate": {
+        "label": "candidate-image256-perf-gc",
+        "log": "llama-output/qwen35-sm8850--1028/refactor-review-20261029/candidate-image256-perf-gc/20261029-020714-473331-chat/runner.log",
+        "prefill_token_per_sec": 104.875,
+        "decode_token_per_sec": 15.2799,
+        "prompt_tokens": 256,
+        "generated_tokens": 256,
+        "generated_ids_sha256": "2af87dcafa4abf2ebf901cb57c7aa7d274ac71376c0b5ca92320eae8690689fe",
+        "prefill_total": {
+          "tokens": 256.0,
+          "chunks": 2.0,
+          "graph_ms": 2079.484739,
+          "loop_ms": 2081.478854,
+          "tokens_per_second": 122.989479,
+          "direct_bytes": 4331683840.0,
+          "native_calls": 80.0,
+          "padded_tokens": 256.0
+        },
+        "prefill_profile": {
+          "batch_setup_ms": 1.721666,
+          "batch_wait_ms": 2.823697,
+          "io_wall_ms": 1776.509738,
+          "io_overlap_ms": 1577.860987,
+          "seed_copy_ms": 82.232913,
+          "retained_copy_ms": 67.552192,
+          "input_copy_sync_ms": 12.199425,
+          "pread_worker_ms": 26429.879874,
+          "payload_copy_worker_ms": 229.699512,
+          "ready_native_ms": 0.0,
+          "missing_native_ms": 1605.750724,
+          "ready_calls": 0.0,
+          "missing_calls": 80.0
+        },
+        "prefill_copy": {
+          "seed_wait_ms": 52.78698,
+          "seed_overlap_ms": 30.397291,
+          "retained_wait_ms": 2.822761,
+          "retained_overlap_ms": 57.290054,
+          "retained_prepare_ms": 6.134896,
+          "input_io_overlap_ms": 12.194582,
+          "router_io_overlap_ms": 20.985784,
+          "attention_io_overlap_ms": 132.250158
+        },
+        "lifecycle": [
+          "DECODE_LIFECYCLE context_creates=0 context_frees=0 memory_registers=432 memory_deregisters=432",
+          "PTE_LIFECYCLE context_creates=1 context_frees=1 memory_registers=504 memory_deregisters=504"
+        ]
+      }
+    },
+    "prefill_only_diagnostics": [
+      {
+        "label": "baseline-prefill-only-r4",
+        "log": "llama-output/qwen35-sm8850--1028/refactor-review-20261029/baseline-prefill-only-r4/20261029-023028-638222-chat/runner.log",
+        "prefill_token_per_sec": 522.449,
+        "decode_token_per_sec": 333.333,
+        "prompt_tokens": 1024,
+        "generated_tokens": 1,
+        "generated_ids_sha256": "27285ff848f678d7ae0decb7b13273d86ecf91415f7585c12e40a3832d36986e",
+        "prefill_total": {
+          "tokens": 1024.0,
+          "chunks": 8.0,
+          "graph_ms": 1956.374531,
+          "loop_ms": 1960.11078,
+          "tokens_per_second": 522.419452,
+          "direct_bytes": 3196542976.0,
+          "native_calls": 40.0,
+          "padded_tokens": 1024.0
+        },
+        "prefill_profile": {
+          "batch_setup_ms": 0.585211,
+          "batch_wait_ms": 5.212398,
+          "io_wall_ms": 1457.563646,
+          "io_overlap_ms": 340.895365,
+          "seed_copy_ms": 113.150206,
+          "retained_copy_ms": 132.262446,
+          "input_copy_sync_ms": 32.918384,
+          "pread_worker_ms": 17775.14847,
+          "payload_copy_worker_ms": 360.608115,
+          "ready_native_ms": 0.0,
+          "missing_native_ms": 502.333802,
+          "ready_calls": 0.0,
+          "missing_calls": 40.0
+        },
+        "prefill_copy": {
+          "seed_wait_ms": 97.614638,
+          "seed_overlap_ms": 23.019168,
+          "retained_wait_ms": 10.746714,
+          "retained_overlap_ms": 107.152135,
+          "retained_prepare_ms": 6.999067,
+          "input_io_overlap_ms": 32.916927,
+          "router_io_overlap_ms": 113.167249,
+          "attention_io_overlap_ms": 790.309168
+        },
+        "lifecycle": [
+          "DECODE_LIFECYCLE context_creates=0 context_frees=0 memory_registers=432 memory_deregisters=432",
+          "PTE_LIFECYCLE context_creates=0 context_frees=0 memory_registers=502 memory_deregisters=502"
+        ]
+      },
+      {
+        "label": "candidate-prefill-only-r4",
+        "log": "llama-output/qwen35-sm8850--1028/refactor-review-20261029/candidate-prefill-only-r4/20261029-023116-080030-chat/runner.log",
+        "prefill_token_per_sec": 500.978,
+        "decode_token_per_sec": 1000,
+        "prompt_tokens": 1024,
+        "generated_tokens": 1,
+        "generated_ids_sha256": "27285ff848f678d7ae0decb7b13273d86ecf91415f7585c12e40a3832d36986e",
+        "prefill_total": {
+          "tokens": 1024.0,
+          "chunks": 8.0,
+          "graph_ms": 2040.599843,
+          "loop_ms": 2044.039843,
+          "tokens_per_second": 500.968708,
+          "direct_bytes": 3196542976.0,
+          "native_calls": 40.0,
+          "padded_tokens": 1024.0
+        },
+        "prefill_profile": {
+          "batch_setup_ms": 0.779166,
+          "batch_wait_ms": 4.571928,
+          "io_wall_ms": 1502.94406,
+          "io_overlap_ms": 312.556877,
+          "seed_copy_ms": 114.665362,
+          "retained_copy_ms": 110.222502,
+          "input_copy_sync_ms": 50.770311,
+          "pread_worker_ms": 17694.751586,
+          "payload_copy_worker_ms": 414.669915,
+          "ready_native_ms": 0.0,
+          "missing_native_ms": 487.456039,
+          "ready_calls": 0.0,
+          "missing_calls": 40.0
+        },
+        "prefill_copy": {
+          "seed_wait_ms": 91.046402,
+          "seed_overlap_ms": 26.079063,
+          "retained_wait_ms": 6.4725,
+          "retained_overlap_ms": 80.009218,
+          "retained_prepare_ms": 6.316043,
+          "input_io_overlap_ms": 46.076509,
+          "router_io_overlap_ms": 116.947078,
+          "attention_io_overlap_ms": 782.954274
+        },
+        "lifecycle": [
+          "DECODE_LIFECYCLE context_creates=0 context_frees=0 memory_registers=432 memory_deregisters=432",
+          "PTE_LIFECYCLE context_creates=0 context_frees=0 memory_registers=502 memory_deregisters=502"
+        ]
+      },
+      {
+        "label": "candidate-prefill-only-r5",
+        "log": "llama-output/qwen35-sm8850--1028/refactor-review-20261029/candidate-prefill-only-r5/20261029-023159-488341-chat/runner.log",
+        "prefill_token_per_sec": 507.937,
+        "decode_token_per_sec": 500,
+        "prompt_tokens": 1024,
+        "generated_tokens": 1,
+        "generated_ids_sha256": "27285ff848f678d7ae0decb7b13273d86ecf91415f7585c12e40a3832d36986e",
+        "prefill_total": {
+          "tokens": 1024.0,
+          "chunks": 8.0,
+          "graph_ms": 2012.779426,
+          "loop_ms": 2016.269114,
+          "tokens_per_second": 507.868713,
+          "direct_bytes": 3196542976.0,
+          "native_calls": 40.0,
+          "padded_tokens": 1024.0
+        },
+        "prefill_profile": {
+          "batch_setup_ms": 0.764005,
+          "batch_wait_ms": 5.820208,
+          "io_wall_ms": 1446.655569,
+          "io_overlap_ms": 258.54375,
+          "seed_copy_ms": 125.541408,
+          "retained_copy_ms": 138.295103,
+          "input_copy_sync_ms": 47.253178,
+          "pread_worker_ms": 16401.885307,
+          "payload_copy_worker_ms": 424.00891,
+          "ready_native_ms": 0.0,
+          "missing_native_ms": 447.595314,
+          "ready_calls": 0.0,
+          "missing_calls": 40.0
+        },
+        "prefill_copy": {
+          "seed_wait_ms": 108.814737,
+          "seed_overlap_ms": 25.021775,
+          "retained_wait_ms": 10.313281,
+          "retained_overlap_ms": 105.734693,
+          "retained_prepare_ms": 7.754322,
+          "input_io_overlap_ms": 47.250675,
+          "router_io_overlap_ms": 113.927705,
+          "attention_io_overlap_ms": 772.055584
+        },
+        "lifecycle": [
+          "DECODE_LIFECYCLE context_creates=0 context_frees=0 memory_registers=432 memory_deregisters=432",
+          "PTE_LIFECYCLE context_creates=0 context_frees=0 memory_registers=502 memory_deregisters=502"
+        ]
+      },
+      {
+        "label": "baseline-prefill-only-r5",
+        "log": "llama-output/qwen35-sm8850--1028/refactor-review-20261029/baseline-prefill-only-r5/20261029-023242-365073-chat/runner.log",
+        "prefill_token_per_sec": 503.937,
+        "decode_token_per_sec": 500,
+        "prompt_tokens": 1024,
+        "generated_tokens": 1,
+        "generated_ids_sha256": "27285ff848f678d7ae0decb7b13273d86ecf91415f7585c12e40a3832d36986e",
+        "prefill_total": {
+          "tokens": 1024.0,
+          "chunks": 8.0,
+          "graph_ms": 2028.732656,
+          "loop_ms": 2032.191405,
+          "tokens_per_second": 503.889544,
+          "direct_bytes": 3196542976.0,
+          "native_calls": 40.0,
+          "padded_tokens": 1024.0
+        },
+        "prefill_profile": {
+          "batch_setup_ms": 0.801671,
+          "batch_wait_ms": 5.459529,
+          "io_wall_ms": 1454.626876,
+          "io_overlap_ms": 254.674115,
+          "seed_copy_ms": 126.416195,
+          "retained_copy_ms": 126.63573,
+          "input_copy_sync_ms": 54.480989,
+          "pread_worker_ms": 16500.994375,
+          "payload_copy_worker_ms": 388.119375,
+          "ready_native_ms": 0.0,
+          "missing_native_ms": 448.477709,
+          "ready_calls": 0.0,
+          "missing_calls": 40.0
+        },
+        "prefill_copy": {
+          "seed_wait_ms": 106.616354,
+          "seed_overlap_ms": 25.5113,
+          "retained_wait_ms": 11.506302,
+          "retained_overlap_ms": 92.723125,
+          "retained_prepare_ms": 7.480944,
+          "input_io_overlap_ms": 53.361926,
+          "router_io_overlap_ms": 114.365517,
+          "attention_io_overlap_ms": 769.516137
+        },
+        "lifecycle": [
+          "DECODE_LIFECYCLE context_creates=0 context_frees=0 memory_registers=432 memory_deregisters=432",
+          "PTE_LIFECYCLE context_creates=0 context_frees=0 memory_registers=502 memory_deregisters=502"
+        ]
+      }
+    ],
+    "other_full_text_samples": [
+      {
+        "label": "baseline-text1024-perf-r1b",
+        "log": "llama-output/qwen35-sm8850--1028/refactor-review-20261029/baseline-text1024-perf-r1b/20261029-011302-445157-chat/runner.log",
+        "prefill_token_per_sec": 475.615,
+        "decode_token_per_sec": 12.4455,
+        "prompt_tokens": 1024,
+        "generated_tokens": 1024,
+        "generated_ids_sha256": "899466c486cd78ea9ca6688ecc04955798b3f9e37392e006ff26e6de02bdaf82",
+        "prefill_total": {
+          "tokens": 1024.0,
+          "chunks": 8.0,
+          "graph_ms": 2149.788229,
+          "loop_ms": 2153.542708,
+          "tokens_per_second": 475.495562,
+          "direct_bytes": 3196542976.0,
+          "native_calls": 40.0,
+          "padded_tokens": 1024.0
+        },
+        "prefill_profile": {
+          "batch_setup_ms": 0.928177,
+          "batch_wait_ms": 6.114373,
+          "io_wall_ms": 1569.504687,
+          "io_overlap_ms": 310.04797,
+          "seed_copy_ms": 131.209426,
+          "retained_copy_ms": 131.546039,
+          "input_copy_sync_ms": 57.66776,
+          "pread_worker_ms": 17768.702573,
+          "payload_copy_worker_ms": 411.307664,
+          "ready_native_ms": 0.0,
+          "missing_native_ms": 498.269947,
+          "ready_calls": 0.0,
+          "missing_calls": 40.0
+        },
+        "prefill_copy": {
+          "seed_wait_ms": 102.74583,
+          "seed_overlap_ms": 27.045779,
+          "retained_wait_ms": 8.442605,
+          "retained_overlap_ms": 94.571401,
+          "retained_prepare_ms": 8.531041,
+          "input_io_overlap_ms": 57.09224,
+          "router_io_overlap_ms": 119.693038,
+          "attention_io_overlap_ms": 782.972396
+        },
+        "lifecycle": [
+          "DECODE_LIFECYCLE context_creates=0 context_frees=0 memory_registers=432 memory_deregisters=432",
+          "PTE_LIFECYCLE context_creates=0 context_frees=0 memory_registers=502 memory_deregisters=502"
+        ]
+      },
+      {
+        "label": "candidate-text1024-perf-gc",
+        "log": "llama-output/qwen35-sm8850--1028/refactor-review-20261029/candidate-text1024-perf-gc/20261029-015831-593553-chat/runner.log",
+        "prefill_token_per_sec": 463.978,
+        "decode_token_per_sec": 12.8776,
+        "prompt_tokens": 1024,
+        "generated_tokens": 1024,
+        "generated_ids_sha256": "899466c486cd78ea9ca6688ecc04955798b3f9e37392e006ff26e6de02bdaf82",
+        "prefill_total": {
+          "tokens": 1024.0,
+          "chunks": 8.0,
+          "graph_ms": 2202.927291,
+          "loop_ms": 2207.696093,
+          "tokens_per_second": 463.831957,
+          "direct_bytes": 3196542976.0,
+          "native_calls": 40.0,
+          "padded_tokens": 1024.0
+        },
+        "prefill_profile": {
+          "batch_setup_ms": 1.03198,
+          "batch_wait_ms": 4.128803,
+          "io_wall_ms": 1586.396095,
+          "io_overlap_ms": 257.246251,
+          "seed_copy_ms": 116.140787,
+          "retained_copy_ms": 108.493123,
+          "input_copy_sync_ms": 62.970627,
+          "pread_worker_ms": 17799.962483,
+          "payload_copy_worker_ms": 392.894355,
+          "ready_native_ms": 0.0,
+          "missing_native_ms": 477.923956,
+          "ready_calls": 0.0,
+          "missing_calls": 40.0
+        },
+        "prefill_copy": {
+          "seed_wait_ms": 82.109582,
+          "seed_overlap_ms": 35.704008,
+          "retained_wait_ms": 4.50542,
+          "retained_overlap_ms": 61.802232,
+          "retained_prepare_ms": 6.617918,
+          "input_io_overlap_ms": 62.622293,
+          "router_io_overlap_ms": 122.814847,
+          "attention_io_overlap_ms": 801.944994
+        },
+        "lifecycle": [
+          "DECODE_LIFECYCLE context_creates=0 context_frees=0 memory_registers=432 memory_deregisters=432",
+          "PTE_LIFECYCLE context_creates=0 context_frees=0 memory_registers=502 memory_deregisters=502"
+        ]
+      },
+      {
+        "label": "candidate-text1024-perf-gc-r3",
+        "log": "llama-output/qwen35-sm8850--1028/refactor-review-20261029/candidate-text1024-perf-gc-r3/20261029-021338-013827-chat/runner.log",
+        "prefill_token_per_sec": 493.256,
+        "decode_token_per_sec": 13.7553,
+        "prompt_tokens": 1024,
+        "generated_tokens": 1024,
+        "generated_ids_sha256": "899466c486cd78ea9ca6688ecc04955798b3f9e37392e006ff26e6de02bdaf82",
+        "prefill_total": {
+          "tokens": 1024.0,
+          "chunks": 8.0,
+          "graph_ms": 2071.594061,
+          "loop_ms": 2076.053645,
+          "tokens_per_second": 493.243516,
+          "direct_bytes": 3196542976.0,
+          "native_calls": 40.0,
+          "padded_tokens": 1024.0
+        },
+        "prefill_profile": {
+          "batch_setup_ms": 1.061094,
+          "batch_wait_ms": 4.186512,
+          "io_wall_ms": 1461.949845,
+          "io_overlap_ms": 197.38599,
+          "seed_copy_ms": 106.573439,
+          "retained_copy_ms": 105.26422,
+          "input_copy_sync_ms": 57.636096,
+          "pread_worker_ms": 16276.912664,
+          "payload_copy_worker_ms": 335.167014,
+          "ready_native_ms": 0.0,
+          "missing_native_ms": 437.017811,
+          "ready_calls": 0.0,
+          "missing_calls": 40.0
+        },
+        "prefill_copy": {
+          "seed_wait_ms": 82.753494,
+          "seed_overlap_ms": 30.896768,
+          "retained_wait_ms": 5.704791,
+          "retained_overlap_ms": 64.898547,
+          "retained_prepare_ms": 6.681979,
+          "input_io_overlap_ms": 57.308076,
+          "router_io_overlap_ms": 118.944736,
+          "attention_io_overlap_ms": 766.551563
+        },
+        "lifecycle": [
+          "DECODE_LIFECYCLE context_creates=0 context_frees=0 memory_registers=432 memory_deregisters=432",
+          "PTE_LIFECYCLE context_creates=0 context_frees=0 memory_registers=502 memory_deregisters=502"
+        ]
+      },
+      {
+        "label": "baseline-text1024-perf-r3",
+        "log": "llama-output/qwen35-sm8850--1028/refactor-review-20261029/baseline-text1024-perf-r3/20261029-021536-089712-chat/runner.log",
+        "prefill_token_per_sec": 533.056,
+        "decode_token_per_sec": 13.8154,
+        "prompt_tokens": 1024,
+        "generated_tokens": 1024,
+        "generated_ids_sha256": "899466c486cd78ea9ca6688ecc04955798b3f9e37392e006ff26e6de02bdaf82",
+        "prefill_total": {
+          "tokens": 1024.0,
+          "chunks": 8.0,
+          "graph_ms": 1918.026197,
+          "loop_ms": 1921.933124,
+          "tokens_per_second": 532.796895,
+          "direct_bytes": 3196542976.0,
+          "native_calls": 40.0,
+          "padded_tokens": 1024.0
+        },
+        "prefill_profile": {
+          "batch_setup_ms": 0.805724,
+          "batch_wait_ms": 2.993539,
+          "io_wall_ms": 1396.381822,
+          "io_overlap_ms": 205.604584,
+          "seed_copy_ms": 79.423486,
+          "retained_copy_ms": 85.328126,
+          "input_copy_sync_ms": 43.781558,
+          "pread_worker_ms": 15948.08621,
+          "payload_copy_worker_ms": 239.118576,
+          "ready_native_ms": 0.0,
+          "missing_native_ms": 421.70245,
+          "ready_calls": 0.0,
+          "missing_calls": 40.0
+        },
+        "prefill_copy": {
+          "seed_wait_ms": 52.971722,
+          "seed_overlap_ms": 29.384064,
+          "retained_wait_ms": 2.8514,
+          "retained_overlap_ms": 52.441044,
+          "retained_prepare_ms": 4.883541,
+          "input_io_overlap_ms": 43.779057,
+          "router_io_overlap_ms": 111.548901,
+          "attention_io_overlap_ms": 745.248598
+        },
+        "lifecycle": [
+          "DECODE_LIFECYCLE context_creates=0 context_frees=0 memory_registers=432 memory_deregisters=432",
+          "PTE_LIFECYCLE context_creates=0 context_frees=0 memory_registers=502 memory_deregisters=502"
+        ]
+      }
+    ],
+    "interpretation": "The consecutive full text pair is within 0.5% for both rates. The final prefill-only pair is 503.889544 to 507.868713 token/s. Other samples fluctuate more; notably candidate r3 followed image workloads while baseline r3 followed text. Expert IO, copy and startup times also vary. These measurements do not establish a statistical guarantee of less than 1% regression for every cold-start/cache/device state.",
+    "changed_compute_operators": false
+  },
+  "memory": {
+    "formula": "PSS - mapped DMA PSS + DMA capacity deduplicated by device and inode",
+    "scope": "CLI process plus owned DMA, not system-wide or JVM peak",
+    "target_interval_ms": 200,
+    "interpretation": "Observed complete-sample peaks; short unsampled transients are not excluded. DMA sizes and counts match exactly.",
+    "baseline_text": {
+      "label": "baseline-text1024-memory-r1",
+      "measurement": "llama-output/qwen35-sm8850--1028/refactor-review-20261029/baseline-text1024-memory-r1/memory/MEASUREMENT.json",
+      "peak_bytes": 5060478976,
+      "peak_gib": 4.71293830871582,
+      "dma_bytes": 4775841792,
+      "dma_buffers": 909,
+      "pss_bytes": 284637184,
+      "sample": 41,
+      "coverage_complete": true,
+      "target_interval_ms": 200
+    },
+    "candidate_text": {
+      "label": "candidate-text1024-memory-gc",
+      "measurement": "llama-output/qwen35-sm8850--1028/refactor-review-20261029/candidate-text1024-memory-gc/memory/MEASUREMENT.json",
+      "peak_bytes": 5060356096,
+      "peak_gib": 4.712823867797852,
+      "dma_bytes": 4775841792,
+      "dma_buffers": 909,
+      "pss_bytes": 284514304,
+      "sample": 34,
+      "coverage_complete": true,
+      "target_interval_ms": 200
+    },
+    "text_delta_bytes": -122880,
+    "baseline_image": {
+      "label": "baseline-image256-memory-r1",
+      "measurement": "llama-output/qwen35-sm8850--1028/refactor-review-20261029/baseline-image256-memory-r1/memory/MEASUREMENT.json",
+      "peak_bytes": 5592731648,
+      "peak_gib": 5.208637237548828,
+      "dma_bytes": 5258047488,
+      "dma_buffers": 1098,
+      "pss_bytes": 334684160,
+      "sample": 133,
+      "coverage_complete": true,
+      "target_interval_ms": 200
+    },
+    "candidate_image": {
+      "label": "candidate-image256-memory-gc",
+      "measurement": "llama-output/qwen35-sm8850--1028/refactor-review-20261029/candidate-image256-memory-gc/memory/MEASUREMENT.json",
+      "peak_bytes": 5590247424,
+      "peak_gib": 5.206323623657227,
+      "dma_bytes": 5258047488,
+      "dma_buffers": 1098,
+      "pss_bytes": 332199936,
+      "sample": 131,
+      "coverage_complete": true,
+      "target_interval_ms": 200
+    },
+    "image_delta_bytes": -2484224
+  },
+  "output_comparison": {
+    "text_generated_ids": 1024,
+    "image_generated_ids": 256,
+    "exact_ids_equal": true,
+    "scope": "Same model, inputs, operator binaries and temperature=0; not a replacement for PPL/SQNR."
+  },
+  "build_directories": {
+    "baseline_cli": "build/moe/qwen35-35B-A3B-sm8850",
+    "candidate_cli": "build/moe/qwen35-refactor-sm8850",
+    "candidate_jni": "build/moe/qwen35-refactor-jni-sm8850/install/jniLibs/arm64-v8a"
+  },
+  "libraries_sha256": {
+    "baseline_cli": {
+      "qwen35_moe_runner": "b945caaf93161410107e99c1cb5426bf87587604e65abf3fd0ddf5bc03970f23",
+      "libmoe_decode.so": "122166a4377ef64df2a24d062a29d3cb4c7f36358bd8d1b1719755b0655b51d9",
+      "libqwen35_shared.so": "252fbe77bbd52fbda48e402473fb0a275078445a799ac5f0a72a30ae06ca651b"
+    },
+    "candidate_cli": {
+      "qwen35_moe_runner": "89eeb915d545daa7c15b5186794ac4e070e24bf05402cb33ef3f13470b8f48a1",
+      "libmoe_decode.so": "367123306bce80ed36aa3bce9739dc35a050fdf1367685210c61535ea183282e",
+      "libqwen35_shared.so": "04efe1c833987bc87c8351209b091bd6ba79b4ea14407e8ffe3b77773df22d9f"
+    },
+    "candidate_jni": {
+      "libmoe_decode.so": "1956b2def3226bfdedeccf4ab0e0e93e662c9d0aa829e30421a78098614aa8cc",
+      "libQnnDeltaNetOpPackage_HTP.so": "caeb0977a597412bae27f2e6b5e83e03e0e61d2dd18f7ce392cb3b7b899e5c9f",
+      "libqwen35_decode_skel.so": "fddc9fdb16e0f6b78e9826a496c430c6b4a27259825971eae3d1315d1cd65ad2",
+      "libqwen35_moe_jni.so": "10bfffc2ca374706a633b10a8729f78948079017a1d67fc0110eb036fd3c2437",
+      "libqwen35_shared.so": "6acf2f2bd669d2ef3ea9a0dd47c704a9327f67013cc8ca9ff63c87946b9396f3",
+      "libqwen35_prefill_skel.so": "49b669e3eeb70e487cdaec7971ae1627c92cd1f0fa4e2e075588b4cc75ea1c82"
+    }
+  },
+  "unchanged_operator_sha256": {
+    "native-prefill/libinteger_rpc_skel.so": "49b669e3eeb70e487cdaec7971ae1627c92cd1f0fa4e2e075588b4cc75ea1c82",
+    "native-decode/libinteger_rpc_skel.so": "fddc9fdb16e0f6b78e9826a496c430c6b4a27259825971eae3d1315d1cd65ad2",
+    "op-package/hexagon-v81/libQnnDeltaNetOpPackage_HTP.so": "caeb0977a597412bae27f2e6b5e83e03e0e61d2dd18f7ce392cb3b7b899e5c9f"
+  },
+  "jni": {
+    "status": "passed-for-raw-directory",
+    "java_signatures_changed": false,
+    "multiple_active_sessions_supported": false,
+    "ordinary_apk": {
+      "passed": false,
+      "target_sdk": 34,
+      "install_attempts": [
+        "incremental/streamed",
+        "push without incremental"
+      ],
+      "device_error": "Failure [-99]",
+      "scope": "Installation failed; ordinary APK execution is unverified."
+    },
+    "raw_directory_java": {
+      "complete": true,
+      "exit_code": 0,
+      "mode": "existing raw deployment",
+      "libraries_sha256": {
+        "libmoe_decode.so": "1956b2def3226bfdedeccf4ab0e0e93e662c9d0aa829e30421a78098614aa8cc",
+        "libQnnDeltaNetOpPackage_HTP.so": "caeb0977a597412bae27f2e6b5e83e03e0e61d2dd18f7ce392cb3b7b899e5c9f",
+        "libqwen35_decode_skel.so": "fddc9fdb16e0f6b78e9826a496c430c6b4a27259825971eae3d1315d1cd65ad2",
+        "libqwen35_moe_jni.so": "10bfffc2ca374706a633b10a8729f78948079017a1d67fc0110eb036fd3c2437",
+        "libqwen35_shared.so": "6acf2f2bd669d2ef3ea9a0dd47c704a9327f67013cc8ca9ff63c87946b9396f3",
+        "libqwen35_prefill_skel.so": "49b669e3eeb70e487cdaec7971ae1627c92cd1f0fa4e2e075588b4cc75ea1c82"
+      },
+      "command": "env -u DSP_LIBRARY_PATH CLASSPATH=/data/local/tmp/qwen35-sm8850-sdk251/refactor-review-20261029/java-raw/lifecycle.jar LD_LIBRARY_PATH=/data/local/tmp/qwen35-sm8850-sdk251/refactor-review-20261029/java-raw/libs:/data/local/tmp/qwen35-sm8850-sdk251/qnn-runtime app_process64 -Djava.library.path=/data/local/tmp/qwen35-sm8850-sdk251/refactor-review-20261029/java-raw/libs:/data/local/tmp/qwen35-sm8850-sdk251/qnn-runtime /system/bin org.pytorch.executorch.review.Qwen35MoeLifecycleTest /data/local/tmp/qwen35-sm8850-sdk251/repetition-diagnostic-20261028/20261028-104711-194763-chat /data/local/tmp/qwen35-sm8850-sdk251/repetition-diagnostic-20261028/shared-model /data/local/tmp/qwen35-sm8850-sdk251/repetition-diagnostic-20261028/tokenizer.json /data/local/tmp/qwen35-sm8850-sdk251/refactor-review-20261029/java-raw/cache /data/local/tmp/qwen35-sm8850-sdk251/refactor-review-20261029/java-raw/libs"
+    },
+    "coverage": [
+      "metadata defaults",
+      "text UTF-8 callback",
+      "history",
+      "reset before and after loading",
+      "stop from callback",
+      "callback exception propagation",
+      "concurrent reset rejection",
+      "single-session enforcement",
+      "disabled image rejection",
+      "idempotent close",
+      "closed-state rejection",
+      "same-process close/reopen",
+      "close/reopen changes expert slots from metadata default 32 to explicit 64"
+    ],
+    "single_pte_java": {
+      "passed": false,
+      "exit_code": 137,
+      "details": "Complete 10,922,203,865-byte PTE transferred. Process was killed during initial extraction; filesystem was observed full. Test-created PTE and partial cache were removed. No inference was reached on this path.",
+      "log": "llama-output/qwen35-sm8850--1028/refactor-review-20261029/java-pte/runner.log"
+    },
+    "final_libraries_sha256": {
+      "libmoe_decode.so": "1956b2def3226bfdedeccf4ab0e0e93e662c9d0aa829e30421a78098614aa8cc",
+      "libQnnDeltaNetOpPackage_HTP.so": "caeb0977a597412bae27f2e6b5e83e03e0e61d2dd18f7ce392cb3b7b899e5c9f",
+      "libqwen35_decode_skel.so": "fddc9fdb16e0f6b78e9826a496c430c6b4a27259825971eae3d1315d1cd65ad2",
+      "libqwen35_moe_jni.so": "10bfffc2ca374706a633b10a8729f78948079017a1d67fc0110eb036fd3c2437",
+      "libqwen35_shared.so": "6acf2f2bd669d2ef3ea9a0dd47c704a9327f67013cc8ca9ff63c87946b9396f3",
+      "libqwen35_prefill_skel.so": "49b669e3eeb70e487cdaec7971ae1627c92cd1f0fa4e2e075588b4cc75ea1c82"
+    },
+    "default_experts_per_layer": 32,
+    "reopened_explicit_experts_per_layer": 64
+  },
+  "validated_release_artifacts_overwritten": false,
+  "raw_artifacts": "llama-output/qwen35-sm8850--1028/refactor-review-20261029",
+  "post_benchmark_fix": {
+    "scope": "C++ PTE extraction only; directory inference hot paths unchanged. JNI rebuilt and tested after this fix. Performance was measured before this storage guard.",
+    "tested": [
+      "insufficient space rejects before writing resources",
+      "completed cache reused with zero free extraction space"
+    ],
+    "cli_rebuilt": true
+  },
+  "benchmarked_libraries_sha256": {
+    "baseline_cli": {
+      "qwen35_moe_runner": "b945caaf93161410107e99c1cb5426bf87587604e65abf3fd0ddf5bc03970f23",
+      "libmoe_decode.so": "122166a4377ef64df2a24d062a29d3cb4c7f36358bd8d1b1719755b0655b51d9",
+      "libqwen35_shared.so": "252fbe77bbd52fbda48e402473fb0a275078445a799ac5f0a72a30ae06ca651b"
+    },
+    "candidate_cli": {
+      "qwen35_moe_runner": "89eeb915d545daa7c15b5186794ac4e070e24bf05402cb33ef3f13470b8f48a1",
+      "libmoe_decode.so": "367123306bce80ed36aa3bce9739dc35a050fdf1367685210c61535ea183282e",
+      "libqwen35_shared.so": "04efe1c833987bc87c8351209b091bd6ba79b4ea14407e8ffe3b77773df22d9f"
+    }
+  },
+  "final_cli_libraries_sha256": {
+    "qwen35_moe_runner": "6875cffaa59d4eda036317fb65c7015c950ba66730f7a611962b51670fb79d31",
+    "libmoe_decode.so": "9c64aa170053e78b9a58e8e18ef145f31a9a1bad6a5b502334e663e7fffdadde",
+    "libqwen35_shared.so": "04efe1c833987bc87c8351209b091bd6ba79b4ea14407e8ffe3b77773df22d9f"
+  },
+  "temporary_device_deployments_cleaned": true
+}
