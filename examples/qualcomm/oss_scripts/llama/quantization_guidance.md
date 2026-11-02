@@ -20,6 +20,16 @@ Everything below runs through `llama.py`.
 
 # Usage
 
+Quantization diagnostics use `QUANTIZATION_METRIC` records with MSE, NMSE and
+SQNR. Qwen3.5 fixed-grid GPTQ also saves its projection metrics in
+`qwen35_export.json`; SeqMSE logs the initial and best error, evaluated candidate
+count and chosen scale ratio. These projection metrics measure weight error on
+calibration inputs, rather than full-model activation/state error or PPL.
+Fixed-grid GPTQ finishes after all columns are processed. SeqMSE finishes its
+bounded coarse/fine candidate search. These finite searches do not use gradient
+reconstruction early stopping; incomplete GPTQ column traversal would leave
+weights unquantized. Nonfinite error aborts quantization.
+
 ## End-to-end PTQ (Post-Training Quantization)
 ```bash
 python examples/qualcomm/oss_scripts/llama/llama.py --build_folder build-android --device ${SERIAL_NUM} --soc_model ${SOC_MODEL} --decoder_model smollm2_135m --model_mode hybrid --prefill_ar_len 128 --max_seq_len 1024 --prompt "I would like to learn python, could you teach me with a simple example?"  --calib_tasks wikitext --calib_limit 1

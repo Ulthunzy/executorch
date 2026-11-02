@@ -446,13 +446,20 @@ def optimize_out_projections(module, weights, capture, device):
         encoding = node.args[0].args[1:]
         assert node.args[0].target == DQ
         inputs = DQ(Q(inputs, *encoding), *encoding)
+        diagnostics = {}
         optimized = gptq_fixed_grid(
-            original.to(device), inputs, effective.to(device)
+            original.to(device),
+            inputs,
+            effective.to(device),
+            report=diagnostics,
+            label=path,
         ).cpu()
         fraction = float((optimized != codes.reshape_as(optimized)).float().mean())
         codes.copy_(optimized.reshape_as(codes))
         scales.copy_(effective.reshape_as(scales))
-        details.append({"module": path, "changed_code_fraction": fraction})
+        details.append(
+            {"module": path, "changed_code_fraction": fraction, **diagnostics}
+        )
         logging.info(
             "Qwen3.5 fixed-grid GPTQ %s: %.2f%% codes changed", path, fraction * 100
         )

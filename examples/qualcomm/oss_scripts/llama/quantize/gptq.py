@@ -6,6 +6,11 @@
 
 import torch
 
+from executorch.backends.qualcomm.quantizer.metrics import (
+    linear_error_metrics,
+    log_quantization,
+)
+
 
 @torch.no_grad()
 def gptq_fixed_grid(
@@ -18,6 +23,8 @@ def gptq_fixed_grid(
     quant_max: int = 7,
     damping: float = 0.01,
     block_size: int = 128,
+    report: dict | None = None,
+    label: str = "fixed_grid_gptq",
 ) -> torch.Tensor:
     """Return signed codes using GPTQ compensation on fixed symmetric grids.
 
@@ -74,6 +81,19 @@ def gptq_fixed_grid(
                 errors[:, index] = error
                 pending[:, index:] -= error[:, None] * factor[index, index:][None, :]
             w[:, end:] -= errors @ inverse_factor[begin:end, end:]
+        if report is not None:
+            reconstructed = result.float() * scale_grid.repeat_interleave(
+                group_size, -1
+            )
+            metrics = linear_error_metrics(weight.to(device).float(), reconstructed, x)
+            report.update(
+                output_error=metrics,
+                error_scope="weight_only_projection_on_calibration_inputs",
+                stop_reason="all_columns_quantized",
+                processed_columns=columns,
+                blocks=(columns + block_size - 1) // block_size,
+            )
+            log_quantization(label, **report)
         return result.to(weight.device)
     finally:
         torch.backends.cuda.matmul.allow_tf32 = previous_tf32

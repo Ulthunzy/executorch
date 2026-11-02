@@ -3,11 +3,16 @@
 #
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
+import math
 import types
 from contextlib import contextmanager
 
 import torch
 import torchao
+from executorch.backends.qualcomm.quantizer.metrics import (
+    error_metrics,
+    log_quantization,
+)
 from executorch.backends.qualcomm.quantizer.observers.per_block_param_observer import (
     PerBlockParamObserver,
 )
@@ -49,6 +54,7 @@ class SeqMseModule(torch.nn.Module):
         ).tolist()
         self.num_fine = num_candidates
         self.operator = self._make_operator(operator)
+        self.projection_name = operator.name
         self.best_candidate_step = 1.0
 
     def _make_operator(self, aten_op):
@@ -110,11 +116,17 @@ class SeqMseModule(torch.nn.Module):
 
         def _eval_step(step):
             self.operator.weight.data = self._fake_quant(scale * step, zero_point)
-            return torch.nn.functional.mse_loss(
+            loss = torch.nn.functional.mse_loss(
                 self.operator(nominal_input), nominal_output
             ).item()
+            if not math.isfinite(loss):
+                raise FloatingPointError(
+                    f"{self.projection_name}: nonfinite SeqMSE error"
+                )
+            return loss
 
         candidate, current_loss = 1, _eval_step(1.0)
+        initial_loss = current_loss
 
         # Coarse sweep
         coarse_resolution = 1.0 / len(self.coarse_steps)
@@ -132,6 +144,18 @@ class SeqMseModule(torch.nn.Module):
             if loss < current_loss:
                 candidate, current_loss = step, loss
 
+        log_quantization(
+            self.projection_name,
+            method="seq_mse",
+            stop_reason="candidate_grid_complete",
+            evaluated_candidates=1 + len(self.coarse_steps) + len(fine_steps),
+            selected_scale_ratio=candidate,
+            initial_mse=initial_loss,
+            output_error=error_metrics(
+                nominal_output.double().square().mean(), current_loss, 1
+            ),
+            error_scope="projection_on_calibration_inputs",
+        )
         return candidate
 
     def forward(self, nominal_input, nominal_output):
