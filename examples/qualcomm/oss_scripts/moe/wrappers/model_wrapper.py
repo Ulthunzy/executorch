@@ -120,6 +120,8 @@ class ModelWrapper(ExportWorkflow):
                     c.expert_batch,
                     "--layer-batch",
                     c.quantization_layer_batch,
+                    "--device",
+                    c.calibration_device,
                     *binding,
                 ),
                 prepared_artifacts(c.calibration_dir, self.architecture.layers),
@@ -127,7 +129,7 @@ class ModelWrapper(ExportWorkflow):
                     f"layer{layer}-router" for layer in range(self.architecture.layers)
                 )
                 + ("head",),
-                resource="gpu",
+                resource="gpu" if c.calibration_device == "cuda" else "cpu",
             )
         if text:
             stage(

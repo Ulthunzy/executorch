@@ -10,6 +10,9 @@ from executorch.examples.qualcomm.oss_scripts.moe.model.qwen35 import (
     add_model_config_argument,
     load_model_config,
 )
+from executorch.examples.qualcomm.oss_scripts.moe.quantize.execution import (
+    resolve_device,
+)
 
 
 def prepare_data(args, settings):
@@ -193,7 +196,7 @@ def prepare_attention(args, settings):
         args.output, layer, settings.quantization.calibration_dtype
     )
     cos, sin = rope_tables(checkpoint.config)
-    model = AttentionFront(checkpoint, layer).eval().cuda()
+    model = AttentionFront(checkpoint, layer).eval().to(args.device)
     inputs = attention_inputs(hidden[:1, :128].contiguous(), linear, cos, sin)
     model = convert_linear_to_conv2d(model.cpu())
     graph = torch.export.export(model, inputs, strict=True).module()
@@ -213,15 +216,15 @@ def prepare_attention(args, settings):
     )
     quantizer.set_recipe(recipe)
     prepared = prepare_pt2e(graph, quantizer)
-    move_graph(prepared, "cuda")
-    hidden = hidden.cuda()
+    move_graph(prepared, args.device)
+    hidden = hidden.to(args.device)
     fit = [0, 1, 2, 4, 5, 6, 7]
     for sequence, start, _, _ in run_attention(prepared, hidden, linear, cos, sin, fit):
         if start == 896:
             print("ACTIVATIONS_CALIBRATED", layer, sequence, flush=True)
     quantized = convert_pt2e(prepared)
     quantized = torch.export.export(
-        quantized, tuple(v.cuda() for v in inputs), strict=False
+        quantized, tuple(v.to(args.device) for v in inputs), strict=False
     ).module()
     remove_export_checks(quantized)
     stabilized = stabilize_gdn_weight_scales(quantized)
@@ -311,20 +314,26 @@ def prepare_head(args, settings):
     )
     quantizer.set_recipe(Qwen3_5QuantRecipe().recipe)
     prepared = prepare_pt2e(graph, quantizer)
-    move_graph(prepared, "cuda")
+    move_graph(prepared, args.device)
     for sequence in [0, 1, 2, 4, 5, 6, 7]:
         for start in range(0, 1024, 128):
             prepared(
-                hidden[sequence : sequence + 1, start : start + 128].contiguous().cuda()
+                hidden[sequence : sequence + 1, start : start + 128]
+                .contiguous()
+                .to(args.device)
             )
     converted = convert_pt2e(prepared)
-    converted = torch.export.export(converted, (sample.cuda(),), strict=False).module()
+    converted = torch.export.export(
+        converted, (sample.to(args.device),), strict=False
+    ).module()
     remove_export_checks(converted)
     capture = HessianCapture(converted)
     for sequence in [0, 1, 2, 4, 5, 6, 7]:
         for start in range(0, 1024, 128):
             capture.run(
-                hidden[sequence : sequence + 1, start : start + 128].contiguous().cuda()
+                hidden[sequence : sequence + 1, start : start + 128]
+                .contiguous()
+                .to(args.device)
             )
     report = apply_gptq(
         converted, weights, capture, settings.quantization.matrix_gptq_damping
@@ -357,7 +366,9 @@ def main():
     parser.add_argument("--qnn-binding", type=Path)
     parser.add_argument("--first-layer", type=int, default=0)
     parser.add_argument("--last-layer", type=int, default=3)
+    parser.add_argument("--device", choices=("auto", "cpu", "cuda"), default="auto")
     args = parser.parse_args()
+    args.device = resolve_device(args.device)
     settings = load_model_config(args.model_config)
     if args.stage == "attention" and settings.quantization.attention != "gptq":
         parser.error("Use attention=gptq for raw attention calibration")
@@ -379,8 +390,9 @@ def main():
 
     torch.set_num_threads(4)
     torch.set_grad_enabled(False)
-    torch.backends.cuda.matmul.allow_tf32 = False
-    torch.backends.cudnn.allow_tf32 = False
+    if args.device == "cuda":
+        torch.backends.cuda.matmul.allow_tf32 = False
+        torch.backends.cudnn.allow_tf32 = False
     if args.stage == "data":
         prepare_data(args, settings)
     elif args.stage == "embedding-inputs":

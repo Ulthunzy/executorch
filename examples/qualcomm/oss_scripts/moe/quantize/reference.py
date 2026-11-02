@@ -9,6 +9,9 @@ import torch
 from safetensors import safe_open
 
 from executorch.backends.qualcomm.quantizer.metrics import log_quantization
+from executorch.examples.qualcomm.oss_scripts.moe.quantize.execution import (
+    reference_backend,
+)
 
 
 def reference_output(root, layer, dtype):
@@ -45,7 +48,11 @@ def prepare_reference(args, settings):
 
     dtype_name = settings.quantization.calibration_dtype
     dtype = {"bfloat16": torch.bfloat16, "float32": torch.float32}[dtype_name]
-    if dtype == torch.bfloat16 and not torch.cuda.is_bf16_supported():
+    if (
+        args.device == "cuda"
+        and dtype == torch.bfloat16
+        and not torch.cuda.is_bf16_supported()
+    ):
         raise RuntimeError("This GPU requires calibration_dtype=float32")
     config = Qwen3_5MoeTextConfig(
         **json.loads((args.model / "config.json").read_text())["text_config"]
@@ -56,16 +63,16 @@ def prepare_reference(args, settings):
         "weight_map"
     ]
     hidden = reference_inputs(args.output, args.first_layer, dtype_name).to(
-        device="cuda", dtype=dtype
+        device=args.device, dtype=dtype
     )
-    positions = torch.arange(hidden.shape[1], device="cuda")[None]
-    rotary = Qwen3_5MoeTextRotaryEmbedding(config, device="cuda")
+    positions = torch.arange(hidden.shape[1], device=args.device)[None]
+    rotary = Qwen3_5MoeTextRotaryEmbedding(config, device=args.device)
     position_embeddings = rotary(hidden[:1], positions)
     mask = torch.triu(
         torch.full(
             (hidden.shape[1], hidden.shape[1]),
             torch.finfo(dtype).min,
-            device="cuda",
+            device=args.device,
             dtype=dtype,
         ),
         diagonal=1,
@@ -74,8 +81,9 @@ def prepare_reference(args, settings):
     directory.mkdir(exist_ok=True)
     for layer in range(args.first_layer, args.last_layer + 1):
         started = time.monotonic()
-        torch.cuda.reset_peak_memory_stats()
-        with torch.device("meta"):
+        if args.device == "cuda":
+            torch.cuda.reset_peak_memory_stats()
+        with reference_backend(args.device), torch.device("meta"):
             model = Qwen3_5MoeDecoderLayer(config, layer)
         state = {}
         for name in model.state_dict():
@@ -84,7 +92,7 @@ def prepare_reference(args, settings):
                 state[name] = shard.get_tensor(key).to(dtype=dtype)
         model.load_state_dict(state, assign=True)
         del state
-        model = model.eval().to("cuda")
+        model = model.eval().to(args.device)
         norms, outputs = [], []
 
         def capture_norm(module, inputs):
@@ -132,9 +140,15 @@ def prepare_reference(args, settings):
             samples=len(hidden),
             tokens=hidden.shape[1],
             seconds=time.monotonic() - started,
-            cuda_peak_mib=torch.cuda.max_memory_allocated() / 2**20,
+            calibration_device=args.device,
+            cuda_peak_mib=(
+                torch.cuda.max_memory_allocated() / 2**20
+                if args.device == "cuda"
+                else None
+            ),
         )
         norms.clear()
         del model, outputs, output
         gc.collect()
-        torch.cuda.empty_cache()
+        if args.device == "cuda":
+            torch.cuda.empty_cache()

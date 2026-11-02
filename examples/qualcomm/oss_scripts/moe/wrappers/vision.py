@@ -10,6 +10,9 @@ from executorch.examples.qualcomm.oss_scripts.moe.model.qwen35 import (
     add_model_config_argument,
     load_model_config,
 )
+from executorch.examples.qualcomm.oss_scripts.moe.quantize.execution import (
+    resolve_device,
+)
 
 
 def main():
@@ -24,9 +27,12 @@ def main():
     data.add_argument("--calib-manifest", type=Path)
     parser.add_argument("--image-height", type=int, default=448)
     parser.add_argument("--image-width", type=int, default=448)
-    parser.add_argument("--calibration-device", choices=["cpu", "cuda"], default="cuda")
+    parser.add_argument(
+        "--calibration-device", choices=["auto", "cpu", "cuda"], default="auto"
+    )
     parser.add_argument("--qnn-binding", type=Path)
     args = parser.parse_args()
+    args.calibration_device = resolve_device(args.calibration_device)
     if args.calib_manifest:
         from executorch.examples.qualcomm.oss_scripts.moe.quantize.calibration_images import (
             dataset_images,

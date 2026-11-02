@@ -31,7 +31,7 @@
     "llama-output/qwen35-moe-from-safetensors-gptq-20261024/calibration/images/000000039769.jpg",
     "llama-output/qwen35-moe-from-safetensors-gptq-20261024/calibration/images/Statue-of-Liberty-Island-New-York-Bay.jpg"
   ],
-  "calibration_device": "cuda",
+  "calibration_device": "auto",
   "expert_batch": 8,
   "image_height": 448,
   "image_width": 448,

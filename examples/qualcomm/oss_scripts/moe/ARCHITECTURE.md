@@ -5,7 +5,7 @@
 `moe.py → cli.export_main → create_model(model_family) → ModelWrapper`。
 模型适配器提供配置及导出后端；公共 `ExportWorkflow` 负责阶段调度、校验、恢复与产物打包。`wrappers/` 定义图组件，`model/` 组合网络，`quantize/strategy.py` 定义量化参数，`quantize/gptq.py` 实现 GPTQ。GDN 图注册与参考计算从 `custom_op/deltanet_support` 引入。
 
-阶段通过显式依赖和经过校验的产物就绪通知调度。量化任务由一路 BF16 原模型激活生成、最多四路独立层权重量化及一路 CPU embedding 量化组成；GPTQ 数学仍保持原精度。原模型激活顺序推进，已就绪的层并行量化，量化验证输出不进入后续校准链。另一路 CPU 在组内所有 Attention/Router 就绪后编译 QNN。就绪通知通过本次运行专有的管道发布，避免复用残留文件；checkpoint 由调度进程加锁写入。Dense/MoE 的误差统计共用 `backends/qualcomm/quantizer/metrics.py`。
+阶段通过显式依赖和经过校验的产物就绪通知调度。CUDA 量化任务由一路 BF16 原模型激活生成、最多四路独立层权重量化及一路 CPU embedding 量化组成；GPTQ 数学仍保持原精度。原模型激活顺序推进，已就绪的层并行量化，量化验证输出不进入后续校准链。另一路 CPU 在组内所有 Attention/Router 就绪后编译 QNN。就绪通知通过本次运行专有的管道发布，避免复用残留文件；checkpoint 由调度进程加锁写入。Dense/MoE 的误差统计共用 `backends/qualcomm/quantizer/metrics.py`。 校准设备默认自动选择；无 CUDA 或显式选择 CPU 时，原模型校准和全部权重量化按层串行，禁用激活预备及后台 embedding。CPU 量化与 QNN 编译共用调度资源，避免同时运行；CPU 原模型前向使用现有 PyTorch GDN 参考实现。
 
 `run_chat.py → cli.run_main → MoeRuntime → ModelInference`。
 `inference/encoder.py` 准备视觉输入，`decoder.py` 启动设备对话；`artifacts.py` 与根目录 `package.py` 校验并读取同一个 PTE 容器。导出与设备部署都使用 `model_family` 选择适配器；未知模型报错。

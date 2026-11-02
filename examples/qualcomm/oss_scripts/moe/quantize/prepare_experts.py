@@ -9,6 +9,9 @@ from executorch.examples.qualcomm.oss_scripts.moe.model.qwen35 import (
     add_model_config_argument,
     load_model_config,
 )
+from executorch.examples.qualcomm.oss_scripts.moe.quantize.execution import (
+    resolve_device,
+)
 
 import numpy as np
 import torch
@@ -59,7 +62,9 @@ def main():
     parser.add_argument("--batch", type=int, choices=[1, 2, 4, 8, 16, 32], default=8)
     parser.add_argument("--joint-steps", type=int)
     parser.add_argument("--gptq-damping", type=float)
+    parser.add_argument("--device", choices=("auto", "cpu", "cuda"), default="auto")
     args = parser.parse_args()
+    args.device = resolve_device(args.device)
     settings = load_model_config(args.model_config)
     args.joint_steps = (
         settings.quantization.reconstruction_steps
@@ -109,9 +114,10 @@ def main():
     ROOT.mkdir(parents=True, exist_ok=True)
     torch.set_num_threads(4)
     torch.set_grad_enabled(False)
-    torch.backends.cuda.matmul.allow_tf32 = False
-    torch.backends.cudnn.allow_tf32 = False
-    levels = torch.tensor([-7.0, -2.0, 2.0, 7.0], device="cuda")
+    if args.device == "cuda":
+        torch.backends.cuda.matmul.allow_tf32 = False
+        torch.backends.cudnn.allow_tf32 = False
+    levels = torch.tensor([-7.0, -2.0, 2.0, 7.0], device=args.device)
     fit_sequences = [0, 1, 2, 4, 5, 6, 7]
     data = torch.load(args.inputs, weights_only=True, mmap=True)
     if tuple(data["calibration"].shape) != (8, 1024, 2048) or tuple(
@@ -125,12 +131,12 @@ def main():
         reference_output,
     )
 
-    cos = torch.from_numpy(
-        np.fromfile(LAYERS / "cos.f32", "<f4").reshape(-1, 32)
-    ).cuda()
-    sin = torch.from_numpy(
-        np.fromfile(LAYERS / "sin.f32", "<f4").reshape(-1, 32)
-    ).cuda()
+    cos = torch.from_numpy(np.fromfile(LAYERS / "cos.f32", "<f4").reshape(-1, 32)).to(
+        args.device
+    )
+    sin = torch.from_numpy(np.fromfile(LAYERS / "sin.f32", "<f4").reshape(-1, 32)).to(
+        args.device
+    )
 
     def pack(codes, scales):
         n, k = codes.shape
@@ -157,27 +163,27 @@ def main():
     def attention(layer, x):
         module = move_graph(
             torch.export.load(LAYERS / f"layer{layer}/front-qdq.pt2").module(),
-            "cuda",
+            args.device,
         )
         normalized, residual = torch.empty_like(x), torch.empty_like(x)
         for sequence in range(len(x)):
             if layer % 4 != 3:
-                first = torch.zeros(1, 8192, 4, device="cuda")
-                second = torch.zeros(1, 32, 128, 128, device="cuda")
+                first = torch.zeros(1, 8192, 4, device=args.device)
+                second = torch.zeros(1, 32, 128, 128, device=args.device)
             else:
-                first = torch.zeros(1, 2, 256, 896, device="cuda")
-                second = torch.zeros(1, 2, 896, 256, device="cuda")
+                first = torch.zeros(1, 2, 256, 896, device=args.device)
+                second = torch.zeros(1, 2, 896, 256, device=args.device)
             for start in range(0, 1024, 128):
                 inputs = x[sequence : sequence + 1, start : start + 128].contiguous()
                 if layer % 4 != 3:
                     result = module(inputs, first, second)
                     first, second = result[2:]
                 else:
-                    mask = torch.full((1, 1, 128, 1024), -255.0, device="cuda")
+                    mask = torch.full((1, 1, 128, 1024), -255.0, device=args.device)
                     if start:
                         mask[..., 896 - start : 896] = 0
                     mask[..., 896:] = torch.triu(
-                        torch.full((128, 128), -255.0, device="cuda"),
+                        torch.full((128, 128), -255.0, device=args.device),
                         diagonal=1,
                     )
                     result = module(
@@ -200,21 +206,21 @@ def main():
         count = len(selected)
         if count > maximum:
             selected = selected[
-                torch.linspace(0, count - 1, maximum, device="cuda").round().long()
+                torch.linspace(0, count - 1, maximum, device=args.device).round().long()
             ]
         global_rows = x[
-            torch.linspace(0, len(x) - 1, support, device="cuda").round().long()
+            torch.linspace(0, len(x) - 1, support, device=args.device).round().long()
         ]
         if not count:
             return (
                 global_rows,
-                torch.full((support,), 1 / support, device="cuda"),
+                torch.full((support,), 1 / support, device=args.device),
                 count,
             )
         weights = torch.cat(
             (
-                torch.full((len(selected),), 0.65 / len(selected), device="cuda"),
-                torch.full((support,), 0.35 / support, device="cuda"),
+                torch.full((len(selected),), 0.65 / len(selected), device=args.device),
+                torch.full((support,), 0.35 / support, device=args.device),
             )
         )
         return torch.cat((selected, global_rows)), weights, count
@@ -237,15 +243,15 @@ def main():
         started = time.monotonic()
         hidden = reference_inputs(
             ROOT, layer, settings.quantization.calibration_dtype
-        ).cuda()
+        ).to(args.device)
         original = reference_output(
             ROOT, layer, settings.quantization.calibration_dtype
         )
         if args.front_output:
             front = torch.load(args.front_output, weights_only=True, mmap=True)
             norm, residual = (
-                front["norm"].float().cuda(),
-                front["residual"].float().cuda(),
+                front["norm"].float().to(args.device),
+                front["residual"].float().to(args.device),
             )
         else:
             norm, residual = attention(layer, hidden)
@@ -257,9 +263,10 @@ def main():
         )
         constants = np.load(LAYERS / f"layer{layer}/moe-constants.npz")
         weights = {
-            k: torch.from_numpy(constants[k]).cuda().half() for k in constants.files
+            k: torch.from_numpy(constants[k]).to(args.device).half()
+            for k in constants.files
         }
-        calibration_norm = original["norm"].float().cuda()
+        calibration_norm = original["norm"].float().to(args.device)
         x = norm.reshape(-1, 2048)
         calibration_ids = (
             F.linear(calibration_norm.reshape(-1, 2048), weights["gate_weight"].float())
@@ -287,7 +294,7 @@ def main():
                 torch.export.load(
                     args.router_qdq / f"layer{layer}/router-ar128-qdq.pt2"
                 ).module(),
-                "cuda",
+                args.device,
             )
             remove_export_checks(router)
             ids, score, shared = router(norm)
@@ -308,21 +315,23 @@ def main():
         directory.mkdir(parents=True, exist_ok=True)
         offsets, lengths, details = [], [], []
         temporary = directory / "experts.n2.partial"
-        with safe_open(str(MODEL / MAPPING[names[0]]), framework="pt") as gf, safe_open(
-            str(MODEL / MAPPING[names[1]]), framework="pt"
-        ) as df, temporary.open("wb") as file:
+        with (
+            safe_open(str(MODEL / MAPPING[names[0]]), framework="pt") as gf,
+            safe_open(str(MODEL / MAPPING[names[1]]), framework="pt") as df,
+            temporary.open("wb") as file,
+        ):
             file.write(bytes(4096))
             for start in range(0, 256, args.batch):
                 experts = list(range(start, min(start + args.batch, 256)))
                 wgu = torch.stack(
                     [
-                        gf.get_slice(names[0])[e : e + 1][0].cuda().float()
+                        gf.get_slice(names[0])[e : e + 1][0].to(args.device).float()
                         for e in experts
                     ]
                 )
                 wd = torch.stack(
                     [
-                        df.get_slice(names[1])[e : e + 1][0].cuda().float()
+                        df.get_slice(names[1])[e : e + 1][0].to(args.device).float()
                         for e in experts
                     ]
                 )
@@ -345,14 +354,16 @@ def main():
                 val_target = (F.silu(vg) * vu).bmm(wd.transpose(1, 2))
                 actual_x = a8(cal, 1024)
                 weighted_x = actual_x * row_weights.sqrt()[:, :, None]
-                best = torch.full((len(experts),), float("inf"), device="cuda")
+                best = torch.full((len(experts),), float("inf"), device=args.device)
                 chosen = [
                     torch.empty_like(wgu, dtype=torch.int8),
                     torch.empty_like(wgu[:, :, :2]),
                     torch.empty_like(wd, dtype=torch.int8),
                     torch.empty_like(wd[:, :, :1]),
                 ]
-                method = torch.zeros(len(experts), dtype=torch.int64, device="cuda")
+                method = torch.zeros(
+                    len(experts), dtype=torch.int64, device=args.device
+                )
                 methods = (
                     [True] if settings.quantization.expert_gptq_only else [False, True]
                 )
@@ -409,7 +420,7 @@ def main():
                     validation_weights=torch.stack(
                         [
                             F.pad(
-                                torch.ones(len(v[0]), device="cuda"),
+                                torch.ones(len(v[0]), device=args.device),
                                 (0, val_width - len(v[0])),
                             )
                             for v in val_rows
@@ -478,7 +489,7 @@ def main():
                 file.read(4096) + np.asarray(lengths, dtype="<u8").tobytes()
             )
         hidden = residual + (routed + shared).reshape_as(residual)
-        reference = original["test"]["output"].float().cuda()
+        reference = original["test"]["output"].float().to(args.device)
         actual = hidden[8:9]
         normalized_gold = (
             reference / reference.square().mean(-1, keepdim=True).add(1e-6).sqrt()
@@ -520,7 +531,12 @@ def main():
             bytes=bank.stat().st_size,
             details=details,
             seconds=time.monotonic() - started,
-            cuda_peak_mib=torch.cuda.max_memory_allocated() / 2**20,
+            calibration_device=args.device,
+            cuda_peak_mib=(
+                torch.cuda.max_memory_allocated() / 2**20
+                if args.device == "cuda"
+                else None
+            ),
             expert_batch_size=args.batch,
         )
         checkpoint.parent.mkdir(exist_ok=True)
@@ -560,7 +576,8 @@ def main():
             original,
         )
         gc.collect()
-        torch.cuda.empty_cache()
+        if args.device == "cuda":
+            torch.cuda.empty_cache()
 
 
 if __name__ == "__main__":

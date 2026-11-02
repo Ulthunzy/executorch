@@ -66,10 +66,16 @@ def export_main(argv=None, *, default_model="qwen35"):
         parser.add_argument("--prefill_ar_len", "--prefill-ar-len", type=int)
         parser.add_argument("--cache-experts", "--cache_experts", type=int)
         parser.add_argument(
+            "--calibration-device",
+            "--calibration_device",
+            choices=("auto", "cpu", "cuda"),
+            help="Host calibration device (default: auto; CPU runs serially)",
+        )
+        parser.add_argument(
             "--quantization-layer-batch",
             type=int,
             choices=(1, 2, 3, 4),
-            help="Concurrent weight-quantization layers (default: 4)",
+            help="Concurrent GPU quantization layers (default: 4; CPU uses 1)",
         )
         parser.add_argument(
             "--calibration-dtype",
@@ -100,6 +106,7 @@ def export_main(argv=None, *, default_model="qwen35"):
             prefill_ar_len=args.prefill_ar_len,
             cache_experts=args.cache_experts,
             calib_image_dataset=args.calib_image_dataset,
+            calibration_device=args.calibration_device,
             quantization_layer_batch=args.quantization_layer_batch,
             calibration_dtype=args.calibration_dtype,
         )

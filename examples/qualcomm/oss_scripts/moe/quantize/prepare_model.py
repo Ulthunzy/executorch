@@ -20,6 +20,9 @@ from executorch.examples.qualcomm.oss_scripts.moe.model.qwen35 import (
     add_model_config_argument,
     load_model_config,
 )
+from executorch.examples.qualcomm.oss_scripts.moe.quantize.execution import (
+    resolve_device,
+)
 from executorch.examples.qualcomm.oss_scripts.moe.quantize.provenance import (
     checkpoint_identity,
     validate_checkpoint_source,
@@ -54,7 +57,16 @@ def main(argv=None):
         "--expert-batch", type=int, choices=[1, 2, 4, 8, 16, 32], default=8
     )
     parser.add_argument("--layer-batch", type=int, choices=range(1, 5), default=4)
+    parser.add_argument("--device", choices=("auto", "cpu", "cuda"), default="auto")
     args = parser.parse_args(argv)
+    args.device = resolve_device(args.device)
+    if args.device == "cpu":
+        args.layer_batch = 1
+    print(
+        "QUANTIZATION_EXECUTION",
+        json.dumps(dict(device=args.device, layer_batch=args.layer_batch)),
+        flush=True,
+    )
     settings = load_model_config(args.model_config)
     if not 0 <= args.last_layer < 40:
         parser.error("Choose last layer 0..39")
@@ -86,6 +98,7 @@ def main(argv=None):
             *ROOT.joinpath("quantize").glob("prepare*.py"),
             ROOT / "quantize/gptq.py",
             ROOT / "quantize/reference.py",
+            ROOT / "quantize/execution.py",
             *ROOT.parent.joinpath("llama/model").glob("*.py"),
             *ROOT.parent.joinpath("llama/quantize").glob("*.py"),
             ROOT.parent / "llama/static_llm_quant_recipe.py",
@@ -113,6 +126,7 @@ def main(argv=None):
         corpus_sha256=hashlib.sha256(args.corpus.read_bytes()).hexdigest(),
         checkpoint=checkpoint_identity(args.model),
         qnn_binding=input_stamp(args.qnn_binding) if args.qnn_binding else None,
+        calibration_device=args.device,
         code_sha256=hashlib.sha256(
             b"".join(str(p).encode() + p.read_bytes() for p in sources if p.is_file())
         ).hexdigest(),
@@ -145,6 +159,8 @@ def prepare(args, settings, cache):
         str(args.model),
         "--output",
         str(args.output),
+        "--device",
+        args.device,
     ]
     binding = ["--qnn-binding", str(args.qnn_binding)] if args.qnn_binding else []
     commands = (
@@ -347,6 +363,8 @@ def prepare(args, settings, cache):
                 args.output / "router",
                 "--layers",
                 layer,
+                "--device",
+                args.device,
                 *binding,
             ],
             tuple(
@@ -390,14 +408,21 @@ def prepare(args, settings, cache):
             force=force,
         )
 
-    # One lookahead window bounds activation generation while four layers quantize.
-    pool = ThreadPoolExecutor(max_workers=args.layer_batch)
-    embedding_pool = ThreadPoolExecutor(max_workers=1)
+    # CPU execution has no lookahead or background embedding work.
+    pool = (
+        ThreadPoolExecutor(max_workers=args.layer_batch)
+        if args.device == "cuda"
+        else None
+    )
+    embedding_pool = ThreadPoolExecutor(max_workers=1) if pool is not None else None
     pending = []
     embedding_future = None
 
     try:
-        embedding_future = embedding_pool.submit(prepare_embedding)
+        if embedding_pool is not None:
+            embedding_future = embedding_pool.submit(prepare_embedding)
+        else:
+            prepare_embedding()
         reference_dirty = not data_reused
         for first in range(0, args.last_layer + 1, args.layer_batch):
             while len(pending) > args.layer_batch:
@@ -428,20 +453,23 @@ def prepare(args, settings, cache):
             )
             reference_dirty = reference_dirty or not reused
             for layer in range(first, last + 1):
-                pending.append(pool.submit(prepare_layer, layer, reference_dirty))
+                if pool is not None:
+                    pending.append(pool.submit(prepare_layer, layer, reference_dirty))
+                else:
+                    prepare_layer(layer, reference_dirty)
         if args.last_layer == 39:
-            pending.append(
-                pool.submit(
-                    run,
-                    "head",
-                    prefix + [raw, *common, *binding, "--stage", "head"],
-                    ("head/GPTQ.json", "head/head-qdq.pt2"),
-                    force=reference_dirty,
+            command = prefix + [raw, *common, *binding, "--stage", "head"]
+            outputs = ("head/GPTQ.json", "head/head-qdq.pt2")
+            if pool is not None:
+                pending.append(
+                    pool.submit(run, "head", command, outputs, force=reference_dirty)
                 )
-            )
+            else:
+                run("head", command, outputs, force=reference_dirty)
         for future in pending:
             future.result()
-        embedding_future.result()
+        if embedding_future is not None:
+            embedding_future.result()
     except BaseException as error:
         abort(error)
         for future in pending:
@@ -450,8 +478,10 @@ def prepare(args, settings, cache):
             embedding_future.cancel()
         raise failure[0]
     finally:
-        pool.shutdown(wait=True, cancel_futures=True)
-        embedding_pool.shutdown(wait=True, cancel_futures=True)
+        if pool is not None:
+            pool.shutdown(wait=True, cancel_futures=True)
+        if embedding_pool is not None:
+            embedding_pool.shutdown(wait=True, cancel_futures=True)
 
     if args.last_layer == 39:
         import numpy as np

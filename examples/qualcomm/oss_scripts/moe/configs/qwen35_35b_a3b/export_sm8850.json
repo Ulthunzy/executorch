@@ -31,7 +31,7 @@
     "test.jpg",
     "docs/source/_static/img/demo_ios_xcode.jpg"
   ],
-  "calibration_device": "cuda",
+  "calibration_device": "auto",
   "expert_batch": 8,
   "image_height": 448,
   "image_width": 448,

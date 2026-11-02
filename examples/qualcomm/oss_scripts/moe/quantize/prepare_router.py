@@ -12,6 +12,9 @@ from executorch.examples.qualcomm.oss_scripts.moe.model.qwen35 import (
     add_model_config_argument,
     load_model_config,
 )
+from executorch.examples.qualcomm.oss_scripts.moe.quantize.execution import (
+    resolve_device,
+)
 
 
 def attention_inputs(args, layer):
@@ -110,8 +113,9 @@ def prepare_layer(args, layer):
 
     torch.set_grad_enabled(False)
     torch.set_num_threads(4)
-    torch.backends.cuda.matmul.allow_tf32 = False
-    torch.backends.cudnn.allow_tf32 = False
+    if args.device == "cuda":
+        torch.backends.cuda.matmul.allow_tf32 = False
+        torch.backends.cudnn.allow_tf32 = False
     directory = args.output / f"layer{layer}"
     directory.mkdir(parents=True, exist_ok=True)
     norm = attention_inputs(args, layer)
@@ -297,10 +301,11 @@ def main():
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--qnn-binding", type=Path)
     parser.add_argument("--layers", type=int, nargs="+", default=list(range(40)))
-    parser.add_argument("--device", choices=["cuda", "cpu"], default="cuda")
+    parser.add_argument("--device", choices=("auto", "cuda", "cpu"), default="auto")
     parser.add_argument("--damping", type=float)
     parser.add_argument("--worker", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args()
+    args.device = resolve_device(args.device)
     settings = load_model_config(args.model_config)
     if settings.quantization.router_shared != "w8a16_gptq":
         parser.error(

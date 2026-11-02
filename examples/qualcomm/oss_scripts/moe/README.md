@@ -76,11 +76,13 @@ python examples/qualcomm/oss_scripts/moe/moe.py \
 
 视觉编码器默认用 [COCO128](https://github.com/ultralytics/ultralytics/blob/main/ultralytics/cfg/datasets/coco128.yaml) 的全部 128 张图片。`--calib-image-dataset coco8` 改用 [COCO8](https://github.com/ultralytics/ultralytics/blob/main/ultralytics/cfg/datasets/coco8.yaml) 的全部 8 张图片作快速试跑。`vision-data` 阶段从官方发布地址准备数据，下载包和图片通过 SHA256 校验，缓存于 `llama-output/.calibration-datasets/`；有效缓存不会重复下载，校准源和图片列表写入 `VISION.json`。无需安装 Ultralytics。`--image_path` 仍可指定自己的校准图片，与内置数据集选项互斥。文本 GPTQ 使用 `--corpus`，未指定时采用对应 SoC 配方中的语料。
 
-原 `--config examples/qualcomm/oss_scripts/moe/configs/qwen35_35b_a3b/export_sm8850.json --output <directory>` 方式仍受支持；显式配置保留原路径约定，命令行参数可覆盖。`--print-plan` 只查看导出阶段且不会下载数据，`--check` 检查前置条件。实际执行包含数据准备、构建、CUDA GPTQ、文本/视觉图导出、权重捕获与 PTE 打包，中断后重复原命令续跑。`quantize` 日志中的 `QUANTIZATION_REUSED` 表示已直接复用完整量化模型。输出目录内的 `MODEL_CONFIG.json` 是各阶段共用的生效配方。
+原 `--config examples/qualcomm/oss_scripts/moe/configs/qwen35_35b_a3b/export_sm8850.json --output <directory>` 方式仍受支持；显式配置保留原路径约定，命令行参数可覆盖。`--print-plan` 只查看导出阶段且不会下载数据，`--check` 检查前置条件。实际执行包含数据准备、构建、GPTQ、文本/视觉图导出、权重捕获与 PTE 打包，中断后重复原命令续跑。`quantize` 日志中的 `QUANTIZATION_REUSED` 表示已直接复用完整量化模型。输出目录内的 `MODEL_CONFIG.json` 是各阶段共用的生效配方。
 
-从 safetensors 导出时，先用原模型 BF16 前向生成每四层的校准激活，然后四层同时量化 Attention、Router/shared 和专家权重；下一组的输入始终取上一组最后一层的原模型输出。原模型前向顺序推进，权重量化不等待前层量化结束，也不把前层量化后的输出作为下一层校准输入。默认 `--quantization-layer-batch 4`，显存紧张时可设为 1～3；`--calibration-dtype float32` 可切换原模型校准精度。数值配方中的 `quantization.calibration_dtype` 默认为 `bfloat16`；精度和校准方法进入缓存身份，旧版顺序量化缓存不会被当作新配方复用。BF16 用于生成原模型激活，GPTQ 的 Hessian、重建和误差计算仍使用原来的浮点精度。
+CUDA 路径从 safetensors 导出时，先用原模型 BF16 前向生成每四层的校准激活，然后四层同时量化 Attention、Router/shared 和专家权重；下一组的输入始终取上一组最后一层的原模型输出。原模型前向顺序推进，权重量化不等待前层量化结束，也不把前层量化后的输出作为下一层校准输入。默认 `--quantization-layer-batch 4`，显存紧张时可设为 1～3；`--calibration-dtype float32` 可切换原模型校准精度。数值配方中的 `quantization.calibration_dtype` 默认为 `bfloat16`；精度和校准方法进入缓存身份，旧版顺序量化缓存不会被当作新配方复用。BF16 用于生成原模型激活，GPTQ 的 Hessian、重建和误差计算仍使用原来的浮点精度。
 
-CPU 的 embedding 量化与 GPU 校准并行；原模型前向最多预备下一组，四层权重量化各自在子进程中运行，完成后释放 CUDA 资源。QNN 仍由一路 CPU 编译；每组四层的 Attention/Router QDQ 都校验通过后立即编译该组，无需等待所有专家量化结束。组内完成顺序可以不同，不能仅凭最后一层就绪就开始编译。`--print-plan` 显示 `requires`、`publishes` 和 `resource`。任一阶段失败会取消在途任务，成功标记只在产物完整校验后写入。
+CUDA 路径下，CPU 的 embedding 量化与 GPU 校准并行；原模型前向最多预备下一组，四层权重量化各自在子进程中运行，完成后释放 CUDA 资源。QNN 仍由一路 CPU 编译；每组四层的 Attention/Router QDQ 都校验通过后立即编译该组，无需等待所有专家量化结束。组内完成顺序可以不同，不能仅凭最后一层就绪就开始编译。`--print-plan` 显示 `requires`、`publishes` 和 `resource`。任一阶段失败会取消在途任务，成功标记只在产物完整校验后写入。
+
+校准设备默认 `auto`：有可用 CUDA 时沿用上述并发流程，否则自动使用 CPU。CPU 路径将 `--quantization-layer-batch` 固定为 1，按层串行执行原模型校准、Attention、Router/shared 和专家量化，embedding 不后台并发，也不预备下一组激活；QNN 编译与 CPU 量化使用同一调度资源，串行执行。文本和视觉校准均支持 CPU。可用 `--calibration-device cpu`（或 `--calibration_device cpu`）显式选择 CPU；显式选择 `cuda` 但 CUDA 不可用时给出错误。CPU 校准同样遵循配方中的 BF16/FP32 设置，使用现有 PyTorch GDN 参考实现，不依赖 CUDA 扩展。
 
 完整 `model.pte` 的导出顺序为：主机量化与 QNN 编译 → 视觉导出 → 设备 SDK 部署 → 共享权重分离 → PTE 打包。主机量化和编译不连接 ADB；`runtime` 与 `separate-groupN` 阶段才需要配置的 SM8850 设备在线。权重分离通过 QNN context 恢复回调获取权重范围，不调用对话 Runner，也不执行生成推理。`--print-plan` 的 `needs_device` 标明直接使用设备的阶段；`--check` 只检查静态输入和工具路径。设备阶段失败后重跑原命令可复用此前已校验的主机产物。
 

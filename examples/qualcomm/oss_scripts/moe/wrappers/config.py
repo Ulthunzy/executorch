@@ -86,6 +86,7 @@ def load_export_config(
     prefill_ar_len=None,
     cache_experts=None,
     calib_image_dataset=None,
+    calibration_device=None,
     quantization_layer_batch=None,
     calibration_dtype=None,
 ):
@@ -291,22 +292,29 @@ def load_export_config(
         raise ValueError(
             "Typed FP16 state requires calibrated weights, chunked prefill and DDR state"
         )
-    calibration_device = data.get("calibration_device", "cuda")
-    if calibration_device not in ("cuda", "cpu"):
-        raise ValueError("calibration_device must be cuda or cpu")
+    from executorch.examples.qualcomm.oss_scripts.moe.quantize.execution import (
+        resolve_device,
+    )
+
+    calibration_device = resolve_device(
+        calibration_device
+        if calibration_device is not None
+        else data.get("calibration_device", "auto")
+    )
+    if calibration_device == "cpu":
+        layer_batch = 1
     if (
         source == "safetensors"
         and "text" in components
         and (
-            calibration_device != "cuda"
-            or settings.quantization.attention != "gptq"
+            settings.quantization.attention != "gptq"
             or not settings.quantization.expert_gptq_only
             or settings.quantization.embedding != "int4_g32"
             or settings.quantization.router_shared != "w8a16_gptq"
         )
     ):
         raise ValueError(
-            "Raw text preparation requires CUDA, all-GPTQ weights and INT4 embedding"
+            "Raw text preparation requires all-GPTQ weights and INT4 embedding"
         )
     if "text" in components and settings.schedule.context_load_mode == "serial":
         raise ValueError("Shared text contexts require auto/async context loading")
