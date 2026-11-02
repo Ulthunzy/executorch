@@ -17,6 +17,7 @@ PrefillSession::PrefillSession(const std::string& path, int plan_tokens)
   if (plan_tokens < 128 || plan_tokens > 1024 || plan_tokens % 128)
     throw std::runtime_error("invalid prefill plan length");
   sequence_tokens = plan_tokens;
+  workspace_tokens = plan_tokens;
   sequence_valid_tokens = getenv("PREFILL_VALID_TOKENS")
       ? atoi(getenv("PREFILL_VALID_TOKENS"))
       : plan_tokens;
@@ -242,6 +243,7 @@ void PrefillSession::reset() {
   active_group = -1;
   next_layer = 0;
   chunk_start = 0;
+  sequence_start = 0;
   for (auto& a : attention)
     a->reset();
   // Startup seeds belong only to the first request; independent samples reset
@@ -375,18 +377,19 @@ void PrefillSession::attend(
     copy_compute_spans.emplace_back(t, done);
   // Let the preceding layer's final LRU copy run through this first QNN call
   // before the shared memo is reused for the new layer.
-  if (chunk_start == 0)
+  const int offset = chunk_start - sequence_start;
+  if (offset == 0)
     prepare_layer_memo(layer);
   if (layer_memo) {
-    if (chunk_start == 0)
+    if (offset == 0)
       staged_router_layer = -1;
     execute_route(
         layer,
         norm,
-        staged_ids.data() + chunk_start * 8,
-        staged_scores.data() + chunk_start * 8,
-        staged_shared.data() + chunk_start * 2048);
-    if (chunk_start + 128 == sequence_tokens)
+        staged_ids.data() + offset * 8,
+        staged_scores.data() + offset * 8,
+        staged_shared.data() + offset * 2048);
+    if (offset + 128 == sequence_tokens)
       staged_router_layer = layer;
   }
 }
@@ -404,9 +407,10 @@ void PrefillSession::route(
   if (layer != next_layer || staged_router_layer != layer)
     throw std::runtime_error("prefill router handoff order");
   const auto started = Clock::now();
-  memcpy(ids, staged_ids.data() + chunk_start * 8, 128 * 8 * 4);
-  memcpy(scores, staged_scores.data() + chunk_start * 8, 128 * 8 * 4);
-  memcpy(shared, staged_shared.data() + chunk_start * 2048, 128 * 2048 * 4);
+  const int offset = chunk_start - sequence_start;
+  memcpy(ids, staged_ids.data() + offset * 8, 128 * 8 * 4);
+  memcpy(scores, staged_scores.data() + offset * 8, 128 * 8 * 4);
+  memcpy(shared, staged_shared.data() + offset * 2048, 128 * 2048 * 4);
   metrics.router += elapsed(started);
 }
 
@@ -431,14 +435,15 @@ void PrefillSession::execute_route(
     copy_compute_spans.emplace_back(t, Clock::now());
   if (!route_reads.empty())
     route_io_spans.emplace_back(t, Clock::now());
-  if (layer_memo && chunk_start == 0)
+  if (layer_memo && chunk_start == sequence_start)
     finish_memo_copy();
   if (layer_memo)
     prefetch_route(layer, ids);
 }
 
 void PrefillSession::prefetch_route(int layer, const int32_t* ids) {
-  if (chunk_start == 0) {
+  const int chunk_offset = chunk_start - sequence_start;
+  if (chunk_offset == 0) {
     if (!route_reads.empty())
       throw std::runtime_error("unconsumed route prefetch");
     // Keep the allocation stable while workers consume records already
@@ -460,7 +465,7 @@ void PrefillSession::prefetch_route(int layer, const int32_t* ids) {
       seen[expert] = true;
       if (route_first_use[expert] >= 0)
         continue;
-      route_first_use[expert] = (chunk_start + token) * 8 + rank;
+      route_first_use[expert] = (chunk_offset + token) * 8 + rank;
       if (memo_valid[expert])
         continue;
       auto& request = route_reads[route_read_ids.size()];
@@ -480,11 +485,11 @@ void PrefillSession::prefetch_route(int layer, const int32_t* ids) {
       route_read_ids.push_back(expert);
     }
   }
-  if (chunk_start == 0)
+  if (chunk_offset == 0)
     readers->start(route_reads.data(), route_read_ids.size(), true);
   else
     readers->extend(route_read_ids.size());
-  if (chunk_start + 128 == sequence_tokens)
+  if (chunk_offset + 128 == sequence_tokens)
     readers->seal();
 }
 
@@ -798,7 +803,8 @@ void PrefillSession::experts(
     }
     for (int expert : selected)
       memo_valid[expert] = true;
-    if (!route_reads.empty() && chunk_start + tokens == sequence_tokens) {
+    if (!route_reads.empty() &&
+        chunk_start - sequence_start + tokens == sequence_tokens) {
       auto waited = Clock::now();
       try {
         readers->finish();
@@ -1027,7 +1033,7 @@ void PrefillSession::experts(
       if (std::find(retained.begin(), retained.end(), e) == retained.end())
         *std::find(retained.begin(), retained.end(), -1) = e;
     const bool flush_payloads =
-        !layer_memo || chunk_start + 128 == sequence_tokens;
+        !layer_memo || chunk_start - sequence_start + 128 == sequence_tokens;
     for (int slot = 0; slot < capacity; slot++) {
       const int expert = retained[slot];
       cache.entries[slot] = {expert, expert < 0 ? 0 : stamp_of(expert), false};

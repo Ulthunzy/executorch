@@ -47,10 +47,13 @@ DecodeSession::DecodeSession(const std::string& path, size_t cache_mib)
     throw std::runtime_error("temporal route seed");
   const auto* prior = reinterpret_cast<const int32_t*>(history.data());
   for (int layer = 0; layer < 40; layer++)
-    std::copy(
+    if (prefix_tokens > 0)
+      std::copy(
         prior + layer * 128 * 8 + ((prefix_tokens - 1) % 128) * 8,
         prior + layer * 128 * 8 + (((prefix_tokens - 1) % 128) + 1) * 8,
         previous_routes[layer].begin());
+    else
+      previous_routes[layer].fill(-1);
   if (async_io) {
     const auto profile = bytes(root + "/prediction-profile.f32");
     if (profile.size() != 40 * 16 * 9 * 4)

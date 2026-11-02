@@ -17,6 +17,7 @@
 #include <cstdlib>
 #include <set>
 #include <functional>
+#include <executorch/extension/module/module.h>
 
 #include "attention.h"
 #include "shared_io.h"
@@ -47,6 +48,8 @@ struct Metrics {
 // 完整 40 层 AR128 调度；多块计划逐层处理整段输入，复用当前层的临时权重。
 // Runtime 声明在资源对象之前，使其最后析构，覆盖所有 QNN/RPC 资源的生命周期。
 struct PrefillSession {
+  executorch::extension::Module* initial_module = nullptr;
+  bool initial_attempted = false;
   std::string root;
   Runtime runtime{Runtime::Phase::Prefill, resolve_model_graph};
   NativeCore core;
@@ -82,8 +85,8 @@ struct PrefillSession {
       ? getenv("STARTUP_EXPERT_PREFETCH")
       : "none";
   bool startup_seed_pending = false;
-  int sequence_tokens = 128, valid_tokens = 128, sequence_valid_tokens = 128,
-      memo_layer = -1;
+  int sequence_tokens = 128, workspace_tokens = 128, sequence_start = 0,
+      valid_tokens = 128, sequence_valid_tokens = 128, memo_layer = -1;
   std::shared_ptr<Buffer> layer_memo;
   std::array<bool, 256> memo_valid{};
   std::array<int, 64> memo_slot_ids{};
@@ -130,6 +133,13 @@ struct PrefillSession {
       Qwen35SessionState& state,
       float* logits,
       const std::function<bool()>& stopped);
+
+  void initial_prefill(
+      const int64_t* tokens, size_t count, const float* features,
+      size_t feature_count, const float* cos, const float* sin,
+      size_t table_count, Qwen35SessionState& state, float* logits,
+      const std::function<bool()>& stopped);
+  void export_append_state(Qwen35SessionState& state, int begin, size_t count);
 
   void reset();
 

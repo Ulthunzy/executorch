@@ -1,42 +1,25 @@
 #include "prefill/prefill_session.h"
 #include "qnn/qnn_cache.h"
+#include <executorch/extension/module/module.h>
+#include <executorch/extension/tensor/tensor_ptr.h>
 
 void PrefillSession::prepare_decode() {
   finish_memo_copy();
   if (!route_reads.empty())
     throw std::runtime_error("unfinished prefill reads at decode handoff");
-  if (sequence_tokens > 128) {
-    core.release_io();
-    check(et_prefill_rpc_configure(core.handle, 128), "configure chat AR128");
-    core.inbuf[0] = shared_io->hidden;
-    core.inbuf[1] = shared_io->ids;
-    core.inbuf[2] = shared_io->scores;
-    core.inbuf[3] = shared_io->shared;
-    core.outbuf[0] = attention[0]->hidden_alias;
-    core.residual = shared_io->residual;
-    layer_memo.reset();
-    for (auto& buffer : expert_slots)
-      core.map_buffer(buffer);
-    for (int i = 0; i < 4; ++i)
-      core.map_buffer(core.inbuf[i]);
-    core.map_buffer(core.outbuf[0]);
-    core.map_buffer(core.residual);
-    if (async_io && pipeline_banks.empty())
-      for (int i = 0; i < 2; ++i) {
-        pipeline_banks.push_back(
-            std::make_shared<Buffer>(runtime, 4096 + capacity * stride, false));
-        core.map_buffer(pipeline_banks.back());
-      }
-  }
+  core.end_output_read();
+  // DSP mappings fix each fd's length. Retain grouped IO in io_mappings and
+  // reuse the AR128 buffers already registered with QNN for subsequent turns.
+  core.inbuf[0] = shared_io->hidden;
+  core.inbuf[1] = shared_io->ids;
+  core.inbuf[2] = shared_io->scores;
+  core.inbuf[3] = shared_io->shared;
+  core.outbuf[0] = attention[0]->hidden_alias;
+  core.residual = shared_io->residual;
   sequence_tokens = 128;
+  sequence_start = 0;
   memo_layer = -1;
   staged_router_layer = -1;
-  std::vector<int32_t>().swap(sequence_routes);
-  std::vector<int32_t>().swap(sequence_seeds);
-  std::vector<uint64_t>().swap(sequence_stamps);
-  std::vector<int32_t>().swap(staged_ids);
-  std::vector<float>().swap(staged_scores);
-  std::vector<float>().swap(staged_shared);
 }
 
 void PrefillSession::append(
@@ -51,10 +34,15 @@ void PrefillSession::append(
     float* logits,
     const std::function<bool()>& stopped) {
   const auto append_started = Clock::now();
+  if (initial_module) {
+    initial_prefill(tokens, count, features, feature_count, rotary_cos,
+                    rotary_sin, table_count, state, logits, stopped);
+    return;
+  }
   if (!tokens || !count || !logits || count > size_t(state.capacity) ||
       state.position < 0 || state.position + count >= size_t(state.capacity) ||
       state.capacity != logical_capacity || state.slots != capacity ||
-      sequence_tokens != 128 || layer_memo || !core.handle ||
+      sequence_tokens != 128 || !core.handle ||
       feature_count % 2048 || (feature_count && !features))
     throw std::runtime_error("invalid resident AR128 prefill request");
   if (attention[3]->history < state.position ||
@@ -115,6 +103,8 @@ void PrefillSession::append(
     const auto started = Clock::now();
     valid_tokens = std::min(size_t(128), count - offset);
     chunk_start = begin + offset;
+    sequence_start = chunk_start;
+    sequence_valid_tokens = valid_tokens;
     std::copy(tokens + offset, tokens + offset + valid_tokens, padded.begin());
     float* chain = static_cast<float*>(attention[0]->hidden_alias->data);
     embed(padded.data(), chain);
@@ -145,6 +135,70 @@ void PrefillSession::append(
   }
   if (image_cursor != image_features.size())
     throw std::runtime_error("unconsumed prefill image features");
+  export_append_state(state, begin, count);
+  printf(
+      "CHAT_PREFILL tokens=%zu blocks=%zu tail_valid=%d total_ms=%.6f blocks_ms=%.6f ar1_calls=0\n",
+      count,
+      (count + 127) / 128,
+      valid_tokens,
+      elapsed(append_started),
+      total_ms);
+}
+
+void PrefillSession::initial_prefill(
+    const int64_t* tokens, size_t count, const float* features,
+    size_t feature_count, const float* rotary_cos, const float* rotary_sin,
+    size_t table_count, Qwen35SessionState& state, float* logits,
+    const std::function<bool()>& stopped) {
+  if (!tokens || !count || !logits || state.position != 0 ||
+      count >= size_t(state.capacity) || state.capacity != logical_capacity ||
+      state.slots != capacity || feature_count % 2048 ||
+      (feature_count && !features) || !rotary_cos || !rotary_sin ||
+      table_count * sizeof(float) != cos.size() || cos.size() != sin.size())
+    throw std::runtime_error("invalid first resident prefill request");
+  if (stopped && stopped())
+    throw std::runtime_error("prefill interrupted; reset required");
+  const auto started = Clock::now();
+  const size_t first_count = std::min(count, size_t(workspace_tokens));
+  const int plan_tokens = int((first_count + 127) / 128 * 128);
+  if (initial_attempted)
+    reset();
+  initial_attempted = true;
+  sequence_tokens = plan_tokens;
+  sequence_start = 0;
+  sequence_valid_tokens = first_count;
+  memcpy(cos.data(), rotary_cos, cos.size());
+  memcpy(sin.data(), rotary_sin, sin.size());
+  image_features.clear();
+  if (feature_count)
+    image_features.assign(features, features + feature_count);
+  std::vector<int64_t> padded(tokens, tokens + first_count);
+  padded.resize(plan_tokens, 248044);
+  auto input = executorch::extension::make_tensor_ptr(
+      {1, plan_tokens}, padded.data(), executorch::aten::ScalarType::Long);
+  auto result = initial_module->execute(
+      "prefill_forward", std::vector<executorch::runtime::EValue>{*input});
+  if (!result.ok())
+    throw std::runtime_error("First prefill PTE execution failed");
+  memcpy(logits, result->at(0).toTensor().const_data_ptr<float>(), 248320 * sizeof(float));
+  export_append_state(state, 0, first_count);
+  const size_t consumed_features = image_cursor;
+  initial_module = nullptr;
+  prepare_decode();
+  if (count > first_count) {
+    append(tokens + first_count, count - first_count,
+           features ? features + consumed_features : nullptr,
+           feature_count - consumed_features, rotary_cos, rotary_sin,
+           table_count, state, logits, stopped);
+  } else if (consumed_features != feature_count) {
+    throw std::runtime_error("unconsumed first prefill image features");
+  }
+  printf("CHAT_INITIAL_PREFILL tokens=%zu plan_tokens=%d total_ms=%.6f model_load=0\n",
+         count, plan_tokens, elapsed(started));
+}
+
+void PrefillSession::export_append_state(
+    Qwen35SessionState& state, int begin, size_t count) {
   // Only new KV crosses back: historical decode codes retain their original
   // grid and never undergo an additional round trip through prefill encoding.
   for (int layer = 0; layer < 40; ++layer) {
@@ -190,11 +244,4 @@ void PrefillSession::append(
         state.layer[layer].routes);
   }
   state.position = begin + count;
-  printf(
-      "CHAT_PREFILL tokens=%zu blocks=%zu tail_valid=%d total_ms=%.6f blocks_ms=%.6f ar1_calls=0\n",
-      count,
-      (count + 127) / 128,
-      valid_tokens,
-      elapsed(append_started),
-      total_ms);
 }

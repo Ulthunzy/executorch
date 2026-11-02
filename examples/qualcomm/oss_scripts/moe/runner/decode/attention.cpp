@@ -44,14 +44,15 @@ Attention::Attention(
       initial[c].resize(source.elements);
     } else {
       if (!source_window || source.elements % 512 ||
-          state_elements[c] != 512 * size_t(history) || initial_tokens < 1 ||
+          state_elements[c] != 512 * size_t(history) || initial_tokens < 0 ||
           initial_tokens > source_window || initial_tokens > history)
         throw std::runtime_error("KV cache layout or prefix length");
       // Store only real prefix tokens; unused decode capacity is quantized
       // zero.
       initial[c].resize(512 * size_t(initial_tokens));
     }
-    copy_cache_range(
+    if (linear || initial_tokens)
+      copy_cache_range(
         {reinterpret_cast<uint16_t*>(old.data()),
          source.elements,
          source.scale,
@@ -85,7 +86,8 @@ void Attention::reset() {
   for (int c = 0; c < 2; ++c) {
     auto destination = cache_view(c);
     clear_cache(destination);
-    copy_cache_range(
+    if (linear || initial_tokens)
+      copy_cache_range(
         {initial[c].data(),
          initial[c].size(),
          destination.scale,
