@@ -82,7 +82,9 @@ CUDA 路径从 safetensors 导出时，先用原模型 BF16 前向生成每四�
 
 CUDA 路径下，CPU 的 embedding 量化与 GPU 校准并行；原模型前向最多预备下一组，四层权重量化各自在子进程中运行，完成后释放 CUDA 资源。QNN 仍由一路 CPU 编译；每组四层的 Attention/Router QDQ 都校验通过后立即编译该组，无需等待所有专家量化结束。组内完成顺序可以不同，不能仅凭最后一层就绪就开始编译。`--print-plan` 显示 `requires`、`publishes` 和 `resource`。任一阶段失败会取消在途任务，成功标记只在产物完整校验后写入。
 
-校准设备默认 `auto`：有可用 CUDA 时沿用上述并发流程，否则自动使用 CPU。CPU 路径将 `--quantization-layer-batch` 固定为 1，按层串行执行原模型校准、Attention、Router/shared 和专家量化，embedding 不后台并发，也不预备下一组激活；QNN 编译与 CPU 量化使用同一调度资源，串行执行。文本和视觉校准均支持 CPU。可用 `--calibration-device cpu`（或 `--calibration_device cpu`）显式选择 CPU；显式选择 `cuda` 但 CUDA 不可用时给出错误。CPU 校准同样遵循配方中的 BF16/FP32 设置，使用现有 PyTorch GDN 参考实现，不依赖 CUDA 扩展。
+校准设备默认 `auto`：有可用 CUDA 时沿用上述并发流程，否则自动使用 CPU。CPU 路径将 `--quantization-layer-batch` 固定为 1，按层串行执行原模型校准、Attention、Router/shared 和专家量化，embedding 不后台并发，也不预备下一组激活；QNN 编译与 CPU 量化使用同一调度资源，串行执行。文本和视觉校准均支持 CPU。可用 `--calibration-device cpu`（或 `--calibration_device cpu`）显式选择 CPU；显式选择 `cuda` 但 CUDA 不可用时给出错误。CPU 文本原模型前向同样遵循配方中的 BF16/FP32 设置，使用现有 PyTorch GDN 参考实现，不依赖 CUDA 扩展。
+
+设备端 teacher-forced 结果使用 `quantize/evaluate_device.py` 计算 PPL 和信噪比。该脚本默认自动选择主机评估设备，可用 `--device cpu` 强制 CPU；`QUALITY.json` 的 `reference_device` 记录实际设备。
 
 完整 `model.pte` 的导出顺序为：主机量化与 QNN 编译 → 视觉导出 → 设备 SDK 部署 → 共享权重分离 → PTE 打包。主机量化和编译不连接 ADB；`runtime` 与 `separate-groupN` 阶段才需要配置的 SM8850 设备在线。权重分离通过 QNN context 恢复回调获取权重范围，不调用对话 Runner，也不执行生成推理。`--print-plan` 的 `needs_device` 标明直接使用设备的阶段；`--check` 只检查静态输入和工具路径。设备阶段失败后重跑原命令可复用此前已校验的主机产物。
 

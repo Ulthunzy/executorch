@@ -5,6 +5,10 @@ import json
 import math
 from pathlib import Path
 
+from executorch.examples.qualcomm.oss_scripts.moe.quantize.execution import (
+    resolve_device,
+)
+
 
 def reference_hidden(artifacts):
     import torch
@@ -34,7 +38,9 @@ def main():
     parser.add_argument("--artifacts", type=Path, required=True)
     parser.add_argument("--run", type=Path, required=True)
     parser.add_argument("--sequence", type=int, choices=[8, 9], default=8)
+    parser.add_argument("--device", choices=("auto", "cpu", "cuda"), default="auto")
     args = parser.parse_args()
+    args.device = resolve_device(args.device)
     import numpy as np
     import torch
     import torch.nn.functional as F
@@ -45,7 +51,8 @@ def main():
 
     torch.set_num_threads(4)
     torch.set_grad_enabled(False)
-    torch.backends.cuda.matmul.allow_tf32 = False
+    if args.device == "cuda":
+        torch.backends.cuda.matmul.allow_tf32 = False
     inputs = torch.load(args.artifacts / "INPUTS.pt", weights_only=True, mmap=True)
     ids = inputs["heldout_ids"][args.sequence - 8].numpy()
     prompt = np.fromfile(args.run / "tokens.i64", "<i8")
@@ -71,10 +78,18 @@ def main():
         raise ValueError("Missing device hidden rows")
     vocab = 248320
     first = np.fromfile(args.run / "prefill/logits.f32", "<f4").reshape(-1, vocab)[-1:]
-    logits = np.memmap(
-        args.run / "logits.f32", mode="r", dtype="<f4", shape=(count - 1, vocab)
+    logits = (
+        np.memmap(
+            args.run / "logits.f32", mode="r", dtype="<f4", shape=(count - 1, vocab)
+        )
+        if count > 1
+        else np.empty((0, vocab), dtype="<f4")
     )
-    head = Head(Checkpoint(args.model)).eval().to(device="cuda", dtype=reference_dtype)
+    head = (
+        Head(Checkpoint(args.model))
+        .eval()
+        .to(device=args.device, dtype=reference_dtype)
+    )
     native_loss = reference_loss = 0.0
     top1_match = 0
     for start in range(0, count, 32):
@@ -84,13 +99,13 @@ def main():
             if start == 0
             else logits[start - 1 : end - 1]
         )
-        native = torch.from_numpy(np.array(native, copy=True)).cuda()
+        native = torch.from_numpy(np.array(native, copy=True)).to(args.device)
         reference = (
-            head(golden[start:end, None].to(device="cuda", dtype=reference_dtype))
+            head(golden[start:end, None].to(device=args.device, dtype=reference_dtype))
             .reshape(-1, vocab)
             .float()
         )
-        target = torch.tensor(targets[start:end], device="cuda")
+        target = torch.tensor(targets[start:end], device=args.device)
         if not torch.isfinite(native).all() or not torch.isfinite(reference).all():
             raise ValueError("Nonfinite logits")
         native_loss += float(F.cross_entropy(native, target, reduction="sum"))
@@ -128,6 +143,7 @@ def main():
         predicted_tokens=count,
         reference_ppl=math.exp(reference_loss / count),
         reference_dtype=dtype_name,
+        reference_device=args.device,
         device_ppl=math.exp(native_loss / count),
         hidden_sqnr_db=raw_sqnr,
         normalized_hidden_sqnr_db=normalized_sqnr,
