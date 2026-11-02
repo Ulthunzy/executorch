@@ -81,6 +81,8 @@ class ModelConfig:
             q.expert_gu_group,
             q.expert_down_group,
             q.reconstruction_steps,
+            q.reconstruction_min_steps,
+            q.reconstruction_patience,
             x.max_seq_len,
             x.prefill_ar_len,
             g.max_new_tokens,
@@ -99,9 +101,17 @@ class ModelConfig:
                 q.expert_gptq_damping,
                 q.router_gptq_damping,
                 q.matrix_gptq_damping,
+                q.reconstruction_min_delta,
+                *(
+                    ()
+                    if q.reconstruction_target_nmse is None
+                    else (q.reconstruction_target_nmse,)
+                ),
             )
         ):
-            raise ValueError("GPTQ damping must be numeric")
+            raise ValueError(
+                "GPTQ damping and reconstruction tolerances must be numeric"
+            )
         if q.attention not in {"source_qdq", "gptq"}:
             raise ValueError(
                 "Attention is loaded from calibrated QDQ; requantize the source to change its precision"
@@ -110,6 +120,8 @@ class ModelConfig:
             raise ValueError("The vision exporter currently supports the W8A16 recipe")
         if q.head not in {"source_qdq", "w4a16_gptq"}:
             raise ValueError("Unsupported head recipe")
+        if q.calibration_dtype not in {"bfloat16", "float32"}:
+            raise ValueError("calibration_dtype must be bfloat16 or float32")
         if (
             q.expert_bits,
             q.expert_activation_bits,
@@ -134,9 +146,20 @@ class ModelConfig:
                 )
             )
             or q.reconstruction_steps < 0
+            or q.reconstruction_min_steps < 0
+            or q.reconstruction_patience < 0
+            or not math.isfinite(q.reconstruction_min_delta)
+            or not 0 <= q.reconstruction_min_delta < 1
+            or (
+                q.reconstruction_target_nmse is not None
+                and (
+                    not math.isfinite(q.reconstruction_target_nmse)
+                    or q.reconstruction_target_nmse < 0
+                )
+            )
         ):
             raise ValueError(
-                "GPTQ damping must be positive and reconstruction_steps nonnegative"
+                "Use positive GPTQ damping, nonnegative reconstruction limits and a finite relative min_delta in [0, 1)"
             )
         if (
             c.kv_dtype != "uint16"

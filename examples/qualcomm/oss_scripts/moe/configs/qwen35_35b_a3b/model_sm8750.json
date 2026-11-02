@@ -14,7 +14,12 @@
     "reconstruction_steps": 80,
     "router_shared": "w8a16_gptq",
     "router_gptq_damping": 0.01,
-    "embedding": "int4_g32"
+    "embedding": "int4_g32",
+    "reconstruction_min_steps": 20,
+    "reconstruction_patience": 10,
+    "reconstruction_min_delta": 0.0001,
+    "reconstruction_target_nmse": null,
+    "calibration_dtype": "bfloat16"
   },
   "cache": {
     "kv_dtype": "uint16",

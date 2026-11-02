@@ -5,6 +5,8 @@
 `moe.py → cli.export_main → create_model(model_family) → ModelWrapper`。
 模型适配器提供配置及导出后端；公共 `ExportWorkflow` 负责阶段调度、校验、恢复与产物打包。`wrappers/` 定义图组件，`model/` 组合网络，`quantize/strategy.py` 定义量化参数，`quantize/gptq.py` 实现 GPTQ。GDN 图注册与参考计算从 `custom_op/deltanet_support` 引入。
 
+阶段通过显式依赖和经过校验的产物就绪通知调度。量化任务由一路 BF16 原模型激活生成、最多四路独立层权重量化及一路 CPU embedding 量化组成；GPTQ 数学仍保持原精度。原模型激活顺序推进，已就绪的层并行量化，量化验证输出不进入后续校准链。另一路 CPU 在组内所有 Attention/Router 就绪后编译 QNN。就绪通知通过本次运行专有的管道发布，避免复用残留文件；checkpoint 由调度进程加锁写入。Dense/MoE 的误差统计共用 `backends/qualcomm/quantizer/metrics.py`。
+
 `run_chat.py → cli.run_main → MoeRuntime → ModelInference`。
 `inference/encoder.py` 准备视觉输入，`decoder.py` 启动设备对话；`artifacts.py` 与根目录 `package.py` 校验并读取同一个 PTE 容器。导出与设备部署都使用 `model_family` 选择适配器；未知模型报错。
 
@@ -16,7 +18,9 @@ CLI 通过 `Runner::run_terminal` 进入终端适配层；JNI 将 Java 请求交
 
 `prompt_processor.cpp` 编排 Prefill，`token_generator.cpp` 编排 Decode；阶段内部的图绑定与流水调度位于 `prefill/`、`decode/`。`state_manager` 负责 KV、GDN state 以及阶段交接，`expert_manager` 负责 Decode 专家缓存和预取。`qnn/` 集中管理 Graph、Buffer、共享 context 和共享常量；JNI 不再维护一套 QNN session。
 
-`Runner` 管理加载、取消、回调、reset、关闭与线程回收。上下文在首次输入时建立，后续轮次复用；`reset()` 保留模型资源并清空对话。`Workspace` 维护私有缓存与 memfd，模型文件只读。进程内仍只允许一个活动 MoE 实例，因为底层阶段入口和环境配置是进程级资源；增加模型种类与并发加载多个模型是不同能力。
+`Runner` 管理加载、取消、回调、reset、关闭与线程回收。`load()` 等待Prefill、Decode及专家缓存完成初始化后才报告成功，初始化保持空对话；首次输入继续走按层批处理的Prefill，后续轮次复用资源；`reset()` 保留模型资源并清空对话。`Workspace` 维护私有缓存与 memfd，模型文件只读。进程内仍只允许一个活动 MoE 实例，因为底层阶段入口和环境配置是进程级资源；增加模型种类与并发加载多个模型是不同能力。
+
+Prefill的工作区容量与本次执行长度独立维护。首轮结束后保留专家memo、路由暂存、Native IO及其映射，续轮使用原缓冲区执行有效长度AR128并覆盖写入。`chunk_start`是会话内的绝对位置，memo/路由暂存使用相对`sequence_start`的偏移；KV与GDN state持续复用，正常轮次切换不释放或重新申请这些缓冲区。
 
 ## 算子与 Native 服务
 

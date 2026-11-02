@@ -78,6 +78,28 @@ python examples/qualcomm/oss_scripts/moe/moe.py \
 
 原 `--config examples/qualcomm/oss_scripts/moe/configs/qwen35_35b_a3b/export_sm8850.json --output <directory>` 方式仍受支持；显式配置保留原路径约定，命令行参数可覆盖。`--print-plan` 只查看导出阶段且不会下载数据，`--check` 检查前置条件。实际执行包含数据准备、构建、CUDA GPTQ、文本/视觉图导出、权重捕获与 PTE 打包，中断后重复原命令续跑。`quantize` 日志中的 `QUANTIZATION_REUSED` 表示已直接复用完整量化模型。输出目录内的 `MODEL_CONFIG.json` 是各阶段共用的生效配方。
 
+从 safetensors 导出时，先用原模型 BF16 前向生成每四层的校准激活，然后四层同时量化 Attention、Router/shared 和专家权重；下一组的输入始终取上一组最后一层的原模型输出。原模型前向顺序推进，权重量化不等待前层量化结束，也不把前层量化后的输出作为下一层校准输入。默认 `--quantization-layer-batch 4`，显存紧张时可设为 1～3；`--calibration-dtype float32` 可切换原模型校准精度。数值配方中的 `quantization.calibration_dtype` 默认为 `bfloat16`；精度和校准方法进入缓存身份，旧版顺序量化缓存不会被当作新配方复用。BF16 用于生成原模型激活，GPTQ 的 Hessian、重建和误差计算仍使用原来的浮点精度。
+
+CPU 的 embedding 量化与 GPU 校准并行；原模型前向最多预备下一组，四层权重量化各自在子进程中运行，完成后释放 CUDA 资源。QNN 仍由一路 CPU 编译；每组四层的 Attention/Router QDQ 都校验通过后立即编译该组，无需等待所有专家量化结束。组内完成顺序可以不同，不能仅凭最后一层就绪就开始编译。`--print-plan` 显示 `requires`、`publishes` 和 `resource`。任一阶段失败会取消在途任务，成功标记只在产物完整校验后写入。
+
+完整 `model.pte` 的导出顺序为：主机量化与 QNN 编译 → 视觉导出 → 设备 SDK 部署 → 共享权重分离 → PTE 打包。主机量化和编译不连接 ADB；`runtime` 与 `separate-groupN` 阶段才需要配置的 SM8850 设备在线。权重分离通过 QNN context 恢复回调获取权重范围，不调用对话 Runner，也不执行生成推理。`--print-plan` 的 `needs_device` 标明直接使用设备的阶段；`--check` 只检查静态输入和工具路径。设备阶段失败后重跑原命令可复用此前已校验的主机产物。
+
+量化过程中会打印 `QUANTIZATION_METRIC`，包含 MSE、NMSE、SQNR 及停止原因。日志区分校准输入上的权重投影误差、专家选择集误差和原模型输入下的单层 heldout 输出误差（包含该层量化 Attention、Router/shared 和专家）；它们不能替代整模 PPL。结构化结果保存在 `quantized/layers/layerN/GPTQ.json`、`quantized/router/layerN/REPORT.json` 和 `quantized/banks/layerN/BANK.json`，专家详细迭代日志位于 `quantized/logs/layerN-experts.log`。原模型输出及 FFN 输入保存在 `quantized/reference/layerN.pt`，单层量化验证输出保存在 `quantized/layer-output/layerN.pt`；后者只供验证，不进入后续层的校准链。
+
+专家缩放重建在模型配置的 `quantization` 中使用以下默认值；每个专家独立选择最佳参数，批次在所有专家停止后结束：
+
+```json
+{
+  "reconstruction_steps": 80,
+  "reconstruction_min_steps": 20,
+  "reconstruction_patience": 10,
+  "reconstruction_min_delta": 0.0001,
+  "reconstruction_target_nmse": null
+}
+```
+
+至少运行 20 步后，连续 10 步没有达到 0.01% 的相对验证误差改善时停止，最多运行 80 步；返回所访问步骤中验证误差最小的参数，包含初始参数。`reconstruction_target_nmse` 可另设达标停止阈值，`null` 表示不启用；`reconstruction_patience=0` 关闭平台期提前停止。非有限误差会中止导出，`BANK.json` 记录每个专家的实际停止步数、最佳步数和原因。停止策略进入量化缓存身份，旧版缓存不会被误认为已使用新策略。
+
 ```bash
 PYTHONPATH="$PWD/.." python examples/qualcomm/oss_scripts/moe/run_chat.py \
   --config /your/output/directory/device.json \

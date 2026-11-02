@@ -27,11 +27,15 @@ from executorch.examples.qualcomm.oss_scripts.moe.quantize.gptq import (
     middle,
     quantize,
 )
+from executorch.backends.qualcomm.quantizer.metrics import (
+    error_metrics,
+    log_quantization,
+)
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Reconstruct W2 experts with sequential layer calibration"
+        description="Reconstruct W2 experts using original-model activation calibration"
     )
     add_model_config_argument(parser)
     parser.add_argument("--model", type=Path, required=True)
@@ -76,12 +80,19 @@ def main():
             "Expected nonnegative reconstruction steps and positive GPTQ damping"
         )
     expert_settings = dict(
+        calibration_source="original_model",
+        calibration_dtype=settings.quantization.calibration_dtype,
+        calibration_norm="original_model",
         bits=2,
         activation_bits=8,
         gu_group=1024,
         down_group=512,
         damping=args.gptq_damping,
         joint_steps=args.joint_steps,
+        reconstruction_min_steps=settings.quantization.reconstruction_min_steps,
+        reconstruction_patience=settings.quantization.reconstruction_patience,
+        reconstruction_min_delta=settings.quantization.reconstruction_min_delta,
+        reconstruction_target_nmse=settings.quantization.reconstruction_target_nmse,
         gptq_only=settings.quantization.expert_gptq_only,
         router_shared="w8a16_gptq" if args.router_qdq else "fp16",
     )
@@ -90,7 +101,7 @@ def main():
     if args.front_output and args.first_layer != args.last_layer:
         parser.error("--front-output requires a single layer")
     ROOT = args.output
-    REFERENCE = args.source_dir
+    LAYERS = args.source_dir
     MODEL = args.model
     MAPPING = json.loads((MODEL / "model.safetensors.index.json").read_text())[
         "weight_map"
@@ -109,18 +120,16 @@ def main():
         raise ValueError(
             "Expected eight calibration and two heldout FP32 embedding sequences"
         )
-    hidden = torch.cat((data["calibration"], data["heldout"])).cuda()
-    if args.first_layer:
-        hidden = torch.load(
-            ROOT / f"sequential/layer{args.first_layer-1}.pt",
-            weights_only=True,
-            mmap=True,
-        )["hidden"].cuda()
+    from executorch.examples.qualcomm.oss_scripts.moe.quantize.reference import (
+        reference_inputs,
+        reference_output,
+    )
+
     cos = torch.from_numpy(
-        np.fromfile(REFERENCE / "cos.f32", "<f4").reshape(-1, 32)
+        np.fromfile(LAYERS / "cos.f32", "<f4").reshape(-1, 32)
     ).cuda()
     sin = torch.from_numpy(
-        np.fromfile(REFERENCE / "sin.f32", "<f4").reshape(-1, 32)
+        np.fromfile(LAYERS / "sin.f32", "<f4").reshape(-1, 32)
     ).cuda()
 
     def pack(codes, scales):
@@ -147,7 +156,7 @@ def main():
 
     def attention(layer, x):
         module = move_graph(
-            torch.export.load(REFERENCE / f"layer{layer}/front-qdq.pt2").module(),
+            torch.export.load(LAYERS / f"layer{layer}/front-qdq.pt2").module(),
             "cuda",
         )
         normalized, residual = torch.empty_like(x), torch.empty_like(x)
@@ -211,7 +220,7 @@ def main():
         return torch.cat((selected, global_rows)), weights, count
 
     for layer in range(args.first_layer, args.last_layer + 1):
-        checkpoint = ROOT / f"sequential/layer{layer}.pt"
+        checkpoint = ROOT / f"layer-output/layer{layer}.pt"
         directory = ROOT / f"banks/layer{layer}"
         if checkpoint.is_file() and (directory / "BANK.json").is_file():
             if (
@@ -223,15 +232,21 @@ def main():
                 raise ValueError(
                     f"Layer {layer}: existing bank has different or unrecorded quantization settings; use a new output directory"
                 )
-            hidden = torch.load(checkpoint, weights_only=True, mmap=True)[
-                "hidden"
-            ].cuda()
             print("REUSED", layer, flush=True)
             continue
         started = time.monotonic()
+        hidden = reference_inputs(
+            ROOT, layer, settings.quantization.calibration_dtype
+        ).cuda()
+        original = reference_output(
+            ROOT, layer, settings.quantization.calibration_dtype
+        )
         if args.front_output:
             front = torch.load(args.front_output, weights_only=True, mmap=True)
-            norm, residual = front["norm"].cuda(), front["residual"].cuda()
+            norm, residual = (
+                front["norm"].float().cuda(),
+                front["residual"].float().cuda(),
+            )
         else:
             norm, residual = attention(layer, hidden)
         print(
@@ -240,11 +255,17 @@ def main():
             round(time.monotonic() - started, 2),
             flush=True,
         )
-        constants = np.load(REFERENCE / f"layer{layer}/moe-constants.npz")
+        constants = np.load(LAYERS / f"layer{layer}/moe-constants.npz")
         weights = {
             k: torch.from_numpy(constants[k]).cuda().half() for k in constants.files
         }
+        calibration_norm = original["norm"].float().cuda()
         x = norm.reshape(-1, 2048)
+        calibration_ids = (
+            F.linear(calibration_norm.reshape(-1, 2048), weights["gate_weight"].float())
+            .topk(8, -1)
+            .indices
+        )
         score, ids = (
             F.linear(x.half(), weights["gate_weight"]).float().softmax(-1).topk(8, -1)
         )
@@ -270,14 +291,15 @@ def main():
             )
             remove_export_checks(router)
             ids, score, shared = router(norm)
+            calibration_ids = router(calibration_norm)[0].reshape(-1, 8).long()
             ids = ids.reshape(-1, 8).long()
             score = score.reshape(-1, 8)
             shared = shared.reshape(-1, 2048)
             del router
-        fit_x = norm[fit_sequences].reshape(-1, 2048)
-        fit_ids = ids.reshape(10, 1024, 8)[fit_sequences].reshape(-1, 8)
-        val_x = norm[3]
-        val_ids = ids.reshape(10, 1024, 8)[3]
+        fit_x = calibration_norm[fit_sequences].reshape(-1, 2048)
+        fit_ids = calibration_ids.reshape(10, 1024, 8)[fit_sequences].reshape(-1, 8)
+        val_x = calibration_norm[3]
+        val_ids = calibration_ids.reshape(10, 1024, 8)[3]
         routed = torch.zeros_like(x)
         names = [
             f"model.language_model.layers.{layer}.mlp.experts." + n
@@ -369,6 +391,7 @@ def main():
                         )
                         best = torch.minimum(best, error)
                 qgu, sgu, qd, sd = chosen
+                optimization = {}
                 sgu, sd = joint_scales(
                     qgu,
                     sgu,
@@ -379,6 +402,21 @@ def main():
                     validation=(validation, val_target),
                     weights=row_weights,
                     steps=args.joint_steps,
+                    min_steps=settings.quantization.reconstruction_min_steps,
+                    patience=settings.quantization.reconstruction_patience,
+                    min_delta=settings.quantization.reconstruction_min_delta,
+                    target_nmse=settings.quantization.reconstruction_target_nmse,
+                    validation_weights=torch.stack(
+                        [
+                            F.pad(
+                                torch.ones(len(v[0]), device="cuda"),
+                                (0, val_width - len(v[0])),
+                            )
+                            for v in val_rows
+                        ]
+                    ),
+                    report=optimization,
+                    label=f"layer{layer}/experts{start}-{experts[-1]}",
                 )
                 gu, down = dequantize(qgu, sgu, 1024), dequantize(qd, sd, 512)
                 for b, expert in enumerate(experts):
@@ -416,6 +454,7 @@ def main():
                             fit_routed_tokens=train_rows[b][2],
                             selection_routed_tokens=val_rows[b][2],
                             selected_method=int(method[b]),
+                            reconstruction=optimization["experts"][b],
                         )
                     )
                 if start % 64 == 0:
@@ -439,11 +478,7 @@ def main():
                 file.read(4096) + np.asarray(lengths, dtype="<u8").tobytes()
             )
         hidden = residual + (routed + shared).reshape_as(residual)
-        reference = torch.load(
-            REFERENCE / f"layer{layer}/reference.pt",
-            weights_only=True,
-            mmap=True,
-        )["test"]["output"].cuda()
+        reference = original["test"]["output"].float().cuda()
         actual = hidden[8:9]
         normalized_gold = (
             reference / reference.square().mean(-1, keepdim=True).add(1e-6).sqrt()
@@ -451,20 +486,17 @@ def main():
         normalized_actual = (
             actual / actual.square().mean(-1, keepdim=True).add(1e-6).sqrt()
         )
-        sqnr = float(
-            10
-            * torch.log10(
-                reference.double().square().sum()
-                / (reference.double() - actual.double()).square().sum()
-            )
+        hidden_error = error_metrics(
+            reference.double().square().sum(),
+            (reference.double() - actual.double()).square().sum(),
+            reference.numel(),
         )
-        normalized_sqnr = float(
-            10
-            * torch.log10(
-                normalized_gold.double().square().sum()
-                / (normalized_gold.double() - normalized_actual.double()).square().sum()
-            )
+        normalized_error = error_metrics(
+            normalized_gold.double().square().sum(),
+            (normalized_gold.double() - normalized_actual.double()).square().sum(),
+            normalized_gold.numel(),
         )
+        sqnr, normalized_sqnr = hidden_error["sqnr_db"], normalized_error["sqnr_db"]
         report = dict(
             quantization_config=expert_settings,
             layer=layer,
@@ -472,7 +504,10 @@ def main():
             bits=2,
             gu_group=1024,
             down_group=512,
-            sequential=True,
+            sequential=False,
+            calibration_source="original_model",
+            calibration_dtype=settings.quantization.calibration_dtype,
+            heldout_error_scope="single_layer_on_original_model_inputs",
             calibration_tokens=8192,
             fitting_tokens=7168,
             selection_tokens=1024,
@@ -480,6 +515,8 @@ def main():
             full_expert_scale_reconstruction=True,
             heldout_hidden_sqnr_db=sqnr,
             heldout_normalized_hidden_sqnr_db=normalized_sqnr,
+            heldout_hidden_error=hidden_error,
+            heldout_normalized_hidden_error=normalized_error,
             bytes=bank.stat().st_size,
             details=details,
             seconds=time.monotonic() - started,
@@ -489,6 +526,12 @@ def main():
         checkpoint.parent.mkdir(exist_ok=True)
         torch.save(dict(hidden=hidden.cpu()), checkpoint)
         (directory / "BANK.json").write_text(json.dumps(report, indent=2) + "\n")
+        log_quantization(
+            f"layer{layer}/hidden",
+            error_scope="single_layer_on_original_model_inputs",
+            output_error=hidden_error,
+            normalized_output_error=normalized_error,
+        )
         print(
             "LAYER_READY",
             layer,
@@ -512,6 +555,9 @@ def main():
             val_ids,
             reference,
             weights,
+            calibration_norm,
+            calibration_ids,
+            original,
         )
         gc.collect()
         torch.cuda.empty_cache()

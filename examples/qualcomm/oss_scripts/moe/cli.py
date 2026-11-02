@@ -65,6 +65,17 @@ def export_main(argv=None, *, default_model="qwen35"):
         parser.add_argument("--max_seq_len", "--max-seq-len", type=int)
         parser.add_argument("--prefill_ar_len", "--prefill-ar-len", type=int)
         parser.add_argument("--cache-experts", "--cache_experts", type=int)
+        parser.add_argument(
+            "--quantization-layer-batch",
+            type=int,
+            choices=(1, 2, 3, 4),
+            help="Concurrent weight-quantization layers (default: 4)",
+        )
+        parser.add_argument(
+            "--calibration-dtype",
+            choices=("bfloat16", "float32"),
+            help="Original-model calibration precision (default: bfloat16)",
+        )
         parser.add_argument("--components", nargs="+", choices=("text", "vision"))
         mode = parser.add_mutually_exclusive_group()
         mode.add_argument("--print-plan", action="store_true")
@@ -89,6 +100,8 @@ def export_main(argv=None, *, default_model="qwen35"):
             prefill_ar_len=args.prefill_ar_len,
             cache_experts=args.cache_experts,
             calib_image_dataset=args.calib_image_dataset,
+            quantization_layer_batch=args.quantization_layer_batch,
+            calibration_dtype=args.calibration_dtype,
         )
         workflow = model.create_export_workflow(config)
         if args.print_plan:

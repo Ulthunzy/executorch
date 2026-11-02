@@ -11,6 +11,10 @@ from executorch.examples.qualcomm.oss_scripts.moe.model.qwen35 import (
 
 import numpy as np
 import torch
+from executorch.backends.qualcomm.quantizer.metrics import (
+    error_metrics,
+    log_quantization,
+)
 
 
 def main():
@@ -74,6 +78,13 @@ def main():
             blocks[..., 16:18] = scale[..., None].view(np.uint8)
             blocks[..., 18:20] = bias[..., None].view(np.uint8)
             handle.write(blocks.tobytes())
+    weight_error = error_metrics(signal, error, int(np.prod(shape)))
+    calibration_error = error_metrics(
+        train_signal, train_error, int(counts.sum()) * shape[1]
+    )
+    heldout_error = error_metrics(
+        test_signal, test_error, int(heldout_counts.sum()) * shape[1]
+    )
     result = dict(
         method="diagonal_one_hot_gptq_equivalent_to_rtn",
         hessian="diag(calibration_token_counts / 8192)",
@@ -88,12 +99,23 @@ def main():
         shape=shape,
         source_bytes=args.source.stat().st_size,
         packed_bytes=args.output.stat().st_size,
-        weight_sqnr_db=float(10 * np.log10(signal / error)),
-        calibration_lookup_sqnr_db=float(10 * np.log10(train_signal / train_error)),
-        heldout_lookup_sqnr_db=float(10 * np.log10(test_signal / test_error)),
+        weight_sqnr_db=weight_error["sqnr_db"],
+        calibration_lookup_sqnr_db=calibration_error["sqnr_db"],
+        heldout_lookup_sqnr_db=heldout_error["sqnr_db"],
+        weight_error=weight_error,
+        calibration_lookup_error=calibration_error,
+        heldout_lookup_error=heldout_error,
+        stop_reason="all_rows_quantized",
     )
     args.output.with_suffix(".json").write_text(json.dumps(result, indent=2) + "\n")
     print(json.dumps(result), flush=True)
+    log_quantization(
+        "embedding",
+        stop_reason=result["stop_reason"],
+        weight_error=weight_error,
+        calibration_lookup_error=calibration_error,
+        heldout_lookup_error=heldout_error,
+    )
 
 
 if __name__ == "__main__":

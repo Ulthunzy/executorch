@@ -28,7 +28,7 @@ def attention_inputs(args, layer):
     if args.normalized_inputs:
         return torch.load(args.normalized_inputs, weights_only=True, mmap=True)[
             "norm"
-        ].to(args.device)
+        ].to(device=args.device, dtype=torch.float32)
 
     if layer:
         hidden = torch.load(
@@ -208,6 +208,20 @@ def prepare_layer(args, layer):
             .sum()
         )
         gptq_error = (F.linear(inputs, reconstructed) - target).double().square().sum()
+        from executorch.backends.qualcomm.quantizer.metrics import (
+            error_metrics,
+            log_quantization,
+        )
+
+        diagnostics = dict(
+            output_error=error_metrics(
+                target.double().square().sum(), gptq_error, target.numel()
+            ),
+            stop_reason="all_columns_quantized",
+            processed_columns=weight.shape[-1],
+            error_scope="weight_only_projection_on_calibration_inputs",
+        )
+        log_quantization(f"layer{layer}/router/{name}", **diagnostics)
         reports.append(
             dict(
                 name=name,
@@ -220,6 +234,7 @@ def prepare_layer(args, layer):
                 rtn_fit_mse=float(rtn_error / target.numel()),
                 gptq_fit_mse=float(gptq_error / target.numel()),
                 code_sha256=hashlib.sha256(gptq.cpu().numpy().tobytes()).hexdigest(),
+                **diagnostics,
             )
         )
     actual = converted(heldout)

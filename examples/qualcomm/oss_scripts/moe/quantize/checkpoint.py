@@ -5,7 +5,6 @@ from pathlib import Path
 
 import numpy as np
 import torch
-import torch.nn.functional as F
 from safetensors import safe_open
 
 from executorch.examples.models.llama.model_args import ModelArgs
@@ -201,59 +200,6 @@ def run_attention(module, hidden, linear, cos, sin, sequences=None):
                 first = torch.cat((old_first[..., 128:], result[2]), -1)
                 second = torch.cat((old_second[:, :, 128:], result[3]), 2)
             yield sequence, start, args, result
-
-
-@torch.no_grad()
-def reference_moe(checkpoint, index, norm):
-    x = norm.reshape(-1, 2048)
-    score, ids = (
-        F.linear(
-            x, checkpoint.layer_tensor(index, "mlp.gate.weight").to(x.device).float()
-        )
-        .softmax(-1)
-        .topk(8, -1)
-    )
-    score = score / score.sum(-1, keepdim=True)
-    result = torch.zeros_like(x)
-    gu_name = f"model.language_model.layers.{index}.mlp.experts.gate_up_proj"
-    d_name = f"model.language_model.layers.{index}.mlp.experts.down_proj"
-    with safe_open(
-        checkpoint.path / checkpoint.mapping[gu_name], framework="pt"
-    ) as gu_file, safe_open(
-        checkpoint.path / checkpoint.mapping[d_name], framework="pt"
-    ) as d_file:
-        for expert in ids.unique().tolist():
-            tokens, slots = torch.where(ids == expert)
-            gu = gu_file.get_slice(gu_name)[expert : expert + 1][0].to(x.device).float()
-            down = d_file.get_slice(d_name)[expert : expert + 1][0].to(x.device).float()
-            gate, up = F.linear(x[tokens], gu).chunk(2, -1)
-            output = F.linear(F.silu(gate) * up, down)
-            result.index_add_(0, tokens, output * score[tokens, slots, None])
-    gate = F.linear(
-        x,
-        checkpoint.layer_tensor(index, "mlp.shared_expert.gate_proj.weight")
-        .to(x.device)
-        .float(),
-    )
-    up = F.linear(
-        x,
-        checkpoint.layer_tensor(index, "mlp.shared_expert.up_proj.weight")
-        .to(x.device)
-        .float(),
-    )
-    shared = F.linear(
-        F.silu(gate) * up,
-        checkpoint.layer_tensor(index, "mlp.shared_expert.down_proj.weight")
-        .to(x.device)
-        .float(),
-    )
-    shared *= F.linear(
-        x,
-        checkpoint.layer_tensor(index, "mlp.shared_expert_gate.weight")
-        .to(x.device)
-        .float(),
-    ).sigmoid()
-    return (result + shared).reshape_as(norm)
 
 
 class Head(torch.nn.Module):

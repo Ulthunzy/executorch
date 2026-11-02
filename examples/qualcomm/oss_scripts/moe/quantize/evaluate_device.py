@@ -1,9 +1,31 @@
-"""Evaluate heldout teacher-forced device outputs against the raw FP32 chain."""
+"""Evaluate heldout teacher-forced device outputs against the original model."""
 
 import argparse
 import json
 import math
 from pathlib import Path
+
+
+def reference_hidden(artifacts):
+    import torch
+    from executorch.examples.qualcomm.oss_scripts.moe.model.qwen35 import (
+        load_model_config,
+    )
+    from executorch.examples.qualcomm.oss_scripts.moe.quantize.reference import (
+        reference_output,
+    )
+
+    if (artifacts / "reference/layer39.pt").is_file():
+        dtype = load_model_config(
+            artifacts / "MODEL_CONFIG.json"
+        ).quantization.calibration_dtype
+        return reference_output(artifacts, 39, dtype)["all_output"].float(), dtype
+    return (
+        torch.load(
+            artifacts / "layers/layer39/reference.pt", weights_only=True, mmap=True
+        )["all_output"].float(),
+        "float32",
+    )
 
 
 def main():
@@ -37,9 +59,9 @@ def main():
     targets = ids[prefix : prefix + count]
     if len(targets) != count:
         raise ValueError("Teacher run exceeds the heldout sequence")
-    golden = torch.load(
-        args.artifacts / "layers/layer39/reference.pt", weights_only=True, mmap=True
-    )["all_output"][args.sequence, prefix - 1 : prefix - 1 + count]
+    golden, dtype_name = reference_hidden(args.artifacts)
+    golden = golden[args.sequence, prefix - 1 : prefix - 1 + count]
+    reference_dtype = {"bfloat16": torch.bfloat16, "float32": torch.float32}[dtype_name]
     prefill_hidden = np.fromfile(args.run / "prefill/hidden.f32", "<f4").reshape(
         -1, 2048
     )[-1:]
@@ -52,8 +74,8 @@ def main():
     logits = np.memmap(
         args.run / "logits.f32", mode="r", dtype="<f4", shape=(count - 1, vocab)
     )
-    head = Head(Checkpoint(args.model)).eval().cuda()
-    native_loss = fp32_loss = 0.0
+    head = Head(Checkpoint(args.model)).eval().to(device="cuda", dtype=reference_dtype)
+    native_loss = reference_loss = 0.0
     top1_match = 0
     for start in range(0, count, 32):
         end = min(start + 32, count)
@@ -63,12 +85,16 @@ def main():
             else logits[start - 1 : end - 1]
         )
         native = torch.from_numpy(np.array(native, copy=True)).cuda()
-        reference = head(golden[start:end, None].cuda()).reshape(-1, vocab)
+        reference = (
+            head(golden[start:end, None].to(device="cuda", dtype=reference_dtype))
+            .reshape(-1, vocab)
+            .float()
+        )
         target = torch.tensor(targets[start:end], device="cuda")
         if not torch.isfinite(native).all() or not torch.isfinite(reference).all():
             raise ValueError("Nonfinite logits")
         native_loss += float(F.cross_entropy(native, target, reduction="sum"))
-        fp32_loss += float(F.cross_entropy(reference, target, reduction="sum"))
+        reference_loss += float(F.cross_entropy(reference, target, reduction="sum"))
         top1_match += int((native.argmax(-1) == reference.argmax(-1)).sum())
 
     def sqnr(reference, actual):
@@ -100,16 +126,20 @@ def main():
         heldout_sequence=args.sequence,
         prefix_tokens=prefix,
         predicted_tokens=count,
-        fp32_ppl=math.exp(fp32_loss / count),
+        reference_ppl=math.exp(reference_loss / count),
+        reference_dtype=dtype_name,
         device_ppl=math.exp(native_loss / count),
         hidden_sqnr_db=raw_sqnr,
         normalized_hidden_sqnr_db=normalized_sqnr,
         top1_agreement=top1_match / count,
         token_curve=token_curve,
-        reference="Original safetensors FP32 chain on the identical heldout token IDs",
+        reference=f"Original safetensors {dtype_name} chain on the identical heldout token IDs",
         fitted_on_heldout=False,
         device_run=str(args.run),
     )
+    report["bf16_ppl" if dtype_name == "bfloat16" else "fp32_ppl"] = report[
+        "reference_ppl"
+    ]
     (args.run / "QUALITY.json").write_text(json.dumps(report, indent=2) + "\n")
     print("DEVICE_QUALITY", json.dumps(report), flush=True)
 

@@ -54,6 +54,7 @@ class ExportConfig:
     executorch_android_build: Path | None = None
     calib_image_dataset: str | None = None
     calib_dataset_dir: Path | None = None
+    quantization_layer_batch: int = 4
 
     @property
     def dsp_arch(self):
@@ -85,6 +86,8 @@ def load_export_config(
     prefill_ar_len=None,
     cache_experts=None,
     calib_image_dataset=None,
+    quantization_layer_batch=None,
+    calibration_dtype=None,
 ):
     direct = path is None
     automatic_calibration = direct and calibration_dir is None
@@ -163,6 +166,20 @@ def load_export_config(
     if config_path is None:
         raise ValueError("model_config must name the numerical recipe")
     settings = load_model_config(config_path)
+    if calibration_dtype is not None:
+        settings = replace(
+            settings,
+            quantization=replace(
+                settings.quantization, calibration_dtype=calibration_dtype
+            ),
+        )
+    layer_batch = (
+        quantization_layer_batch
+        if quantization_layer_batch is not None
+        else data.get("quantization_layer_batch", 4)
+    )
+    if type(layer_batch) is not int or not 1 <= layer_batch <= 4:
+        raise ValueError("quantization_layer_batch must be between 1 and 4")
     selected_soc = soc_model or data.get("soc_model", settings.target.soc_model)
     selected_arch = data.get("dsp_arch") if soc_model is None else None
     context = settings.context
@@ -408,6 +425,7 @@ def load_export_config(
         images=tuple((REPO / p).resolve() for p in images),
         calibration_device=calibration_device,
         expert_batch=batch,
+        quantization_layer_batch=layer_batch,
         image_height=dimensions["image_height"],
         image_width=dimensions["image_width"],
         vision_source=vision_source,

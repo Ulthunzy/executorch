@@ -108,19 +108,20 @@ class StageCheckpoint:
         self.lock_context.__exit__(*unused)
 
     def reusable(self, name, outputs):
+        if self.dirty:
+            return False
+        valid = self.valid(name, outputs)
+        self.dirty = not valid
+        return valid
+
+    def valid(self, name, outputs):
         previous = self.state["stages"].get(name, {})
-        if (
-            self.dirty
-            or not isinstance(previous, dict)
-            or previous.get("status") != "complete"
-        ):
-            self.dirty = True
+        if not isinstance(previous, dict) or previous.get("status") != "complete":
             return False
         try:
             valid = previous.get("outputs") == artifact_stamps(outputs)
         except (OSError, ValueError):
             valid = False
-        self.dirty = not valid
         return valid
 
     def update(self, name, **values):

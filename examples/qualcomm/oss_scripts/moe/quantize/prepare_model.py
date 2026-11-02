@@ -1,11 +1,14 @@
-"""Serial safetensors -> GPTQ QDQ/banks; QNN compilation remains a separate step."""
+"""Quantize independent layer windows using original-model calibration activations."""
 
 import argparse
 import csv
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+import threading
 from dataclasses import asdict
 import hashlib
 import importlib.metadata
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -30,6 +33,15 @@ from executorch.examples.qualcomm.oss_scripts.moe.checkpoint import (
 )
 
 
+def publish_progress(**event):
+    descriptor = os.environ.get("ET_EXPORT_PROGRESS_FD")
+    if descriptor is not None:
+        payload = (json.dumps(event, allow_nan=False) + "\n").encode()
+        if len(payload) > 4096:
+            raise ValueError("Export progress event exceeds the atomic pipe limit")
+        os.write(int(descriptor), payload)
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     add_model_config_argument(parser)
@@ -41,6 +53,7 @@ def main(argv=None):
     parser.add_argument(
         "--expert-batch", type=int, choices=[1, 2, 4, 8, 16, 32], default=8
     )
+    parser.add_argument("--layer-batch", type=int, choices=range(1, 5), default=4)
     args = parser.parse_args(argv)
     settings = load_model_config(args.model_config)
     if not 0 <= args.last_layer < 40:
@@ -63,12 +76,16 @@ def main(argv=None):
             args.output, args.model, settings, args.corpus, args.qnn_binding
         ):
             print("QUANTIZATION_REUSED", args.output, flush=True)
+            for layer in range(40):
+                publish_progress(ready=f"layer{layer}-router")
+            publish_progress(ready="head")
             return
 
     sources = sorted(
         [
             *ROOT.joinpath("quantize").glob("prepare*.py"),
             ROOT / "quantize/gptq.py",
+            ROOT / "quantize/reference.py",
             *ROOT.parent.joinpath("llama/model").glob("*.py"),
             *ROOT.parent.joinpath("llama/quantize").glob("*.py"),
             ROOT.parent / "llama/static_llm_quant_recipe.py",
@@ -136,50 +153,116 @@ def prepare(args, settings, cache):
         else []
     )
 
-    def run(name, command, outputs):
+    lock = threading.RLock()
+    cancelled = threading.Event()
+    active = {}
+    failure = []
+
+    def abort(error):
+        with lock:
+            if not failure:
+                failure.append(error)
+            cancelled.set()
+            children = tuple(active.values())
+        for child in children:
+            if child.poll() is None:
+                child.terminate()
+        for child in children:
+            try:
+                child.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                child.kill()
+                child.wait()
+
+    def run(name, command, outputs, *, force=False, cache_names=None):
         outputs = tuple(args.output / path for path in outputs)
-        if cache.reusable(name, outputs):
-            print("STAGE_REUSED", name, flush=True)
-            return
-        for path in outputs:
-            remove_path(path)
-        (args.output / "QUANTIZATION_COMPLETE.json").unlink(missing_ok=True)
         command = list(map(str, command))
-        commands.append(dict(stage=name, command=command))
-        (args.output / "COMMANDS.json").write_text(
-            json.dumps(commands, indent=2) + "\n"
+        if cache_names is not None and len(cache_names) != len(outputs):
+            raise ValueError("Reference checkpoint names must match layer outputs")
+        records = (
+            [(key, (path,)) for key, path in zip(cache_names, outputs)]
+            if cache_names is not None
+            else [(name, outputs)]
         )
-        print("STAGE_START", name, flush=True)
-        started = time.monotonic()
-        cache.update(name, status="running")
-        with (args.output / "logs" / f"{name}.log").open("w") as log:
-            result = subprocess.run(
-                ["/usr/bin/time", "-v", *command],
-                stdout=log,
-                stderr=subprocess.STDOUT,
-                pass_fds=(cache.lock.fileno(),),
+        try:
+            with lock:
+                if cancelled.is_set():
+                    raise RuntimeError(
+                        "Preparation cancelled after another stage failed"
+                    )
+                if not force and all(cache.valid(key, paths) for key, paths in records):
+                    print("STAGE_REUSED", name, flush=True)
+                    if name.endswith("-router") or name == "head":
+                        publish_progress(ready=name)
+                    return True
+                for path in outputs:
+                    remove_path(path)
+                (args.output / "QUANTIZATION_COMPLETE.json").unlink(missing_ok=True)
+                commands.append(dict(stage=name, command=command))
+                (args.output / "COMMANDS.json").write_text(
+                    json.dumps(commands, indent=2) + "\n"
+                )
+                started_ns = time.monotonic_ns()
+                print("STAGE_START", name, flush=True)
+                for key, _ in records:
+                    cache.update(key, status="running", started_ns=started_ns)
+                result = subprocess.Popen(
+                    command,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    pass_fds=(cache.lock.fileno(),),
+                    text=True,
+                )
+                active[name] = result
+            with (args.output / "logs" / f"{name}.log").open("w") as log:
+                with result.stdout:
+                    for line in result.stdout:
+                        log.write(line)
+                        log.flush()
+                        if line.startswith("QUANTIZATION_METRIC "):
+                            with lock:
+                                print(line, end="", flush=True)
+                                publish_progress(metric=line.rstrip())
+                result.wait()
+            row = dict(
+                stage=name,
+                seconds=round((time.monotonic_ns() - started_ns) / 1e9, 3),
+                exit_code=result.returncode,
             )
-        row = dict(
-            stage=name,
-            seconds=round(time.monotonic() - started, 3),
-            exit_code=result.returncode,
-        )
-        with (args.output / "STAGES.csv").open("a") as file:
-            writer = csv.DictWriter(file, row)
-            writer.writeheader() if file.tell() == 0 else None
-            writer.writerow(row)
-        print("STAGE_DONE", json.dumps(row), flush=True)
-        if result.returncode:
-            cache.update(name, status="failed", exit_code=result.returncode)
-            print(
-                (args.output / "logs" / f"{name}.log").read_text()[-6000:], flush=True
-            )
-            raise subprocess.CalledProcessError(result.returncode, command)
-        stamps = artifact_stamps(outputs)
-        cache.update(name, status="complete", outputs=stamps)
+            with lock:
+                active.pop(name, None)
+                with (args.output / "STAGES.csv").open("a") as file:
+                    writer = csv.DictWriter(file, row)
+                    if file.tell() == 0:
+                        writer.writeheader()
+                    writer.writerow(row)
+                print("STAGE_DONE", json.dumps(row), flush=True)
+                if result.returncode:
+                    print(
+                        (args.output / "logs" / f"{name}.log").read_text()[-6000:],
+                        flush=True,
+                    )
+                    raise subprocess.CalledProcessError(result.returncode, command)
+                for key, paths in records:
+                    cache.update(
+                        key,
+                        status="complete",
+                        outputs=artifact_stamps(paths),
+                        started_ns=started_ns,
+                        seconds=row["seconds"],
+                    )
+                if name.endswith("-router") or name == "head":
+                    publish_progress(ready=name)
+            return False
+        except BaseException as error:
+            with lock:
+                for key, _ in records:
+                    cache.update(key, status="failed", error=str(error))
+            abort(error)
+            raise
 
     raw = ROOT / "quantize/prepare_safetensors.py"
-    run(
+    data_reused = run(
         "data",
         prefix + [raw, *common, *binding, "--stage", "data", "--corpus", args.corpus],
         (
@@ -194,35 +277,41 @@ def prepare(args, settings, cache):
     validate_checkpoint_source(args.model, data)
     if data["corpus_sha256"] != hashlib.sha256(args.corpus.read_bytes()).hexdigest():
         raise ValueError("Calibration corpus changed")
-    run(
-        "embedding",
-        prefix
-        + [
-            ROOT / "quantize/prepare_embedding.py",
-            "--model-config",
-            configuration,
-            "--source",
-            args.output / "embedding.bf16",
-            "--calibration-inputs",
-            args.output / "INPUTS-fp32.pt",
-            "--output",
-            args.output / "embedding.int4",
-        ],
-        ("embedding.json", "embedding.int4"),
-    )
-    run(
-        "embedding-inputs",
-        prefix + [raw, *common, *binding, "--stage", "embedding-inputs"],
-        ("EMBEDDING_INPUTS.json", "INPUTS.pt"),
-    )
+
+    def prepare_embedding():
+        reused = run(
+            "embedding",
+            prefix
+            + [
+                ROOT / "quantize/prepare_embedding.py",
+                "--model-config",
+                configuration,
+                "--source",
+                args.output / "embedding.bf16",
+                "--calibration-inputs",
+                args.output / "INPUTS-fp32.pt",
+                "--output",
+                args.output / "embedding.int4",
+            ],
+            ("embedding.json", "embedding.int4"),
+            force=not data_reused,
+        )
+        run(
+            "embedding-inputs",
+            prefix + [raw, *common, *binding, "--stage", "embedding-inputs"],
+            ("EMBEDDING_INPUTS.json", "INPUTS.pt"),
+            force=not data_reused or not reused,
+        )
+
     (args.output / "layers").mkdir(exist_ok=True)
     for name in ["cos.f32", "sin.f32"]:
         target = args.output / "layers" / name
         if not target.exists():
             target.symlink_to(args.output / "assets" / name)
-    for layer in range(args.last_layer + 1):
+
+    def prepare_layer(layer, force):
         directory = args.output / f"layers/layer{layer}"
-        run(
+        reused = run(
             f"layer{layer}-attention",
             prefix + [raw, *common, *binding, "--stage", "attention", "--layer", layer],
             tuple(
@@ -235,22 +324,25 @@ def prepare(args, settings, cache):
                     "front-output.pt",
                 )
             ),
+            force=force,
         )
-        run(
+        force = force or not reused
+        reused = run(
             f"layer{layer}-router",
             prefix
             + [
                 ROOT / "quantize/prepare_router.py",
+                "--worker",
                 "--model-config",
                 configuration,
                 "--source-dir",
                 args.output / "layers",
                 "--sequential",
-                args.output / "sequential",
+                args.output / "layer-output",
                 "--inputs",
-                args.output / "INPUTS.pt",
+                args.output / "INPUTS-fp32.pt",
                 "--normalized-inputs",
-                directory / "front-output.pt",
+                args.output / f"reference/layer{layer}.pt",
                 "--output",
                 args.output / "router",
                 "--layers",
@@ -265,7 +357,9 @@ def prepare(args, settings, cache):
                     "router-ar1-qdq.pt2",
                 )
             ),
+            force=force,
         )
+        force = force or not reused
         run(
             f"layer{layer}-experts",
             prefix
@@ -275,7 +369,7 @@ def prepare(args, settings, cache):
                 "--source-dir",
                 args.output / "layers",
                 "--inputs",
-                args.output / "INPUTS.pt",
+                args.output / "INPUTS-fp32.pt",
                 "--front-output",
                 directory / "front-output.pt",
                 "--router-qdq",
@@ -291,15 +385,75 @@ def prepare(args, settings, cache):
                 f"banks/layer{layer}/BANK.json",
                 f"banks/layer{layer}/experts.n2",
                 f"indices/layer{layer}/bank-index.bin",
-                f"sequential/layer{layer}.pt",
+                f"layer-output/layer{layer}.pt",
             ),
+            force=force,
         )
+
+    # One lookahead window bounds activation generation while four layers quantize.
+    pool = ThreadPoolExecutor(max_workers=args.layer_batch)
+    embedding_pool = ThreadPoolExecutor(max_workers=1)
+    pending = []
+    embedding_future = None
+
+    try:
+        embedding_future = embedding_pool.submit(prepare_embedding)
+        reference_dirty = not data_reused
+        for first in range(0, args.last_layer + 1, args.layer_batch):
+            while len(pending) > args.layer_batch:
+                done, remaining = wait(pending, return_when=FIRST_COMPLETED)
+                pending = list(remaining)
+                for future in done:
+                    future.result()
+            last = min(first + args.layer_batch - 1, args.last_layer)
+            reused = run(
+                f"reference-{first}-{last}",
+                prefix
+                + [
+                    raw,
+                    *common,
+                    *binding,
+                    "--stage",
+                    "reference",
+                    "--first-layer",
+                    first,
+                    "--last-layer",
+                    last,
+                ],
+                tuple(f"reference/layer{layer}.pt" for layer in range(first, last + 1)),
+                force=reference_dirty,
+                cache_names=tuple(
+                    f"reference-layer{layer}" for layer in range(first, last + 1)
+                ),
+            )
+            reference_dirty = reference_dirty or not reused
+            for layer in range(first, last + 1):
+                pending.append(pool.submit(prepare_layer, layer, reference_dirty))
+        if args.last_layer == 39:
+            pending.append(
+                pool.submit(
+                    run,
+                    "head",
+                    prefix + [raw, *common, *binding, "--stage", "head"],
+                    ("head/GPTQ.json", "head/head-qdq.pt2"),
+                    force=reference_dirty,
+                )
+            )
+        for future in pending:
+            future.result()
+        embedding_future.result()
+    except BaseException as error:
+        abort(error)
+        for future in pending:
+            future.cancel()
+        if embedding_future is not None:
+            embedding_future.cancel()
+        raise failure[0]
+    finally:
+        pool.shutdown(wait=True, cancel_futures=True)
+        embedding_pool.shutdown(wait=True, cancel_futures=True)
+
     if args.last_layer == 39:
-        run(
-            "head",
-            prefix + [raw, *common, *binding, "--stage", "head"],
-            ("head/GPTQ.json", "head/head-qdq.pt2"),
-        )
         import numpy as np
 
         candidates = []
@@ -337,6 +491,8 @@ def prepare(args, settings, cache):
                     format_version=QUANTIZATION_VERSION,
                     layers=40,
                     experts=10240,
+                    calibration_source="original_model",
+                    calibration_dtype=settings.quantization.calibration_dtype,
                     all_expert_gu_down_gptq=True,
                     old_qdq_used=False,
                     model_configuration=settings.to_dict(),

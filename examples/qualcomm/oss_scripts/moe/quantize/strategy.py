@@ -13,7 +13,12 @@ class QuantizationConfig:
     expert_down_group: int = 512
     expert_gptq_damping: float = 0.1
     reconstruction_steps: int = 80
+    reconstruction_min_steps: int = 20
+    reconstruction_patience: int = 10
+    reconstruction_min_delta: float = 1e-4
+    reconstruction_target_nmse: float | None = None
     expert_gptq_only: bool = False
     router_shared: str = "w8a16_gptq"
     router_gptq_damping: float = 0.01
     embedding: str = "int4_g32"
+    calibration_dtype: str = "bfloat16"

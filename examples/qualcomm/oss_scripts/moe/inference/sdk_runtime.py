@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 import re
 import shlex
+import subprocess
 
 from executorch.examples.qualcomm.oss_scripts.moe.inference.device import AndroidDevice
 from executorch.examples.qualcomm.oss_scripts.moe.target import (
@@ -47,7 +48,15 @@ def deploy_runtime(sdk, target, device, remote, manifest):
     missing = [str(path) for path in files if not path.is_file()]
     if missing:
         raise FileNotFoundError("Missing SDK runtime libraries:\n" + "\n".join(missing))
-    device.check_target(target)
+    try:
+        device.check_target(target)
+    except subprocess.CalledProcessError as error:
+        detail = (error.stderr or error.stdout or str(error)).strip()
+        raise RuntimeError(
+            f"Cannot deploy the QNN runtime to {target.soc_model} device "
+            f"{device.serial}. Export needs this device for shared-weight "
+            f"separation, without conversation inference. ADB: {detail}"
+        ) from error
     device.adb("shell", "mkdir -p " + shlex.quote(remote))
     device.adb("push", "--sync", *files, remote + "/")
     metadata = dict(

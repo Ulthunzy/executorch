@@ -25,6 +25,9 @@ from executorch.examples.qualcomm.oss_scripts.moe.quantize.cache import (
 from executorch.examples.qualcomm.oss_scripts.moe.inference.sdk_runtime import (
     runtime_files,
 )
+from executorch.examples.qualcomm.oss_scripts.moe.model.qwen35 import (
+    load_model_config,
+)
 
 
 class ModelWrapper(ExportWorkflow):
@@ -43,7 +46,18 @@ class ModelWrapper(ExportWorkflow):
         binding = ("--qnn-binding", str(c.qnn_binding)) if c.qnn_binding else ()
         stages = []
 
-        def stage(name, script, arguments, outputs, cleanup=()):
+        def stage(
+            name,
+            script,
+            arguments,
+            outputs,
+            cleanup=(),
+            *,
+            requires=None,
+            publishes=(),
+            resource="cpu",
+            needs_device=False,
+        ):
             command = (sys.executable, "-u", str(ROOT / script), *map(str, arguments))
             stages.append(
                 Stage(
@@ -53,6 +67,10 @@ class ModelWrapper(ExportWorkflow):
                     tuple(cleanup),
                     always_run=name in ("runtime", "vision-data"),
                     preserve_outputs=name == "quantize",
+                    requires=requires,
+                    publishes=publishes,
+                    resource=resource,
+                    needs_device=needs_device,
                 )
             )
 
@@ -84,26 +102,9 @@ class ModelWrapper(ExportWorkflow):
                     ),
                 )
             )
-        if c.deploy_runtime:
-            stage(
-                "runtime",
-                ROOT / "inference/sdk_runtime.py",
-                (
-                    "--sdk",
-                    c.qnn_sdk_root,
-                    "--soc-model",
-                    c.soc_model,
-                    "--device",
-                    c.device,
-                    "--remote",
-                    c.runtime_device_dir,
-                    "--manifest",
-                    c.build_dir / "QNN_RUNTIME.json",
-                ),
-                (c.build_dir / "QNN_RUNTIME.json",),
-            )
         text = "text" in c.components
-        if text and c.source == "safetensors":
+        pipeline = text and c.source == "safetensors"
+        if pipeline:
             stage(
                 "quantize",
                 "quantize/prepare_model.py",
@@ -117,9 +118,16 @@ class ModelWrapper(ExportWorkflow):
                     c.corpus,
                     "--expert-batch",
                     c.expert_batch,
+                    "--layer-batch",
+                    c.quantization_layer_batch,
                     *binding,
                 ),
                 prepared_artifacts(c.calibration_dir, self.architecture.layers),
+                publishes=tuple(
+                    f"layer{layer}-router" for layer in range(self.architecture.layers)
+                )
+                + ("head",),
+                resource="gpu",
             )
         if text:
             stage(
@@ -135,6 +143,7 @@ class ModelWrapper(ExportWorkflow):
                 ),
                 (out / "head/HEAD.json", out / "head/head.bin"),
                 (out / "head/head.pte",),
+                requires=("quantize:head",) if pipeline else None,
             )
             for group in range(self.architecture.groups):
                 directory = out / f"qnn-shared/group{group}"
@@ -189,6 +198,11 @@ class ModelWrapper(ExportWorkflow):
                         ),
                     ),
                     (directory / "methods.pte",),
+                    requires=(
+                        tuple(f"quantize:layer{layer}-router" for layer in layers)
+                        if pipeline
+                        else None
+                    ),
                 )
             stage(
                 "runtime-assets",
@@ -209,6 +223,18 @@ class ModelWrapper(ExportWorkflow):
                         "sin.f32",
                         "RUNTIME.json",
                     )
+                ),
+                requires=(
+                    (
+                        "quantize",
+                        "head",
+                        *(
+                            f"qnn-group{group}"
+                            for group in range(self.architecture.groups)
+                        ),
+                    )
+                    if pipeline
+                    else None
                 ),
             )
         if "vision" in c.components:
@@ -268,6 +294,25 @@ class ModelWrapper(ExportWorkflow):
                 (out / "vision/vision.pte",) if c.format == "qnn" else (),
             )
         if text and c.format == "pte":
+            if c.deploy_runtime:
+                stage(
+                    "runtime",
+                    ROOT / "inference/sdk_runtime.py",
+                    (
+                        "--sdk",
+                        c.qnn_sdk_root,
+                        "--soc-model",
+                        c.soc_model,
+                        "--device",
+                        c.device,
+                        "--remote",
+                        c.runtime_device_dir,
+                        "--manifest",
+                        c.build_dir / "QNN_RUNTIME.json",
+                    ),
+                    (c.build_dir / "QNN_RUNTIME.json",),
+                    needs_device=True,
+                )
             for group in range(self.architecture.groups):
                 outputs = [
                     out / f"shared-model/group{group}" / name
@@ -326,6 +371,7 @@ class ModelWrapper(ExportWorkflow):
                         c.remote_root,
                     ),
                     outputs,
+                    needs_device=True,
                 )
             for phase in c.phases:
                 workspace_tokens = (
@@ -487,7 +533,9 @@ class ModelWrapper(ExportWorkflow):
             validate_checkpoint_source(
                 c.model, json.loads((c.calibration_dir / "DATA.json").read_text())
             )
-            prepared = json.loads((c.calibration_dir / "MODEL_CONFIG.json").read_text())
+            prepared = load_model_config(
+                c.calibration_dir / "MODEL_CONFIG.json"
+            ).to_dict()
             if prepared["quantization"] != self.settings.to_dict()[
                 "quantization"
             ] or any(
@@ -626,6 +674,7 @@ class ModelWrapper(ExportWorkflow):
             )
             and "tests" not in p.parts
         )
+        sources.append(REPO / "backends/qualcomm/quantizer/metrics.py")
         code_hash = hashlib.sha256(
             b"".join(
                 str(p.relative_to(REPO)).encode() + p.read_bytes() for p in sources

@@ -15,7 +15,7 @@ from executorch.examples.qualcomm.oss_scripts.moe.quantize.provenance import (
 )
 
 # Bump when calibration math or packed weight formats change.
-QUANTIZATION_VERSION = 1
+QUANTIZATION_VERSION = 3
 
 
 def prepared_artifacts(root, layers=40):
@@ -60,6 +60,12 @@ def reusable_preparation(root, model, settings, corpus, qnn_binding=None):
         if not isinstance(complete, dict):
             return False
         if complete.get("format_version", 1) != QUANTIZATION_VERSION:
+            return False
+        if (
+            complete.get("calibration_source") != "original_model"
+            or complete.get("calibration_dtype")
+            != settings.quantization.calibration_dtype
+        ):
             return False
         if (
             complete.get("layers") != 40

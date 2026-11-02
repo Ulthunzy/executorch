@@ -4,6 +4,10 @@ import torch
 import torch.nn.functional as F
 
 from executorch.examples.qualcomm.oss_scripts.llama.quantize.qwen35 import tensor
+from executorch.backends.qualcomm.quantizer.metrics import (
+    hessian_error_metrics,
+    log_quantization,
+)
 
 TARGETS = {torch.ops.aten.linear.default, torch.ops.aten.conv2d.default}
 
@@ -141,6 +145,9 @@ def apply_gptq(module, weights, capture, damping=0.01):
             raise ValueError(f"Expected a positive symmetric weight grid: {path}")
         h = capture.hessians.pop(path) / capture.counts[path]
         optimized = codes_from_hessian(weight, h, effective, group, qmin, qmax, damping)
+        metrics = hessian_error_metrics(
+            weight, optimized, h, scales=effective, group_size=group
+        )
         changed = float((codes.reshape_as(optimized) != optimized).float().mean())
         codes.copy_(optimized.reshape_as(codes))
         scales.copy_(effective.reshape_as(scales))
@@ -153,9 +160,17 @@ def apply_gptq(module, weights, capture, damping=0.01):
                 samples=capture.counts[path],
                 damping=damping,
                 changed_code_fraction=changed,
+                output_error=metrics,
+                error_scope="weight_only_projection_on_calibration_inputs",
+                stop_reason="all_columns_quantized",
+                processed_columns=weight.shape[-1],
             )
         )
         print("GPTQ_PROJECTION", details[-1], flush=True)
+        log_quantization(
+            path,
+            **{key: value for key, value in details[-1].items() if key != "module"},
+        )
     if len(details) != len(weights) or capture.hessians:
         raise ValueError("GPTQ projection coverage is incomplete")
     return details

@@ -169,7 +169,6 @@ def prepare_attention(args, settings):
         rope_tables,
         run_attention,
         attention_inputs,
-        reference_moe,
     )
     from executorch.examples.qualcomm.oss_scripts.moe.quantize.matrix import (
         HessianCapture,
@@ -186,44 +185,15 @@ def prepare_attention(args, settings):
     checkpoint = Checkpoint(args.model)
     linear = layer % 4 != 3
     checkpoint.constants(layer, directory / "moe-constants.npz")
-    data = torch.load(args.output / "INPUTS.pt", weights_only=True, mmap=True)
-    hidden = (
-        torch.load(
-            args.output / f"sequential/layer{layer-1}.pt", weights_only=True, mmap=True
-        )["hidden"]
-        if layer
-        else torch.cat((data["calibration"], data["heldout"]))
+    from executorch.examples.qualcomm.oss_scripts.moe.quantize.reference import (
+        reference_inputs,
     )
-    reference = (
-        torch.load(
-            args.output / f"layers/layer{layer-1}/reference.pt",
-            weights_only=True,
-            mmap=True,
-        )["all_output"]
-        if layer
-        else torch.cat((data["reference_calibration"], data["reference_heldout"]))
+
+    hidden = reference_inputs(
+        args.output, layer, settings.quantization.calibration_dtype
     )
     cos, sin = rope_tables(checkpoint.config)
     model = AttentionFront(checkpoint, layer).eval().cuda()
-    norm, residual = torch.empty_like(reference, device="cuda"), torch.empty_like(
-        reference, device="cuda"
-    )
-    for sequence, start, _, out in run_attention(
-        model, reference.cuda(), linear, cos, sin
-    ):
-        norm[sequence, start : start + 128] = out[0][0]
-        residual[sequence, start : start + 128] = out[1][0]
-    reference_output = residual + reference_moe(checkpoint, layer, norm)
-    if not torch.isfinite(reference_output).all():
-        raise ValueError("Nonfinite FP32 reference")
-    torch.save(
-        dict(
-            all_output=reference_output.cpu(),
-            test=dict(output=reference_output[8:9].cpu()),
-        ),
-        directory / "reference.pt",
-    )
-    del reference, reference_output, norm, residual
     inputs = attention_inputs(hidden[:1, :128].contiguous(), linear, cos, sin)
     model = convert_linear_to_conv2d(model.cpu())
     graph = torch.export.export(model, inputs, strict=True).module()
@@ -324,9 +294,11 @@ def prepare_head(args, settings):
 
     directory = args.output / "head"
     directory.mkdir(exist_ok=True)
-    hidden = torch.load(
-        args.output / "sequential/layer39.pt", weights_only=True, mmap=True
-    )["hidden"]
+    from executorch.examples.qualcomm.oss_scripts.moe.quantize.reference import (
+        reference_inputs,
+    )
+
+    hidden = reference_inputs(args.output, 40, settings.quantization.calibration_dtype)
     model = convert_linear_to_conv2d(Head(Checkpoint(args.model)).eval())
     sample = hidden[:1, :128].contiguous()
     graph = torch.export.export(model, (sample,), strict=True).module()
@@ -377,12 +349,14 @@ def main():
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument(
         "--stage",
-        choices=["data", "embedding-inputs", "attention", "head"],
+        choices=["data", "embedding-inputs", "reference", "attention", "head"],
         required=True,
     )
     parser.add_argument("--corpus", type=Path)
     parser.add_argument("--layer", type=int)
     parser.add_argument("--qnn-binding", type=Path)
+    parser.add_argument("--first-layer", type=int, default=0)
+    parser.add_argument("--last-layer", type=int, default=3)
     args = parser.parse_args()
     settings = load_model_config(args.model_config)
     if args.stage == "attention" and settings.quantization.attention != "gptq":
@@ -391,6 +365,8 @@ def main():
         parser.error("Use head=w4a16_gptq for raw head calibration")
     if args.stage == "attention" and args.layer not in range(40):
         parser.error("attention needs --layer 0..39")
+    if args.stage == "reference" and not 0 <= args.first_layer <= args.last_layer < 40:
+        parser.error("Reference layer range must be within 0..39")
     if args.stage == "data" and args.corpus is None:
         parser.error("data needs --corpus")
     args.output.mkdir(parents=True, exist_ok=True)
@@ -409,6 +385,12 @@ def main():
         prepare_data(args, settings)
     elif args.stage == "embedding-inputs":
         quantized_embedding_inputs(args)
+    elif args.stage == "reference":
+        from executorch.examples.qualcomm.oss_scripts.moe.quantize.reference import (
+            prepare_reference,
+        )
+
+        prepare_reference(args, settings)
     elif args.stage == "attention":
         prepare_attention(args, settings)
     else:

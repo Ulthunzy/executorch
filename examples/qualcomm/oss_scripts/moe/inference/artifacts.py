@@ -59,6 +59,39 @@ def check_shared_head(args):
         raise ValueError("Shared head does not match the calibrated GPTQ head")
 
 
+def check_expert_bank(bank, quantization, layer):
+    recipe = bank.get("quantization_config", {})
+    if quantization.expert_gptq_only and (
+        recipe.get("gptq_only") is not True
+        or len(bank.get("details", [])) != 256
+        or any(d.get("selected_method") != 3 for d in bank["details"])
+    ):
+        raise ValueError(
+            f"Layer {layer}: the selected recipe requires GPTQ for every GU/down matrix"
+        )
+    if bank.get("calibration_source") is None:
+        calibrated = bank.get("sequential") is True
+    else:
+        calibrated = (
+            bank.get("calibration_source") == "original_model"
+            and bank.get("sequential") is False
+            and bank.get("calibration_dtype") == quantization.calibration_dtype
+            and recipe.get("calibration_source") == "original_model"
+            and recipe.get("calibration_dtype") == quantization.calibration_dtype
+            and recipe.get("calibration_norm") == "original_model"
+            and bank.get("full_expert_scale_reconstruction") is True
+        )
+    if (
+        bank.get("codebook") != [-7, -2, 2, 7]
+        or not calibrated
+        or (bank.get("bits"), bank.get("gu_group"), bank.get("down_group"))
+        != (2, 1024, 512)
+    ):
+        raise ValueError(
+            f"Layer {layer} requires reconstructed W2 weights with compatible calibration metadata"
+        )
+
+
 def check_artifacts(args):
     if (
         args.model_settings.quantization.embedding == "int4_g32"
@@ -257,23 +290,7 @@ def check_artifacts(args):
         bank = json.loads(
             (args.artifacts / f"banks/layer{layer}/BANK.json").read_text()
         )
-        if args.model_settings.quantization.expert_gptq_only and (
-            not bank.get("quantization_config", {}).get("gptq_only")
-            or len(bank.get("details", [])) != 256
-            or any(d["selected_method"] != 3 for d in bank["details"])
-        ):
-            raise ValueError(
-                f"Layer {layer}: the selected recipe requires GPTQ for every GU/down matrix"
-            )
-        if (
-            bank["codebook"] != [-7, -2, 2, 7]
-            or not bank["sequential"]
-            or (bank.get("bits"), bank.get("gu_group"), bank.get("down_group"))
-            != (2, 1024, 512)
-        ):
-            raise ValueError(
-                f"Layer {layer} requires sequentially reconstructed W2 weights"
-            )
+        check_expert_bank(bank, args.model_settings.quantization, layer)
         with (args.artifacts / f"indices/layer{layer}/bank-index.bin").open(
             "rb"
         ) as handle:
