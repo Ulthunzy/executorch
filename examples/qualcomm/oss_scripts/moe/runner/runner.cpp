@@ -203,8 +203,10 @@ void Workspace::release_handoff() {
 }
 
 void Runner::ready() {
-  loaded_.store(true);
   workspace_->release_handoff();
+  std::lock_guard<std::mutex> lock(mutex_);
+  loaded_.store(true);
+  changed_.notify_all();
 }
 
 Runner::Runner(moe_chat::Options options, std::unique_ptr<Workspace> workspace)
@@ -272,15 +274,10 @@ void Runner::fail(const std::string& error) {
 void Runner::run() {
   Environment restore;
   try {
-    auto request = next();
-    if (request.kind != moe_chat::Request::Kind::Close) {
-      options_.prompts = {request.prompt};
-      options_.image_path = request.image_path;
-      options_.max_new_tokens = request.max_new_tokens;
-      options_.temperature = request.temperature;
-      options_.thinking = request.thinking;
-      if (request.ignore_eos)
-        options_.ignore_eos = *request.ignore_eos;
+    {
+      options_.preload = true;
+      options_.prompts.clear();
+      options_.image_path.clear();
       setenv("QWEN35_TOKENIZER_CACHE", workspace_->root().c_str(), 1);
       const int status = qwen35_moe_run_client(options_, *this);
       if (status)
@@ -358,12 +355,19 @@ bool Runner::is_loaded() const {
 }
 
 executorch::runtime::Error Runner::load() {
-  // QNN contexts remain lazy until the first input.
   std::lock_guard<std::mutex> operation(invocation_);
-  std::lock_guard<std::mutex> lock(mutex_);
+  std::unique_lock<std::mutex> lock(mutex_);
   if (closing_ || exited_)
     return executorch::runtime::Error::InvalidState;
-  loaded_.store(true);
+  if (!worker_.joinable())
+    worker_ = std::thread(&Runner::run, this);
+  changed_.wait(lock, [&] {
+    return loaded_.load() || !error_.empty() || exited_ || closing_;
+  });
+  if (!error_.empty())
+    throw std::runtime_error(error_);
+  if (!loaded_.load() || exited_ || closing_)
+    return executorch::runtime::Error::InvalidState;
   return executorch::runtime::Error::Ok;
 }
 void Runner::reset() {

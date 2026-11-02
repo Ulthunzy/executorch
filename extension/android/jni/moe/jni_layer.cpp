@@ -1,6 +1,7 @@
 #include <executorch/examples/qualcomm/oss_scripts/moe/runner/runner.h>
 #include <executorch/examples/qualcomm/oss_scripts/moe/runner/chat/options.h>
 
+#include <android/log.h>
 #include <jni.h>
 #include <cmath>
 #include <map>
@@ -64,8 +65,14 @@ std::string utf8(JNIEnv* env, jstring value) {
 }
 
 void raise(JNIEnv* env, const std::exception& error) {
-  if (env->ExceptionCheck())
+  if (env->ExceptionCheck()) {
+    __android_log_write(
+        ANDROID_LOG_ERROR,
+        "ExecuTorchMoE",
+        "Java exception pending in MoE JNI call");
     return;
+  }
+  __android_log_write(ANDROID_LOG_ERROR, "ExecuTorchMoE", error.what());
   const char* type = dynamic_cast<const std::invalid_argument*>(&error)
       ? "java/lang/IllegalArgumentException"
       : "java/lang/IllegalStateException";
@@ -156,6 +163,17 @@ Java_org_pytorch_executorch_extension_llm_Qwen35MoeModule_createNative(
   } catch (const std::exception& error) {
     raise(env, error);
     return 0;
+  }
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_org_pytorch_executorch_extension_llm_Qwen35MoeModule_loadNative(
+    JNIEnv* env, jclass, jlong handle) {
+  try {
+    if (find(handle)->load() != executorch::runtime::Error::Ok)
+      throw std::runtime_error("MoE model loading did not complete");
+  } catch (const std::exception& error) {
+    raise(env, error);
   }
 }
 

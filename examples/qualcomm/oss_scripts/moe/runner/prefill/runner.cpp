@@ -23,6 +23,7 @@
 using namespace executorch::runtime;
 static std::string model_root;
 static std::unique_ptr<PrefillSession> session;
+
 static bool dynamic_sequence = false;
 
 void qwen35_prefill_append(
@@ -283,7 +284,10 @@ static int prefill_main(int argc, char** argv, bool chat) try {
   const int plan_tokens = dynamic_sequence
       ? prefill_plan_tokens(prompt_tokens, workspace_tokens)
       : workspace_tokens;
+  const bool preload = chat && moe_chat::preloading();
   session = std::make_unique<PrefillSession>(model_root, plan_tokens);
+  if (preload)
+    session->initial_module = &module;
 
   struct SessionLifetime {
     ~SessionLifetime() {
@@ -297,8 +301,8 @@ static int prefill_main(int argc, char** argv, bool chat) try {
   const int valid_tokens = getenv("PREFILL_VALID_TOKENS")
       ? atoi(getenv("PREFILL_VALID_TOKENS"))
       : prompt_tokens;
-  if (valid_tokens < 1 || valid_tokens > session->logical_capacity ||
-      valid_tokens > prompt_tokens || prompt_tokens - valid_tokens >= 128)
+  if (!preload && (valid_tokens < 1 || valid_tokens > session->logical_capacity ||
+      valid_tokens > prompt_tokens || prompt_tokens - valid_tokens >= 128))
     throw std::runtime_error("invalid prefill padding length");
   const int max_prefill_tokens = session->attention[3]->history + 128;
   if (samples != 1 || warmups || prompt_tokens < 128 ||
@@ -306,8 +310,8 @@ static int prefill_main(int argc, char** argv, bool chat) try {
       (plan_tokens != 128 && plan_tokens != prompt_tokens))
     throw std::runtime_error(
         "prefill sequence exceeds the compiled KV history or plan alignment");
-  auto data = bytes(model_root + "/tokens.i64");
-  if (data.size() != size_t(prompt_tokens) * 8)
+  auto data = preload ? std::vector<uint8_t>{} : bytes(model_root + "/tokens.i64");
+  if (!preload && data.size() != size_t(prompt_tokens) * 8)
     throw std::runtime_error("token input size");
   printf(
       "PTE_READY layers=40 ar_len=128 prompt_tokens=%d chunks=%d plan_calls=122 embedded_qnn_contexts=%d expert_slots=%zu expert_buffer_bytes=%zu rpc_buffer_bytes=%llu peak_rpc_buffer_bytes=%llu setup_ms=%.6f context_creates=%llu memory_registers=%llu hot=0\n",
@@ -334,7 +338,7 @@ static int prefill_main(int argc, char** argv, bool chat) try {
   int native_total = 0;
   const auto sequence_begin = Clock::now();
   const int chunks_per_plan = plan_tokens / 128;
-  for (int chunk = 0; chunk < prompt_tokens / 128; chunk += chunks_per_plan) {
+  for (int chunk = 0; !preload && chunk < prompt_tokens / 128; chunk += chunks_per_plan) {
     const int active_tokens = std::min(plan_tokens, valid_tokens - chunk * 128);
     session->sequence_valid_tokens =
         active_tokens + (plan_tokens == 128 ? chunk * 128 : 0);
@@ -500,6 +504,13 @@ static int prefill_main(int argc, char** argv, bool chat) try {
               session->attention[layer]->export_bytes(c));
     }
   }
+  if (preload)
+    for (int layer = 0; layer < 40; ++layer)
+      for (int c = 0; c < 2; ++c)
+        save(model_root + "/pte-0-layer" + std::to_string(layer) +
+                 "-cache" + std::to_string(c) + ".u16",
+             session->attention[layer]->export_data(c),
+             session->attention[layer]->export_bytes(c));
   save(
       model_root + "/prefill-all-routes.i32",
       all_routes.data(),
@@ -619,7 +630,8 @@ static int prefill_main(int argc, char** argv, bool chat) try {
     const char* decode_async = getenv("ASYNC_DECODE_IO");
     if (decode_async)
       setenv("ASYNC_EXPERT_IO", decode_async, 1);
-    session->prepare_decode();
+    if (!preload)
+      session->prepare_decode();
     const auto creates = session->runtime.context_creates;
     const auto frees = session->runtime.context_frees;
     const auto registrations = session->runtime.memory_registers;

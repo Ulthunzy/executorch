@@ -11,7 +11,7 @@ import java.util.Objects;
  * Qwen3.5 35B-A3B external-expert runtime. Independent of LlmModule.
  *
  * <p>Construct and generate on a background thread. Callbacks run on that same caller thread.
- * The first generation loads the model; subsequent turns reuse context, KV and
+ * Call load() before entering chat. Subsequent turns reuse context, KV and
  * experts until close(). A bundled PTE is extracted and cached internally. Use an
  * app-private cache directory for workspaceDirectory. Only one instance may be
  * open per process; do not run another QNN model concurrently with this runtime.
@@ -58,6 +58,11 @@ public final class Qwen35MoeModule implements AutoCloseable {
         config.tokenizerPath, config.workspaceDirectory, config.nativeLibraryDirectory,
         Objects.requireNonNull(config.systemPrompt), config.contextLength, config.expertsPerLayer,
         config.enableVision);
+  }
+
+  /** Load QNN graphs and expert buffers without consuming any conversation tokens. */
+  public void load() {
+    loadNative(requireHandle());
   }
 
   /** Returns JSON statistics. Retains prior turns; use resetContext() for a new conversation. */
@@ -138,6 +143,7 @@ public final class Qwen35MoeModule implements AutoCloseable {
 
   private static native long createNative(String model, String shared, String tokenizer,
       String workspace, String libraries, String system, int capacity, int experts, boolean vision);
+  private static native void loadNative(long handle);
   private static native String generateNative(long handle, String prompt, String image, int count,
       float temperature, boolean thinking, Stream callback);
   private static native void stopNative(long handle);

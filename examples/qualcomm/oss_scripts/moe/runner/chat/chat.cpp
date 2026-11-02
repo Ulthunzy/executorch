@@ -15,6 +15,10 @@ int converse() {
   return conversation->run();
 }
 
+bool preloading() {
+  return conversation->options.preload;
+}
+
 std::vector<float> initial_image(VisionEncoder* encoder) {
   return conversation->initial_image(encoder);
 }

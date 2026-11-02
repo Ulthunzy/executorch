@@ -6,7 +6,9 @@
 
 JNI 入口位于本目录 `jni_layer.cpp`，只转换 Java 参数、UTF-8 与回调。会话、取消、状态和 Workspace 由 `examples/qualcomm/oss_scripts/moe/runner/runner.{h,cpp}` 统一实现，`Runner` 继承 `IRunner`。JNI CMake 复用 MoE 根 CMake 的 `et_infer` 目标，与 CLI 共用 Prefill、Decode、QNN 和模型工厂代码。本目录不再维护独立的 session 实现。
 
-Java 方法签名保持不变，库加载名为 `System.loadLibrary("et_infer")`。项目交付两个自研库：ARM64 的 `libet_infer.so` 包含 JNI、Runner、Prefill/Decode、专家管理和共享 context；Hexagon 的 `libet_qnnop.so` 包含 GDN、低 bit 内核和两套独立命名的 FastRPC 服务。源码仍按算子、调度和 JNI 分目录维护。DSP 架构从 Native 构建的 `TARGET.json` 读取，支持 V79/V81/V85 配套构建。QNN SDK 运行库继续单独提供。
+Java 新增 `load()` 接口，现有生成方法签名保持不变，库加载名为 `System.loadLibrary("et_infer")`。项目交付两个自研库：ARM64 的 `libet_infer.so` 包含 JNI、Runner、Prefill/Decode、专家管理和共享 context；Hexagon 的 `libet_qnnop.so` 包含 GDN、低 bit 内核和两套独立命名的 FastRPC 服务。源码仍按算子、调度和 JNI 分目录维护。DSP 架构从 Native 构建的 `TARGET.json` 读取，支持 V79/V81/V85 配套构建。QNN SDK 运行库继续单独提供。
+
+首轮和后续轮复用专家 memo、KV/GDN state 和 QNN 已注册的 AR128 IO；工作区容量与本轮有效 token 数、位置分别维护。分组 Prefill 的 DSP 映射保留至模型关闭，避免后续轮次出现 AR128 请求校验失败或映射长度不匹配。JNI 错误同时写入 Android 日志 `ExecuTorchMoE`，Java 异常类型保持兼容。
 
 ## Android 调用
 
@@ -32,6 +34,7 @@ config.contextLength = 2048;
 config.expertsPerLayer = 64;
 config.enableVision = false;
 Qwen35MoeModule model = new Qwen35MoeModule(config);
+model.load(); // 后台完成实际加载，再开放聊天入口
 ```
 
 从仓库根目录构建并打包当前8850版本：
@@ -56,6 +59,7 @@ config.contextLength = 2048; // 当前8850；必须与实际导出 PLANS.json �
 config.expertsPerLayer = 64; // 32 / 64，与现有运行时一致
 config.enableVision = true;
 Qwen35MoeModule model = new Qwen35MoeModule(config);
+model.load(); // 后台完成实际加载，再开放聊天入口
 
 // 在后台线程调用；回调就在该调用线程执行，更新 UI 时自行 post 到主线程。
 Qwen35MoeModule.Callback callback = new Qwen35MoeModule.Callback() {
@@ -70,7 +74,7 @@ model.resetContext();
 model.close();
 ```
 
-构造函数检查部署并创建独立会话目录；**首次 generate 才加载模型并执行 AR128 prefill**，后续复用所有 context/state/专家缓存，`close()` 统一释放。`resetContext()` 清理历史而不卸载模型。首轮和后续轮都支持任意有效输入长度，实际输入加输出预算不能超过模型的上下文容量。超过单次 PTE 工作区的长输入重复执行 AR128；不足 128 的尾块补齐，通过有效长度屏蔽 padding 的 GDN/conv/KV 更新，位置只按真实 token 推进；AR1 用于输出生成。`PLANS.json` v3 的 `workspace_tokens` 仅为工作区大小，旧 v2 的 `max_prefill_tokens` 也只按工作区解释，不再限制整段输入。短输入保留原有批处理优化。图片解码/encoder 始终在内部完成。旧图如果没有完整上下文 KV/mask 或 GDN `last_token_index`，仍需重新导出；更新 Java 配置无法补齐这些图接口。
+构造函数检查部署并创建独立会话目录；**在后台调用 `load()`，等待Prefill/Decode图、共享权重和专家缓存资源就绪，再进入聊天界面**。加载阶段不消耗对话token，`generate()` 负责输入Prefill和输出生成；后续复用所有 context/state/专家缓存，`close()` 统一释放。`resetContext()` 清理历史而不卸载模型。首轮和后续轮都支持任意有效输入长度，实际输入加输出预算不能超过模型的上下文容量。超过单次 PTE 工作区的长输入重复执行 AR128；不足 128 的尾块补齐，通过有效长度屏蔽 padding 的 GDN/conv/KV 更新，位置只按真实 token 推进；AR1 用于输出生成。`PLANS.json` v3 的 `workspace_tokens` 仅为工作区大小，旧 v2 的 `max_prefill_tokens` 也只按工作区解释，不再限制整段输入。短输入保留原有批处理优化。图片解码/encoder 始终在内部完成。旧图如果没有完整上下文 KV/mask 或 GDN `last_token_index`，仍需重新导出；更新 Java 配置无法补齐这些图接口。
 
 单 PTE 构造函数首次调用还会同步解包，应在后台线程调用。除原始 PTE 外，工作目录需要容纳解包资源及 1 GiB 余量；解包前按未缓存资源核算空间，写入各资源前再次检查。完整缓存可直接复用，空间不足会抛异常，部分已完成资源可在后续继续使用。
 

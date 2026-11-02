@@ -27,6 +27,7 @@ struct Options {
   bool profile = false;
   bool help_requested = false;
   bool stream = true, vision_enabled = true;
+  bool preload = false;
   std::string log_path;
 };
 

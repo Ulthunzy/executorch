@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <cmath>
 #include <dlfcn.h>
+#include <exception>
 #include <fstream>
 #include <iostream>
 #include <iomanip>
@@ -133,6 +134,11 @@ void Conversation::prepare() {
   if (!options.image_path.empty() && !image_layout)
     throw std::runtime_error(
         "Deploy vision.bin, VISION.json and model-config.json before using --image-path");
+  if (options.preload) {
+    rotary->save(options.model_root);
+    configure_environment(options, options.prefill_workspace_tokens, 0);
+    return;
+  }
   if (options.prompts.empty()) {
     std::string line;
     const auto waiting = time_in_ms();
@@ -587,22 +593,26 @@ int Conversation::run() {
 
   if (open((options.model_root + "/decode").c_str(), 4096))
     throw std::runtime_error(error());
+  if (!options.preload) {
+    {
+      std::ifstream file(
+          options.model_root + "/prefill/pte-0-logits.f32", std::ios::binary);
+      file.read(
+          reinterpret_cast<char*>(logits.data()), logits.size() * sizeof(float));
+      if (!file)
+        throw std::runtime_error("Cannot read first prefill logits");
+    }
+    // Prefill runs while resident sessions are being constructed. Keep its
+    // measured work in prompt evaluation rather than model-load time.
+    stats.model_load_end_ms = time_in_ms() - static_cast<long>(initial_prompt_ms);
+    stats.inference_start_ms = stats.model_load_end_ms;
+    stats.token_encode_end_ms = stats.inference_start_ms;
+    generate();
+  } else {
+    stats.model_load_end_ms = time_in_ms();
+  }
   if (client)
     client->ready();
-  {
-    std::ifstream file(
-        options.model_root + "/prefill/pte-0-logits.f32", std::ios::binary);
-    file.read(
-        reinterpret_cast<char*>(logits.data()), logits.size() * sizeof(float));
-    if (!file)
-      throw std::runtime_error("Cannot read first prefill logits");
-  }
-  // Prefill runs while resident sessions are being constructed. Keep its
-  // measured work in prompt evaluation rather than model-load time.
-  stats.model_load_end_ms = time_in_ms() - static_cast<long>(initial_prompt_ms);
-  stats.inference_start_ms = stats.model_load_end_ms;
-  stats.token_encode_end_ms = stats.inference_start_ms;
-  generate();
   if (client) {
     while (true) {
       const auto request = client->next();
