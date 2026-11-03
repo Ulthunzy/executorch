@@ -103,6 +103,8 @@ python -c 'from executorch.backends.qualcomm.python import PyQnnManagerAdaptor a
 
 `MOE_NATIVE_PROFILE=1` 构建DSP计时版本，建议使用独立 `MOE_BUILD_DIR`。推理加 `--profile` 才读取累计计数；`TARGET.json` 会验证该构建标记。`MOE_BUILD_OP_PACKAGE=0` 可跳过GDN包构建以复用已验证的同架构算子，默认仍构建完整依赖。分析工具为 `tools/moe_profile.py`，常规吞吐测试应使用无插桩版本。
 
+`MOE_EXPERT_CACHE_TRACE=1` 输出每层、每个有效 AR128 块的专家请求、命中、缺失和新增文件加载次数，默认关闭。每次真实 Top8 使用计一次请求；首次需要加载记一次 miss，同一窗口后续复用常驻或 memo 权重记 hit，重复请求合并等待同一次加载。Native 在权重 ready 后才计算，因此该计数表示加载及复用，不表示 Router 阶段瞬时就绪率。启动预加载另见 `STARTUP_COLD_PRELOAD`。可用 `MOE_EXPERT_CACHE_TRACE_FILE` 指定二进制路由追加文件；每帧包含七个 little-endian int32（magic `0x4d4f4552`、版本 1、层号、块起点、窗口起点、有效 token 数、槽数），后接槽内专家 ID 和有效 Top8 ID。每次独立采样前清空该文件。
+
 ## 3. 修改原始 safetensors 路径和导出配置
 
 ### 3.1 原始模型路径改哪里

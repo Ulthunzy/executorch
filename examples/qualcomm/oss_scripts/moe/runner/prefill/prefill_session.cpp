@@ -1,5 +1,6 @@
 #include "prefill_session.h"
 #include <exception>
+#include <fstream>
 #include "../../../../custom_op/lowbit/expert_stream.h"
 #include "cold_start.h"
 
@@ -460,6 +461,8 @@ void PrefillSession::prefetch_route(int layer, const int32_t* ids) {
     attention_io_spans.clear();
   }
   auto& bank = *banks[layer];
+  const size_t reads_before = route_read_ids.size();
+  size_t cache_requests = 0, cache_hits = 0;
   for (int token = 0; token < valid_tokens; token++) {
     std::array<bool, 256> seen{};
     for (int rank = 0; rank < 8; rank++) {
@@ -467,6 +470,11 @@ void PrefillSession::prefetch_route(int layer, const int32_t* ids) {
       if (expert < 0 || expert >= 256 || seen[expert])
         throw std::runtime_error("Top8 route prefetch");
       seen[expert] = true;
+      if (trace_expert_cache) {
+        ++cache_requests;
+        // Repeated routes share one load; Native waits for ready before use.
+        cache_hits += route_first_use[expert] >= 0 || memo_valid[expert];
+      }
       if (route_first_use[expert] >= 0)
         continue;
       route_first_use[expert] = (chunk_offset + token) * 8 + rank;
@@ -487,6 +495,36 @@ void PrefillSession::prefetch_route(int layer, const int32_t* ids) {
                                expert_stream::kReadyOffset) +
           expert;
       route_read_ids.push_back(expert);
+    }
+  }
+  if (trace_expert_cache) {
+    const size_t file_misses = route_read_ids.size() - reads_before;
+    printf(
+        "PREFILL_CACHE_BLOCK layer=%d start=%d window_start=%d valid_tokens=%d requests=%zu hits=%zu misses=%zu file_load_requests=%zu\n",
+        layer,
+        chunk_start,
+        sequence_start,
+        valid_tokens,
+        cache_requests,
+        cache_hits,
+        cache_requests - cache_hits,
+        file_misses);
+    if (const char* path = getenv("MOE_EXPERT_CACHE_TRACE_FILE")) {
+      std::ofstream trace(path, std::ios::binary | std::ios::app);
+      const int32_t header[] = {
+          0x4d4f4552, 1, layer, chunk_start, sequence_start,
+          valid_tokens, capacity};
+      trace.write(reinterpret_cast<const char*>(header), sizeof(header));
+      for (const auto& slot : caches[layer].entries) {
+        const int32_t expert = slot.expert;
+        trace.write(reinterpret_cast<const char*>(&expert), sizeof(expert));
+      }
+      trace.write(
+          reinterpret_cast<const char*>(ids),
+          valid_tokens * 8 * sizeof(int32_t));
+      trace.close();
+      if (!trace)
+        throw std::runtime_error("Cannot write expert cache route trace");
     }
   }
   if (chunk_offset == 0)

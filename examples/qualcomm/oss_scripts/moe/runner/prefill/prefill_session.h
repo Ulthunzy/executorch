@@ -83,6 +83,8 @@ struct PrefillSession {
   std::array<std::array<int32_t, 128 * 8>, 40> route_history{};
   bool async_io = getenv("ASYNC_EXPERT_IO") &&
       std::string(getenv("ASYNC_EXPERT_IO")) == "1";
+  bool trace_expert_cache = getenv("MOE_EXPERT_CACHE_TRACE") &&
+      std::string(getenv("MOE_EXPERT_CACHE_TRACE")) == "1";
   std::vector<std::shared_ptr<Buffer>> pipeline_banks;
   std::string startup_policy = getenv("STARTUP_EXPERT_PREFETCH")
       ? getenv("STARTUP_EXPERT_PREFETCH")
