@@ -1,4 +1,8 @@
 #include "native_core.h"
+#if SM_MOE_IDLE_POWER_MANAGEMENT
+#include <sys/prctl.h>
+#include <time.h>
+#endif
 
 namespace moe::decode {
 
@@ -15,6 +19,13 @@ void NativeCore::await_mailbox(int word, uint32_t expected) {
     if ((++polls & 4095) == 0 &&
         std::chrono::steady_clock::now() - start > std::chrono::seconds(20))
       throw std::runtime_error("native mailbox timeout");
+#if SM_MOE_IDLE_POWER_MANAGEMENT
+    if (timer_slack_ns > 0 && polls >= 256) {
+      const timespec pause{0, 20000};
+      nanosleep(&pause, nullptr);
+      continue;
+    }
+#endif
     asm volatile("yield");
   }
 }
@@ -128,6 +139,13 @@ NativeCore::NativeCore(Runtime& r, const std::string&) : runtime(r) {
   }
   if (mapped)
     sync_buffer(outbuf[0], DMA_BUF_SYNC_END | DMA_BUF_SYNC_WRITE);
+#if SM_MOE_IDLE_POWER_MANAGEMENT && defined(SM_MOE_DSP_ARCH) && SM_MOE_DSP_ARCH == 81
+  if (use_mailbox) {
+    const long previous = prctl(PR_GET_TIMERSLACK, 0UL, 0UL, 0UL, 0UL);
+    if (previous > 0 && !prctl(PR_SET_TIMERSLACK, 1UL, 0UL, 0UL, 0UL))
+      timer_slack_ns = previous;
+  }
+#endif
 }
 
 int NativeCore::named(bool input, const char* name) {
@@ -344,6 +362,15 @@ NativeCore::~NativeCore() {
     } catch (const std::exception& error) {
       fprintf(stderr, "native cleanup failed: %s\n", error.what());
     }
+#if SM_MOE_IDLE_POWER_MANAGEMENT
+  if (timer_slack_ns > 0)
+    prctl(
+        PR_SET_TIMERSLACK,
+        static_cast<unsigned long>(timer_slack_ns),
+        0UL,
+        0UL,
+        0UL);
+#endif
 }
 
 } // namespace moe::decode

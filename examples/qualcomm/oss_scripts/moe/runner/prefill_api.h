@@ -14,3 +14,5 @@ void qwen35_prefill_append(
     Qwen35SessionState& state,
     float* logits,
     const std::function<bool()>& stopped);
+
+void qwen35_prefill_set_power_active(bool active);

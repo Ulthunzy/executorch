@@ -62,6 +62,7 @@ def record_build(args):
             chat_controls=1,
             runtime_layout="two_libraries",
             native_profile=args.profile,
+            idle_power_management=bool(args.idle_power_management),
             native_build_sha256=artifact_hashes(root, (name,))[name],
             artifacts=artifact_hashes(root, RUNTIME_FILES),
         )
@@ -77,6 +78,7 @@ if __name__ == "__main__":
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--arch", type=int, choices=(79, 81, 85), required=True)
     parser.add_argument("--profile", type=int, choices=(0, 1), default=0)
+    parser.add_argument("--idle-power-management", type=int, choices=(0, 1), default=0)
     parser.add_argument("--sdk", type=Path, required=True)
     parser.add_argument("--soc", choices=("SM8750", "SM8850", "SM8975"))
     args = parser.parse_args()

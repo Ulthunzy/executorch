@@ -109,6 +109,24 @@ Runtime::Runtime(Phase selected_phase, SharedGraphResolver resolver)
     check(
         q.deviceGetInfrastructure(&infrastructure), "deviceGetInfrastructure");
     perf = ((QnnHtpDevice_Infrastructure_t*)infrastructure)->perfInfra;
+    set_power_active(true);
+  } catch (...) {
+    release_handles();
+    throw;
+  }
+}
+
+void Runtime::set_power_active(bool active) {
+  if (!active) {
+    if (power_id) {
+      check(perf.destroyPowerConfigId(power_id), "destroyPowerConfigId");
+      power_id = 0;
+    }
+    return;
+  }
+  if (power_id)
+    return;
+  try {
     check(perf.createPowerConfigId(0, 0, &power_id), "createPowerConfigId");
 
     QnnHtpPerfInfrastructure_PowerConfig_t dcvs{}, latency{}, poll{};
@@ -138,7 +156,9 @@ Runtime::Runtime(Phase selected_phase, SharedGraphResolver resolver)
         &dcvs, &latency, &poll, nullptr};
     check(perf.setPowerConfig(power_id, config), "setPowerConfig");
   } catch (...) {
-    release_handles();
+    if (power_id)
+      perf.destroyPowerConfigId(power_id);
+    power_id = 0;
     throw;
   }
 }

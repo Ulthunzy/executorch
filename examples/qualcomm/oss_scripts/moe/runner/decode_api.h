@@ -27,6 +27,7 @@ __attribute__((visibility("default"))) int qwen35_decode_set_inputs(
     const float* sin,
     size_t table_count);
 __attribute__((visibility("default"))) int qwen35_decode_reset();
+__attribute__((visibility("default"))) int qwen35_decode_set_power_active(int active);
 __attribute__((visibility("default"))) int qwen35_decode_position();
 __attribute__((visibility("default"))) int qwen35_decode_export_state(
     Qwen35SessionState* state);

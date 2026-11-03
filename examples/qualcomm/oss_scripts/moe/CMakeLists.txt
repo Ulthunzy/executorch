@@ -7,6 +7,7 @@ set(EXECUTORCH_ANDROID_BUILD "${MOE_REPO}/build-android" CACHE PATH "ExecuTorch 
 set(MOE_NATIVE_BUILD "${CMAKE_BINARY_DIR}" CACHE PATH "Generated FastRPC interfaces and DSP library")
 set(MOE_DSP_ARCH "81" CACHE STRING "HTP ISA: 79, 81 or 85")
 option(MOE_BUILD_TOOLS "Build CLI runners and the export capture tool" ON)
+option(MOE_ENABLE_IDLE_POWER_MANAGEMENT "Enable experimental per-turn power release and mailbox sleep" OFF)
 if(NOT ANDROID OR NOT ANDROID_ABI STREQUAL "arm64-v8a")
   message(FATAL_ERROR "MoE requires Android arm64-v8a")
 endif()
@@ -36,7 +37,8 @@ target_link_libraries(et_infer PRIVATE moe_chat_runtime moe_decode_runtime moe_c
 target_compile_features(et_infer PRIVATE cxx_std_17)
 target_compile_options(et_infer PRIVATE -O3 -fno-emulated-tls -fvisibility=hidden -fvisibility-inlines-hidden -ffunction-sections -fdata-sections)
 target_compile_definitions(et_infer PRIVATE MOE_CHAT_RUNNER MOE_JNI_RUNNER MOE_DECODE_LIBRARY
-  C10_USING_CUSTOM_GENERATED_MACROS SM_MOE_DSP_ARCH=${MOE_DSP_ARCH} ET_EVENT_TRACER_ENABLED
+  C10_USING_CUSTOM_GENERATED_MACROS SM_MOE_DSP_ARCH=${MOE_DSP_ARCH}
+  SM_MOE_IDLE_POWER_MANAGEMENT=$<BOOL:${MOE_ENABLE_IDLE_POWER_MANAGEMENT}> ET_EVENT_TRACER_ENABLED
   ET_ENABLE_DEPRECATED_CONSTANT_BUFFER=0 ET_ENABLE_PROGRAM_VERIFICATION=0)
 target_include_directories(et_infer PRIVATE "${MOE_REPO}/.."
   "${MOE_REPO}/runtime/core/portable_type/c10" "${MOE_REPO}/third-party/flatbuffers/include"

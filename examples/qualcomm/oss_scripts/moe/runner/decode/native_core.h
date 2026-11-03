@@ -18,6 +18,9 @@ namespace moe::decode {
 struct NativeCore {
   Runtime& runtime;
   remote_handle64 handle = 0;
+#if SM_MOE_IDLE_POWER_MANAGEMENT
+  long timer_slack_ns = 0;
+#endif
   bool mapped = getenv("NATIVE_MAPPED_IO"),
        fuse_residual = getenv("NATIVE_RESIDUAL"), output_read = false;
   std::shared_ptr<Buffer> residual;

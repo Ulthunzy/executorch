@@ -8,4 +8,5 @@ interface et_decode_rpc : remote_handle64 {
  AEEResult release_fds(in sequence<long> descriptors);
  AEEResult configure_banks(in sequence<long> descriptors);
  AEEResult serve(in long mailbox_fd);
+ AEEResult set_active(in long active);
 };

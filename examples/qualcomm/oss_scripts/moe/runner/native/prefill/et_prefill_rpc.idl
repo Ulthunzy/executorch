@@ -7,4 +7,5 @@ interface et_prefill_rpc : remote_handle64 {
  AEEResult release_io();
  AEEResult counts(rout sequence<long> result);
  AEEResult configure(in long tokens);
+ AEEResult set_active(in long active);
 };

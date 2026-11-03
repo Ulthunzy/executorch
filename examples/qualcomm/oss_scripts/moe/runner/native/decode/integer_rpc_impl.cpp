@@ -1,4 +1,5 @@
 #include "bank_mapping.h"
+#include "../power.h"
 // FastRPC 入口与持久 DSP 线程池；IntegerMoE.cpp 提供实际 HVX/HMX 计算。
 #include "../../../../../custom_op/lowbit/decode/integer_moe.h"
 #include "../worker_start.h"
@@ -83,6 +84,7 @@ struct IoMapping {
 // 生命周期覆盖全部 decode：保留 IO 映射、线程栈、bank mapper 和 CRM 资源描述。
 // VTCM 使用权在 QNN 与 Native 间切换，内容只在一次资源占用期间有效。
 struct State {
+  PowerVote power{this};
   BankMapper bank_mapper;
   IoMapping io[256];
   const float* residual = nullptr;
@@ -131,7 +133,6 @@ struct State {
       qurt_pimutex_destroy(&lock);
     if (resource_context)
       HAP_compute_res_release(resource_context);
-    HAP_power_destroy(this);
     for (auto stack : stacks)
       free(stack);
     free(route);
@@ -152,44 +153,7 @@ extern "C" AEEResult et_decode_rpc_open(const char*, remote_handle64* handle) {
     if (!stack)
       return 13;
   }
-  HAP_power_request_t power{};
-  power.type = HAP_power_set_apptype;
-  power.apptype = HAP_POWER_COMPUTE_CLIENT_CLASS;
-  int error = HAP_power_set(state.get(), &power);
-  if (error)
-    return error;
-  power = {};
-  power.type = HAP_power_set_DCVS_v3;
-  auto& dcvs = power.dcvs_v3;
-  dcvs.set_dcvs_enable = 1;
-  dcvs.dcvs_enable = 0;
-  dcvs.set_bus_params = 1;
-  dcvs.bus_params.min_corner = dcvs.bus_params.target_corner =
-      dcvs.bus_params.max_corner = HAP_DCVS_VCORNER_MAX;
-  dcvs.set_core_params = 1;
-  dcvs.core_params.min_corner = dcvs.core_params.target_corner =
-      dcvs.core_params.max_corner = HAP_DCVS_VCORNER_MAX;
-  dcvs.set_sleep_disable = 1;
-  dcvs.sleep_disable = 1;
-  HAP_set_dcvs_v3_protected_bus_corners(&power, 1);
-  error = HAP_power_set(state.get(), &power);
-  if (error)
-    return error;
-  power = {};
-  power.type = HAP_power_set_HVX;
-  power.hvx.power_up = 1;
-  error = HAP_power_set(state.get(), &power);
-  if (error)
-    return error;
-  memset(&power, 0, sizeof(power));
-  power.type = HAP_power_set_HMX_v2;
-  power.hmx_v2.set_power = 1;
-  power.hmx_v2.power_up = 1;
-  power.hmx_v2.set_clock = 1;
-  power.hmx_v2.target_corner = power.hmx_v2.min_corner =
-      power.hmx_v2.max_corner = HAP_DCVS_EXP_VCORNER_MAX;
-  power.hmx_v2.perf_mode = HAP_CLK_PERF_HIGH;
-  error = HAP_power_set(state.get(), &power);
+  int error = state->power.set(true);
   if (error)
     return error;
 #if SM_EXPERT_BITS == 2
@@ -630,6 +594,12 @@ extern "C" AEEResult et_decode_rpc_serve(remote_handle64 handle, int mailbox_fd)
   write(box + 64, 2);
   const int unmap = HAP_munmap(box, 4096);
   return result ? result : unmap;
+}
+
+extern "C" AEEResult et_decode_rpc_set_active(remote_handle64 handle, int active) {
+  if (!handle)
+    return 12;
+  return reinterpret_cast<State*>(uintptr_t(handle))->power.set(active != 0);
 }
 
 } // namespace moe::dsp::decode

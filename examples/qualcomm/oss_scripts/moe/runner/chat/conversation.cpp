@@ -18,6 +18,62 @@ namespace moe_chat {
 using executorch::extension::llm::time_in_ms;
 
 namespace {
+#if SM_MOE_IDLE_POWER_MANAGEMENT
+void set_model_power(bool active) {
+  if (active) {
+    if (qwen35_shared_set_power_active(1))
+      throw std::runtime_error("Cannot resume shared context power");
+    qwen35_prefill_set_power_active(true);
+    if (qwen35_decode_set_power_active(1))
+      throw std::runtime_error(qwen35_decode_error());
+  } else {
+    std::exception_ptr failure;
+    const auto release = [&](auto action) {
+      try {
+        action();
+      } catch (...) {
+        if (!failure)
+          failure = std::current_exception();
+      }
+    };
+    release([] {
+      if (qwen35_decode_set_power_active(0))
+        throw std::runtime_error(qwen35_decode_error());
+    });
+    release([] { qwen35_prefill_set_power_active(false); });
+    release([] {
+      if (qwen35_shared_set_power_active(0))
+        throw std::runtime_error("Cannot release shared context power");
+    });
+    if (failure)
+      std::rethrow_exception(failure);
+  }
+  printf("MODEL_POWER active=%d resources_retained=1\n", active);
+  fflush(stdout);
+}
+
+struct ScopedModelPower {
+  ScopedModelPower() {
+    try {
+      set_model_power(true);
+    } catch (...) {
+      idle();
+      throw;
+    }
+  }
+  ~ScopedModelPower() {
+    idle();
+  }
+  void idle() noexcept {
+    try {
+      set_model_power(false);
+    } catch (const std::exception& error) {
+      fprintf(stderr, "MODEL_POWER_IDLE_FAILURE %s\n", error.what());
+    }
+  }
+};
+#endif
+
 std::unique_ptr<ModelSession> create_conversation(Options options, Client* client) {
   return std::make_unique<Conversation>(std::move(options), client);
 }
@@ -439,6 +495,9 @@ void Conversation::reset_context() {
 }
 
 void Conversation::client_turn(const Request& request) {
+#if SM_MOE_IDLE_POWER_MANAGEMENT
+  ScopedModelPower power;
+#endif
   if (request.ignore_eos)
     options.ignore_eos = *request.ignore_eos;
   if (request.kind == Request::Kind::Reset) {
@@ -496,6 +555,9 @@ void Conversation::client_turn(const Request& request) {
 }
 
 bool Conversation::turn(std::string text) {
+#if SM_MOE_IDLE_POWER_MANAGEMENT
+  ScopedModelPower power;
+#endif
   if (!normalize_terminal_line(text))
     return true;
   if (text == "/exit")
@@ -611,6 +673,9 @@ int Conversation::run() {
   } else {
     stats.model_load_end_ms = time_in_ms();
   }
+#if SM_MOE_IDLE_POWER_MANAGEMENT
+  set_model_power(false);
+#endif
   if (client)
     client->ready();
   if (client) {

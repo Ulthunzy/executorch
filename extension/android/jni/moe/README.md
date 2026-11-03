@@ -10,6 +10,9 @@ Java 新增 `load()` 接口，现有生成方法签名保持不变，库加载�
 
 首轮和后续轮复用专家 memo、KV/GDN state 和 QNN 已注册的 AR128 IO；工作区容量与本轮有效 token 数、位置分别维护。分组 Prefill 的 DSP 映射保留至模型关闭，避免后续轮次出现 AR128 请求校验失败或映射长度不匹配。JNI 错误同时写入 Android 日志 `ExecuTorchMoE`，Java 异常类型保持兼容。
 
+默认构建保留已验证的性能请求和 mailbox 等待方式。每轮结束释放性能/QoS 请求以及 mailbox 休眠属于待验证的发热优化，默认关闭；仅在显式设置 `MOE_ENABLE_IDLE_POWER_MANAGEMENT=1` 构建环境变量，或 CMake 的同名选项为 `ON` 时开启。该选项不释放权重、图、专家缓存和 state。JNI 失败同时写入 Android 日志 `ExecuTorchMoE`，原有 Java 异常语义保持不变。
+
+
 ## Android 调用
 
 模型目录使用现有 `run_chat.py` 部署生成的布局：`prefill/`、`decode/`、`base-cos.f32`、`base-sin.f32`；图文另需 `VISION.json`、`model-config.json`、`prefill/vision.bin`。共享权重和 tokenizer 分别传入。模型、专家及权重必须解包成普通文件，不能直接传 APK asset URI。App UID 必须能读取这些路径。

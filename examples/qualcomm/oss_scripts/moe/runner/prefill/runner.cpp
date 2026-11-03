@@ -24,6 +24,22 @@ using namespace executorch::runtime;
 static std::string model_root;
 static std::unique_ptr<PrefillSession> session;
 
+#if SM_MOE_IDLE_POWER_MANAGEMENT
+void qwen35_prefill_set_power_active(bool active) {
+  if (!session)
+    return;
+  const int dsp_status =
+      et_prefill_rpc_set_active(session->core.handle, active);
+  remote_rpc_control_latency latency{
+      active ? RPC_POLL_QOS : RPC_DISABLE_QOS, active ? 9999U : 0U};
+  const int qos_status = remote_handle64_control(
+      session->core.handle, DSPRPC_CONTROL_LATENCY, &latency, sizeof(latency));
+  session->runtime.set_power_active(active);
+  check(dsp_status, "prefill DSP power");
+  check(qos_status, "prefill RPC QoS");
+}
+#endif
+
 static bool dynamic_sequence = false;
 
 void qwen35_prefill_append(

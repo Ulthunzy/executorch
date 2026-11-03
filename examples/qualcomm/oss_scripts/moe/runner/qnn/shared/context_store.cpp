@@ -346,3 +346,15 @@ qwen35_shared_context_count() {
   std::lock_guard<std::mutex> guard(registry_mutex);
   return active_store ? active_store->contexts.size() : 0;
 }
+
+extern "C" int qwen35_shared_set_power_active(int active) {
+  std::lock_guard<std::mutex> guard(registry_mutex);
+  try {
+    if (active_store)
+      active_store->runtime.set_power_active(active != 0);
+    return 0;
+  } catch (const std::exception& error) {
+    fprintf(stderr, "SHARED_POWER_FAILED active=%d %s\n", active, error.what());
+    return 1;
+  }
+}

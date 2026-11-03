@@ -19,3 +19,5 @@ extern "C" int qwen35_shared_unregister(
     Qnn_ContextHandle_t context,
     Qnn_MemHandle_t handle);
 extern "C" uint64_t qwen35_shared_context_count();
+
+extern "C" int qwen35_shared_set_power_active(int active);

@@ -1,4 +1,5 @@
 #include "bank_mapping.h"
+#include "../power.h"
 // Prefill FastRPC 入口；同层专家可归并 token，复用 worker、线程栈和 IO 映射。
 #include "../../../../../custom_op/lowbit/prefill/integer_moe.h"
 #include "../../../../../custom_op/lowbit/expert_stream.h"
@@ -108,6 +109,7 @@ static int prepare_resources(ComputeResources& resources, unsigned bytes) {
 // Workers and VTCM address layouts stay with the handle. Compute leases return
 // to QNN after each call; VTCM contents cannot survive that handoff.
 struct State {
+  moe::dsp::PowerVote power{this};
   IoMapping io[256];
   const float* residual = nullptr;
   int pending = -1, assigned = 0;
@@ -152,7 +154,6 @@ struct State {
         HAP_compute_res_release(resources->context);
     for (auto& lock : token_locks)
       qurt_pimutex_destroy(&lock);
-    HAP_power_destroy(this);
     for (auto stack : stacks)
       free(stack);
     free(route);
@@ -172,44 +173,7 @@ extern "C" AEEResult et_prefill_rpc_open(const char*, remote_handle64* handle) {
     if (!stack)
       return 13;
   }
-  HAP_power_request_t power{};
-  power.type = HAP_power_set_apptype;
-  power.apptype = HAP_POWER_COMPUTE_CLIENT_CLASS;
-  int error = HAP_power_set(state.get(), &power);
-  if (error)
-    return error;
-  power = {};
-  power.type = HAP_power_set_DCVS_v3;
-  auto& dcvs = power.dcvs_v3;
-  dcvs.set_dcvs_enable = 1;
-  dcvs.dcvs_enable = 0;
-  dcvs.set_bus_params = 1;
-  dcvs.bus_params.min_corner = dcvs.bus_params.target_corner =
-      dcvs.bus_params.max_corner = HAP_DCVS_VCORNER_MAX;
-  dcvs.set_core_params = 1;
-  dcvs.core_params.min_corner = dcvs.core_params.target_corner =
-      dcvs.core_params.max_corner = HAP_DCVS_VCORNER_MAX;
-  dcvs.set_sleep_disable = 1;
-  dcvs.sleep_disable = 1;
-  HAP_set_dcvs_v3_protected_bus_corners(&power, 1);
-  error = HAP_power_set(state.get(), &power);
-  if (error)
-    return error;
-  power = {};
-  power.type = HAP_power_set_HVX;
-  power.hvx.power_up = 1;
-  error = HAP_power_set(state.get(), &power);
-  if (error)
-    return error;
-  memset(&power, 0, sizeof(power));
-  power.type = HAP_power_set_HMX_v2;
-  power.hmx_v2.set_power = 1;
-  power.hmx_v2.power_up = 1;
-  power.hmx_v2.set_clock = 1;
-  power.hmx_v2.target_corner = power.hmx_v2.min_corner =
-      power.hmx_v2.max_corner = HAP_DCVS_EXP_VCORNER_MAX;
-  power.hmx_v2.perf_mode = HAP_CLK_PERF_HIGH;
-  error = HAP_power_set(state.get(), &power);
+  int error = state->power.set(true);
   if (error)
     return error;
   for (int i = 0; i < kWorkers + 1; i++) {
@@ -536,4 +500,10 @@ extern "C" AEEResult et_prefill_rpc_release_io(remote_handle64 handle) {
       entry = IoMapping{};
     }
   return release_banks();
+}
+
+extern "C" AEEResult et_prefill_rpc_set_active(remote_handle64 handle, int active) {
+  if (!handle)
+    return 12;
+  return reinterpret_cast<State*>(uintptr_t(handle))->power.set(active != 0);
 }

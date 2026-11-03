@@ -271,6 +271,27 @@ qwen35_decode_step(int64_t token, float* logits, size_t count) try {
   return 1;
 }
 
+#if SM_MOE_IDLE_POWER_MANAGEMENT
+extern "C" int qwen35_decode_set_power_active(int active) try {
+  if (!session)
+    return 0;
+  const int service_status = active ? 0 : session->core.stop_service();
+  const int dsp_status = et_decode_rpc_set_active(session->core.handle, active);
+  remote_rpc_control_latency latency{
+      active ? RPC_POLL_QOS : RPC_DISABLE_QOS, active ? 9999U : 0U};
+  const int qos_status = remote_handle64_control(
+      session->core.handle, DSPRPC_CONTROL_LATENCY, &latency, sizeof(latency));
+  session->runtime.set_power_active(active != 0);
+  check(service_status, "stop idle native service");
+  check(dsp_status, "decode DSP power");
+  check(qos_status, "decode RPC QoS");
+  return 0;
+} catch (const std::exception& error) {
+  last_error = error.what();
+  return 1;
+}
+#endif
+
 extern "C" int qwen35_decode_reset() try {
   if (!session || failed || session->in_step)
     throw std::runtime_error("decode session cannot be reset");

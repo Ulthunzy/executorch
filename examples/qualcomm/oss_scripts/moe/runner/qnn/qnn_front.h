@@ -70,6 +70,8 @@ struct Runtime {
 
   void package(const char* path);
 
+  void set_power_active(bool active);
+
   ~Runtime();
 
  private:

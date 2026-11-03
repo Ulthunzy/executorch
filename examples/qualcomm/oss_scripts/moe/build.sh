@@ -18,6 +18,7 @@ task_soc=${MOE_SOC_MODEL:-SM8975}
 task_arch=$(PYTHONPATH="$task_repo/..${PYTHONPATH:+:$PYTHONPATH}" "${MOE_PYTHON:-python}" "$moe_root/target.py" --soc-model "$task_soc")
 case "${MOE_NATIVE_PROFILE:-0}" in 0|1) ;; *) echo "MOE_NATIVE_PROFILE must be 0 or 1" >&2; exit 2 ;; esac
 case "${MOE_BUILD_NATIVE:-1}" in 0|1) ;; *) echo "MOE_BUILD_NATIVE must be 0 or 1" >&2; exit 2 ;; esac
+case "${MOE_ENABLE_IDLE_POWER_MANAGEMENT:-0}" in 0|1) ;; *) echo "MOE_ENABLE_IDLE_POWER_MANAGEMENT must be 0 or 1" >&2; exit 2 ;; esac
 export MOE_SOC_MODEL="$task_soc" MOE_DSP_ARCH="$task_arch"
 rm -f "$task_build/TARGET.json"
 if [[ "${MOE_BUILD_NATIVE:-1}" == 1 ]]; then
@@ -29,11 +30,13 @@ cmake -S "$moe_root" -B "$task_build/cmake" -G Ninja \
   -DCMAKE_BUILD_TYPE=Release -DQNN_SDK_ROOT="$QNN_SDK_ROOT" -DHEXAGON_SDK_ROOT="$HEXAGON_SDK_ROOT" \
   -DMOE_NATIVE_BUILD="$task_build" -DMOE_DSP_ARCH="$task_arch" \
   -DMOE_NATIVE_PROFILE="${MOE_NATIVE_PROFILE:-0}" -DMOE_BUILD_TOOLS=ON \
+  -DMOE_ENABLE_IDLE_POWER_MANAGEMENT="${MOE_ENABLE_IDLE_POWER_MANAGEMENT:-0}" \
   -DEXECUTORCH_ANDROID_BUILD="${EXECUTORCH_ANDROID_BUILD:-$task_repo/build-android}" \
   -DCMAKE_RUNTIME_OUTPUT_DIRECTORY="$task_build" -DCMAKE_LIBRARY_OUTPUT_DIRECTORY="$task_build"
 cmake --build "$task_build/cmake" -j "${MOE_BUILD_JOBS:-3}"
 "${MOE_PYTHON:-python}" "$moe_root/build_manifest.py" runtime --output "$task_build" \
-  --arch "$task_arch" --soc "$task_soc" --profile "${MOE_NATIVE_PROFILE:-0}" --sdk "$QNN_SDK_ROOT"
+  --arch "$task_arch" --soc "$task_soc" --profile "${MOE_NATIVE_PROFILE:-0}" --sdk "$QNN_SDK_ROOT" \
+  --idle-power-management "${MOE_ENABLE_IDLE_POWER_MANAGEMENT:-0}"
 
 for legacy in libmoe_decode.so libqwen35_shared.so libqwen35_moe_jni.so; do
   rm -f "$task_build/$legacy"
