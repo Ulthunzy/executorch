@@ -1,10 +1,24 @@
 import json
 import hashlib
+import warnings
 
 from executorch.examples.qualcomm.oss_scripts.moe.model.qwen35 import (
     shared_model_signature,
 )
 from executorch.examples.qualcomm.oss_scripts.moe.utils import runtime_assets
+
+
+def check_prefill_order(metadata, path):
+    order = metadata.get("prefill_order")
+    if order not in {"layer_major", "chunk_major"}:
+        raise ValueError(f"{path}: invalid prefill order")
+    if order == "chunk_major":
+        warnings.warn(
+            f"{path}: chunk_major is deprecated and will be removed in a future "
+            "release; using the unified layer_major scheduler with this plan's workspace",
+            FutureWarning,
+            stacklevel=2,
+        )
 
 
 def check_plan(path, args, phase, expected_tokens=None):
@@ -51,14 +65,9 @@ def check_plan(path, args, phase, expected_tokens=None):
             raise ValueError(
                 f"{path}: invalid dynamic prefill workspace; re-export the single PTE"
             )
-        if metadata.get("prefill_order") != args.prefill_order:
-            raise ValueError(
-                f"{path}: prefill order differs; run export.py for the selected schedule"
-            )
+        check_prefill_order(metadata, path)
         expected = (
-            expected_tokens
-            if expected_tokens is not None
-            else (args.prompt_tokens if args.prefill_order == "layer_major" else 128)
+            expected_tokens if expected_tokens is not None else args.prompt_tokens
         )
         if expected is not None and (
             expected < 128
@@ -102,25 +111,24 @@ def load_prefill_bundle(args):
         metadata.get("version") not in {2, 3}
         or metadata.get("ar_len") != 128
         or metadata.get("capacity") != args.decode_capacity
-        or metadata.get("prefill_order") != args.prefill_order
         or metadata.get("prefill_pte") != "prefill.pte"
     ):
         raise ValueError(
             f"{manifest}: context or schedule differs; export matching PTEs with export.py"
         )
+    check_prefill_order(metadata, manifest)
     args.model_settings.target.check_manifest(metadata["model_configuration"])
     expected_limit = (
         metadata.get("workspace_tokens")
         if metadata["version"] == 3
         else metadata.get("max_prefill_tokens", 1024)
     )
-    if metadata["version"] == 2 and args.prefill_order == "chunk_major":
+    if metadata["version"] == 2 and metadata["prefill_order"] == "chunk_major":
         expected_limit = 128
     if (
         type(expected_limit) is not int
         or not 128 <= expected_limit <= 1024
         or expected_limit % 128
-        or (args.prefill_order == "chunk_major" and expected_limit != 128)
     ):
         raise ValueError(f"{manifest}: invalid prefill workspace bound")
     plan = check_plan(

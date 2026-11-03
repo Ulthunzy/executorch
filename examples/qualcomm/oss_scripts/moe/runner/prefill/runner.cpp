@@ -159,9 +159,7 @@ class PrefillBackend final : public BackendInterface {
       if (!session)
         throw std::runtime_error("prefill session not initialized");
       auto stage = *static_cast<Stage*>(handle);
-      if (stage.dynamic
-              ? uint32_t(session->sequence_tokens) > stage.plan_tokens
-              : stage.plan_tokens != uint32_t(session->sequence_tokens))
+      if (uint32_t(session->sequence_tokens) > stage.plan_tokens)
         throw std::runtime_error("prefill stage sequence length mismatch");
       const size_t counts[] = {2, 3, 4, 6, 2};
       if (args.size() != counts[stage.kind])
@@ -185,10 +183,11 @@ class PrefillBackend final : public BackendInterface {
         return args[i]->toTensor().mutable_data_ptr<float>();
       };
       const int chunks = session->sequence_tokens / 128;
-      // PTE 的 workspace 覆盖整段输入，QNN/Native 每次仍处理 128 个 token。
-      // Attention 的 state 在每块之后立即反馈，MoE 权重则复用到本层结束。
+      if (session->stop_requested && *session->stop_requested &&
+          (*session->stop_requested)())
+        throw std::runtime_error("prefill interrupted; reset required");
       if (stage.kind == 3 && session->layer_memo && chunks >= 4) {
-        session->chunk_start = 0;
+        session->chunk_start = session->sequence_start;
         session->experts(
             stage.layer,
             input(0),
@@ -201,10 +200,12 @@ class PrefillBackend final : public BackendInterface {
         return Error::Ok;
       }
       for (int chunk = 0; chunk < chunks; chunk++) {
-        if (chunks > 1)
-          session->chunk_start = chunk * 128;
-        session->valid_tokens = std::min(
-            128, session->sequence_valid_tokens - session->chunk_start);
+        if (session->stop_requested && *session->stop_requested &&
+            (*session->stop_requested)())
+          throw std::runtime_error("prefill interrupted; reset required");
+        session->chunk_start = session->sequence_start + chunk * 128;
+        session->valid_tokens =
+            std::min(128, session->sequence_valid_tokens - chunk * 128);
         const size_t hidden_offset = size_t(chunk) * 128 * 2048;
         const size_t route_offset = size_t(chunk) * 128 * 8;
         switch (stage.kind) {
@@ -297,13 +298,13 @@ static int prefill_main(int argc, char** argv, bool chat) try {
   const int prompt_tokens =
       getenv("PREFILL_TOKENS") ? atoi(getenv("PREFILL_TOKENS")) : 128;
   const int workspace_tokens = input_meta->sizes()[1];
-  const int plan_tokens = dynamic_sequence
+  const int plan_tokens = dynamic_sequence && !chat
       ? prefill_plan_tokens(prompt_tokens, workspace_tokens)
       : workspace_tokens;
   const bool preload = chat && moe_chat::preloading();
   session = std::make_unique<PrefillSession>(model_root, plan_tokens);
-  if (preload)
-    session->initial_module = &module;
+  session->prefill_module = &module;
+  session->dynamic_plan = dynamic_sequence;
 
   struct SessionLifetime {
     ~SessionLifetime() {
@@ -323,7 +324,7 @@ static int prefill_main(int argc, char** argv, bool chat) try {
   const int max_prefill_tokens = session->attention[3]->history + 128;
   if (samples != 1 || warmups || prompt_tokens < 128 ||
       prompt_tokens > max_prefill_tokens || prompt_tokens % 128 ||
-      (plan_tokens != 128 && plan_tokens != prompt_tokens))
+      plan_tokens < 128 || plan_tokens > 1024 || plan_tokens % 128)
     throw std::runtime_error(
         "prefill sequence exceeds the compiled KV history or plan alignment");
   auto data = preload ? std::vector<uint8_t>{} : bytes(model_root + "/tokens.i64");
@@ -356,17 +357,15 @@ static int prefill_main(int argc, char** argv, bool chat) try {
   const int chunks_per_plan = plan_tokens / 128;
   for (int chunk = 0; !preload && chunk < prompt_tokens / 128; chunk += chunks_per_plan) {
     const int active_tokens = std::min(plan_tokens, valid_tokens - chunk * 128);
-    session->sequence_valid_tokens =
-        active_tokens + (plan_tokens == 128 ? chunk * 128 : 0);
-    for (const auto& cache : session->caches)
-      for (const auto& entry : cache.entries) {
-        seeds.push_back(entry.expert);
-        seed_stamps.push_back(entry.stamp);
-      }
-    auto tokens = executorch::extension::make_tensor_ptr(
-        {1, plan_tokens},
-        data.data() + chunk * 128 * 8,
-        executorch::aten::ScalarType::Long);
+    const int window_chunks = (active_tokens + 127) / 128;
+    if (window_chunks == 1)
+      for (const auto& cache : session->caches)
+        for (int slot = 0; slot < kMaxExpertSlots; ++slot) {
+          const auto entry = slot < session->capacity ? cache.entries[slot]
+                                                     : ExpertCache::Entry{};
+          seeds.push_back(entry.expert);
+          seed_stamps.push_back(entry.stamp);
+        }
     auto& rt = session->runtime;
     auto creates = rt.context_creates, frees = rt.context_frees,
          regs = rt.memory_registers, deregs = rt.memory_deregisters,
@@ -375,44 +374,53 @@ static int prefill_main(int argc, char** argv, bool chat) try {
     check(et_prefill_rpc_counts(session->core.handle, before, 4), "counts before");
     uint64_t physical_before = physical_reads();
     auto t = Clock::now();
-    auto result =
-        module.execute("prefill_forward", std::vector<EValue>{*tokens});
+    auto result = session->execute_plan(
+        reinterpret_cast<const int64_t*>(data.data()) + chunk * 128,
+        active_tokens,
+        chunk * 128);
     const double total_ms = elapsed(t);
     uint64_t physical = physical_reads() - physical_before;
-    if (!result.ok() || result->size() != 2)
-      throw std::runtime_error("PTE execute/output failure");
     auto& m = session->metrics;
     int counts[4];
     check(et_prefill_rpc_counts(session->core.handle, counts, 4), "counts after");
     for (int i = 0; i < 4; i++)
       counts[i] -= before[i];
-    if (m.calls[0] != chunks_per_plan || m.calls[1] != 40 * chunks_per_plan ||
-        m.calls[2] != 40 * chunks_per_plan ||
-        m.calls[3] != 40 * chunks_per_plan || m.calls[4] != 1 ||
-        m.assignments != active_tokens * 8 * 40 ||
+    if (m.calls[0] != window_chunks || m.calls[1] != 40 * window_chunks ||
+        m.calls[2] != 40 * window_chunks || m.calls[3] != 40 * window_chunks ||
+        m.calls[4] != 1 || m.assignments != active_tokens * 8 * 40 ||
         counts[0] != m.native_calls || counts[1] != int(m.requests) ||
         counts[2] != active_tokens * 8 * 40 ||
-        counts[3] != 40 * chunks_per_plan ||
+        counts[3] != 40 * window_chunks ||
         session->chunk_start != chunk * 128 + active_tokens)
       throw std::runtime_error("chunk task coverage");
     if (rt.context_creates != creates || rt.context_frees != frees ||
         rt.memory_registers != regs || rt.memory_deregisters != deregs ||
         rt.buffer_allocations != allocs || rt.buffer_frees != deallocs)
       throw std::runtime_error("changed runtime buffer/context lifetime");
-    for (const auto& v : *result) {
-      auto& tensor = v.toTensor();
+    for (size_t output = 0; output < result.size(); ++output) {
+      auto& tensor = result[output].toTensor();
       auto* values = tensor.const_data_ptr<float>();
-      for (int i = 0; i < tensor.numel(); i++)
+      const int elements = output ? window_chunks * 128 * 2048 : tensor.numel();
+      for (int i = 0; i < elements; i++)
         if (!std::isfinite(values[i]))
           throw std::runtime_error("nonfinite PTE output");
     }
     graph_total += total_ms;
     direct_total += m.direct;
     native_total += m.native_calls;
-    if (chunks_per_plan > 1) {
-      all_routes = session->sequence_routes;
-      seeds = session->sequence_seeds;
-      seed_stamps = session->sequence_stamps;
+    if (window_chunks > 1) {
+      all_routes.insert(
+          all_routes.end(),
+          session->sequence_routes.begin(),
+          session->sequence_routes.begin() + window_chunks * 40 * 128 * 8);
+      seeds.insert(
+          seeds.end(),
+          session->sequence_seeds.begin(),
+          session->sequence_seeds.begin() + window_chunks * 40 * 64);
+      seed_stamps.insert(
+          seed_stamps.end(),
+          session->sequence_stamps.begin(),
+          session->sequence_stamps.begin() + window_chunks * 40 * 64);
     } else
       for (const auto& routes : session->route_history)
         all_routes.insert(all_routes.end(), routes.begin(), routes.end());
@@ -420,7 +428,7 @@ static int prefill_main(int argc, char** argv, bool chat) try {
         "PTE_RESULT chunk=%d start=%d plan_tokens=%d total_ms=%.6f tokens_per_second=%.6f embedding_ms=%.6f attention_ms=%.6f router_ms=%.6f moe_ms=%.6f head_ms=%.6f read_ms=%.6f native_ms=%.6f feedback_ms=%.6f direct_bytes=%llu physical_read_bytes=%llu hits=%llu requests=%llu seed_hits=%llu native_calls=%d assignments=%d context_creates_in_loop=%llu context_frees_in_loop=%llu memory_registers_in_loop=%llu memory_deregisters_in_loop=%llu rpc_allocations_in_loop=%llu rpc_frees_in_loop=%llu\n",
         chunk,
         chunk * 128,
-        plan_tokens,
+        session->sequence_tokens,
         total_ms,
         active_tokens * 1000. / total_ms,
         m.embedding,
@@ -481,7 +489,7 @@ static int prefill_main(int argc, char** argv, bool chat) try {
         m.input_io_overlap,
         m.router_io_overlap,
         m.attention_io_overlap);
-    if (chunk + chunks_per_plan == prompt_tokens / 128) {
+    if (chunk + window_chunks == prompt_tokens / 128) {
       if (session->image_cursor != session->image_features.size())
         throw std::runtime_error(
             "encoded image features were not fully consumed");
@@ -498,7 +506,7 @@ static int prefill_main(int argc, char** argv, bool chat) try {
           (unsigned long long)direct_total,
           native_total,
           prompt_tokens);
-      auto* scores = result->at(0).toTensor().const_data_ptr<float>();
+      auto* scores = result[0].toTensor().const_data_ptr<float>();
       const int64_t first = std::max_element(scores, scores + 248320) - scores;
       printf(
           "PREFILL_TOKEN {\"index\":0,\"id\":%lld,\"model_ms\":%.6f}\n",
@@ -508,8 +516,8 @@ static int prefill_main(int argc, char** argv, bool chat) try {
       save(prefix + "logits.f32", scores, 248320 * 4);
       save(
           prefix + "hidden.f32",
-          result->at(1).toTensor().const_data_ptr<float>() +
-              (plan_tokens - 128) * 2048,
+          result[1].toTensor().const_data_ptr<float>() +
+              (window_chunks * 128 - 128) * 2048,
           128 * 2048 * 4);
       for (int layer = 0; layer < 40; layer++)
         for (int c = 0; c < 2; c++)

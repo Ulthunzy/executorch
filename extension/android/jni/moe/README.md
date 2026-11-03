@@ -12,6 +12,7 @@ Java 新增 `load()` 接口，现有生成方法签名保持不变，库加载�
 
 默认构建保留已验证的性能请求和 mailbox 等待方式。每轮结束释放性能/QoS 请求以及 mailbox 休眠属于待验证的发热优化，默认关闭；仅在显式设置 `MOE_ENABLE_IDLE_POWER_MANAGEMENT=1` 构建环境变量，或 CMake 的同名选项为 `ON` 时开启。该选项不释放权重、图、专家缓存和 state。JNI 失败同时写入 Android 日志 `ExecuTorchMoE`，原有 Java 异常语义保持不变。
 
+所有生成接口共用按层 Prefill 调度；首轮、后续轮、图片输入和 reset 后的新请求均通过绝对起始位置、有效长度及 KV/GDN state 执行同一个 PTE。超过工作区的输入继续按窗口处理。Prefill 尚未完成时被中断，会先完成已提交 IO 的收尾并返回 `requires_reset=true`；reset 后可继续使用同一模型。旧 `chunk_major` 选项已弃用并转到统一调度，后续版本将移除。
 
 ## Android 调用
 

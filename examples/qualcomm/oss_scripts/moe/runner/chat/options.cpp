@@ -34,7 +34,7 @@ Options parse_options(int argc, char** argv) {
           "  [--stream|--no-stream] [--vision|--no-vision]\n"
           "  [--prompt-tokens N] [--ignore-eos] (fixed-length performance runs)\n"
           "  [--max-seq-len 1152] [--cache-experts 32] [--shared-model DIR]\n"
-          "  [--prefill-order layer_major|chunk_major]\n"
+          "  [--prefill-order layer_major] (chunk_major is deprecated and uses layer_major)\n"
           "  [--prefill-io-workers N] [--decode-io-workers 4|8|16]\n"
           "  [--read-chunk-kib 64|128|256|512|1024]\n"
           "  [--model-config FILE] (deployed plan settings; V81 defaults to IO 16/8, chunk 512)\n"
@@ -187,14 +187,18 @@ Options parse_options(int argc, char** argv) {
   options.prefill_workspace_tokens = plans.at("version") == 3
       ? plans.at("workspace_tokens").get<int>()
       : plans.value("max_prefill_tokens", 1024);
-  if (options.prefill_order == "chunk_major")
-    options.prefill_workspace_tokens = 128;
   if (options.runtime.context_load_mode == "serial")
     throw std::runtime_error(
         "Shared contexts require batched initialization; serial loading is unsupported");
   if (options.prefill_order != "layer_major" &&
       options.prefill_order != "chunk_major")
     throw std::runtime_error("Invalid prefill order");
+  if (options.prefill_order == "chunk_major") {
+    fprintf(
+        stderr,
+        "DEPRECATED: chunk_major will be removed in a future release; using the unified layer_major scheduler\n");
+    options.prefill_order = "layer_major";
+  }
   options.tokenizer_path = std::filesystem::absolute(options.tokenizer_path)
                                .lexically_normal()
                                .string();
@@ -236,9 +240,8 @@ void configure_environment(
     valid_tokens = prefix_tokens;
   const std::string prefill = o.model_root + "/prefill",
                     decode = o.model_root + "/decode";
-  const int plan_tokens = prefill_plan_tokens(
-      prefix_tokens,
-      o.prefill_order == "layer_major" ? o.prefill_workspace_tokens : 128);
+  const int plan_tokens =
+      prefill_plan_tokens(prefix_tokens, o.prefill_workspace_tokens);
   const std::string plan = prefill + "/plans/prefill.pte";
   if (!o.tokenize_only && !std::filesystem::is_regular_file(plan))
     throw std::runtime_error("Missing prefill plan: " + plan);
@@ -248,7 +251,7 @@ void configure_environment(
       std::filesystem::is_regular_file(prefill + "/vision.bin");
   printf(
       "CHAT_PREFILL_PLAN order=%s prompt_tokens=%d plan_tokens=%d path=%s vision_enabled=%d\n",
-      plan_tokens > 128 ? "layer_major" : "chunk_major",
+      "layer_major",
       prefix_tokens,
       plan_tokens,
       plan.c_str(),

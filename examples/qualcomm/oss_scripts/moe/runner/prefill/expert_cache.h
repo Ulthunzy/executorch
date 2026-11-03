@@ -28,7 +28,11 @@ struct ExpertCache {
   int find(int expert) const;
 
   // Replay access order without moving payloads after grouped computation.
-  void advance(const int32_t* ids, int tokens, int first_token);
+  void advance(
+      const int32_t* ids,
+      int tokens,
+      int first_token,
+      uint64_t stamp_offset = 0);
 
   std::vector<Binding> prepare(const std::vector<int>& experts);
 };

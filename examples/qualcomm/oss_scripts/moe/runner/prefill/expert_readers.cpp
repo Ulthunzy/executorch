@@ -185,6 +185,11 @@ double ExpertReaders::wall_ms() const {
   return std::chrono::duration<double, std::milli>(completed - started).count();
 }
 
+void ExpertReaders::drain() {
+  if (pending)
+    finish();
+}
+
 double ExpertReaders::overlap_ms(Clock::time_point begin, Clock::time_point end)
     const {
   double overlap = 0;

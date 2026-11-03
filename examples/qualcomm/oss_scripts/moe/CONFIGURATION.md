@@ -512,7 +512,7 @@ SM8850/V81 构建直接加载模型包时，原生 runner/JNI 使用 prefill IO 
 
 同一请求先合并模板、文字和图片，再统一按AR128分块。253个真实token执行两块，第二块125个有效位置；无效padding不推进GDN/conv/KV，不参与路由和LRU。不是文字与图片分别补齐，也不是每128/1024个token多导出一个PTE。后续轮输入同样分块，AR1用于生成；超限拒绝追加，不静默截断历史。
 
-首轮与后续轮都只受总上下文容量约束，实际输入加输出预算不能超过 `max_seq_len`。旧配置中的 `context.max_prefill_tokens` 读取时忽略，新配置不再保存该字段。`PLANS.json` v3 的 `workspace_tokens` 仅描述单次 PTE 的临时工作区；短输入保留 `layer_major` 批处理优化，超过工作区的输入重复执行 AR128，复用同一个 PTE、KV/GDN state 和专家缓存，不按整段输入扩张图的工作区。
+首轮与后续轮都只受总上下文容量约束，实际输入加输出预算不能超过 `max_seq_len`。旧配置中的 `context.max_prefill_tokens` 读取时忽略，新配置不再保存该字段。`PLANS.json` v3 的 `workspace_tokens` 仅描述单次 PTE 的临时工作区。所有 Prefill 入口共用按层调度：每层完成当前窗口内全部 AR128 块后再换层；超过工作区的输入按窗口继续执行同一个 PTE，携带绝对起始位置、有效长度及 KV/GDN state。reset 只重置会话状态，保留图、工作区和专家权重内存，调度方式保持不变。
 
 ## 8. Thinking、统计与运行调度
 
@@ -522,7 +522,7 @@ SM8850/V81 构建直接加载模型包时，原生 runner/JNI 使用 prefill IO 
 
 | `schedule` 字段 / CLI | 默认 | 实际行为 |
 | --- | --- | --- |
-| `prefill_order` / `--prefill-order` | `layer_major` | 当前层完成窗口内全部AR128块再换层；`chunk_major` 每块走完全部层 |
+| `prefill_order` / `--prefill-order` | `layer_major` | 统一按层调度；`chunk_major` 参数暂时保留，发出弃用提示后转到同一实现，后续版本移除 |
 | `cache_experts` / `--cache-experts` | `32` | 当前支持32/64槽，每层独立LRU、40层保留 |
 | `prefill_async_io` / `--prefill-async-io` | `true` | 专家读取与计算重叠 |
 | `startup_prefetch` / `--startup-prefetch` | `overlap` | `overlap` / `sync` / `none`，候选profile不代表永久锁定热专家 |

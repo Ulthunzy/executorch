@@ -47,6 +47,8 @@ class ExpertReaders {
 
   void finish();
 
+  void drain();
+
   double wall_ms() const;
 
   double overlap_ms(Clock::time_point begin, Clock::time_point end) const;

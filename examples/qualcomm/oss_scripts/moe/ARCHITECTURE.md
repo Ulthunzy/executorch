@@ -18,9 +18,11 @@ CLI 通过 `Runner::run_terminal` 进入终端适配层；JNI 将 Java 请求交
 
 `prompt_processor.cpp` 编排 Prefill，`token_generator.cpp` 编排 Decode；阶段内部的图绑定与流水调度位于 `prefill/`、`decode/`。`state_manager` 负责 KV、GDN state 以及阶段交接，`expert_manager` 负责 Decode 专家缓存和预取。`qnn/` 集中管理 Graph、Buffer、共享 context 和共享常量；JNI 不再维护一套 QNN session。
 
-`Runner` 管理加载、取消、回调、reset、关闭与线程回收。`load()` 等待Prefill、Decode及专家缓存完成初始化后才报告成功，初始化保持空对话；首次输入继续走按层批处理的Prefill，后续轮次复用资源；`reset()` 保留模型资源并清空对话。`Workspace` 维护私有缓存与 memfd，模型文件只读。进程内仍只允许一个活动 MoE 实例，因为底层阶段入口和环境配置是进程级资源；增加模型种类与并发加载多个模型是不同能力。
+`Runner` 管理加载、取消、回调、reset、关闭与线程回收。`load()` 等待Prefill、Decode及专家缓存完成初始化后才报告成功，初始化保持空对话；首轮、后续输入和 reset 后的请求均使用按层 Prefill 调度；`reset()` 保留模型资源并清空对话。`Workspace` 维护私有缓存与 memfd，模型文件只读。进程内仍只允许一个活动 MoE 实例，因为底层阶段入口和环境配置是进程级资源；增加模型种类与并发加载多个模型是不同能力。
 
-Prefill的工作区容量与本次执行长度独立维护。首轮结束后保留专家memo、路由暂存、Native IO及其映射，续轮使用原缓冲区执行有效长度AR128并覆盖写入。`chunk_start`是会话内的绝对位置，memo/路由暂存使用相对`sequence_start`的偏移；KV与GDN state持续复用，正常轮次切换不释放或重新申请这些缓冲区。
+Prefill 的工作区容量与本次执行长度独立维护。`PrefillSession::append` 导入 KV/GDN state 和实际驻留的专家/LRU 元数据，按已有工作区切分输入；它与 Prefill 工具共用 `execute_plan` 和同一个 PTE 的按层执行器。每层处理完窗口内全部 AR128 块后再换层，超过工作区时继续下一个窗口。`chunk_start` 是会话内的绝对位置，memo/路由暂存及 LRU 重放使用相对 `sequence_start` 的偏移；正常轮次切换不释放或重新申请图、工作区和专家权重内存。中断时先收尾已提交的读取，再允许 reset 恢复。
+
+旧 `chunk_major` 选项保留弃用提示并转到统一调度；原按块循环保留为私有弃用实现，没有运行入口调用，后续版本将移除。JNI、终端和公开 C++ 生成接口不根据首轮、历史或 reset 选择另一套 Prefill 实现。
 
 ## 算子与 Native 服务
 

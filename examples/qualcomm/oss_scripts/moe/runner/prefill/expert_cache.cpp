@@ -18,7 +18,11 @@ int ExpertCache::find(int expert) const {
   return -1;
 }
 
-void ExpertCache::advance(const int32_t* ids, int tokens, int first_token) {
+void ExpertCache::advance(
+    const int32_t* ids,
+    int tokens,
+    int first_token,
+    uint64_t stamp_offset) {
   std::array<uint64_t, 256> stamps{};
   std::array<bool, 256> present{};
   for (const auto& entry : entries)
@@ -31,7 +35,7 @@ void ExpertCache::advance(const int32_t* ids, int tokens, int first_token) {
     if (expert < 0 || expert >= 256)
       throw std::runtime_error("LRU route ID");
     present[expert] = true;
-    stamps[expert] = uint64_t(first_token) * 8 + i + 1;
+    stamps[expert] = stamp_offset + uint64_t(first_token) * 8 + i + 1;
   }
   std::vector<int> recent;
   for (int e = 0; e < 256; e++)
@@ -54,7 +58,7 @@ void ExpertCache::advance(const int32_t* ids, int tokens, int first_token) {
     const int expert = retained[slot];
     entries[slot] = {expert, expert < 0 ? 0 : stamps[expert], false};
   }
-  clock = uint64_t(first_token + tokens) * 8;
+  clock = stamp_offset + uint64_t(first_token + tokens) * 8;
 }
 
 std::vector<ExpertCache::Binding> ExpertCache::prepare(

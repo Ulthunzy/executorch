@@ -25,7 +25,11 @@ def main(argv=None):
         "--quiet", action="store_true", help="Suppress per-stage packing output"
     )
     parser.add_argument("--max-seq-len", type=int)
-    parser.add_argument("--prefill-order", choices=["layer_major", "chunk_major"])
+    parser.add_argument(
+        "--prefill-order",
+        choices=["layer_major", "chunk_major"],
+        help="chunk_major is deprecated and redirects to layer_major",
+    )
     parser.add_argument("--phase", choices=["prefill", "decode"], required=True)
     parser.add_argument("--cache-encoding", type=Path, help="Required for decode")
     parser.add_argument("--output", type=Path, required=True)
@@ -58,12 +62,8 @@ def main(argv=None):
         args.prefill_tokens < 128
         or args.prefill_tokens > settings.prefill_workspace_tokens
         or args.prefill_tokens % 128
-        or (
-            settings.schedule.prefill_order == "layer_major"
-            and args.prefill_tokens > 1024
-        )
     ):
-        parser.error("Invalid prefill length for the selected context and schedule")
+        parser.error("Invalid prefill workspace bound")
     if args.phase == "decode" and args.cache_encoding is None:
         parser.error("Decode packing requires --cache-encoding")
     prefill_cores = set()
@@ -121,15 +121,7 @@ def main(argv=None):
     )
 
     decode = args.phase == "decode"
-    ar_len = (
-        1
-        if decode
-        else (
-            args.prefill_tokens
-            if settings.schedule.prefill_order == "layer_major"
-            else settings.context.prefill_ar_len
-        )
-    )
+    ar_len = 1 if decode else args.prefill_tokens
     hidden_bytes = ar_len * 2048 * 4
     route_bytes = max(4096, ar_len * 8 * 4)
     offsets = dict(

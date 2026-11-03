@@ -211,6 +211,7 @@ def parse_args(argv=None):
         "--prefill-order",
         choices=["layer_major", "chunk_major"],
         default=schedule.prefill_order,
+        help="chunk_major is deprecated and redirects to the unified layer_major scheduler",
     )
     parser.add_argument(
         "--prefill-async-io",
@@ -390,7 +391,8 @@ def parse_args(argv=None):
         ),
     )
     try:
-        args.model_settings.validate()
+        args.model_settings = args.model_settings.validate()
+        args.prefill_order = args.model_settings.schedule.prefill_order
     except ValueError as error:
         parser.error(str(error))
     if args.embedding_table and settings.quantization.embedding != "int4_g32":

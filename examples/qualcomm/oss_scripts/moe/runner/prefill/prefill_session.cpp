@@ -1,6 +1,7 @@
 #include "prefill_session.h"
-#include "cold_start.h"
+#include <exception>
 #include "../../../../custom_op/lowbit/expert_stream.h"
+#include "cold_start.h"
 
 PrefillSession::PrefillSession(const std::string& path, int plan_tokens)
     : root(path),
@@ -32,7 +33,7 @@ PrefillSession::PrefillSession(const std::string& path, int plan_tokens)
       core.map_buffer(layer_memo, FASTRPC_MAP_FD);
     }
     sequence_routes.resize(sequence_tokens / 128 * 40 * 128 * 8);
-    sequence_seeds.resize(sequence_tokens / 128 * 40 * 64);
+    sequence_seeds.resize(sequence_tokens / 128 * 40 * 64, -1);
     sequence_stamps.resize(sequence_seeds.size());
     if (layer_memo) {
       staged_ids.resize(sequence_tokens * 8);
@@ -41,9 +42,8 @@ PrefillSession::PrefillSession(const std::string& path, int plan_tokens)
     }
   }
   printf(
-      "PREFILL_SCHEDULE plan_tokens=%d ar_len=128 layer_major=%d memo_bytes=%zu\n",
+      "PREFILL_SCHEDULE plan_tokens=%d ar_len=128 layer_major=1 memo_bytes=%zu\n",
       sequence_tokens,
-      sequence_tokens > 128,
       layer_memo ? layer_memo->size : 0);
   capacity = configuredExpertSlots();
   pool_count = reuse ? 40 : 4;
@@ -174,6 +174,9 @@ PrefillSession::PrefillSession(const std::string& path, int plan_tokens)
     core.residual = shared_io->residual;
   } else
     core.residual = std::make_shared<Buffer>(runtime, plan_tokens * 2048 * 4);
+  plan_inputs = core.inbuf;
+  plan_output = core.outbuf[0];
+  plan_residual = core.residual;
   head = std::make_unique<Graph>(runtime, root + "/head.bin");
   std::vector<Graph*> graphs;
   for (int i = 0; i < 40; i++) {
@@ -234,6 +237,7 @@ PrefillSession::PrefillSession(const std::string& path, int plan_tokens)
 }
 
 void PrefillSession::reset() {
+  drain_reads();
   image_cursor = 0;
   staged_router_layer = -1;
   memo_layer = -1;
@@ -257,7 +261,7 @@ void PrefillSession::reset() {
 
 void PrefillSession::embed(const int64_t* tokens, float* out) {
   core.end_output_read();
-  if (sequence_tokens == 128 || chunk_start == 0)
+  if (chunk_start == sequence_start)
     metrics = {};
   active_group = -1;
   next_layer = 0;
@@ -565,7 +569,8 @@ void PrefillSession::experts(
     throw std::runtime_error("MoE layer order");
   if (tokens < 128 || tokens > sequence_tokens || tokens % 128 ||
       (tokens > 128 &&
-       (!layer_memo || tokens != sequence_tokens || chunk_start)))
+       (!layer_memo || tokens != sequence_tokens ||
+        chunk_start != sequence_start)))
     throw std::runtime_error("MoE token group");
   const int active_tokens =
       tokens == 128 ? valid_tokens : sequence_valid_tokens;
@@ -575,7 +580,8 @@ void PrefillSession::experts(
   prepare_layer_memo(layer);
   finish_memo_copy();
   if (sequence_tokens > 128 && tokens == 128) {
-    const int base = (chunk_start / 128 * 40 + layer) * 64;
+    const int block = (chunk_start - sequence_start) / 128;
+    const int base = (block * 40 + layer) * 64;
     for (int slot = 0; slot < capacity; slot++) {
       sequence_seeds[base + slot] = caches[layer].entries[slot].expert;
       sequence_stamps[base + slot] = caches[layer].entries[slot].stamp;
@@ -583,7 +589,7 @@ void PrefillSession::experts(
     std::copy(
         ids,
         ids + 128 * 8,
-        sequence_routes.begin() + (chunk_start / 128 * 40 + layer) * 128 * 8);
+        sequence_routes.begin() + (block * 40 + layer) * 128 * 8);
   }
   Clock::time_point input_begin{}, input_end{};
   bool inputs_published = false;
@@ -629,7 +635,8 @@ void PrefillSession::experts(
   }
   auto stamp_of = [&](int e) -> uint64_t {
     if (histogram[e])
-      return stamp_offsets[layer] + uint64_t(chunk_start) * 8 + last_use[e] + 1;
+      return stamp_offsets[layer] + uint64_t(chunk_start - sequence_start) * 8 +
+          last_use[e] + 1;
     auto found = std::find(original_ids.begin(), original_ids.end(), e);
     return found == original_ids.end()
         ? 0
@@ -992,14 +999,14 @@ void PrefillSession::experts(
           ids + (block + 128) * 8,
           sequence_routes.begin() + (block / 128 * 40 + layer) * 128 * 8);
       if (block + 128 < tokens)
-        cache.advance(ids + block * 8, 128, block);
+        cache.advance(ids + block * 8, 128, block, stamp_offsets[layer]);
     }
-    chunk_start = tokens - 128;
+    chunk_start = sequence_start + tokens - 128;
     histogram.fill(0);
     last_use.fill(0);
-    valid_tokens = active_tokens - chunk_start;
+    valid_tokens = active_tokens - (tokens - 128);
     for (int i = 0; i < valid_tokens * 8; i++) {
-      const int expert = ids[chunk_start * 8 + i];
+      const int expert = ids[(tokens - 128) * 8 + i];
       ++histogram[expert];
       last_use[expert] = i;
     }
@@ -1089,7 +1096,8 @@ void PrefillSession::experts(
     if (entry.expert >= 0 && histogram[entry.expert])
       entry.stamp = stamp_of(entry.expert);
 
-  cache.clock = stamp_offsets[layer] + uint64_t(chunk_start + valid_tokens) * 8;
+  cache.clock = stamp_offsets[layer] +
+      uint64_t(chunk_start - sequence_start + valid_tokens) * 8;
   printf(
       "PREFILL_PIPE layer=%d chunk=%d group_tokens=%d ready_experts=%zu missing_experts=%zu async=%d io_wall_ms=%.6f overlap_ms=%.6f wait_ms=%.6f native_ms=%.6f\n",
       layer,
@@ -1130,7 +1138,7 @@ void PrefillSession::experts(
   metrics.feedback += elapsed(stamp);
   metrics.moe += elapsed(t);
   metrics.calls[3] += tokens / 128;
-  if (sequence_tokens == 128 || chunk_start + 128 == sequence_tokens)
+  if (chunk_start - sequence_start + 128 == sequence_tokens)
     next_layer++;
 }
 
@@ -1162,17 +1170,38 @@ void PrefillSession::project(const float* x, float* logits) {
   chunk_start += valid_tokens;
 }
 
-void PrefillSession::finish_prefill_native() {
-  if (!route_reads.empty()) {
+void PrefillSession::drain_reads() {
+  std::exception_ptr failure;
+  if (readers) {
     try {
-      readers->finish();
-    } catch (const std::exception& error) {
-      fprintf(stderr, "pending route cleanup failed: %s\n", error.what());
+      readers->drain();
+    } catch (...) {
+      failure = std::current_exception();
     }
-    route_reads.clear();
-    route_read_ids.clear();
   }
-  finish_memo_copy();
+  if (memo_copy == MemoCopy::Retain) {
+    try {
+      core.sync_buffer(
+          expert_slots[memo_copy_layer], DMA_BUF_SYNC_END | DMA_BUF_SYNC_WRITE);
+    } catch (...) {
+      if (!failure)
+        failure = std::current_exception();
+    }
+  }
+  route_reads.clear();
+  route_read_ids.clear();
+  memo_copies.clear();
+  memo_copy = MemoCopy::None;
+  memo_copy_layer = -1;
+  copy_compute_spans.clear();
+  memo_layer = -1;
+  staged_router_layer = -1;
+  if (failure)
+    std::rethrow_exception(failure);
+}
+
+void PrefillSession::finish_prefill_native() {
+  drain_reads();
   readers.reset();
   core.close();
   layer_memo.reset();

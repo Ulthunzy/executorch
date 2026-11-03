@@ -379,7 +379,6 @@ class ModelWrapper(ExportWorkflow):
                 workspace_tokens = (
                     self.settings.prefill_workspace_tokens
                     if phase == "prefill"
-                    and self.settings.schedule.prefill_order == "layer_major"
                     else 128
                 )
                 path = out / "plans" / f"{phase}.pte"

@@ -38,6 +38,7 @@ GDN 与低比特计算分别调用 [`custom_op/deltanet_op_package_htp`](../../c
 
 两个库须配套更新：Prefill 的 mapped-IO 协议同时传递有效长度和分配容量，构建时通过 `NATIVE_TARGET.json` 的 `prefill_mapped_io` 校验，旧 DSP 构建需重新生成。发热优化默认关闭；实验时可设置 `MOE_ENABLE_IDLE_POWER_MANAGEMENT=1`，构建清单会记录该选项。
 
+JNI、终端聊天和 Prefill 工具共用按层调度，首轮、reset 后及带历史的追加输入只在起始位置和 KV/GDN state 上有差异。超过工作区的输入按窗口继续执行同一个 PTE。`chunk_major` 参数及旧实现暂时保留，接口提示后续版本将移除并转到统一调度；旧循环仅保留为私有代码，不再由运行入口调用。
 
 命令行 `qwen35_moe_runner` 与诊断入口 `prefill_handoff_runner` 是链接 `libet_infer.so` 的薄入口。JNI 也使用同一库，Java 方法签名保留，加载名为 `et_infer`。已有 PTE 无需因合库重新导出或量化。QNN SDK 运行库单独部署。
 

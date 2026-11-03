@@ -48,8 +48,9 @@ struct Metrics {
 // 完整 40 层 AR128 调度；多块计划逐层处理整段输入，复用当前层的临时权重。
 // Runtime 声明在资源对象之前，使其最后析构，覆盖所有 QNN/RPC 资源的生命周期。
 struct PrefillSession {
-  executorch::extension::Module* initial_module = nullptr;
-  bool initial_attempted = false;
+  executorch::extension::Module* prefill_module = nullptr;
+  bool dynamic_plan = false;
+  const std::function<bool()>* stop_requested = nullptr;
   std::string root;
   Runtime runtime{Runtime::Phase::Prefill, resolve_model_graph};
   NativeCore core;
@@ -64,6 +65,8 @@ struct PrefillSession {
   std::unique_ptr<Graph> head;
   std::unique_ptr<VisionEncoder> vision;
   std::unique_ptr<SharedIo> shared_io;
+  std::vector<std::shared_ptr<Buffer>> plan_inputs;
+  std::shared_ptr<Buffer> plan_output, plan_residual;
   std::vector<uint8_t> cos, sin;
   std::vector<float> image_features;
   size_t image_cursor = 0;
@@ -85,6 +88,8 @@ struct PrefillSession {
       ? getenv("STARTUP_EXPERT_PREFETCH")
       : "none";
   bool startup_seed_pending = false;
+  // Positions are absolute; workspace and route-table indices use their offset
+  // from sequence_start.
   int sequence_tokens = 128, workspace_tokens = 128, sequence_start = 0,
       valid_tokens = 128, sequence_valid_tokens = 128, memo_layer = -1;
   std::shared_ptr<Buffer> layer_memo;
@@ -116,6 +121,8 @@ struct PrefillSession {
 
   void finish_memo_copy();
 
+  void drain_reads();
+
   void prefetch_route(int layer, const int32_t* ids);
 
   void finish_prefill_native();
@@ -134,11 +141,43 @@ struct PrefillSession {
       float* logits,
       const std::function<bool()>& stopped);
 
-  void initial_prefill(
-      const int64_t* tokens, size_t count, const float* features,
-      size_t feature_count, const float* cos, const float* sin,
-      size_t table_count, Qwen35SessionState& state, float* logits,
+  [[deprecated(
+      "Chunk-major prefill will be removed in a future release; use append")]]
+  void append_chunk_major(
+      const int64_t* tokens,
+      size_t count,
+      const float* features,
+      size_t feature_count,
+      const float* cos,
+      const float* sin,
+      size_t table_count,
+      Qwen35SessionState& state,
+      float* logits,
       const std::function<bool()>& stopped);
+
+ private:
+  [[deprecated(
+      "Retained for source comparison only; all entry points use append")]]
+  void append_chunk_major_legacy(
+      const int64_t* tokens,
+      size_t count,
+      const float* features,
+      size_t feature_count,
+      const float* cos,
+      const float* sin,
+      size_t table_count,
+      Qwen35SessionState& state,
+      float* logits,
+      const std::function<bool()>& stopped);
+
+ public:
+  std::vector<executorch::runtime::EValue> execute_plan(
+      const int64_t* tokens,
+      int count,
+      int start,
+      const std::function<bool()>& stopped = {});
+  void import_append_state(const Qwen35SessionState& state);
+  void restore_expert_cache(const Qwen35SessionState& state);
   void export_append_state(Qwen35SessionState& state, int begin, size_t count);
 
   void reset();

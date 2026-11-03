@@ -1,7 +1,8 @@
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 import hashlib
 import json
 import math
+import warnings
 from pathlib import Path
 
 from executorch.examples.qualcomm.oss_scripts.moe.target import TargetConfig
@@ -196,7 +197,8 @@ class ModelConfig:
             "chunk_major",
         } or s.cache_experts not in {32, 64}:
             raise ValueError(
-                "Use layer_major/chunk_major prefill and 32/64 expert slots per layer"
+                "Use layer_major prefill (chunk_major is a deprecated alias) "
+                "and 32/64 expert slots per layer"
             )
         if (
             s.io_workers not in {4, 8, 16}
@@ -231,6 +233,14 @@ class ModelConfig:
                 raise ValueError("Boolean model settings must be JSON true/false")
         if s.decode_ready_io and not s.decode_hit_first:
             raise ValueError("decode_ready_io requires decode_hit_first")
+        if s.prefill_order == "chunk_major":
+            warnings.warn(
+                "chunk_major is deprecated and will be removed in a future release; "
+                "using the unified layer_major prefill scheduler",
+                FutureWarning,
+                stacklevel=2,
+            )
+            return replace(self, schedule=replace(s, prefill_order="layer_major"))
         return self
 
     def to_dict(self):
@@ -250,7 +260,7 @@ class ModelConfig:
 
     @property
     def prefill_workspace_tokens(self):
-        return 1024 if self.schedule.prefill_order == "layer_major" else 128
+        return 1024
 
     def matches_compile_settings(self, compiled):
         if not isinstance(compiled, dict) or not isinstance(
