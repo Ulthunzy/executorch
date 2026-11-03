@@ -10,7 +10,9 @@ int configuredExpertSlots() {
     return 64;
   if (std::strcmp(value, "32") == 0)
     return 32;
-  throw std::runtime_error("EXPERT_CACHE_SLOTS must be 32 or 64");
+  if (std::strcmp(value, "16") == 0)
+    return 16;
+  throw std::runtime_error("EXPERT_CACHE_SLOTS must be 16, 32 or 64");
 }
 
 uint64_t residentFingerprint(

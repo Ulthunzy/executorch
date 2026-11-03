@@ -195,10 +195,10 @@ class ModelConfig:
         if s.prefill_order not in {
             "layer_major",
             "chunk_major",
-        } or s.cache_experts not in {32, 64}:
+        } or s.cache_experts not in {16, 32, 64}:
             raise ValueError(
                 "Use layer_major prefill (chunk_major is a deprecated alias) "
-                "and 32/64 expert slots per layer"
+                "and 16/32/64 expert slots per layer"
             )
         if (
             s.io_workers not in {4, 8, 16}

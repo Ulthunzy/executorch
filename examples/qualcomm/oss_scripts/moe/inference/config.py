@@ -279,7 +279,7 @@ def parse_args(argv=None):
     parser.add_argument(
         "--cache-experts",
         type=int,
-        choices=[32, 64],
+        choices=[16, 32, 64],
         default=defaults.get("cache_experts", schedule.cache_experts),
         help="Resident LRU expert slots per layer, shared by prefill and decode",
     )
