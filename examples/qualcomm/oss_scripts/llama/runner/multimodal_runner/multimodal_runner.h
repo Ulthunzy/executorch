@@ -111,6 +111,10 @@ class QNNMultimodalRunner
   int32_t context_length() const {
     return context_len_;
   }
+  bool can_start_prefill() const {
+    return prompt_processor_ ? prompt_processor_->can_prefill(cur_pos_, 1)
+                             : cur_pos_ == 0;
+  }
   bool reached_eos() const {
     return has_pending_token_ && token_generator_->is_eos(pending_token_);
   }

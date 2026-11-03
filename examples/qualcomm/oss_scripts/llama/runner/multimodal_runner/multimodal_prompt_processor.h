@@ -63,6 +63,12 @@ class MultimodalPromptProcessor : public example::PromptProcessor {
     return metadata_.num_layers;
   }
 
+  bool can_prefill(int64_t start_pos, int64_t num_tokens) const {
+    return is_bert() ? start_pos == 0
+                     : metadata_.can_prefill(
+                           start_pos, num_tokens, kv_manager_->max_cache_len());
+  }
+
   /**
    * @brief Initialize I/O tensor and allocate I/O data buffer.
    * @param buffer_manager Pointer to IMemAlloc instance which depends on

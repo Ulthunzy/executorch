@@ -157,6 +157,10 @@ std::string Session::generate(
       temperature < 0)
     throw std::invalid_argument(
         "Prompt, token budget or temperature is invalid");
+  if (!runner_->can_start_prefill())
+    throw std::invalid_argument(
+        "Dense prefill cannot start at the current context position; "
+        "call resetContext");
   PackageDirectory packages(config_.libraries);
   std::vector<MultimodalInput> inputs;
   std::string prefix;
@@ -200,24 +204,29 @@ std::string Session::generate(
   generation.ignore_eos = ignore_eos;
   std::string stats;
   bool first_piece = true;
+  const auto status = runner_->generate(
+      inputs,
+      generation,
+      [&](const std::string& piece) {
+        if (piece.empty() || piece == "<|im_end|>" ||
+            piece == "<|endoftext|>" || piece == "<|end_of_text|>")
+          return;
+        if (callback) {
+          if (first_piece && thinking)
+            callback("<think>\n");
+          callback(piece);
+        }
+        first_piece = false;
+      },
+      [&](const llm::Stats& value) {
+        stats = extension::llm::stats_to_json_string(value);
+      });
+  if (status == Error::InvalidArgument)
+    throw std::invalid_argument(
+        "Dense prompt exceeds context or compiled prefill capacity; "
+        "shorten the prompt or call resetContext");
   check(
-      runner_->generate(
-          inputs,
-          generation,
-          [&](const std::string& piece) {
-            if (piece.empty() || piece == "<|im_end|>" ||
-                piece == "<|endoftext|>" || piece == "<|end_of_text|>")
-              return;
-            if (callback) {
-              if (first_piece && thinking)
-                callback("<think>\n");
-              callback(piece);
-            }
-            first_piece = false;
-          },
-          [&](const llm::Stats& value) {
-            stats = extension::llm::stats_to_json_string(value);
-          }),
+      status,
       "Dense generation (resetContext is required after interrupted prefill)");
   started_ = true;
   ended_with_eos_ = runner_->reached_eos();

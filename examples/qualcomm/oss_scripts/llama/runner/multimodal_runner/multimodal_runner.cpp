@@ -910,6 +910,11 @@ executorch::runtime::Error QNNMultimodalRunner::generate(
       !stop_requested_.load(std::memory_order_relaxed),
       InvalidState,
       "Generation stopped");
+  ET_CHECK_OR_RETURN_ERROR(
+      can_start_prefill(),
+      InvalidArgument,
+      "Prefill cannot start at position %lld; reset the context",
+      static_cast<long long>(cur_pos_));
   stats_.inference_start_ms = time_in_ms();
   ET_CHECK_OK_OR_RETURN_ERROR(
       decoder_runner_->set_temperature(config.temperature));
@@ -982,6 +987,15 @@ executorch::runtime::Error QNNMultimodalRunner::generate(
               static_cast<size_t>(seq_len),
           InvalidArgument,
           "Prompt exceeds the context capacity");
+      ET_CHECK_OR_RETURN_ERROR(
+          placeholder_merge ||
+              prompt_processor_->can_prefill(
+                  cur_pos_,
+                  embedding_merger_->get_total_tokens() +
+                      static_cast<int64_t>(tokens.size())),
+          InvalidArgument,
+          "Prompt exceeds compiled prefill capacity; shorten the prompt or "
+          "reset the context");
       tok_embedding_processor_->prefill(tokens);
       const TensorStruct<float>& text_embeddings =
           tok_embedding_processor_->get_prompt_embeddings();
@@ -1053,7 +1067,6 @@ executorch::runtime::Error QNNMultimodalRunner::generate(
   const int32_t next_position_delta = use_qwen35_mrope
       ? mrope_pos - static_cast<int32_t>(cur_pos_) - num_prompt_tokens
       : 0;
-  token_generator_->set_position_delta(next_position_delta);
 
   ET_CHECK_OR_RETURN_ERROR(
       num_prompt_tokens >= 1,
@@ -1063,12 +1076,20 @@ executorch::runtime::Error QNNMultimodalRunner::generate(
       cur_pos_ + num_prompt_tokens < seq_len,
       InvalidArgument,
       "sequence length exceeded - please increase the seq_len value");
+  ET_CHECK_OR_RETURN_ERROR(
+      prompt_processor_->can_prefill(cur_pos_, num_prompt_tokens),
+      InvalidArgument,
+      "Prompt exceeds compiled prefill capacity at position %lld (%d tokens); "
+      "shorten the prompt or reset the context",
+      static_cast<long long>(cur_pos_),
+      num_prompt_tokens);
   auto effective_config = config;
   effective_config.seq_len = seq_len;
   const int32_t budget = effective_config.resolve_max_new_tokens(
       context_len_, cur_pos_ + num_prompt_tokens);
   ET_CHECK_OR_RETURN_ERROR(
       budget > 0, InvalidArgument, "No room for generated tokens");
+  token_generator_->set_position_delta(next_position_delta);
 
   if (token_callback && config.echo) {
     token_callback(prompt);

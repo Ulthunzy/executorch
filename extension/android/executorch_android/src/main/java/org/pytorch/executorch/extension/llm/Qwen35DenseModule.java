@@ -70,7 +70,11 @@ public final class Qwen35DenseModule implements AutoCloseable {
     return generateWithImage(image, prompt, count, temperature, thinking, false, callback);
   }
 
-  /** Setting ignoreEos runs to the token budget, subject to compiled context capacity. */
+  /**
+   * Setting ignoreEos runs to the token budget, subject to compiled context capacity.
+   * A prompt that exceeds the compiled prefill capacity throws IllegalArgumentException
+   * without changing KV/GDN history. Shorten the prompt or call resetContext() before retrying.
+   */
   public String generateWithImage(String image, String prompt, int count, float temperature,
       boolean thinking, boolean ignoreEos, Callback callback) {
     Objects.requireNonNull(prompt);

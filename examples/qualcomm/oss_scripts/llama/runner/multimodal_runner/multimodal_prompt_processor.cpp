@@ -265,9 +265,10 @@ Result<uint64_t> MultimodalPromptProcessor::prefill(
   }
   int32_t num_prompt_tokens = prompt_embedding.tensor->size(1);
   if (!is_bert()) {
-    ET_CHECK_MSG(
+    ET_CHECK_OR_RETURN_ERROR(
         metadata_.can_prefill(
             start_pos, num_prompt_tokens, kv_manager_->max_cache_len()),
+        InvalidArgument,
         "Prompt exceeds prefill capacity: start=%ld tokens=%d AR=%d context=%d max_past=%d",
         start_pos,
         num_prompt_tokens,
@@ -275,8 +276,10 @@ Result<uint64_t> MultimodalPromptProcessor::prefill(
         metadata_.context_len,
         metadata_.max_prefill_past);
   } else {
-    ET_CHECK_MSG(
-        start_pos == 0, "Bert model doesn't support multi-turn conversation.");
+    ET_CHECK_OR_RETURN_ERROR(
+        start_pos == 0,
+        InvalidArgument,
+        "Bert model doesn't support multi-turn conversation.");
   }
 
   // store the token

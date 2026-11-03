@@ -85,6 +85,34 @@ public final class Qwen35DenseSmokeTest {
       } catch (RuntimeException expected) {}
       run(model, "", "1+1等于多少？", 8, false, new StringBuilder());
       model.resetContext();
+      JSONObject single = new JSONObject(model.generate("a", 1, 0, false, x -> {}));
+      int nearCapacity = single.getInt("context_length") - 128 + 16;
+      StringBuilder near = new StringBuilder("a");
+      for (int i = single.getInt("prompt_tokens"); i < nearCapacity; ++i)
+        near.append(" a");
+      model.resetContext();
+      JSONObject boundary = new JSONObject(model.generate(near.toString(), 1, 0, false, x -> {}));
+      check(boundary.getInt("global_kv_tokens") == nearCapacity, "Boundary fixture token count changed");
+      // Decode can finish beyond the last legal AR128 prefill starting position.
+      for (int i = 0; i < 2; ++i) {
+        try {
+          model.generate("你好。", 1, 0, false, x -> {});
+          throw new AssertionError("AR128 prefill overflow accepted");
+        } catch (IllegalArgumentException expected) {}
+      }
+      try {
+        model.generateWithImage(args[0] + "/tokenizer.json", "你好。", 1, 0,
+            false, x -> {});
+        throw new AssertionError("Image prefill overflow accepted");
+      } catch (IllegalArgumentException expected) {
+        check(expected.getMessage().contains("prefill cannot start"),
+            "Image decoding ran before the prefill capacity check: " + expected);
+        System.out.println("DENSE_IMAGE_PREFILL_PRECHECK_PASS");
+      }
+      model.resetContext();
+      JSONObject recovered = new JSONObject(run(model, "", "1+1等于多少？", 8, false, new StringBuilder()));
+      check(recovered.getLong("model_load_end_ms") == a.getLong("model_load_end_ms"), "Boundary reset reloaded the model");
+      model.resetContext();
       try {
         model.generate("你好。", 4, 0, false, x -> { throw new IllegalStateException("callback probe"); });
         throw new AssertionError("Callback exception was swallowed");

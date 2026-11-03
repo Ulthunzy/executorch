@@ -1004,15 +1004,20 @@ class Qwen35DenseJni : public facebook::jni::HybridClass<Qwen35DenseJni> {
       jboolean thinking,
       jboolean ignore_eos,
       facebook::jni::alias_ref<Qwen35DenseStream> callback) {
-    auto stats = session_.generate(
-        prompt,
-        image,
-        count,
-        temperature,
-        thinking,
-        ignore_eos,
-        [&](const std::string& piece) { callback->onBytes(piece); });
-    return facebook::jni::make_jstring(stats);
+    try {
+      auto stats = session_.generate(
+          prompt,
+          image,
+          count,
+          temperature,
+          thinking,
+          ignore_eos,
+          [&](const std::string& piece) { callback->onBytes(piece); });
+      return facebook::jni::make_jstring(stats);
+    } catch (const std::invalid_argument& error) {
+      facebook::jni::throwNewJavaException(
+          "java/lang/IllegalArgumentException", error.what());
+    }
   }
   void stop() {
     session_.stop();
