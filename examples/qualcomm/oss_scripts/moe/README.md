@@ -36,6 +36,9 @@ GDN 与低比特计算分别调用 [`custom_op/deltanet_op_package_htp`](../../c
 
 `build.sh` 输出两个自研库：`libet_infer.so` 在 ARM64 运行，统一包含 JNI、Runner、Prefill/Decode 和共享 context；`libet_qnnop.so` 在 Hexagon 运行，统一包含 GDN、低 bit 内核和两套 FastRPC 服务。两阶段服务使用独立的 `et_prefill_rpc`、`et_decode_rpc` 接口，Native QHPI 适配不覆盖 QNN 的同名函数。V79/V81/V85 按目标分别编译，源码分工保持不变。
 
+两个库须配套更新：Prefill 的 mapped-IO 协议同时传递有效长度和分配容量，构建时通过 `NATIVE_TARGET.json` 的 `prefill_mapped_io` 校验，旧 DSP 构建需重新生成。发热优化默认关闭；实验时可设置 `MOE_ENABLE_IDLE_POWER_MANAGEMENT=1`，构建清单会记录该选项。
+
+
 命令行 `qwen35_moe_runner` 与诊断入口 `prefill_handoff_runner` 是链接 `libet_infer.so` 的薄入口。JNI 也使用同一库，Java 方法签名保留，加载名为 `et_infer`。已有 PTE 无需因合库重新导出或量化。QNN SDK 运行库单独部署。
 
 环境设置完成后构建并安装：

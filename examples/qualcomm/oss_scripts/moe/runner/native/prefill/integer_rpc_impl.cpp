@@ -402,7 +402,7 @@ extern "C" AEEResult et_prefill_rpc_run_mapped(
     remote_handle64 handle,
     const int* descriptors,
     int count) {
-  if (count != 14)
+  if (count != 14 && count != 20)
     return 40;
   auto* state = reinterpret_cast<State*>(uintptr_t(handle));
   const int tokens = expert_stream::token_count(descriptors[9]);
@@ -419,6 +419,13 @@ extern "C" AEEResult et_prefill_rpc_run_mapped(
   for (int i = 0; i < 6; i++) {
     if (i == 5 && descriptors[i] < 0)
       continue;
+    const unsigned int mapped_bytes = count == 20
+        ? static_cast<unsigned int>(descriptors[14 + i])
+        : sizes[i];
+    const unsigned int maximum_bytes =
+        unsigned(state->capacity * (i == 1 || i == 2 ? 8 : 2048) * 4);
+    if (mapped_bytes < sizes[i] || mapped_bytes > maximum_bytes)
+      return 47;
     IoMapping* found = nullptr;
     for (auto& entry : state->io)
       if (entry.fd == descriptors[i]) {
@@ -436,7 +443,7 @@ extern "C" AEEResult et_prefill_rpc_run_mapped(
     if (found->fd == -1) {
       auto* pointer = HAP_mmap2(
           nullptr,
-          sizes[i],
+          mapped_bytes,
           HAP_PROT_READ | HAP_PROT_WRITE,
           0,
           descriptors[i],
@@ -445,9 +452,9 @@ extern "C" AEEResult et_prefill_rpc_run_mapped(
         return 42 + i;
       found->fd = descriptors[i];
       found->pointer = pointer;
-      found->bytes = sizes[i];
+      found->bytes = mapped_bytes;
     }
-    if (found->bytes != sizes[i])
+    if (found->bytes < sizes[i])
       return 47;
     buffers[i] = found->pointer;
   }

@@ -103,21 +103,25 @@ void NativeCore::execute(bool read_output) {
       sync_buffer(outbuf[0], DMA_BUF_SYNC_END | DMA_BUF_SYNC_READ);
       output_read = false;
     }
-    // 六个 IO fd，后接八个 bank 描述字段；与 native/prefill 的 RPC ABI 对齐。
-    int descriptors[14];
+    // FD、bank 描述和分配容量分开传递，映射不随有效 token 数改变。
+    int descriptors[20];
     for (int i = 0; i < 4; i++) {
       map_buffer(inbuf[i]);
       descriptors[i] = inbuf[i]->fd;
+      descriptors[14 + i] = int(inbuf[i]->size);
     }
     map_buffer(outbuf[0]);
     descriptors[4] = outbuf[0]->fd;
+    descriptors[18] = int(outbuf[0]->size);
     descriptors[5] = -1;
+    descriptors[19] = 0;
     if (fuse_residual && residual) {
       map_buffer(residual);
       descriptors[5] = residual->fd;
+      descriptors[19] = int(residual->size);
     }
     memcpy(descriptors + 6, input(4), 32);
-    const int status = et_prefill_rpc_run_mapped(handle, descriptors, 14);
+    const int status = et_prefill_rpc_run_mapped(handle, descriptors, 20);
     if (status == 25)
       fprintf(
           stderr,
