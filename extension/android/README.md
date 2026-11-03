@@ -133,15 +133,22 @@ Build from that complete staging directory with native-content validation:
   -PexecutorchQwen35Modules=dense,moe
 ```
 
-The additional property checks both Java APIs, required native libraries and
-ARM64/Hexagon ELF types, and rejects V79/V85 runtime libraries. It catches a
-MoE-only staging directory before the combined release is accepted.
+The additional property checks both Java APIs, required native libraries,
+ARM64/Hexagon ELF types and 16 KB Android `LOAD` segment alignment, and rejects
+V79/V85 runtime libraries. It catches a MoE-only staging directory or a 4 KB
+Android library before the combined release is accepted. Hexagon ELF32 DSP
+libraries are checked separately for their architecture; Android ARM64 page
+alignment requirements apply to the host libraries.
 
 When consuming a local AAR file, retain the application's `fbjni:0.7.0` and
 `nativeloader:0.10.5` dependencies, plus Kotlin stdlib. The fbjni dependency
 supplies `libfbjni.so` and `libc++_shared.so`; these are not duplicated in the
 combined AAR. The app must extract its DSP libraries as described in the
 [Dense JNI](jni/dense/README.md) and [MoE JNI](jni/moe/README.md) instructions.
+Local `files(...)` AAR dependencies do not resolve Maven dependencies, so the
+consumer must declare these dependencies explicitly and use compatible native
+libraries in the final APK. CameraX belongs to the consuming application and
+is outside this AAR's dependency set.
 
 Compare a new AAR against an app's existing one:
 
