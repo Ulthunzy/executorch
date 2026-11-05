@@ -285,7 +285,8 @@ uint32_t execute_integer_moe(
   auto* route_output = static_cast<float*>(native_qhpi::tensor_raw_data(outputs[2]));
   const auto* descriptor =
       static_cast<const int32_t*>(native_qhpi::tensor_raw_data(inputs[4]));
-  const bool streaming = descriptor[4] == expert_stream::kPhase;
+  const bool streaming = descriptor[4] == expert_stream::kPhase ||
+      descriptor[4] == expert_stream::kResidentPhase;
   const int phase = streaming ? 0 : descriptor[4];
   const int tokens_count = expert_stream::token_count(descriptor[3]);
   const int valid_tokens = expert_stream::valid_token_count(descriptor[3]);
@@ -545,7 +546,10 @@ uint32_t execute_integer_moe(
       tokens[i] = assignment >> 3;
       slots[i] = assignment & 7;
     }
-    const uint8_t* expert_data = bank + offsets[expert];
+    const uint64_t offset = offsets[expert];
+    const uint8_t* expert_data = (offset & expert_stream::kResident)
+        ? sync->resident_bank + (offset & ~expert_stream::kResident)
+        : bank + offset;
     auto* header = reinterpret_cast<uint32_t*>(base + 389120);
     // 专家头与 prepare_experts.py 的 12×UINT32 ABI 一致；
     // GU 的 codes/scales/sums 在 [4/5/6]，down 在

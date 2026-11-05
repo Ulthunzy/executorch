@@ -1,5 +1,6 @@
 #include "decode_session.h"
 #include <filesystem>
+#include "../qnn/phase_memory.h"
 
 namespace moe::decode {
 
@@ -82,6 +83,20 @@ DecodeSession::DecodeSession(const std::string& path, size_t cache_mib)
   core.inbuf[3] = shared_io->shared;
   core.residual = shared_io->residual;
   head = std::make_unique<Graph>(runtime, root + "/head.bin");
+  for (bool output : {false, true}) {
+    const int index = head->index(!output, 0);
+    auto& tensor = output ? head->outputs[index] : head->inputs[index];
+    auto& buffer = output ? head->outbuf[index] : head->inbuf[index];
+    if (auto shared = moe::prefill_head_buffer(output, tensor)) {
+      runtime.shared_workspace_bytes += buffer->size;
+      buffer = shared;
+      head->bind(tensor, shared);
+    }
+  }
+  printf(
+      "PHASE_MEMORY_SHARED state_bytes=%llu workspace_bytes=%llu\n",
+      (unsigned long long)runtime.shared_state_bytes,
+      (unsigned long long)runtime.shared_workspace_bytes);
   std::vector<Graph*> graphs;
   for (int i = 0; i < 40; i++) {
     graphs.push_back(&attention[i]->graph);

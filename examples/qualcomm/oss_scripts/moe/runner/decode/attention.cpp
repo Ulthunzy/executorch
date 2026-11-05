@@ -1,5 +1,6 @@
 #include "attention.h"
 #include "../qnn/qnn_cache.h"
+#include "../qnn/phase_memory.h"
 
 namespace moe::decode {
 
@@ -22,6 +23,21 @@ Attention::Attention(
     output.push_back(graph.index(false, order[2 + order[0] + i]));
   for (int c = 0; c < 2; c++) {
     const int target = input[c + (linear ? 1 : 4)];
+    if (auto shared = moe::prefill_state_buffer(
+            layer, c, false, graph.inputs[target])) {
+      runtime.shared_state_bytes += graph.inbuf[target]->size;
+      graph.inbuf[target] = shared;
+      graph.bind(graph.inputs[target], shared);
+    }
+    if (linear) {
+      const int out = output[c + 2];
+      if (auto shared = moe::prefill_state_buffer(
+              layer, c, true, graph.outputs[out])) {
+        runtime.shared_state_bytes += graph.outbuf[out]->size;
+        graph.outbuf[out] = shared;
+        graph.bind(graph.outputs[out], shared);
+      }
+    }
     state[c] = graph.inbuf[target];
     if (!linear)
       history = Graph::elements(graph.inputs[target]) / 512;

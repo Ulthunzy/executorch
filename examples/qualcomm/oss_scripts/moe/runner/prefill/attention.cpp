@@ -1,11 +1,13 @@
 #include "attention.h"
+#include "../qnn/qnn_cache.h"
 
 Attention::Attention(
     Runtime& r,
     const std::string& root,
     int layer,
     bool is_linear,
-    bool cold_fa)
+    bool cold_fa,
+    int resident_capacity)
     : graph(
           r,
           root +
@@ -69,13 +71,8 @@ Attention::Attention(
       if (i && current != history)
         throw std::runtime_error("prefill K/V history mismatch");
       history = current;
-      handoff_cache[i].resize(512 * (history + 128));
-    }
-    // Matching GDN state grids swap DMA handles and never use CPU staging.
-    if (!swap_state[i]) {
-      cache_host[i].resize(
-          Graph::elements(cache_owner().inputs[cache_input[i]]));
-      cache_temporary[i].resize(Graph::elements(graph.outputs[output[i + 2]]));
+      if (resident_capacity <= 0 || history < resident_capacity)
+        handoff_cache[i].resize(512 * (history + 128));
     }
   }
 }
@@ -85,15 +82,37 @@ size_t Attention::cache_bytes(int c) {
 }
 
 size_t Attention::export_bytes(int c) {
-  return linear ? cache_bytes(c) : handoff_cache[c].size() * 2;
+  return handoff_cache[c].empty() ? cache_bytes(c)
+                                : handoff_cache[c].size() * 2;
+}
+
+void Attention::save_cache(const std::string& path, int c) {
+  if (linear || !handoff_cache[c].empty()) {
+    save(path, export_data(c), export_bytes(c));
+    return;
+  }
+  // Existing diagnostic files include an extra AR128 window. A resident
+  // conversation keeps all valid tokens in the live history instead.
+  const auto source = qnn_cache_view(
+      cache_owner().inputs[cache_input[c]], cache_data(c));
+  std::vector<uint16_t> expanded(512 * (history + 128));
+  const QuantizedCacheView destination{
+      expanded.data(), expanded.size(), source.scale, source.offset,
+      source.dtype};
+  clear_cache(destination);
+  copy_cache_range(
+      source,
+      destination,
+      c ? CacheLayout::Value : CacheLayout::Key,
+      0,
+      128,
+      history);
+  save(path, expanded.data(), expanded.size() * 2);
 }
 
 void Attention::reset() {
-  for (int c = 0; c < 2; c++) {
+  for (int c = 0; c < 2; c++)
     reset_quant(cache_owner(), cache_input[c]);
-    if (!linear)
-      memcpy(cache_host[c].data(), cache_data(c), cache_host[c].size() * 2);
-  }
 }
 
 void Attention::prefill(
@@ -161,30 +180,28 @@ void Attention::feedback() {
       graph.bindings[FIELD(graph.outputs[out], id)] = graph.outbuf[out];
       continue;
     }
-    const size_t count = cache_temporary[c].size();
+    const size_t count = Graph::elements(graph.outputs[output[c + 2]]);
     auto* device_input = (uint16_t*)cache_data(c);
+    const auto* from = static_cast<const uint16_t*>(
+        graph.output(output[c + 2]));
     if (linear && identity[c]) {
-      memcpy(device_input, graph.output(output[c + 2]), count * 2);
+      memcpy(device_input, from, count * 2);
       continue;
     }
-    memcpy(cache_temporary[c].data(), graph.output(output[c + 2]), count * 2);
-    const uint16_t* from = cache_temporary[c].data();
-    auto* to = cache_host[c].data();
     auto& lut = cache_maps[c];
     if (linear) {
       for (size_t i = 0; i < count; i++)
-        to[i] = lut[from[i]];
+        device_input[i] = lut[from[i]];
     } else {
       const auto q = FIELD(cache_owner().inputs[cache_input[c]], quantizeParams)
                          .scaleOffsetEncoding;
       append_prefill_kv(
-          {to, cache_host[c].size(), q.scale, q.offset},
+          {device_input, cache_bytes(c) / 2, q.scale, q.offset},
           from,
           lut.data(),
-          handoff_cache[c].data(),
+          handoff_cache[c].empty() ? nullptr : handoff_cache[c].data(),
           c ? CacheLayout::Value : CacheLayout::Key,
           valid_tokens);
     }
-    memcpy(device_input, to, cache_host[c].size() * 2);
   }
 }

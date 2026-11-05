@@ -12,6 +12,8 @@
 #include "../infer_api.h"
 #include "../prefill_schedule.h"
 #include "../qnn/shared/graph_binding.h"
+#include "../qnn/phase_memory.h"
+#include "../qnn/qnn_cache.h"
 #ifdef MOE_CHAT_RUNNER
 #include "../chat/chat.h"
 #include "../runner.h"
@@ -23,6 +25,56 @@
 using namespace executorch::runtime;
 static std::string model_root;
 static std::unique_ptr<PrefillSession> session;
+
+std::shared_ptr<Buffer> moe::prefill_state_buffer(
+    int layer, int cache, bool output, const Qnn_Tensor_t& target) {
+  if (!session || layer < 0 || layer >= int(session->attention.size()) ||
+      cache < 0 || cache >= 2)
+    return nullptr;
+  auto& owner = *session->attention[layer];
+  auto& graph = owner.graph;
+  const int index = output ? owner.output[cache + 2] : owner.cache_input[cache];
+  const auto& tensor = output ? graph.outputs[index] : graph.inputs[index];
+  if (!owner.linear) {
+    const char* append = getenv("KV_APPEND_ONLY");
+    if (output || !append || std::string(append) != "1" ||
+        !owner.handoff_cache[cache].empty() ||
+        FIELD(tensor, dataType) != QNN_DATATYPE_UFIXED_POINT_16 ||
+        FIELD(target, dataType) != QNN_DATATYPE_UFIXED_POINT_16 ||
+        FIELD(tensor, dataFormat) != QNN_TENSOR_DATA_FORMAT_FLAT_BUFFER ||
+        FIELD(target, dataFormat) != QNN_TENSOR_DATA_FORMAT_FLAT_BUFFER ||
+        FIELD(tensor, rank) != 4 || FIELD(target, rank) != 4)
+      return nullptr;
+    const auto* from = FIELD(tensor, dimensions);
+    const auto* to = FIELD(target, dimensions);
+    const int axis = cache ? 2 : 3;
+    for (int i = 0; i < 4; ++i)
+      if (i == axis ? from[i] != to[i] + 1 : from[i] != to[i])
+        return nullptr;
+    if (from[0] != 1 || from[1] != 2 || from[cache ? 3 : 2] != 256)
+      return nullptr;
+    const auto a = qnn_cache_view(tensor, nullptr);
+    const auto b = qnn_cache_view(target, nullptr);
+    if (a.scale != b.scale || a.offset != b.offset || a.dtype != b.dtype)
+      return nullptr;
+    return graph.inbuf[index];
+  }
+  if (!Graph::same_encoding_and_layout(tensor, target))
+    return nullptr;
+  return output ? graph.outbuf[index] : graph.inbuf[index];
+}
+
+std::shared_ptr<Buffer> moe::prefill_head_buffer(
+    bool output, const Qnn_Tensor_t& target) {
+  if (!session || !session->head)
+    return nullptr;
+  auto& graph = *session->head;
+  const int index = graph.index(!output, 0);
+  const auto& tensor = output ? graph.outputs[index] : graph.inputs[index];
+  if (!Graph::same_encoding_and_layout(tensor, target))
+    return nullptr;
+  return output ? graph.outbuf[index] : graph.inbuf[index];
+}
 
 #if SM_MOE_IDLE_POWER_MANAGEMENT
 void qwen35_prefill_set_power_active(bool active) {
@@ -302,7 +354,7 @@ static int prefill_main(int argc, char** argv, bool chat) try {
       ? prefill_plan_tokens(prompt_tokens, workspace_tokens)
       : workspace_tokens;
   const bool preload = chat && moe_chat::preloading();
-  session = std::make_unique<PrefillSession>(model_root, plan_tokens);
+  session = std::make_unique<PrefillSession>(model_root, plan_tokens, chat);
   session->prefill_module = &module;
   session->dynamic_plan = dynamic_sequence;
 
@@ -521,20 +573,19 @@ static int prefill_main(int argc, char** argv, bool chat) try {
           128 * 2048 * 4);
       for (int layer = 0; layer < 40; layer++)
         for (int c = 0; c < 2; c++)
-          save(
+          session->attention[layer]->save_cache(
               prefix + "layer" + std::to_string(layer) + "-cache" +
                   std::to_string(c) + ".u16",
-              session->attention[layer]->export_data(c),
-              session->attention[layer]->export_bytes(c));
+              c);
     }
   }
   if (preload)
     for (int layer = 0; layer < 40; ++layer)
       for (int c = 0; c < 2; ++c)
-        save(model_root + "/pte-0-layer" + std::to_string(layer) +
+        session->attention[layer]->save_cache(
+             model_root + "/pte-0-layer" + std::to_string(layer) +
                  "-cache" + std::to_string(c) + ".u16",
-             session->attention[layer]->export_data(c),
-             session->attention[layer]->export_bytes(c));
+             c);
   save(
       model_root + "/prefill-all-routes.i32",
       all_routes.data(),

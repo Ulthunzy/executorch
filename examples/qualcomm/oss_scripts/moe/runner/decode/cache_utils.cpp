@@ -11,7 +11,8 @@ std::vector<uint16_t> grid_map(
   auto a = qnn_cache_view(from, nullptr), b = qnn_cache_view(to, nullptr);
   if (a.dtype != b.dtype)
     throw std::runtime_error("Cache feedback requires matching dtypes");
-  if (a.dtype == CacheDType::Float16)
+  if (a.dtype == CacheDType::Float16 ||
+      (a.scale == b.scale && a.offset == b.offset))
     return {};
   std::vector<uint16_t> map(65536);
   for (int i = 0; i < 65536; i++)

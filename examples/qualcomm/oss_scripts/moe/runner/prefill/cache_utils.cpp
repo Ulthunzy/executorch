@@ -10,7 +10,8 @@ std::vector<uint16_t> remap(
        b = qnn_cache_view(destination, nullptr);
   if (a.dtype != b.dtype)
     throw std::runtime_error("Cache feedback requires matching dtypes");
-  if (a.dtype == CacheDType::Float16)
+  if (a.dtype == CacheDType::Float16 ||
+      (a.scale == b.scale && a.offset == b.offset))
     return {};
   std::vector<uint16_t> result(65536);
   for (int i = 0; i < 65536; i++)

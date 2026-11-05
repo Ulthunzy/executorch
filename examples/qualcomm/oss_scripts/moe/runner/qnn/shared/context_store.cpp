@@ -1,6 +1,7 @@
 #include <filesystem>
 #include "context_api.h"
 #include "weight_source.h"
+#include "../binary_weights.h"
 #include "../qnn_front.h"
 #include <tuple>
 
@@ -10,6 +11,11 @@ std::mutex registry_mutex;
 struct Context {
   Runtime& runtime;
   std::unique_ptr<WeightSource> weights;
+  std::unique_ptr<MappedBinary> binary;
+  std::unique_ptr<BinaryWeights> binary_weights;
+  const void* image = nullptr;
+  size_t image_bytes = 0;
+  const Qnn_ContextBinaryCallback_t* callback = nullptr;
   Qnn_ContextHandle_t handle = nullptr;
   QnnSystemContext_Handle_t system = nullptr;
   const QnnSystemContext_BinaryInfo_t* metadata = nullptr;
@@ -18,7 +24,8 @@ struct Context {
   std::mutex* init_mutex = nullptr;
   std::condition_variable* init_changed = nullptr;
   Qnn_ErrorHandle_t init_error = QNN_SUCCESS;
-  using MemoryKey = std::tuple<int, Qnn_DataType_t, std::vector<uint32_t>>;
+  using MemoryKey =
+      std::tuple<int, uint64_t, Qnn_DataType_t, std::vector<uint32_t>>;
 
   struct Memory {
     Qnn_MemHandle_t handle;
@@ -27,18 +34,26 @@ struct Context {
 
   std::map<MemoryKey, Memory> memory;
 
-  Context(Runtime& r, const std::string& directory) : runtime(r) {
-    const void* image;
-    size_t size;
-    weights = std::make_unique<WeightSource>(r, directory);
-    image = weights->image();
-    size = weights->image_size();
+  Context(Runtime& r, const std::string& path, bool standalone = false)
+      : runtime(r) {
+    if (standalone) {
+      binary = std::make_unique<MappedBinary>(path);
+      binary_weights = std::make_unique<BinaryWeights>(r, path);
+      image = binary->data();
+      image_bytes = binary->size();
+      callback = binary_weights->callback();
+    } else {
+      weights = std::make_unique<WeightSource>(r, path);
+      image = weights->image();
+      image_bytes = weights->image_size();
+      callback = weights->callback();
+    }
     try {
       check(r.s.systemContextCreate(&system), "shared metadata create");
       Qnn_ContextBinarySize_t length = 0;
       check(
           r.s.systemContextGetBinaryInfo(
-              system, const_cast<void*>(image), size, &metadata, &length),
+              system, const_cast<void*>(image), image_bytes, &metadata, &length),
           "shared metadata");
       if (metadata->version != QNN_SYSTEM_CONTEXT_BINARY_INFO_VERSION_3)
         throw std::runtime_error("shared binary metadata version");
@@ -76,6 +91,7 @@ struct Store {
   std::mutex init_mutex;
   std::condition_variable init_changed;
   std::map<std::string, std::unique_ptr<Context>> contexts;
+  std::string vision_path;
 
   bool has_references() const {
     return std::any_of(contexts.begin(), contexts.end(), [](const auto& entry) {
@@ -119,6 +135,15 @@ struct Store {
       entries.push_back(entry.get());
       contexts.emplace(path, std::move(entry));
     }
+    if (!vision_path.empty()) {
+      if (contexts.count(root + "/vision"))
+        throw std::runtime_error("duplicate vision context in shared batch");
+      auto entry = std::make_unique<Context>(runtime, vision_path, true);
+      entry->init_mutex = &init_mutex;
+      entry->init_changed = &init_changed;
+      entries.push_back(entry.get());
+      contexts.emplace(root + "/vision", std::move(entry));
+    }
     std::vector<QnnContext_ParamsV2_t> details;
     details.reserve(entries.size());
     std::vector<QnnContext_Params_t> parameters;
@@ -128,12 +153,12 @@ struct Store {
       auto& entry = *entries[i];
       details.push_back(
           {nullptr,
-           entry.weights->image(),
-           entry.weights->image_size(),
+           entry.image,
+           entry.image_bytes,
            nullptr,
            notify,
            &entry,
-           entry.weights->callback()});
+           entry.callback});
       parameters.push_back(QnnContext_Params_t{});
       parameters[i].version = QNN_CONTEXT_PARAMS_VERSION_2;
       parameters[i].v2 = &details.back();
@@ -181,12 +206,22 @@ struct Store {
     });
     for (auto* entry : entries) {
       check(entry->init_error, "shared asynchronous context callback");
-      fprintf(
-          stderr,
-          "SHARED_CONTEXT_READY graphs=%u weight_bytes=%llu provides=%llu\n",
-          entry->metadata->contextBinaryInfoV3.numGraphs,
-          (unsigned long long)entry->weights->allocated_bytes,
-          (unsigned long long)entry->weights->provides);
+      if (entry->weights) {
+        entry->weights->discard_file_cache();
+        fprintf(
+            stderr,
+            "SHARED_CONTEXT_READY graphs=%u weight_bytes=%llu provides=%llu\n",
+            entry->metadata->contextBinaryInfoV3.numGraphs,
+            (unsigned long long)entry->weights->allocated_bytes,
+            (unsigned long long)entry->weights->provides);
+      } else {
+        entry->binary->discard_pages();
+        entry->binary_weights->discard_file_cache();
+        fprintf(
+            stderr,
+            "SHARED_CONTEXT_READY graphs=%u vision=1\n",
+            entry->metadata->contextBinaryInfoV3.numGraphs);
+      }
     }
     fprintf(
         stderr,
@@ -224,6 +259,27 @@ Store& store() {
   return *active_store;
 }
 } // namespace
+
+extern "C" __attribute__((visibility("default"))) int
+qwen35_shared_prepare_vision(const char* path) {
+  std::lock_guard<std::mutex> guard(registry_mutex);
+  try {
+    const char* root = getenv("SHARED_MODEL_ROOT");
+    if (!root || !*root || ((!path || !*path) && !active_store))
+      return 0;
+    auto& owner = store();
+    const std::string selected = path ? path : "";
+    if (!owner.contexts.empty() && owner.vision_path != selected)
+      throw std::runtime_error("cannot change vision in a loaded shared batch");
+    owner.vision_path = selected;
+    return 0;
+  } catch (const std::exception& error) {
+    fprintf(stderr, "SHARED_VISION_PREPARE_FAILED %s\n", error.what());
+    if (active_store && !active_store->has_references())
+      active_store.reset();
+    return 1;
+  }
+}
 
 extern "C" __attribute__((visibility("default"))) int qwen35_shared_acquire(
     const char* directory,
@@ -291,8 +347,23 @@ extern "C" __attribute__((visibility("default"))) int qwen35_shared_register(
       auto& entry = *pair.second;
       if (entry.handle != context)
         continue;
+      int fd;
+      uint64_t offset = 0;
+      if (descriptor->memType == QNN_MEM_TYPE_ION) {
+        fd = descriptor->ionInfo.fd;
+      } else if (descriptor->memType == QNN_MEM_TYPE_CUSTOM) {
+        const auto* shared = static_cast<const QnnMemHtp_Descriptor_t*>(
+            descriptor->customInfo);
+        if (!shared || shared->type != QNN_HTP_MEM_SHARED_BUFFER)
+          return 1;
+        fd = shared->sharedBufferConfig.fd;
+        offset = shared->sharedBufferConfig.offset;
+      } else {
+        return 1;
+      }
       Context::MemoryKey key{
-          descriptor->ionInfo.fd,
+          fd,
+          offset,
           descriptor->dataType,
           std::vector<uint32_t>(
               descriptor->memShape.dimSize,

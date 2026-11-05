@@ -96,8 +96,11 @@ struct PrefillSession {
       valid_tokens = 128, sequence_valid_tokens = 128, memo_layer = -1;
   std::shared_ptr<Buffer> layer_memo;
   std::array<bool, 256> memo_valid{};
+  std::array<uint64_t, 256> memo_offsets{};
   std::array<int, 64> memo_slot_ids{};
-  enum class MemoCopy { None, Seed, Retain };
+  std::vector<int> memo_cold_ids;
+  int memo_used = 0;
+  enum class MemoCopy { None, Retain };
   MemoCopy memo_copy = MemoCopy::None;
   int memo_copy_layer = -1;
   std::vector<ExpertRead> memo_copies;
@@ -117,9 +120,12 @@ struct PrefillSession {
   std::vector<int32_t> sequence_routes, sequence_seeds;
   std::vector<uint64_t> sequence_stamps;
 
-  explicit PrefillSession(const std::string& path, int plan_tokens = 128);
+  explicit PrefillSession(
+      const std::string& path, int plan_tokens = 128, bool resident_chat = false);
 
   void prepare_layer_memo(int layer);
+
+  uint8_t* memo_payload(int layer, int expert);
 
   void finish_memo_copy();
 
@@ -180,7 +186,9 @@ struct PrefillSession {
       const std::function<bool()>& stopped = {});
   void import_append_state(const Qwen35SessionState& state);
   void restore_expert_cache(const Qwen35SessionState& state);
-  void export_append_state(Qwen35SessionState& state, int begin, size_t count);
+  void export_append_state(
+      Qwen35SessionState& state, int begin, size_t count,
+      bool final_window = true);
 
   void reset();
 

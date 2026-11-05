@@ -77,7 +77,7 @@ void PrefillSession::append(
         logits,
         result[0].toTensor().const_data_ptr<float>(),
         248320 * sizeof(float));
-    export_append_state(state, start, current);
+    export_append_state(state, start, current, offset + current == count);
     ++windows;
     printf(
         "PREFILL_WINDOW order=layer_major start=%d valid_tokens=%d plan_tokens=%d native_calls=%d total_ms=%.6f\n",
@@ -128,8 +128,9 @@ void PrefillSession::import_append_state(const Qwen35SessionState& state) {
       for (int c = 0; c < 2; ++c) {
         const auto& tensor = a->cache_owner().inputs[a->cache_input[c]];
         auto destination = qnn_cache_view(tensor, a->cache_data(c));
-        clear_cache(destination);
         const auto& source = state.layer[layer].cache[c];
+        if (a->linear && source.elements != destination.elements)
+          throw std::runtime_error("GDN state import size mismatch");
         copy_cache_range(
             source,
             destination,
@@ -140,12 +141,8 @@ void PrefillSession::import_append_state(const Qwen35SessionState& state) {
                 ? 0
                 : state.capacity - 1 - state.position,
             a->linear ? 0 : a->history - state.position,
-            a->linear ? source.elements : state.position);
-        if (!a->linear)
-          memcpy(
-              a->cache_host[c].data(),
-              destination.data,
-              destination.elements * 2);
+            a->linear ? source.elements : state.position,
+            !a->linear);
       }
     }
   }
@@ -213,7 +210,7 @@ std::vector<executorch::runtime::EValue> PrefillSession::execute_plan(
 }
 
 void PrefillSession::export_append_state(
-    Qwen35SessionState& state, int begin, size_t count) {
+    Qwen35SessionState& state, int begin, size_t count, bool final_window) {
   // Only new KV crosses back: historical decode codes retain their original
   // grid and never undergo an additional round trip through prefill encoding.
   for (int layer = 0; layer < 40; ++layer) {
@@ -226,6 +223,22 @@ void PrefillSession::export_append_state(
       const auto layout = a.linear ? CacheLayout::State
           : c                      ? CacheLayout::Value
                                    : CacheLayout::Key;
+      if (!a.linear && source.data == destination.data) {
+        if (!final_window)
+          continue;
+        const size_t length = begin + count;
+        // Shared FA storage changes stride at stage boundaries. Its grids
+        // match, so move the entire valid prefix without re-encoding it.
+        copy_cache_range(
+            source,
+            destination,
+            layout,
+            source.elements / 512 - length,
+            state.append_only ? 0 : destination.elements / 512 - length,
+            length,
+            true);
+        continue;
+      }
       if (!a.linear && !state.append_only) {
         // Move old sliding history once before inserting this turn's suffix.
         std::vector<uint16_t> old(
@@ -243,7 +256,7 @@ void PrefillSession::export_append_state(
           source,
           destination,
           layout,
-          a.linear ? 0 : a.history + 128 - count,
+          a.linear ? 0 : source.elements / 512 - count,
           a.linear                ? 0
               : state.append_only ? begin
                                   : state.capacity - 1 - count,
@@ -328,8 +341,9 @@ void PrefillSession::append_chunk_major_legacy(
     for (int c = 0; c < 2; ++c) {
       const auto& tensor = a.cache_owner().inputs[a.cache_input[c]];
       auto destination = qnn_cache_view(tensor, a.cache_data(c));
-      clear_cache(destination);
       const auto& source = state.layer[layer].cache[c];
+      if (a.linear && source.elements != destination.elements)
+        throw std::runtime_error("GDN state import size mismatch");
       const auto layout = a.linear ? CacheLayout::State
           : c                      ? CacheLayout::Value
                                    : CacheLayout::Key;
@@ -340,10 +354,8 @@ void PrefillSession::append_chunk_major_legacy(
           a.linear || state.append_only ? 0
                                         : state.capacity - 1 - state.position,
           a.linear ? 0 : a.history - state.position,
-          a.linear ? source.elements : state.position);
-      if (!a.linear)
-        memcpy(
-            a.cache_host[c].data(), destination.data, destination.elements * 2);
+          a.linear ? source.elements : state.position,
+          !a.linear);
     }
   }
   restore_expert_cache(state);

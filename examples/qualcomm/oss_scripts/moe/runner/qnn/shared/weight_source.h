@@ -24,6 +24,7 @@ class WeightSource {
   uint64_t image_size() const;
   const Qnn_ContextBinaryCallback_t* callback() const;
   size_t live_allocations() const;
+  void discard_file_cache();
 
   uint64_t provides = 0, releases = 0, allocated_bytes = 0;
 

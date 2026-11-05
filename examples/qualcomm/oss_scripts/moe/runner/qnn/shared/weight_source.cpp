@@ -140,6 +140,50 @@ size_t WeightSource::live_allocations() const {
   return allocations_.size();
 }
 
+void WeightSource::discard_file_cache() {
+  // Only weights.bin is discarded. Graph metadata and expert IO source files
+  // remain available; QNN inference reads the provided DMA allocations.
+  struct stat info {};
+  const long system_page_size = sysconf(_SC_PAGESIZE);
+  if (fstat(weights_fd_, &info) || info.st_size <= 0 || system_page_size <= 0) {
+    fprintf(stderr, "shared weights cache stat failed: %d\n", errno);
+    return;
+  }
+  const size_t page_size = system_page_size;
+  const size_t length = info.st_size;
+  std::vector<unsigned char> pages((length + page_size - 1) / page_size);
+  void* mapping = mmap(
+      nullptr, length, PROT_READ, MAP_PRIVATE, weights_fd_, 0);
+  auto resident_bytes = [&]() -> uint64_t {
+    if (mapping == MAP_FAILED || mincore(mapping, length, pages.data()))
+      return 0;
+    return std::count_if(pages.begin(), pages.end(), [](unsigned char value) {
+      return value & 1;
+    }) * page_size;
+  };
+  const auto before = resident_bytes();
+  for (const auto& section : weights_)
+    if (madvise(
+            static_cast<char*>(image_) + section.offset,
+            section.size,
+            MADV_DONTNEED))
+      fprintf(stderr, "shared weights page advice failed: %d\n", errno);
+  const int status = posix_fadvise(weights_fd_, 0, 0, POSIX_FADV_DONTNEED);
+  if (status)
+    fprintf(stderr, "shared weights file advice failed: %d\n", status);
+  const auto after = resident_bytes();
+  if (mapping != MAP_FAILED)
+    munmap(mapping, length);
+  fprintf(
+      stderr,
+      "SHARED_WEIGHT_FILE_CACHE dma_bytes=%llu source_bytes=%zu resident_before=%llu resident_after=%llu advice_status=%d\n",
+      (unsigned long long)allocated_bytes,
+      length,
+      (unsigned long long)before,
+      (unsigned long long)after,
+      status);
+}
+
 Qnn_ErrorHandle_t WeightSource::provide(
     Qnn_ContextBinaryDataRequest_t request,
     Qnn_ContextBinaryDmaDataResponse_t* response,
@@ -156,12 +200,17 @@ Qnn_ErrorHandle_t WeightSource::provide(
     if (!response || !request.size || found == self.weights_.end() ||
         request.size > std::numeric_limits<int>::max() - 4095)
       return QNN_CONTEXT_ERROR_INVALID_ARGUMENT;
-    auto buffer = std::make_shared<Buffer>(self.runtime_, request.size);
+    auto buffer = std::make_shared<Buffer>(self.runtime_, request.size, false);
     read_exact(
         self.weights_fd_,
         buffer->data,
         request.size,
         found->file_offset + request.offset - found->offset);
+    if (buffer->size > request.size)
+      memset(
+          static_cast<char*>(buffer->data) + request.size,
+          0,
+          buffer->size - request.size);
     response->dmaBuffer.fd = buffer->fd;
     response->dmaBuffer.data = buffer->data;
     response->dataStartOffset = 0;
@@ -169,6 +218,13 @@ Qnn_ErrorHandle_t WeightSource::provide(
     self.allocations_.emplace(buffer->fd, buffer);
     ++self.provides;
     self.allocated_bytes += buffer->size;
+    // The callback supplies a DMA copy; avoid retaining another file-backed
+    // copy until every context has finished loading.
+    posix_fadvise(
+        self.weights_fd_,
+        found->file_offset + request.offset - found->offset,
+        request.size,
+        POSIX_FADV_DONTNEED);
     return QNN_SUCCESS;
   } catch (const std::exception& error) {
     fprintf(stderr, "weight source: %s\n", error.what());

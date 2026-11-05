@@ -287,6 +287,27 @@ size_t Graph::size(const Qnn_Tensor_t& t) {
   return elements(t) * (((code >> 4) * 10 + (code & 15)) / 8);
 }
 
+bool Graph::same_encoding_and_layout(
+    const Qnn_Tensor_t& first, const Qnn_Tensor_t& second) {
+  if (FIELD(first, dataType) != FIELD(second, dataType) ||
+      FIELD(first, rank) != FIELD(second, rank) ||
+      !std::equal(
+          FIELD(first, dimensions),
+          FIELD(first, dimensions) + FIELD(first, rank),
+          FIELD(second, dimensions)))
+    return false;
+  const auto a = FIELD(first, quantizeParams);
+  const auto b = FIELD(second, quantizeParams);
+  if (a.encodingDefinition != b.encodingDefinition ||
+      a.quantizationEncoding != b.quantizationEncoding)
+    return false;
+  if (a.quantizationEncoding == QNN_QUANTIZATION_ENCODING_UNDEFINED)
+    return true;
+  return a.quantizationEncoding == QNN_QUANTIZATION_ENCODING_SCALE_OFFSET &&
+      a.scaleOffsetEncoding.scale == b.scaleOffsetEncoding.scale &&
+      a.scaleOffsetEncoding.offset == b.scaleOffsetEncoding.offset;
+}
+
 Graph::Graph(Runtime& r, const std::string& path, bool metadata_only,
              bool callback_weights)
     : runtime(r),
@@ -520,8 +541,20 @@ void Graph::register_tensor(
     Qnn_MemDescriptor_t descriptor = QNN_MEM_DESCRIPTOR_INIT;
     descriptor.memShape = {FIELD(t, rank), FIELD(t, dimensions), nullptr};
     descriptor.dataType = FIELD(t, dataType);
+    if (buffer->size < size(t))
+      throw std::runtime_error("QNN tensor exceeds buffer allocation");
     descriptor.memType = QNN_MEM_TYPE_ION;
     descriptor.ionInfo.fd = buffer->fd;
+    QnnMemHtp_Descriptor_t shared{};
+    if (buffer->shared_views ||
+        buffer->size > ((size(t) + 4095) & ~size_t(4095))) {
+      // All views of this fd must use one mapping type and allocation size.
+      shared.type = QNN_HTP_MEM_SHARED_BUFFER;
+      shared.size = buffer->size;
+      shared.sharedBufferConfig = {buffer->fd, 0};
+      descriptor.memType = QNN_MEM_TYPE_CUSTOM;
+      descriptor.customInfo = &shared;
+    }
     check(
         borrowed_context
             ? register_shared_io(context, &descriptor, &handle)

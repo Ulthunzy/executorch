@@ -13,13 +13,16 @@ std::optional<SharedGraphBinding> resolve_qwen35_graph(
   const auto slash = source.find_last_of('/');
   const auto file = source.substr(slash == source.npos ? 0 : slash + 1);
   if (file != "head.bin" && file != "forward_0.bin" &&
-      file != "attention.bin" && file != "moe-front.bin")
+      file != "attention.bin" && file != "moe-front.bin" &&
+      file != "vision.bin")
     return std::nullopt;
   std::string directory(root);
   while (!directory.empty() && directory.back() == '/')
     directory.pop_back();
   if (file == "head.bin")
     return SharedGraphBinding{directory + "/head", ""};
+  if (file == "vision.bin")
+    return SharedGraphBinding{directory + "/vision", ""};
   if (slash == source.npos || slash == 0)
     return std::nullopt;
   const auto previous = source.find_last_of('/', slash - 1);

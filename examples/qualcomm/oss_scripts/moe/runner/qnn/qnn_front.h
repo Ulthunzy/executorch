@@ -1,12 +1,13 @@
 #pragma once
 
-// QNN 图、context 与 rpcmem buffer 的生命周期管理；层间共享 IO，state
-// 各自保留。
+// QNN 图、context 与 rpcmem buffer 的生命周期管理；state 按层保留，
+// 串行阶段可共享兼容缓冲。
 #include "QnnInterface.h"
 #include "System/QnnSystemInterface.h"
 #include "HTP/QnnHtpDevice.h"
 #include "HTP/QnnHtpGraph.h"
 #include "HTP/QnnHtpContext.h"
+#include "HTP/QnnHtpMem.h"
 #include "shared/graph_binding.h"
 #include <condition_variable>
 #include <mutex>
@@ -48,6 +49,7 @@ struct Runtime {
            peak_contexts = 0, memory_registers = 0, memory_deregisters = 0;
   uint64_t buffer_allocations = 0, buffer_frees = 0, buffer_bytes = 0,
            peak_buffer_bytes = 0;
+  uint64_t shared_state_bytes = 0, shared_workspace_bytes = 0;
   QNN_INTERFACE_VER_TYPE q;
   QNN_SYSTEM_INTERFACE_VER_TYPE s;
 
@@ -84,6 +86,7 @@ struct Buffer {
   enum class CachePolicy { Cached, Uncached };
   struct ImportedFd { int value; };
   bool inherited = false;
+  bool shared_views = false;
   Runtime* runtime;
   void* data;
   size_t size;
@@ -152,6 +155,9 @@ struct Graph {
   static size_t elements(const Qnn_Tensor_t& t);
 
   static size_t size(const Qnn_Tensor_t& t);
+
+  static bool same_encoding_and_layout(
+      const Qnn_Tensor_t& first, const Qnn_Tensor_t& second);
 
   Graph(Runtime& r, const std::string& path, bool metadata_only = false,
         bool callback_weights = false);

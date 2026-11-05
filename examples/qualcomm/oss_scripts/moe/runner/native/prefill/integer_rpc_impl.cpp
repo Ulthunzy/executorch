@@ -292,7 +292,9 @@ extern "C" AEEResult et_prefill_rpc_run(
       scores_len != tokens * 8 || shared_len != tokens * 2048 ||
       result_len != tokens * 2048)
     return 14;
-  const int phase = descriptor[4] == expert_stream::kPhase ? 0 : descriptor[4];
+  const int phase = (descriptor[4] == expert_stream::kPhase ||
+                     descriptor[4] == expert_stream::kResidentPhase)
+      ? 0 : descriptor[4];
   if (phase < 0 || phase > 3 || descriptor[5] < 1 || descriptor[5] > 256 ||
       descriptor[6] < 1 || descriptor[6] > valid * 8)
     return 54;

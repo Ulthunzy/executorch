@@ -18,7 +18,7 @@ struct Attention {
   int history = 0;
   int valid_tokens = 128;
   std::vector<int> input, output;
-  std::vector<uint16_t> cache_maps[2], cache_host[2], cache_temporary[2];
+  std::vector<uint16_t> cache_maps[2];
   bool identity[2], swap_state[2]{};
   std::vector<uint16_t> handoff_cache[2];
 
@@ -27,7 +27,8 @@ struct Attention {
       const std::string& root,
       int layer,
       bool is_linear,
-      bool cold_fa = false);
+      bool cold_fa = false,
+      int resident_capacity = 0);
 
   Graph& cache_owner() {
     return cold ? *cache_graph : graph;
@@ -40,10 +41,12 @@ struct Attention {
   size_t cache_bytes(int c);
 
   void* export_data(int c) {
-    return linear ? cache_data(c) : handoff_cache[c].data();
+    return handoff_cache[c].empty() ? cache_data(c) : handoff_cache[c].data();
   }
 
   size_t export_bytes(int c);
+
+  void save_cache(const std::string& path, int c);
 
   void reset();
 

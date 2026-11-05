@@ -4,6 +4,8 @@
 #include "System/QnnSystemContext.h"
 
 // Graph views borrow metadata and a context until their matching release.
+// Configure before the first graph lease; nullptr keeps vision out of the batch.
+extern "C" int qwen35_shared_prepare_vision(const char* path);
 extern "C" int qwen35_shared_acquire(
     const char* directory,
     const char* graph_name,

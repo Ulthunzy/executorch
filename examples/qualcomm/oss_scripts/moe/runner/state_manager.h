@@ -22,8 +22,10 @@ void copy_cache_range(
     CacheLayout layout,
     size_t source_begin,
     size_t destination_begin,
-    size_t count);
+    size_t count,
+    bool clear_unused = false);
 
+// A null handoff omits the snapshot; a null encoding preserves input codes.
 void append_prefill_kv(
     const QuantizedCacheView& history,
     const uint16_t* block,

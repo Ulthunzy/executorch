@@ -22,6 +22,20 @@ CLI 通过 `Runner::run_terminal` 进入终端适配层；JNI 将 Java 请求交
 
 Prefill 的工作区容量与本次执行长度独立维护。`PrefillSession::append` 导入 KV/GDN state 和实际驻留的专家/LRU 元数据，按已有工作区切分输入；它与 Prefill 工具共用 `execute_plan` 和同一个 PTE 的按层执行器。每层处理完窗口内全部 AR128 块后再换层，超过工作区时继续下一个窗口。`chunk_start` 是会话内的绝对位置，memo/路由暂存及 LRU 重放使用相对 `sequence_start` 的偏移；正常轮次切换不释放或重新申请图、工作区和专家权重内存。中断时先收尾已提交的读取，再允许 reset 恢复。
 
+Prefill 直接在已分配的 KV 输入缓冲中归约、追加有效位置，不保留 CPU 历史镜像或输出暂存。常驻会话仅在图的历史容量足以覆盖整个逻辑上下文时，省去额外的 `history + AR` 交接副本；短历史图及独立 Prefill 工具仍保留交接窗口。内存交接按实际缓冲长度读取新增 token，磁盘交接仍输出原有扩展窗口格式。GDN 保留原有 DMA state 交换；需要重编码时直接写入输入缓冲。这些复用不改变专家槽数、权重、状态编码或图签名。
+
+`qnn/phase_memory.h` 提供串行阶段的缓冲借用：Decode 仅在类型、维度和量化编码完全一致时复用 Prefill 的 GDN 输入/输出以及 head IO，各图仍在自己的 context 内注册句柄。两阶段保留现有 state 交换；导入完整 GDN state 时不先清空目标，避免共享源被清零。Prefill owner 比 Decode 活得更久，关闭时先释放 Decode 引用。FA KV 仅在 append 模式、量化网格相同且历史长度相差一个 token 时共用 Prefill 分配。进入 Prefill 时原地扩展并右对齐有效历史；多个工作窗口之间保持 Prefill 布局，整段输入完成后才压缩成 Decode 的左对齐布局。行搬移顺序避免覆盖未读取数据，空闲位置随后填入量化零；其它不兼容的布局仍保留独立存储。视觉输入、输出在容量足够时复用 Native Prefill 的输入和 residual 工作区；视觉特征复制完成后才进入 Prefill。较小张量借用较大分配时，通过 SDK 的 HTP shared-buffer 描述符注册完整分配容量，避免同一 FD 被映射成不同长度；共享注册缓存同时区分 FD、偏移和张量描述。
+
+`WeightSource` 回调直接读满 DMA 权重，仅补零对齐尾部，随后按已提供的范围回收可丢弃的源文件页，避免所有 context 加载期间累计保留文件副本。共享 QNN context 初始化完成后，再清理 `weights.bin` 的文件映射驻留及剩余可回收页缓存，保留 DMA 权重、图元数据和源文件描述符；专家读盘文件不在清理范围内。日志分别记录兼容 state/工作区减少的 DMA 字节和源文件页驻留量，文件页回收不计入 DMA 节省。
+
+QNN 图编译和执行均使用共享 IO。HTP 编译时，`QnnManager` 根据 `shared_buffer` 将应用输入、输出标记为 `MEMHANDLE`，让 SDK 序列化该提示，避免加载后仍为 RAW IO 保留内部 RPC 缓冲。静态权重和图内张量不修改。Attention/Router、head、视觉导出后使用 SDK context utility 检查 IO 内存类型，并写入组件元数据；宿主 binding 未更新时直接报告重新构建要求。旧 RAW context 仍可推理，但需要复用原量化产物重新编译图才能获得这部分内存收益。
+
+专家暂存区只保存当前层的缺失权重，容量为 `(256 - 常驻槽数) × stride + 4 KiB`。已有专家由 Native 直接读取原常驻槽，不再复制到暂存区。两个 DSP 映射分别持有当前层暂存区和常驻槽，offset 高位区分来源；新 ARM/DSP 的 `prefill_expert_stream=2` 必须配套构建。冷缓存的空槽由同一读线程池先填入，首次 Native 调用前等待这些写入完成并统一刷新该 FD；其余缺失专家继续流式加载。最终 LRU 恢复原有 AR128 调度的逐槽排列。跨槽移动的常驻专家先快照到本层已消费完、且不承载最终保留专家的暂存槽，快照全部完成后再并行写回常驻槽，避免覆盖尚未复制的来源；这一过程复用原暂存区，不新增 DMA 分配。停止和异常沿用读线程排空、会话失效及 reset 恢复流程。
+
+启用视觉时，在首个共享图创建前登记 `vision.bin`，并把视觉与文本 context 放入同一次 `SHARE_RESOURCES` 顺序加载批次，允许 SDK 复用二者互斥的 spill/fill 工作区。文本共享权重继续由 `WeightSource` 提供；视觉完整 binary 由 `BinaryWeights` 提供 DMA 权重，两个回调都保留到对应 context 释放后。视觉关闭时不登记或加载视觉 context；运行期间不改变批次成员，不在每轮对话重载视觉权重。实际内存收益以唯一 DMA 分配实测为准，不能直接把图规划量相加当作节省。
+
+编码相同的 cache 反馈不分配恒等 LUT，直接复制原编码；不同网格仍使用原有查表转换。
+
 旧 `chunk_major` 选项保留弃用提示并转到统一调度；原按块循环保留为私有弃用实现，没有运行入口调用，后续版本将移除。JNI、终端和公开 C++ 生成接口不根据首轮、历史或 reset 选择另一套 Prefill 实现。
 
 ## 算子与 Native 服务

@@ -49,6 +49,7 @@ def record_build(args):
         dsp_arch=f"v{args.arch}",
         native_profile=args.profile,
         prefill_mapped_io=2,
+        prefill_expert_stream=2,
         qnn_sdk=str(args.sdk.resolve()),
         artifacts=artifact_hashes(root, NATIVE_FILES),
     )
