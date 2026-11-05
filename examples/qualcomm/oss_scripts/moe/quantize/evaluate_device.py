@@ -63,6 +63,50 @@ def main():
         consumed, ids[prefix : prefix + len(consumed)]
     ):
         raise ValueError("Device inputs are not the selected heldout sequence")
+    events = [
+        json.loads(line.split(" ", 1)[1])
+        for line in (args.run / "runner.log").read_text().splitlines()
+        if line.startswith("TOKEN ")
+    ]
+    if len(events) != count or any(
+        event.get("index") != index or event.get("position") != prefix + index
+        for index, event in enumerate(events)
+    ):
+        raise ValueError("Device token positions do not preserve the heldout prefix")
+    record = json.loads((args.run / "RUN.json").read_text())
+    if record.get("shared_model"):
+        for group in range(10):
+            manifest = json.loads(
+                (Path(record["shared_model"]) / f"group{group}/GRAPHS.json").read_text()
+            )
+            for layer, metadata in manifest.get("attention_cache", {}).items():
+                for cache in range(2):
+                    if metadata["prefill"][cache] != metadata["decode"][cache]:
+                        continue
+                    before = np.memmap(
+                        args.run / f"prefill/layer{layer}-cache{cache}.u16",
+                        mode="r",
+                        dtype="<u2",
+                    )
+                    after = np.memmap(
+                        args.run / f"layer{layer}-cache{cache}.u16",
+                        mode="r",
+                        dtype="<u2",
+                    )
+                    if cache == 0:
+                        before = before.reshape(512, -1)[:, -prefix:]
+                        after = after.reshape(512, -1)[:, -(prefix + len(consumed)) :][
+                            :, :prefix
+                        ]
+                    else:
+                        before = before.reshape(2, -1, 256)[:, -prefix:, :]
+                        after = after.reshape(2, -1, 256)[
+                            :, -(prefix + len(consumed)) :, :
+                        ][:, :prefix, :]
+                    if not np.array_equal(before, after):
+                        raise ValueError(
+                            f"Layer {layer}: mapped KV lost the heldout prefix"
+                        )
     targets = ids[prefix : prefix + count]
     if len(targets) != count:
         raise ValueError("Teacher run exceeds the heldout sequence")
