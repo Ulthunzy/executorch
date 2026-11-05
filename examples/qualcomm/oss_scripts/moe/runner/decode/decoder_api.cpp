@@ -84,7 +84,7 @@ extern "C" int qwen35_decode_open(const char* root, int cache_mib) try {
   session = std::make_unique<DecodeSession>(model_root, cache_mib);
   for (const auto& attention : session->attention)
     if (!attention->linear &&
-        attention->history + 1 != session->context_capacity)
+        (attention->mapped[0].active ? attention->history : attention->history + 1) != session->context_capacity)
       throw std::runtime_error("decode capacity differs from compiled graph");
   // Chat reset starts an empty conversation; it never restores this prefix.
   for (auto& attention : session->attention)
@@ -154,6 +154,9 @@ extern "C" int qwen35_decode_import_state(const Qwen35SessionState* state) try {
         state->layer[layer].routes + 8,
         session->previous_routes[layer].begin());
     session->attention[layer]->last_position = state->position - 1;
+    for (int c = 0; c < 2; ++c)
+      if (session->attention[layer]->mapped[c].active)
+        session->attention[layer]->mapped[c].invalidate();
   }
   session->position = state->position;
   session->prefix_tokens = state->position;

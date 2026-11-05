@@ -120,8 +120,10 @@ NativeCore::NativeCore(Runtime& r, const std::string&) : runtime(r) {
       remote_session_control(
           DSPRPC_CONTROL_UNSIGNED_MODULE, &request, sizeof(request)),
       "unsigned_module");
-  const std::string uri =
-      "file:///libet_qnnop.so?et_decode_rpc_skel_handle_invoke&_modver=1.0";
+  const char* package = getenv("SHARED_OP_PACKAGE");
+  const std::string uri = std::string("file:///") +
+      (package ? package : "libet_qnnop.so") +
+      "?et_decode_rpc_skel_handle_invoke&_modver=1.0";
   check(
       et_decode_rpc_open((uri + "&_dom=cdsp").c_str(), &handle),
       "et_decode_rpc_open");

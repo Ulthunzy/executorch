@@ -28,6 +28,8 @@ Prefill 直接在已分配的 KV 输入缓冲中归约、追加有效位置，�
 
 `WeightSource` 回调直接读满 DMA 权重，仅补零对齐尾部，随后按已提供的范围回收可丢弃的源文件页，避免所有 context 加载期间累计保留文件副本。共享 QNN context 初始化完成后，再清理 `weights.bin` 的文件映射驻留及剩余可回收页缓存，保留 DMA 权重、图元数据和源文件描述符；专家读盘文件不在清理范围内。日志分别记录兼容 state/工作区减少的 DMA 字节和源文件页驻留量，文件页回收不计入 DMA 节省。
 
+导出 profile 的 `attention_core=valid_online` 将 FA 核心替换为 `custom_op/attention_op_package_htp` 中的有效长度算子，仍使用同一个 Prefill 调度器。`GRAPHS.json` 记录原始 KV 的容量、前缀布局及两阶段量化网格；`qnn/mapped_cache.h` 验证元数据，提供 FD、逻辑字节数和 epoch 描述符。兼容的 Prefill/Decode 共用原始 KV，只追加实际 token；算子按可见历史搬运和计算，reset 或历史重写更新 epoch。QNN 与 Native RPC 使用同一绝对算子库路径，关闭时先释放 DSP 引用再解除 ARM 映射。独立诊断入口从 `PREFILL_VALID_TOKENS` 或 `PREFILL_TOKENS` 恢复前缀，PPL 检查其位置及缓存内容。
+
 QNN 图编译和执行均使用共享 IO。HTP 编译时，`QnnManager` 根据 `shared_buffer` 将应用输入、输出标记为 `MEMHANDLE`，让 SDK 序列化该提示，避免加载后仍为 RAW IO 保留内部 RPC 缓冲。静态权重和图内张量不修改。Attention/Router、head、视觉导出后使用 SDK context utility 检查 IO 内存类型，并写入组件元数据；宿主 binding 未更新时直接报告重新构建要求。旧 RAW context 仍可推理，但需要复用原量化产物重新编译图才能获得这部分内存收益。
 
 专家暂存区只保存当前层的缺失权重，容量为 `(256 - 常驻槽数) × stride + 4 KiB`。已有专家由 Native 直接读取原常驻槽，不再复制到暂存区。两个 DSP 映射分别持有当前层暂存区和常驻槽，offset 高位区分来源；新 ARM/DSP 的 `prefill_expert_stream=2` 必须配套构建。冷缓存的空槽由同一读线程池先填入，首次 Native 调用前等待这些写入完成并统一刷新该 FD；其余缺失专家继续流式加载。最终 LRU 恢复原有 AR128 调度的逐槽排列。跨槽移动的常驻专家先快照到本层已消费完、且不承载最终保留专家的暂存槽，快照全部完成后再并行写回常驻槽，避免覆盖尚未复制的来源；这一过程复用原暂存区，不新增 DMA 分配。停止和异常沿用读线程排空、会话失效及 reset 恢复流程。

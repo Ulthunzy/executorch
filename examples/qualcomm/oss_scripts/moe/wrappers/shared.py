@@ -34,6 +34,9 @@ def main():
         default="chunked_mixed_fp16",
     )
     parser.add_argument("--gdn-state-vtcm", action="store_true")
+    parser.add_argument(
+        "--attention-core", choices=("sdk", "valid_online"), default="sdk"
+    )
     args = parser.parse_args()
     if args.gdn_state_vtcm and args.prefill_gdn_core in ("custom_fp16", "custom_fp32"):
         parser.error("GDN VTCM layout requires a UINT16 core")
@@ -108,6 +111,7 @@ def main():
     torch.set_grad_enabled(False)
     torch.set_num_threads(4)
     models, examples, router_calibration = {}, {}, {}
+    attention_cache = {}
     for layer in args.layers:
         if settings.quantization.attention == "gptq":
             calibration = json.loads(
@@ -132,16 +136,36 @@ def main():
             prefill, prefill_inputs = fp16_gdn_state(
                 prefill, prefill_inputs, decode=False
             )
-        prefill, prefill_inputs = padded_prefill_front(
-            prefill, prefill_inputs, args.capacity, args.prefill_gdn_core
-        )
+        mapped_attention = layer % 4 == 3 and args.attention_core == "valid_online"
+        if mapped_attention:
+            from executorch.examples.qualcomm.custom_op.attention_support.graph import (
+                replace_attention,
+            )
+
+            prefill_inputs = resize_attention(prefill, args.capacity + 128)
+            prefill, prefill_inputs, record = replace_attention(
+                prefill, prefill_inputs, args.capacity
+            )
+            attention_cache[str(layer)] = {
+                key: value for key, value in record.items() if key != "encodings"
+            }
+            attention_cache[str(layer)]["prefill"] = record["encodings"]
+        else:
+            prefill, prefill_inputs = padded_prefill_front(
+                prefill, prefill_inputs, args.capacity, args.prefill_gdn_core
+            )
         decode = torch.export.load(
             args.decode_source / f"layer{layer}/decode-qdq.pt2"
         ).module()
-        decode_inputs = resize_attention(decode, args.capacity)
+        decode_inputs = resize_attention(decode, args.capacity + int(mapped_attention))
         if fp16_state and layer % 4 != 3:
             decode, decode_inputs = fp16_gdn_state(decode, decode_inputs, decode=True)
-        if layer % 4 == 3:
+        if mapped_attention:
+            decode, decode_inputs, record = replace_attention(
+                decode, decode_inputs, args.capacity
+            )
+            attention_cache[str(layer)]["decode"] = record["encodings"]
+        elif layer % 4 == 3:
             fp16_attention_core(decode, decode_inputs)
         constants = args.prefill_source / f"layer{layer}/moe-constants.npz"
         if args.router_qdq:
@@ -190,6 +214,16 @@ def main():
         fp16_state=fp16_state,
         state_vtcm=args.gdn_state_vtcm,
     )
+    if attention_cache:
+        from executorch.examples.qualcomm.custom_op.attention_support.package import (
+            attention_package,
+        )
+
+        package.op_package_infos.extend(
+            attention_package(
+                args.op_package_host, args.op_package_device
+            ).op_package_infos
+        )
     specs = generate_qnn_executorch_compiler_spec(
         QcomChipset[settings.target.soc_model],
         generate_htp_compiler_spec(use_fp16=False, use_weight_sharing=True),
@@ -282,6 +316,8 @@ def main():
         router_calibration=router_calibration,
         weight_sharing=True,
         prefill_core=args.prefill_gdn_core,
+        attention_core=args.attention_core,
+        attention_cache=attention_cache,
         gdn_state_dtype=settings.cache.gdn_state_dtype,
         gdn_state_vtcm=args.gdn_state_vtcm,
         prefill_valid_length=True,

@@ -35,6 +35,7 @@ add_library(et_infer SHARED
   "${MOE_REPO}/examples/qualcomm/oss_scripts/llama/runner/multimodal_runner/qwen_image.cpp")
 target_link_libraries(et_infer PRIVATE moe_chat_runtime moe_decode_runtime moe_context_store)
 target_compile_features(et_infer PRIVATE cxx_std_17)
+target_include_directories(et_infer PRIVATE "${MOE_REPO}/third-party/json/single_include")
 target_compile_options(et_infer PRIVATE -O3 -fno-emulated-tls -fvisibility=hidden -fvisibility-inlines-hidden -ffunction-sections -fdata-sections)
 target_compile_definitions(et_infer PRIVATE MOE_CHAT_RUNNER MOE_JNI_RUNNER MOE_DECODE_LIBRARY
   C10_USING_CUSTOM_GENERATED_MACROS SM_MOE_DSP_ARCH=${MOE_DSP_ARCH}

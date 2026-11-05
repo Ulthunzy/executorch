@@ -5,6 +5,7 @@
 #include "../runtime_utils.h"
 #include "../state_manager.h"
 #include "../cache_encoding.h"
+#include "../qnn/mapped_cache.h"
 #include <array>
 #include <cmath>
 
@@ -18,6 +19,10 @@ struct Attention {
   Graph graph;
   bool linear;
   int history = 0;
+  MappedCache mapped[2];
+  const Qnn_Tensor_t& cache_tensor(int c) {
+    return mapped[c].active ? mapped[c].metadata : graph.inputs[input[c + (linear ? 1 : 4)]];
+  }
   std::vector<int> input, output;
   std::vector<uint16_t> initial[2], maps[2];
   size_t state_elements[2]{};

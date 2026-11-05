@@ -23,6 +23,40 @@ Attention::Attention(
     output.push_back(graph.index(false, order[2 + order[0] + i]));
   for (int c = 0; c < 2; c++) {
     const int target = input[c + (linear ? 1 : 4)];
+    if (!linear && FIELD(graph.inputs[target], dataType) == QNN_DATATYPE_INT_32) {
+      mapped[c].initialize(graph.outputs[output[c+2]], layer, c, true);
+      mapped[c].storage = moe::prefill_state_buffer(layer, c, false, mapped[c].metadata);
+      if (mapped[c].storage)
+        runtime.shared_state_bytes += Graph::size(mapped[c].metadata);
+      else
+        mapped[c].storage = std::make_shared<Buffer>(runtime, Graph::size(mapped[c].metadata), false, false);
+      mapped[c].storage->shared_views = true;
+      state[c] = mapped[c].storage;
+      state_elements[c] = Graph::elements(mapped[c].metadata);
+      history = state_elements[c] / 512;
+      initial_tokens = getenv("PREFILL_VALID_TOKENS")
+          ? atoi(getenv("PREFILL_VALID_TOKENS"))
+          : getenv("PREFILL_TOKENS") ? atoi(getenv("PREFILL_TOKENS")) : 128;
+      if (!append_kv || initial_tokens < 0 || initial_tokens > history)
+        throw std::runtime_error("Mapped KV requires a valid append-only prefix");
+      if (initial_tokens) {
+        const auto source = read_cache_encoding(cache_encoding, layer * 2 + c);
+        auto old = bytes(root + "/cache-prefill/layer" + std::to_string(layer) + "-cache" + std::to_string(c) + ".u16");
+        if (old.size() != source.elements * 2 || source.elements % 512 ||
+            size_t(initial_tokens) > source.elements / 512)
+          throw std::runtime_error("Mapped KV prefix metadata");
+        initial[c].resize(512 * size_t(initial_tokens));
+        const auto destination = qnn_cache_view(mapped[c].metadata, initial[c].data());
+        copy_cache_range(
+            {reinterpret_cast<uint16_t*>(old.data()), source.elements, source.scale, source.offset, source.dtype},
+            {initial[c].data(), initial[c].size(), destination.scale, destination.offset, destination.dtype},
+            c ? CacheLayout::Value : CacheLayout::Key,
+            source.elements / 512 - initial_tokens, 0, initial_tokens);
+      }
+      maps[c] = grid_map(graph.outputs[output[c+2]], mapped[c].metadata);
+      identity[c] = maps[c].empty();
+      continue;
+    }
     if (auto shared = moe::prefill_state_buffer(
             layer, c, false, graph.inputs[target])) {
       runtime.shared_state_bytes += graph.inbuf[target]->size;
@@ -94,13 +128,14 @@ QuantizedCacheView Attention::cache_view(int c) {
   if (c < 0 || c >= 2)
     throw std::runtime_error("Invalid cache index");
   return qnn_cache_view(
-      graph.inputs[input[c + (linear ? 1 : 4)]], state[c]->data);
+      cache_tensor(c), state[c]->data);
 }
 
 void Attention::reset() {
   last_position = initial_tokens - 1;
   for (int c = 0; c < 2; ++c) {
     auto destination = cache_view(c);
+    if (mapped[c].active) mapped[c].invalidate();
     clear_cache(destination);
     if (linear || initial_tokens)
       copy_cache_range(
@@ -119,8 +154,10 @@ void Attention::reset() {
 
 void Attention::clear() {
   last_position = -1;
-  for (int c = 0; c < 2; ++c)
+  for (int c = 0; c < 2; ++c) {
     clear_cache(cache_view(c));
+    if (mapped[c].active) mapped[c].invalidate();
+  }
 }
 
 void Attention::execute(
@@ -135,6 +172,12 @@ void Attention::execute(
       throw std::runtime_error("FA position");
     memcpy(graph.input(input[1]), cos + position * 32, 32 * 4);
     memcpy(graph.input(input[2]), sin + position * 32, 32 * 4);
+    if (mapped[0].active) {
+      const int lengths[] = {1, 0, position};
+      memcpy(graph.input(input[3]), lengths, sizeof(lengths));
+      for (int c = 0; c < 2; ++c)
+        mapped[c].publish(graph, input[c+4], identity[0] && identity[1]);
+    } else {
     auto* mask = static_cast<float*>(graph.input(input[3]));
     std::fill(mask, mask + history + 1, -255.f);
     if (append_kv) {
@@ -142,6 +185,7 @@ void Attention::execute(
       mask[history] = 0.f;
     } else
       std::fill(mask + history - position, mask + history + 1, 0.f);
+    }
   }
   if (const char* directory = getenv("FA_CAPTURE_ROOT"); directory && !linear &&
       position == 1024 &&
@@ -246,7 +290,7 @@ void Attention::save_cache(const std::string& path, int c) {
   }
   const int valid = std::min(history, last_position + 1);
   const auto q =
-      FIELD(graph.inputs[input[c + 4]], quantizeParams).scaleOffsetEncoding;
+      FIELD(cache_tensor(c), quantizeParams).scaleOffsetEncoding;
   std::vector<uint16_t> ordered(state_elements[c], uint16_t(-q.offset));
   const auto* from = static_cast<const uint16_t*>(state[c]->data);
   if (c == 0)

@@ -9,9 +9,12 @@ NativeCore::NativeCore(Runtime& r, const std::string&, int tokens)
       remote_session_control(
           DSPRPC_CONTROL_UNSIGNED_MODULE, &request, sizeof(request)),
       "unsigned_module");
+  const char* package = getenv("SHARED_OP_PACKAGE");
+  const std::string uri = std::string("file:///") +
+      (package ? package : "libet_qnnop.so") +
+      "?et_prefill_rpc_skel_handle_invoke&_modver=1.0&_dom=cdsp";
   check(
-      et_prefill_rpc_open(
-          (std::string("file:///libet_qnnop.so?et_prefill_rpc_skel_handle_invoke&_modver=1.0") + "&_dom=cdsp").c_str(), &handle),
+      et_prefill_rpc_open(uri.c_str(), &handle),
       "et_prefill_rpc_open");
   const int configured = et_prefill_rpc_configure(handle, tokens);
   if (configured) {

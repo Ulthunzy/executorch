@@ -117,6 +117,9 @@ void PrefillSession::append(
 void PrefillSession::import_append_state(const Qwen35SessionState& state) {
   drain_reads();
   core.end_output_read();
+  for (auto& a : attention)
+    for (int c = 0; c < 2; ++c)
+      if (a->mapped[c].active) a->mapped[c].invalidate();
   memo_layer = -1;
   staged_router_layer = -1;
   if (state.position == 0) {
@@ -126,7 +129,7 @@ void PrefillSession::import_append_state(const Qwen35SessionState& state) {
     for (int layer = 0; layer < 40; ++layer) {
       auto& a = attention[layer];
       for (int c = 0; c < 2; ++c) {
-        const auto& tensor = a->cache_owner().inputs[a->cache_input[c]];
+        const auto& tensor = a->cache_tensor(c);
         auto destination = qnn_cache_view(tensor, a->cache_data(c));
         const auto& source = state.layer[layer].cache[c];
         if (a->linear && source.elements != destination.elements)
@@ -140,7 +143,7 @@ void PrefillSession::import_append_state(const Qwen35SessionState& state) {
             a->linear || state.append_only
                 ? 0
                 : state.capacity - 1 - state.position,
-            a->linear ? 0 : a->history - state.position,
+            a->linear || a->mapped[c].active ? 0 : a->history - state.position,
             a->linear ? source.elements : state.position,
             !a->linear);
       }
@@ -216,13 +219,18 @@ void PrefillSession::export_append_state(
   for (int layer = 0; layer < 40; ++layer) {
     auto& a = *attention[layer];
     for (int c = 0; c < 2; ++c) {
-      const auto& tensor = a.cache_owner().inputs[a.cache_input[c]];
+      const auto& tensor = a.cache_tensor(c);
       auto source = qnn_cache_view(tensor, a.export_data(c));
       source.elements = a.export_bytes(c) / 2;
       auto destination = state.layer[layer].cache[c];
       const auto layout = a.linear ? CacheLayout::State
           : c                      ? CacheLayout::Value
                                    : CacheLayout::Key;
+      if (!a.linear && a.mapped[c].active && source.data == destination.data) {
+        if (source.elements != destination.elements || source.scale != destination.scale || source.offset != destination.offset)
+          throw std::runtime_error("Mapped KV handoff grid mismatch");
+        continue;
+      }
       if (!a.linear && source.data == destination.data) {
         if (!final_window)
           continue;
@@ -256,7 +264,7 @@ void PrefillSession::export_append_state(
           source,
           destination,
           layout,
-          a.linear ? 0 : source.elements / 512 - count,
+          a.linear ? 0 : a.mapped[c].active ? begin : source.elements / 512 - count,
           a.linear                ? 0
               : state.append_only ? begin
                                   : state.capacity - 1 - count,
@@ -339,7 +347,7 @@ void PrefillSession::append_chunk_major_legacy(
   for (int layer = 0; layer < 40; ++layer) {
     auto& a = *attention[layer];
     for (int c = 0; c < 2; ++c) {
-      const auto& tensor = a.cache_owner().inputs[a.cache_input[c]];
+      const auto& tensor = a.cache_tensor(c);
       auto destination = qnn_cache_view(tensor, a.cache_data(c));
       const auto& source = state.layer[layer].cache[c];
       if (a.linear && source.elements != destination.elements)
@@ -353,7 +361,7 @@ void PrefillSession::append_chunk_major_legacy(
           layout,
           a.linear || state.append_only ? 0
                                         : state.capacity - 1 - state.position,
-          a.linear ? 0 : a.history - state.position,
+          a.linear || a.mapped[c].active ? 0 : a.history - state.position,
           a.linear ? source.elements : state.position,
           !a.linear);
     }

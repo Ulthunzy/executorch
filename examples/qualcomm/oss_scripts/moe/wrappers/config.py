@@ -55,6 +55,7 @@ class ExportConfig:
     calib_image_dataset: str | None = None
     calib_dataset_dir: Path | None = None
     quantization_layer_batch: int = 4
+    attention_core: str = "sdk"
 
     @property
     def dsp_arch(self):
@@ -394,6 +395,7 @@ def load_export_config(
     config = ExportConfig(
         soc_model=settings.target.soc_model,
         model_settings=settings,
+        attention_core=data.get("attention_core", "sdk"),
         model_config=config_path,
         model=location("model"),
         calibration_dir=location("calibration_dir"),
@@ -443,6 +445,10 @@ def load_export_config(
             "calib_dataset_dir", "llama-output/.calibration-datasets"
         ),
     )
+    if config.attention_core not in ("sdk", "valid_online"):
+        raise ValueError("Unsupported Attention core")
+    if config.attention_core == "valid_online" and not settings.cache.append_only:
+        raise ValueError("Valid-length Attention requires append-only KV cache")
     if config.output == config.calibration_dir:
         raise ValueError(
             "Use a separate output directory to preserve calibration artifacts"

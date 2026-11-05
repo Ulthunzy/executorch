@@ -159,6 +159,9 @@ PrefillSession::PrefillSession(
     attention.emplace_back(
         new Attention(
             runtime, root, layer, layer % 4 != 3, false, resident_capacity));
+    if (attention.back()->mapped[0].active)
+      for (int c = 0; c < 2; ++c)
+        core.map_buffer(attention.back()->mapped[c].storage, FASTRPC_MAP_FD);
     if (!attention.back()->linear) {
       if (resident_chat)
         for (int c = 0; c < 2; ++c)

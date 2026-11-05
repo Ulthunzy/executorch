@@ -34,7 +34,11 @@ std::shared_ptr<Buffer> moe::prefill_state_buffer(
   auto& owner = *session->attention[layer];
   auto& graph = owner.graph;
   const int index = output ? owner.output[cache + 2] : owner.cache_input[cache];
-  const auto& tensor = output ? graph.outputs[index] : graph.inputs[index];
+  const auto& tensor = output ? graph.outputs[index] : owner.cache_tensor(cache);
+  if (owner.mapped[cache].active) {
+    if (output || !Graph::same_encoding_and_layout(tensor, target)) return nullptr;
+    return owner.mapped[cache].storage;
+  }
   if (!owner.linear) {
     const char* append = getenv("KV_APPEND_ONLY");
     if (output || !append || std::string(append) != "1" ||

@@ -69,6 +69,9 @@ DecodeSession::DecodeSession(const std::string& path, size_t cache_mib)
     tasks.reserve(2);
   for (int layer = 0; layer < 40; layer++) {
     attention.emplace_back(new Attention(runtime, root, layer, layer % 4 != 3));
+    for (int c = 0; c < 2; ++c)
+      if (attention.back()->mapped[c].active)
+        core.map_buffer(attention.back()->mapped[c].storage);
     if (attention.back()->output.size() == 7)
       router.emplace_back(nullptr);
     else

@@ -47,15 +47,19 @@ Attention::Attention(
   for (int i = 0; i < 2; i++) {
     cache_input[i] = cold ? cache_graph->index(true, i ? 3 : 4)
                           : input[i + (linear ? 1 : 4)];
-    cache_maps[i] = remap(
-        graph.outputs[output[i + 2]], cache_owner().inputs[cache_input[i]]);
+    if (!linear && FIELD(graph.inputs[cache_input[i]], dataType) == QNN_DATATYPE_INT_32) {
+      mapped[i].initialize(graph.outputs[output[i + 2]], layer, i, false);
+      mapped[i].storage = std::make_shared<Buffer>(r, Graph::size(mapped[i].metadata), false, false);
+      mapped[i].storage->shared_views = true;
+    }
+    cache_maps[i] = remap(graph.outputs[output[i + 2]], cache_tensor(i));
     identity[i] = true;
     for (size_t j = 0; j < cache_maps[i].size(); j++)
       if (cache_maps[i][j] != j) {
         identity[i] = false;
         break;
       }
-    const auto& in = cache_owner().inputs[cache_input[i]];
+    const auto& in = cache_tensor(i);
     const auto& out = graph.outputs[output[i + 2]];
     swap_state[i] = linear && identity[i] &&
         FIELD(in, dataType) == FIELD(out, dataType) &&
@@ -71,14 +75,14 @@ Attention::Attention(
       if (i && current != history)
         throw std::runtime_error("prefill K/V history mismatch");
       history = current;
-      if (resident_capacity <= 0 || history < resident_capacity)
+      if (!mapped[i].active && (resident_capacity <= 0 || history < resident_capacity))
         handoff_cache[i].resize(512 * (history + 128));
     }
   }
 }
 
 size_t Attention::cache_bytes(int c) {
-  return Graph::size(cache_owner().inputs[cache_input[c]]);
+  return mapped[c].active ? mapped[c].storage->size : Graph::size(cache_owner().inputs[cache_input[c]]);
 }
 
 size_t Attention::export_bytes(int c) {
@@ -87,6 +91,16 @@ size_t Attention::export_bytes(int c) {
 }
 
 void Attention::save_cache(const std::string& path, int c) {
+  if (mapped[c].active) {
+    const auto source = qnn_cache_view(cache_tensor(c), cache_data(c));
+    std::vector<uint16_t> ordered(source.elements);
+    QuantizedCacheView destination{ordered.data(), ordered.size(), source.scale, source.offset};
+    clear_cache(destination);
+    const size_t valid = mapped_start + valid_tokens;
+    copy_cache_range(source, destination, c ? CacheLayout::Value : CacheLayout::Key, 0, history-valid, valid);
+    save(path, ordered.data(), ordered.size()*2);
+    return;
+  }
   if (linear || !handoff_cache[c].empty()) {
     save(path, export_data(c), export_bytes(c));
     return;
@@ -111,8 +125,12 @@ void Attention::save_cache(const std::string& path, int c) {
 }
 
 void Attention::reset() {
-  for (int c = 0; c < 2; c++)
-    reset_quant(cache_owner(), cache_input[c]);
+  for (int c = 0; c < 2; c++) {
+    if (mapped[c].active) {
+      clear_cache(qnn_cache_view(cache_tensor(c), cache_data(c)));
+      mapped[c].invalidate();
+    } else reset_quant(cache_owner(), cache_input[c]);
+  }
 }
 
 void Attention::prefill(
@@ -125,6 +143,7 @@ void Attention::prefill(
   if (valid < 1 || valid > 128 || start < 0)
     throw std::runtime_error("invalid AR128 valid length");
   valid_tokens = valid;
+  mapped_start = start;
   if (linear) {
     if (input.size() == 4)
       *static_cast<int32_t*>(graph.input(input[3])) = valid - 1;
@@ -146,6 +165,10 @@ void Attention::prefill(
     const int history = cold ? 0 : this->history, columns = history + 128;
     if (start < 0 || start > history)
       throw std::runtime_error("prefill position exceeds KV history");
+    if (mapped[0].active) {
+      const int lengths[] = {valid, 0, start};
+      memcpy(graph.input(input[3]), lengths, sizeof(lengths));
+    } else {
     float* mask = (float*)graph.input(input[3]);
     std::fill(mask, mask + 128 * columns, -255.f);
     for (int t = 0; t < valid; t++) {
@@ -161,6 +184,10 @@ void Attention::prefill(
     // Padding rows still need a finite softmax, but never enter saved KV.
     for (int t = valid; t < 128; ++t)
       mask[t * columns + history] = 0.f;
+    }
+    if (mapped[0].active)
+      for (int c = 0; c < 2; ++c)
+        mapped[c].publish(graph, cache_input[c], identity[0] && identity[1]);
   }
   graph.execute();
 }
@@ -169,6 +196,12 @@ void Attention::feedback() {
   // 输出与下一次输入可能使用不同的量化网格，必须先查表重映射。
   // Handoff includes the current block; the next graph input retains history.
   for (int c = 0; c < 2; c++) {
+    if (mapped[c].active) {
+      copy_cache_range(qnn_cache_view(graph.outputs[output[c+2]], graph.output(output[c+2])),
+          qnn_cache_view(cache_tensor(c), cache_data(c)), c ? CacheLayout::Value : CacheLayout::Key,
+          0, mapped_start, valid_tokens);
+      continue;
+    }
     if (swap_state[c]) {
       const int in = cache_input[c], out = output[c + 2];
       // 两端已注册且布局、UINT16 网格相同，复用输出 buffer 作为下一块 state。

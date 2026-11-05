@@ -20,6 +20,10 @@ def build_runtime_assets(output, checkpoint, capacity):
             "-std=c++17",
             "-O2",
             "-I" + str(sdk / "include/QNN"),
+            "-I"
+            + str(
+                Path(__file__).resolve().parents[5] / "third-party/json/single_include"
+            ),
             str(source),
             "-ldl",
             "-o",

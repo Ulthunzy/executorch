@@ -183,6 +183,8 @@ class ModelWrapper(ExportWorkflow):
                         c.op_package_device,
                         "--prefill-gdn-core",
                         c.prefill_gdn_core,
+                        "--attention-core",
+                        c.attention_core,
                         *(("--gdn-state-vtcm",) if c.gdn_state_vtcm else ()),
                         *binding,
                     ),

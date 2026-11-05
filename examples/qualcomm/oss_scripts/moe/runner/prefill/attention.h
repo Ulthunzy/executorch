@@ -4,6 +4,7 @@
 #include "cache_utils.h"
 #include "../runtime_utils.h"
 #include "../state_manager.h"
+#include "../qnn/mapped_cache.h"
 #include <array>
 #include <cmath>
 
@@ -16,7 +17,8 @@ struct Attention {
   int cache_input[2];
   bool linear, cold;
   int history = 0;
-  int valid_tokens = 128;
+  int valid_tokens = 128, mapped_start = 0;
+  MappedCache mapped[2];
   std::vector<int> input, output;
   std::vector<uint16_t> cache_maps[2];
   bool identity[2], swap_state[2]{};
@@ -34,8 +36,12 @@ struct Attention {
     return cold ? *cache_graph : graph;
   }
 
+  const Qnn_Tensor_t& cache_tensor(int c) {
+    return mapped[c].active ? mapped[c].metadata : cache_owner().inputs[cache_input[c]];
+  }
+
   void* cache_data(int c) {
-    return cache_owner().input(cache_input[c]);
+    return mapped[c].active ? mapped[c].storage->data : cache_owner().input(cache_input[c]);
   }
 
   size_t cache_bytes(int c);

@@ -2,6 +2,7 @@
 #include "../runner/cache_encoding.h"
 #include "../runner/qnn/qnn_cache.h"
 #include <algorithm>
+#include <nlohmann/json.hpp>
 #include <dlfcn.h>
 #include <cstdio>
 #include <fstream>
@@ -97,6 +98,14 @@ int main(int argc, char** argv) try {
           const auto& t = selected->graphInputs[index];
           if (std::string(FIELD(t, name)).rfind(prefix, 0))
             continue;
+          if (layer % 4 == 3 && FIELD(t, dataType) == QNN_DATATYPE_INT_32) {
+            const auto raw = read(root + "/GRAPHS.json");
+            const auto manifest = nlohmann::json::parse(raw.begin(), raw.end());
+            const auto& record = manifest.at("attention_cache").at(std::to_string(layer)).at("prefill").at(cache);
+            encodings.push_back({record.at("scale").get<float>(), record.at("offset").get<int32_t>(), record.at("elements").get<uint64_t>(), CacheDType::AffineUint16});
+            found = true;
+            continue;
+          }
           const auto view = qnn_cache_view(t, nullptr);
           if (view.dtype == CacheDType::Float16 && (layer % 4 == 3 || cache != 1))
             throw std::runtime_error("Only GDN recurrent state may use FP16 cache");
