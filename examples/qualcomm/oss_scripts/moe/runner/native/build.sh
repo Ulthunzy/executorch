@@ -79,7 +79,7 @@ for source in "$kernel_root/N2Utils.cpp" "$native_root/worker_start.cpp"; do
     -std=c++17 -c "$source" -o "$object"
   objects+=("$object")
 done
-op_root="$task_repo/examples/qualcomm/custom_op/deltanet_op_package_htp/DeltaNetOpPackage"
+op_root="$task_repo/examples/qualcomm/custom_op/htp_op_package"
 make -C "$op_root" WORK="$task_build/op-package" htp_x86 \
   "NATIVE_OBJECTS=${objects[*]}" \
   "$task_build/op-package/hexagon-v$task_arch/libet_qnnop.so"

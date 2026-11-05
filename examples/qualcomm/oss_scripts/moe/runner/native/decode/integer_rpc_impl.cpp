@@ -197,7 +197,11 @@ extern "C" AEEResult et_decode_rpc_open(const char*, remote_handle64* handle) {
   return 0;
 }
 
+extern "C" void release_attention_cache_maps() __attribute__((weak));
+
 extern "C" AEEResult et_decode_rpc_close(remote_handle64 handle) {
+  if (release_attention_cache_maps)
+    release_attention_cache_maps();
   auto* state = reinterpret_cast<State*>(uintptr_t(handle));
   delete state;
   return release_expert_mappings();

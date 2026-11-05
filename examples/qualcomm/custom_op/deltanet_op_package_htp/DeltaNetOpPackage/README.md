@@ -1,5 +1,10 @@
 # DeltaNet HTP Custom Op Benchmark
 
+This directory owns GDN kernels only. The shared HTP build and package
+registration live in [htp_op_package](../../htp_op_package/README.md).
+Attention is maintained separately in
+[attention_op_package_htp](../../attention_op_package_htp/AttentionOpPackage/README.md).
+
 ## Optional typed FP16 recurrent state
 
 `DeltaNetCoreFp16State` accepts affine QUInt16 Q/K/value/decay/beta and a

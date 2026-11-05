@@ -1,5 +1,5 @@
 //==============================================================================
-// Auto Generated Code for DeltaNetOpPackage
+// Shared HTP package interface; the legacy package name preserves PTE compatibility.
 //==============================================================================
 
 #include "HTP/QnnHtpCommon.h"
@@ -14,7 +14,7 @@
 #define THIS_PKG_NAME_STR STRINGIZE(THIS_PKG_NAME)
 
 static constexpr auto sg_packageName = THIS_PKG_NAME_STR;
-static std::array<const char*, 7> sg_opNames{{
+static std::array<const char*, 10> sg_opNames{{
     "DeltaNetCore",
     "DeltaNetCoreStream",
     "DeltaNetCoreVtcm",
@@ -22,6 +22,9 @@ static std::array<const char*, 7> sg_opNames{{
     "DeltaNetCoreFp16State",
     "DeltaNetCoreValid",
     "DeltaNetCoreValidVtcm",
+    "AttentionValid",
+    "AttentionInitialize",
+    "AttentionExecute",
 }};
 
 static Qnn_ApiVersion_t sg_sdkApiVersion = QNN_HTP_API_VERSION_INIT;
@@ -104,6 +107,16 @@ Qnn_ErrorHandle_t DeltaNetOpPackageValidateOpConfig(Qnn_OpConfig_t opConfig) {
     return QNN_OP_PACKAGE_ERROR_VALIDATION_FAILURE;
   }
 
+  const std::string type(opConfig.v1.typeName);
+  if (type == "AttentionValid" || type == "AttentionInitialize" ||
+      type == "AttentionExecute") {
+    const unsigned inputs = type == "AttentionExecute" ? 9 : 7;
+    const unsigned outputs = type == "AttentionInitialize" ? 2 : 1;
+    return opConfig.v1.numOfParams == 0 && opConfig.v1.numOfInputs == inputs &&
+            opConfig.v1.numOfOutputs == outputs
+        ? QNN_SUCCESS
+        : QNN_OP_PACKAGE_ERROR_VALIDATION_FAILURE;
+  }
   if (std::string(opConfig.v1.typeName) == "DeltaNetCoreValid" ||
       std::string(opConfig.v1.typeName) == "DeltaNetCoreValidVtcm") {
     if (opConfig.v1.numOfParams != 0 || opConfig.v1.numOfInputs != 7 ||
@@ -126,17 +139,21 @@ Qnn_ErrorHandle_t DeltaNetOpPackageValidateOpConfig(Qnn_OpConfig_t opConfig) {
   return QNN_SUCCESS;
 }
 
+extern "C" void release_attention_cache_maps();
+
 Qnn_ErrorHandle_t DeltaNetOpPackageTerminate() {
   if (!sg_packageInitialized) {
     return QNN_OP_PACKAGE_ERROR_LIBRARY_NOT_INITIALIZED;
   }
 
+  release_attention_cache_maps();
   sg_globalInfra = nullptr;
   sg_packageInitialized = false;
   return QNN_SUCCESS;
 }
 
 void register_deltanet_qhpi_ops();
+void register_attention_qhpi_ops();
 
 #ifdef __cplusplus
 extern "C" {
@@ -162,6 +179,7 @@ Qnn_ErrorHandle_t DeltaNetOpPackageInterfaceProvider(
 
 const char* qhpi_init() {
   register_deltanet_qhpi_ops();
+  register_attention_qhpi_ops();
   return THIS_PKG_NAME_STR;
 }
 

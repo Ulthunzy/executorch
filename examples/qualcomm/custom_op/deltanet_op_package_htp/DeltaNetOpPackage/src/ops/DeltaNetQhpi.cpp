@@ -23,7 +23,7 @@
 
 #include "HTP/core/qhpi.h"
 
-#include "../utils/HvxUtils.h"
+#include "HvxUtils.h"
 #include "../utils/NumericUtils.h"
 #include "../utils/QhpiUtils.h"
 

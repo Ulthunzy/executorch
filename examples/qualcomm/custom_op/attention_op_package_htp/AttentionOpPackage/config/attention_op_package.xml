@@ -1,0 +1,58 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<OpDefCollection PackageName="DeltaNetOpPackage" Domain="aisw" Version="1.0">
+    <OpDefList>
+        <OpDef>
+            <Name>AttentionValid</Name>
+            <Description><Content>Valid-length causal grouped-query Attention using persistent FD-backed KV caches.</Content></Description>
+            <Input>
+                <Name>query</Name>
+                <Mandatory>true</Mandatory>
+                <Datatype>QNN_DATATYPE_UFIXED_POINT_16</Datatype>
+                <Shape><Rank>4D</Rank><Text>[B,Hq,Q,D]</Text></Shape>
+            </Input>
+            <Input>
+                <Name>key_descriptor</Name>
+                <Mandatory>true</Mandatory>
+                <Datatype>QNN_DATATYPE_INT_32</Datatype>
+                <Shape><Rank>4D</Rank><Text>[1,1,1,3]: fd, bytes_and_flags, epoch</Text></Shape>
+            </Input>
+            <Input>
+                <Name>new_key</Name>
+                <Mandatory>true</Mandatory>
+                <Datatype>QNN_DATATYPE_UFIXED_POINT_16</Datatype>
+                <Shape><Rank>4D</Rank><Text>[B,Hkv,D,Q]</Text></Shape>
+            </Input>
+            <Input>
+                <Name>value_descriptor</Name>
+                <Mandatory>true</Mandatory>
+                <Datatype>QNN_DATATYPE_INT_32</Datatype>
+                <Shape><Rank>4D</Rank><Text>[1,1,1,3]: fd, bytes_and_flags, epoch</Text></Shape>
+            </Input>
+            <Input>
+                <Name>new_value</Name>
+                <Mandatory>true</Mandatory>
+                <Datatype>QNN_DATATYPE_UFIXED_POINT_16</Datatype>
+                <Shape><Rank>4D</Rank><Text>[B,Hkv,Q,D]</Text></Shape>
+            </Input>
+            <Input>
+                <Name>lengths</Name>
+                <Mandatory>true</Mandatory>
+                <Datatype>QNN_DATATYPE_INT_32</Datatype>
+                <Shape><Rank>4D</Rank><Text>[1,1,1,3]: valid, first, history</Text></Shape>
+            </Input>
+            <Input>
+                <Name>grids</Name>
+                <Mandatory>true</Mandatory>
+                <Datatype>QNN_DATATYPE_FLOAT_32</Datatype>
+                <Shape><Rank>4D</Rank><Text>[1,1,1,13]: logit and historical KV quantization grids</Text></Shape>
+            </Input>
+            <Output>
+                <Name>output</Name>
+                <Mandatory>true</Mandatory>
+                <Datatype>QNN_DATATYPE_UFIXED_POINT_16</Datatype>
+                <Shape><Rank>4D</Rank><Text>[B,Hq,Q,D]</Text></Shape>
+            </Output>
+            <SupportedBackend>HTP</SupportedBackend>
+        </OpDef>
+    </OpDefList>
+</OpDefCollection>
