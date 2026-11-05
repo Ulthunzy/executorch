@@ -127,6 +127,17 @@ delta_net_lib.define(
     ") -> (Tensor(a!), Tensor(b!))"
 )
 delta_net_lib.define(
+    "deltanet_core_valid("
+    "Tensor query, Tensor key, Tensor value, Tensor decay, Tensor beta, "
+    "Tensor recurrent_state, Tensor valid_tokens) -> (Tensor, Tensor)"
+)
+delta_net_lib.define(
+    "deltanet_core_valid.out("
+    "Tensor query, Tensor key, Tensor value, Tensor decay, Tensor beta, "
+    "Tensor recurrent_state, Tensor valid_tokens, *, Tensor(a!) core_attn_out, "
+    "Tensor(b!) new_recurrent_state) -> (Tensor(a!), Tensor(b!))"
+)
+delta_net_lib.define(
     "deltanet_core_stream("
     "Tensor query, Tensor key, Tensor value, Tensor decay, Tensor beta, "
     "Tensor recurrent_state"
@@ -433,6 +444,82 @@ def deltanet_core_out_impl(
     )
     core_attn_out.copy_(ref_out)
     new_recurrent_state.copy_(ref_state)
+    return core_attn_out, new_recurrent_state
+
+
+@impl(
+    delta_net_lib,
+    "deltanet_core_valid",
+    dispatch_key="CompositeExplicitAutograd",
+)
+def deltanet_core_valid_impl(
+    query, key, value, decay, beta, recurrent_state, valid_tokens
+):
+    if valid_tokens.dtype != torch.int32 or valid_tokens.numel() != 1:
+        raise ValueError("DeltaNetCoreValid requires one int32 valid length")
+    if query.dtype not in (torch.float16, torch.float32) or any(
+        tensor.dtype != query.dtype
+        for tensor in (key, value, decay, beta, recurrent_state)
+    ):
+        raise ValueError("DeltaNetCoreValid requires matching FP16 or FP32 tensors")
+    if query.ndim != 4 or key.shape != query.shape or value.shape[:3] != query.shape[:3]:
+        raise ValueError("DeltaNetCoreValid requires B,T,H,K and B,T,H,V tensors")
+    batch, physical, heads, key_dim = query.shape
+    if (
+        value.ndim != 4
+        or decay.shape != (batch, physical, heads)
+        or beta.shape != decay.shape
+        or recurrent_state.shape != (batch, heads, key_dim, value.shape[-1])
+    ):
+        raise ValueError("DeltaNetCoreValid state or coefficient geometry")
+    valid = int(valid_tokens.item())
+    if not 0 <= valid <= physical:
+        raise ValueError("DeltaNetCoreValid length is outside the physical tensor")
+    output = torch.zeros_like(value)
+    state = recurrent_state.float().clone()
+    for index in range(valid):
+        q, k, v = (tensor[:, index].float() for tensor in (query, key, value))
+        d = decay[:, index].float().unsqueeze(-1)
+        b = beta[:, index].float().unsqueeze(-1)
+        delta = (v - (state * (k * d).unsqueeze(-1)).sum(-2)) * b
+        output[:, index] = (
+            (state * (q * d).unsqueeze(-1)).sum(-2)
+            + (q * k).sum(-1, keepdim=True) * delta
+        ).to(query.dtype)
+        state = (state * d.unsqueeze(-1) + k.unsqueeze(-1) * delta.unsqueeze(-2))
+        state = state.to(query.dtype).float()
+    return output, state.to(query.dtype)
+
+
+@torch.library.register_fake("qnn_custom_ops::deltanet_core_valid")
+def deltanet_core_valid_fake(
+    query, key, value, decay, beta, recurrent_state, valid_tokens
+):
+    return torch.empty_like(value), torch.empty_like(recurrent_state)
+
+
+@impl(
+    delta_net_lib,
+    "deltanet_core_valid.out",
+    dispatch_key="CompositeExplicitAutograd",
+)
+def deltanet_core_valid_out_impl(
+    query, key, value, decay, beta, recurrent_state, valid_tokens, *,
+    core_attn_out, new_recurrent_state,
+):
+    output, state = deltanet_core_valid_impl(
+        query, key, value, decay, beta, recurrent_state, valid_tokens
+    )
+    core_attn_out.copy_(output)
+    new_recurrent_state.copy_(state)
+    return core_attn_out, new_recurrent_state
+
+
+@torch.library.register_fake("qnn_custom_ops::deltanet_core_valid.out")
+def deltanet_core_valid_out_fake(
+    query, key, value, decay, beta, recurrent_state, valid_tokens, *,
+    core_attn_out, new_recurrent_state,
+):
     return core_attn_out, new_recurrent_state
 
 

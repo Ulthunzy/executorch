@@ -14,12 +14,14 @@
 #define THIS_PKG_NAME_STR STRINGIZE(THIS_PKG_NAME)
 
 static constexpr auto sg_packageName = THIS_PKG_NAME_STR;
-static std::array<const char*, 5> sg_opNames{{
+static std::array<const char*, 7> sg_opNames{{
     "DeltaNetCore",
     "DeltaNetCoreStream",
     "DeltaNetCoreVtcm",
     "DeltaNetCoreFp16Accum",
     "DeltaNetCoreFp16State",
+    "DeltaNetCoreValid",
+    "DeltaNetCoreValidVtcm",
 }};
 
 static Qnn_ApiVersion_t sg_sdkApiVersion = QNN_HTP_API_VERSION_INIT;
@@ -102,7 +104,13 @@ Qnn_ErrorHandle_t DeltaNetOpPackageValidateOpConfig(Qnn_OpConfig_t opConfig) {
     return QNN_OP_PACKAGE_ERROR_VALIDATION_FAILURE;
   }
 
-  if (std::string(opConfig.v1.typeName) == "DeltaNetCore" ||
+  if (std::string(opConfig.v1.typeName) == "DeltaNetCoreValid" ||
+      std::string(opConfig.v1.typeName) == "DeltaNetCoreValidVtcm") {
+    if (opConfig.v1.numOfParams != 0 || opConfig.v1.numOfInputs != 7 ||
+        opConfig.v1.numOfOutputs != 2) {
+      return QNN_OP_PACKAGE_ERROR_VALIDATION_FAILURE;
+    }
+  } else if (std::string(opConfig.v1.typeName) == "DeltaNetCore" ||
       std::string(opConfig.v1.typeName) == "DeltaNetCoreStream" ||
       std::string(opConfig.v1.typeName) == "DeltaNetCoreVtcm" ||
       std::string(opConfig.v1.typeName) == "DeltaNetCoreFp16Accum" ||
