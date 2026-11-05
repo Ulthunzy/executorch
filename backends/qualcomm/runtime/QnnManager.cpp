@@ -628,19 +628,34 @@ Error QnnManager::Compile(
       qnn_dlc_manager_->backend_params_ptr_->qnn_graph_ptr_.get() != nullptr) {
     qnn_graph_ptr = qnn_dlc_manager_->backend_params_ptr_->qnn_graph_ptr_.get();
   }
+  const bool shared_htp_io = options_->shared_buffer() &&
+      options_->backend_options()->backend_type() ==
+          QnnExecuTorchBackendType::kHtpBackend;
+  auto ensure_tensor = [&](const std::shared_ptr<TensorWrapper>& tensor_wrapper) {
+    if (shared_htp_io && !tensor_wrapper->IsTensorCreated()) {
+      const auto tensor = tensor_wrapper->CloneTensorStruct();
+      const auto type = QNN_TENSOR_VER_PTR(tensor)->type;
+      if (type == QNN_TENSOR_TYPE_APP_WRITE ||
+          type == QNN_TENSOR_TYPE_APP_READ ||
+          type == QNN_TENSOR_TYPE_APP_READWRITE) {
+        // The hint must be serialized; setting MEMHANDLE only at execution
+        // leaves HTP's fallback RPC IO allocations resident.
+        tensor_wrapper->SetMemHandle(nullptr);
+      }
+    }
+    return qnn_graph_ptr->EnsureTensorInQnnGraph(graph_name, tensor_wrapper);
+  };
   for (std::shared_ptr<OpWrapper>& op_wrapper : op_wrappers) {
     for (const auto& tensor_wrapper : op_wrapper->GetInputTensors()) {
       ET_CHECK_OR_RETURN_ERROR(
-          qnn_graph_ptr->EnsureTensorInQnnGraph(graph_name, tensor_wrapper) ==
-              Error::Ok,
+          ensure_tensor(tensor_wrapper) == Error::Ok,
           Internal,
           "Tensor name %s isn't added to Qnn Graph",
           tensor_wrapper->GetName().c_str());
     }
     for (const auto& tensor_wrapper : op_wrapper->GetOutputTensors()) {
       ET_CHECK_OR_RETURN_ERROR(
-          qnn_graph_ptr->EnsureTensorInQnnGraph(graph_name, tensor_wrapper) ==
-              Error::Ok,
+          ensure_tensor(tensor_wrapper) == Error::Ok,
           Internal,
           "Tensor name %s isn't added to Qnn Graph",
           tensor_wrapper->GetName().c_str());

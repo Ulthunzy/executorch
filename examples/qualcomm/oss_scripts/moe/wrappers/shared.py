@@ -193,7 +193,7 @@ def main():
     specs = generate_qnn_executorch_compiler_spec(
         QcomChipset[settings.target.soc_model],
         generate_htp_compiler_spec(use_fp16=False, use_weight_sharing=True),
-        shared_buffer=False,
+        shared_buffer=True,
         op_package_options=package,
     )
     jobs = get_qnn_pass_manager_cls(
@@ -267,7 +267,12 @@ def main():
         )
     if len(contexts) != 1:
         raise ValueError("Shared methods must refer to one context")
+    from executorch.examples.qualcomm.oss_scripts.moe.utils import (
+        validate_qnn_io_memory,
+    )
+
     report = dict(
+        **validate_qnn_io_memory(args.output / next(iter(contexts.values()))),
         target=settings.target.to_dict(),
         compile_settings=settings.compile_settings(),
         model_configuration=settings.to_dict(),

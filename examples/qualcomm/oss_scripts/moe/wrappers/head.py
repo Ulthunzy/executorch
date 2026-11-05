@@ -52,7 +52,7 @@ def main():
     specs = generate_qnn_executorch_compiler_spec(
         QcomChipset[settings.target.soc_model],
         generate_htp_compiler_spec(use_fp16=False),
-        shared_buffer=False,
+        shared_buffer=True,
     )
     manager = to_edge_transform_and_lower_to_qnn(graph, sample, specs)
     args.output.mkdir(parents=True, exist_ok=True)
@@ -66,9 +66,14 @@ def main():
         raise ValueError("Head must have a single QNN delegate")
     blob = program.backend_delegate_data[plan.delegates[0].processed.index].data
     (args.output / "head.bin").write_bytes(bytes(qnn.StripProtocol(blob)))
+    from executorch.examples.qualcomm.oss_scripts.moe.utils import (
+        validate_qnn_io_memory,
+    )
+
     (args.output / "HEAD.json").write_text(
         json.dumps(
             dict(
+                **validate_qnn_io_memory(args.output / "head.bin"),
                 target=settings.target.to_dict(),
                 source_sha256=hashlib.sha256(args.source.read_bytes()).hexdigest(),
                 quantization=report,

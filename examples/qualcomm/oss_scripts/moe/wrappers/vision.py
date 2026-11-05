@@ -203,7 +203,7 @@ def main():
     specs = generate_qnn_executorch_compiler_spec(
         QcomChipset[settings.target.soc_model],
         generate_htp_compiler_spec(use_fp16=False),
-        shared_buffer=False,
+        shared_buffer=True,
     )
     manager = to_edge_transform_and_lower_to_qnn(model, inputs, specs)
     with (args.output / "vision.pte").open("wb") as handle:
@@ -226,7 +226,12 @@ def main():
         )
     blob = program.backend_delegate_data[plan.delegates[0].processed.index].data
     (args.output / "vision.bin").write_bytes(qnn.StripProtocol(blob))
+    from executorch.examples.qualcomm.oss_scripts.moe.utils import (
+        validate_qnn_io_memory,
+    )
+
     metadata = dict(
+        **validate_qnn_io_memory(args.output / "vision.bin"),
         target=settings.target.to_dict(),
         version=1,
         model_config_sha256=hashlib.sha256(
