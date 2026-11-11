@@ -16,15 +16,9 @@ static inline int output_offset(int m, int n) {
   return (m / 2) * 64 + n * 2 + m % 2;
 }
 
-static inline void integer_hmx(
-    const uint8_t* a,
-    const uint8_t* w,
-    const uint32_t* bias,
-    uint16_t* output,
-    int k) {
-  // bias 同时携带定点缩放及 A8 零点修正；输出仍为 HMX 原始 tile，HVX
-  // 再恢复实数尺度。
-  Q6_bias_mxmem2_A((void*)bias);
+static inline void
+integer_hmx(const uint8_t* a, const uint8_t* w, uint16_t* output, int k) {
+  // The caller keeps bias loaded across row tiles sharing this weight block.
   Q6_mxclracc();
   Q6_activation_ub_mxmem_RR_deep(uintptr_t(a), ((k / 32 - 1) << 11) | 0x77c);
   Q6_weight_n_mxmem_RR(uintptr_t(w), k * 16 - 1);

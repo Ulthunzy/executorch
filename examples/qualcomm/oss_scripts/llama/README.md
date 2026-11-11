@@ -667,11 +667,14 @@ by their quantization recipes:
 - Native RMSNorm for decoder, Q/K and gated GDN normalization. External
   recurrent and convolution states use calibrated UINT16 encodings; attention
   cache precision is selected by the recipe.
-- Prefill AR128 with FP16 chunk64/leaf8 GDN, valid-token state updates and one
+- Prefill AR128 with FP16 GDN, valid-token state updates and one
   selected LM-head row. Hybrid decoder PTEs contain only `kv_forward` and
   `prefill_forward`; all prompts use the requested full-context prefill graph.
   No additional short-context prefill graphs are exported or selected at runtime.
-  Decode uses the DeltaNetCoreVtcm op package and direct quantized greedy argmax.
+  Decode uses `DeltaNetCoreGatedVtcm` on SM8850, `DeltaNetCoreVtcm` on other
+  supported SoCs, and direct quantized greedy argmax.
+  SM8850 with K=V=128 uses one fused `Chunk` call per GDN layer; other targets
+  and dimensions retain the portable chunk64/leaf8 implementation.
 - Lincal3.5 retains true SWA and its separate window mask. Calibration masks
   limit each token to the sliding window, including within an AR128 block.
   SWA caches retain their fixed length when deriving AR1. Pure SWA models
@@ -787,8 +790,63 @@ python examples/qualcomm/oss_scripts/llama/llama.py \
 ```
 
 Run exports serially. Change `--max_seq_len` and the artifact directory for
-1024/2048/3072/8192; the default physical capacity is logical length +128.
+1024/2048/3072/8192; the default position-table capacity is logical length +128.
 `--source_safetensors` supplies the local model and tokenizer directory.
+
+On SM8850/v81, Qwen3.5 automatically replaces full-attention cores in both
+methods with `attention_support`'s `AttentionValid` online-softmax operator.
+Full-attention K/V precision comes exclusively from the quantization recipe:
+`annotate_kv_8bit` selects UINT8 for both new K/V and historical caches.
+The 0.8B and 2B recipes already include this annotation. Q/output and GDN
+states remain UINT16; the export does not override the recipe's annotations.
+Calibration still uses tensor caches; the exported methods receive FD
+descriptors and `[valid, first, history]` lengths. `qwen35_export.json` records
+each layer's cache capacity and encodings. The runner must be rebuilt from
+this checkout to allocate mapped caches, append valid tokens, and invalidate
+packed caches on reset. Cache allocations are uncached on the CPU and explicitly
+mapped into the current CDSP session before publishing their FDs. On V81, the
+2B's 8/2 Q/KV heads use the HMX kernel. Other unsupported HMX geometries retain
+the generic FP32 path.
+Re-export the PTE with the updated package when enabling HMX group4; scratch
+workspace sizes are determined during compilation.
+Other SoCs, attention sink and graphs containing SWA retain SDK attention
+automatically.
+
+Mapped KV capacity is the logical `--max_seq_len`. The separate
+`get_prefill_position_capacity` metadata records the compiled position-table
+capacity so a padded AR128 tail can extend beyond the logical token limit.
+The runner checks valid tokens against KV capacity and padded positions against
+the position-table capacity. New PTEs and runners must be used together; missing
+position-capacity metadata is an error. The 0.8B/8K output-projection splitting
+also uses the mapped-cache metadata and remains enabled with online attention.
+
+On SM8850/v81, AR128 with K=V=128 uses the fused FP16 `Chunk` operator for
+GDN preparation, triangular correction, readout and state update. Its
+implementation is in `custom_op/deltanet_op_package_htp/DeltaNetOpPackage/src/kernels/Chunk.h`.
+One graph call handles all 128 tokens; internal triangular blocks remain.
+Rebuild the shared package and re-export the PTE to use `Chunk`.
+
+For other shapes using the portable chunk path, SM8850/v81 uses a fused FP16 state
+update during prefill. It packs weighted correction, runs HMX matmul and
+applies the decay/add epilogue in one custom operator, retaining the original
+FP16 rounding steps. This also applies when attention uses SDK operators.
+Using these defaults requires rebuilding the shared operator package and
+exporting a new PTE; swapping the library alone does not replace the SDK graph.
+
+On SM8850/v81, decode automatically uses `DeltaNetCoreGatedVtcm` to fuse the
+calibrated decay computation into the recurrence. Export generates exact SDK
+AR1 tables under `<artifact>/decode_gate_tables` and caches them by target,
+SDK libraries, gate arithmetic, constants and quantization grids. A cache miss
+requires the target device through `--device`/`--host` and `ANDROID_NDK_ROOT`;
+a valid cache can be reused without the device. This is export-time generation,
+not inference warmup. The 2B model adds 36 MiB of table constants across its
+18 GDN layers. Other supported SoCs use `DeltaNetCoreVtcm` with SDK gates.
+No attention-core, KV-bitwidth, state-update or LUT-directory selector is needed.
+The separate `oss_scripts/moe` export and runner have their own configuration.
+
+For example, the 2B command above exports an 8K hybrid model by setting
+`--max_seq_len 8192` and choosing a new artifact directory. Set
+`--soc_model SM8850` to use the defaults described above.
 
 Qwen3.5-family compilation also uses `compact_fx_provenance()` to stop PyTorch
 from recursively copying FX node origin histories. It retains direct origins

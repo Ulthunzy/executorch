@@ -51,7 +51,17 @@ def use_split_qwen35_output(control_args, data, config, decode, prefill):
         and decode is not None
         and decode.decoder is not None
         and decode.meta["get_ar_len"] == 1
-        and decode.meta["get_max_context_len"] == 8320
+        and decode.meta["get_max_context_len"]
+        == (
+            control_args.max_seq_len
+            if decode.meta.get("get_attention_valid", False)
+            else control_args.max_context_len
+        )
+        and (
+            not decode.meta.get("get_attention_valid", False)
+            or decode.meta.get("get_attention_cache_capacity")
+            == control_args.max_seq_len
+        )
         and decode.meta["get_dim"] == 1024
         and decode.meta["get_vocab_size"] == 248320
         and decode.meta["get_kv_io_bit_width"] == 8

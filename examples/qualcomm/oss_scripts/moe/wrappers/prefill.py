@@ -18,6 +18,7 @@ from executorch.examples.qualcomm.custom_op.deltanet_support.masking import (
 def padded_prefill_front(module, inputs, capacity, gdn_core="chunked_mixed_fp16"):
     if gdn_core not in (
         "chunked_mixed_fp16",
+        "chunk128_hmx",
         "custom_fp16",
         "custom_fp32",
         "custom_u16",
@@ -107,8 +108,8 @@ def padded_prefill_front(module, inputs, capacity, gdn_core="chunked_mixed_fp16"
     FakeTensorProp(module, mode=FakeTensorMode(allow_non_fake_inputs=True)).propagate(
         *inputs
     )
-    if gdn_core == "chunked_mixed_fp16":
-        replace_prefill_cores(module)
+    if gdn_core in ("chunked_mixed_fp16", "chunk128_hmx"):
+        replace_prefill_cores(module, fused_chunk=gdn_core == "chunk128_hmx")
     module = torch.export.export(module, inputs, strict=False).module()
     remove_export_checks(module)
     return module, inputs

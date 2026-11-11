@@ -48,7 +48,9 @@ OP_OBJS += $(patsubst $(ATTENTION_SRC_DIR)/%.cpp,attention/%.o,$(wildcard $(ATTE
 OTHER_OBJS := $(patsubst $(SRC_DIR)/%,%,$(patsubst %.cpp,%.o,$(OTHER_SOURCES)))
 
 HFILES := $(wildcard $(QNN_INCLUDE)/*.h) $(CUSTOM_OP_ROOT)/htp_arch.h $(wildcard $(OP_SRC_DIR)/*.h)
+HFILES += $(wildcard $(DELTANET_ROOT)/src/kernels/*.h) $(wildcard $(DELTANET_ROOT)/src/utils/*.h)
 HFILES += $(wildcard $(ATTENTION_SRC_DIR)/attention/*.h) $(wildcard $(HTP_BUILD_ROOT)/include/*.h)
+HFILES += $(wildcard $(CUSTOM_OP_ROOT)/attention_support/*.h)
 HFILES += $(wildcard $(QNN_INCLUDE)/HTP/*.h)
 HFILES += $(wildcard $(QNN_INCLUDE)/HTP/core/*.h)
 
@@ -79,6 +81,7 @@ X86_CXX_FLAGS := $(X86_CPPFLAGS) $(COMMON_CXX_FLAGS) $(X86_C_FLAGS) -fomit-frame
 # The host container provides libstdc++ headers but not libc++ headers.
 # Keep libc++ for Android/Hexagon targets and use the available host STL here.
 X86_CXX_FLAGS += -stdlib=libstdc++
+X86_CXX_FLAGS += -Wno-unused-const-variable
 X86_CXX_FLAGS += -Wno-invalid-offsetof
 X86_LDFLAGS := $(LDFLAGS) -stdlib=libstdc++ -Wl,--whole-archive
 X86_LDFLAGS += -L$(X86_LIBNATIVE_RELEASE_DIR)/libnative/lib -lnative
@@ -154,7 +157,43 @@ htp_v85: $(WORK)/hexagon-v85/$(HTP_LIBRARY_NAME)
 test-attention: $(WORK)/x86_64-linux-clang/test_attention
 	$<
 
-$(WORK)/x86_64-linux-clang/test_attention: $(ATTENTION_ROOT)/tests/test_attention.cpp $(wildcard $(ATTENTION_SRC_DIR)/attention/*.h) $(RULE_FILES) | $(WORK)/x86_64-linux-clang
+test-attention-u16: $(WORK)/x86_64-linux-clang/test_attention_u16
+	$<
+
+test-attention-stream: $(WORK)/x86_64-linux-clang/test_attention_stream
+	$<
+
+test-chunk-state-update: $(WORK)/x86_64-linux-clang/test_chunk_state_update
+	$<
+
+test-hmx-tile-layout: $(WORK)/x86_64-linux-clang/test_hmx_tile_layout
+	$<
+
+test-chunk: $(WORK)/x86_64-linux-clang/test_chunk
+	$<
+
+test-op-package-interface: $(WORK)/x86_64-linux-clang/test_op_package_interface
+	$<
+
+$(WORK)/x86_64-linux-clang/test_op_package_interface: $(HTP_BUILD_ROOT)/tests/test_op_package_interface.cpp $(WORK)/x86_64-linux-clang/OpPackageInterface.o $(RULE_FILES)
+	$(X86_CXX) $(X86_CXX_FLAGS) -O2 -UNDEBUG $< $(WORK)/x86_64-linux-clang/OpPackageInterface.o -o $@
+
+$(WORK)/x86_64-linux-clang/test_chunk: $(DELTANET_ROOT)/tests/test_chunk.cpp $(DELTANET_ROOT)/src/kernels/Chunk.h $(DELTANET_ROOT)/src/utils/HmxTileLayout.h $(HTP_BUILD_ROOT)/include/HvxUtils.h $(WORK)/x86_64-linux-clang/.build-config $(RULE_FILES) | $(WORK)/x86_64-linux-clang
+	$(X86_CXX) $(X86_CXX_FLAGS) -O2 -Werror -UNDEBUG $< -o $@ $(X86_LDFLAGS)
+
+$(WORK)/x86_64-linux-clang/test_hmx_tile_layout: $(DELTANET_ROOT)/tests/test_hmx_tile_layout.cpp $(DELTANET_ROOT)/src/utils/HmxTileLayout.h $(HTP_BUILD_ROOT)/include/HvxUtils.h $(WORK)/x86_64-linux-clang/.build-config $(RULE_FILES) | $(WORK)/x86_64-linux-clang
+	$(X86_CXX) $(X86_CXX_FLAGS) -O2 -Werror -UNDEBUG $< -o $@ $(X86_LDFLAGS)
+
+$(WORK)/x86_64-linux-clang/test_chunk_state_update: $(DELTANET_ROOT)/tests/test_chunk_state_update.cpp $(HTP_BUILD_ROOT)/include/HvxUtils.h $(WORK)/x86_64-linux-clang/.build-config $(RULE_FILES) | $(WORK)/x86_64-linux-clang
+	$(X86_CXX) $(X86_CXX_FLAGS) -O2 -Werror -UNDEBUG $< -o $@ $(X86_LDFLAGS)
+
+$(WORK)/x86_64-linux-clang/test_attention_stream: $(ATTENTION_ROOT)/tests/test_attention_stream.cpp $(wildcard $(ATTENTION_SRC_DIR)/attention/*.h) $(HTP_BUILD_ROOT)/include/HmxDispatch.h $(RULE_FILES) | $(WORK)/x86_64-linux-clang
+	$(X86_CXX) -std=c++17 -O2 -Wall -Wextra -Werror -UNDEBUG -pthread $< -o $@
+
+$(WORK)/x86_64-linux-clang/test_attention_u16: $(ATTENTION_ROOT)/tests/test_attention_u16.cpp $(wildcard $(ATTENTION_SRC_DIR)/attention/*.h) $(WORK)/x86_64-linux-clang/.build-config $(RULE_FILES) | $(WORK)/x86_64-linux-clang
+	$(X86_CXX) $(X86_CXX_FLAGS) -O2 -UNDEBUG -pthread $< -o $@ $(X86_LDFLAGS)
+
+$(WORK)/x86_64-linux-clang/test_attention: $(ATTENTION_ROOT)/tests/test_attention.cpp $(wildcard $(ATTENTION_SRC_DIR)/attention/*.h) $(HTP_BUILD_ROOT)/include/HmxDispatch.h $(RULE_FILES) | $(WORK)/x86_64-linux-clang
 	$(X86_CXX) -std=c++17 -O2 -Wall -Wextra -Werror -UNDEBUG -pthread $< -o $@
 
 test-reduction: $(WORK)/x86_64-linux-clang/test_reduction
@@ -163,7 +202,7 @@ test-reduction: $(WORK)/x86_64-linux-clang/test_reduction
 test-reference-reduction: $(WORK)/x86_64-linux-clang/test_reference_reduction
 	$<
 
-$(WORK)/x86_64-linux-clang/test_reference_reduction: $(DELTANET_ROOT)/tests/test_reference_reduction.cpp $(OP_SOURCES) $(wildcard $(DELTANET_ROOT)/src/utils/*.h) $(wildcard $(HTP_BUILD_ROOT)/include/*.h) $(WORK)/x86_64-linux-clang/.build-config $(RULE_FILES) | $(WORK)/x86_64-linux-clang
+$(WORK)/x86_64-linux-clang/test_reference_reduction: $(DELTANET_ROOT)/tests/test_reference_reduction.cpp $(wildcard $(DELTANET_ROOT)/src/kernels/*.h) $(wildcard $(DELTANET_ROOT)/src/utils/*.h) $(wildcard $(HTP_BUILD_ROOT)/include/*.h) $(WORK)/x86_64-linux-clang/.build-config $(RULE_FILES) | $(WORK)/x86_64-linux-clang
 	$(X86_CXX) $(X86_CXX_FLAGS) -DTHIS_PKG_NAME=$(PACKAGE_NAME) -O2 -ffunction-sections -fdata-sections $< -Wl,--gc-sections $(X86_LDFLAGS) -o $@
 
 test-fp16-register: $(WORK)/x86_64-linux-clang/test_fp16_reference $(WORK)/x86_64-linux-clang/test_fp16_register
@@ -171,14 +210,14 @@ test-fp16-register: $(WORK)/x86_64-linux-clang/test_fp16_reference $(WORK)/x86_6
 	$(WORK)/x86_64-linux-clang/test_fp16_register $(WORK)/x86_64-linux-clang/fp16-register.bin
 	cmp $(WORK)/x86_64-linux-clang/fp16-reference.bin $(WORK)/x86_64-linux-clang/fp16-register.bin
 
-$(WORK)/x86_64-linux-clang/test_fp16_reference: $(DELTANET_ROOT)/tests/test_fp16_register.cpp $(OP_SOURCES) $(wildcard $(DELTANET_ROOT)/src/utils/*.h) $(wildcard $(HTP_BUILD_ROOT)/include/*.h) $(WORK)/x86_64-linux-clang/.build-config $(RULE_FILES) | $(WORK)/x86_64-linux-clang
+$(WORK)/x86_64-linux-clang/test_fp16_reference: $(DELTANET_ROOT)/tests/test_fp16_register.cpp $(wildcard $(DELTANET_ROOT)/src/kernels/*.h) $(wildcard $(DELTANET_ROOT)/src/utils/*.h) $(wildcard $(HTP_BUILD_ROOT)/include/*.h) $(WORK)/x86_64-linux-clang/.build-config $(RULE_FILES) | $(WORK)/x86_64-linux-clang
 	$(X86_CXX) $(X86_CXX_FLAGS) -DTHIS_PKG_NAME=$(PACKAGE_NAME) -DDELTANET_FP16_REGISTER_REUSE=0 -UNDEBUG -O2 -ffunction-sections -fdata-sections $< -Wl,--gc-sections $(X86_LDFLAGS) -o $@
 
-$(WORK)/x86_64-linux-clang/test_fp16_register: $(DELTANET_ROOT)/tests/test_fp16_register.cpp $(OP_SOURCES) $(wildcard $(DELTANET_ROOT)/src/utils/*.h) $(wildcard $(HTP_BUILD_ROOT)/include/*.h) $(WORK)/x86_64-linux-clang/.build-config $(RULE_FILES) | $(WORK)/x86_64-linux-clang
+$(WORK)/x86_64-linux-clang/test_fp16_register: $(DELTANET_ROOT)/tests/test_fp16_register.cpp $(wildcard $(DELTANET_ROOT)/src/kernels/*.h) $(wildcard $(DELTANET_ROOT)/src/utils/*.h) $(wildcard $(HTP_BUILD_ROOT)/include/*.h) $(WORK)/x86_64-linux-clang/.build-config $(RULE_FILES) | $(WORK)/x86_64-linux-clang
 	$(X86_CXX) $(X86_CXX_FLAGS) -DTHIS_PKG_NAME=$(PACKAGE_NAME) -DDELTANET_FP16_REGISTER_REUSE=1 -UNDEBUG -O2 -ffunction-sections -fdata-sections $< -Wl,--gc-sections $(X86_LDFLAGS) -o $@
 
-$(WORK)/x86_64-linux-clang/test_reduction: $(DELTANET_ROOT)/tests/test_reduction.cpp $(OP_SOURCES) $(wildcard $(DELTANET_ROOT)/src/utils/*.h) $(wildcard $(HTP_BUILD_ROOT)/include/*.h) $(WORK)/x86_64-linux-clang/.build-config | $(WORK)/x86_64-linux-clang
-	$(X86_CXX) $(X86_CXX_FLAGS) -DTHIS_PKG_NAME=$(PACKAGE_NAME) -O2 -ffunction-sections -fdata-sections $< -Wl,--gc-sections $(X86_LDFLAGS) -o $@
+$(WORK)/x86_64-linux-clang/test_reduction: $(DELTANET_ROOT)/tests/test_reduction.cpp $(wildcard $(DELTANET_ROOT)/src/kernels/*.h) $(wildcard $(DELTANET_ROOT)/src/utils/*.h) $(wildcard $(HTP_BUILD_ROOT)/include/*.h) $(WORK)/x86_64-linux-clang/.build-config | $(WORK)/x86_64-linux-clang
+	$(X86_CXX) $(X86_CXX_FLAGS) -UDELTANET_U16_KARATSUBA_REDUCTION -UDELTANET_U16_RADIX256_REDUCTION -O2 -ffunction-sections -fdata-sections $< -Wl,--gc-sections $(X86_LDFLAGS) -o $@
 
 $(WORK)/x86_64-linux-clang $(WORK)/aarch64-android $(WORK)/hexagon-v79 $(WORK)/hexagon-v81 $(WORK)/hexagon-v85:
 	@mkdir -p $@/ops $@/attention
@@ -191,25 +230,27 @@ $(WORK)/aarch64-android/.build-config: FORCE | $(WORK)/aarch64-android
 	@python3 $(HTP_BUILD_ROOT)/write_build_config.py "$@" AARCH64_BUILD_CONFIG
 
 $(WORK)/x86_64-linux-clang/%.o: $(SRC_DIR)/%.cpp $(WORK)/x86_64-linux-clang/.build-config $(RULE_FILES) | $(WORK)/x86_64-linux-clang
-	$(X86_CXX) $(X86_CXX_FLAGS) -DTHIS_PKG_NAME=$(PACKAGE_NAME) -MMD -c $< -o $@
+	$(X86_CXX) $(X86_CXX_FLAGS) -DTHIS_PKG_NAME=$(PACKAGE_NAME) -MMD -MP -c $< -o $@
 
 $(WORK)/x86_64-linux-clang/ops/%.o: $(OP_SRC_DIR)/%.cpp $(WORK)/x86_64-linux-clang/.build-config $(RULE_FILES) | $(WORK)/x86_64-linux-clang
-	$(X86_CXX) $(X86_CXX_FLAGS) -DTHIS_PKG_NAME=$(PACKAGE_NAME) -MMD -c $< -o $@
+	$(X86_CXX) $(X86_CXX_FLAGS) -DTHIS_PKG_NAME=$(PACKAGE_NAME) -MMD -MP -c $< -o $@
 
 $(WORK)/x86_64-linux-clang/attention/%.o: $(ATTENTION_SRC_DIR)/%.cpp $(WORK)/x86_64-linux-clang/.build-config $(RULE_FILES) | $(WORK)/x86_64-linux-clang
-	$(X86_CXX) $(X86_CXX_FLAGS) -DTHIS_PKG_NAME=$(PACKAGE_NAME) -MMD -c $< -o $@
+	@mkdir -p $(@D)
+	$(X86_CXX) $(X86_CXX_FLAGS) -DTHIS_PKG_NAME=$(PACKAGE_NAME) -MMD -MP -c $< -o $@
 
 $(WORK)/x86_64-linux-clang/$(LIBRARY_NAME): $(addprefix $(WORK)/x86_64-linux-clang/,$(OTHER_OBJS) $(OP_OBJS)) $(WORK)/x86_64-linux-clang/.build-config $(RULE_FILES) | $(HFILES)
 	$(X86_CXX) -fPIC -std=c++17 -g -shared -o $@ $(filter %.o,$^) $(X86_LDFLAGS)
 
 $(WORK)/aarch64-android/%.o: $(SRC_DIR)/%.cpp $(WORK)/aarch64-android/.build-config $(RULE_FILES) | $(WORK)/aarch64-android
-	$(AARCH64_CXX) $(ARM_CLANG_OPTS) $(AARCH64_CXX_FLAGS) -DTHIS_PKG_NAME=$(PACKAGE_NAME) -MMD -c $< -o $@
+	$(AARCH64_CXX) $(ARM_CLANG_OPTS) $(AARCH64_CXX_FLAGS) -DTHIS_PKG_NAME=$(PACKAGE_NAME) -MMD -MP -c $< -o $@
 
 $(WORK)/aarch64-android/ops/%.o: $(OP_SRC_DIR)/%.cpp $(WORK)/aarch64-android/.build-config $(RULE_FILES) | $(WORK)/aarch64-android
-	$(AARCH64_CXX) $(ARM_CLANG_OPTS) $(AARCH64_CXX_FLAGS) -DTHIS_PKG_NAME=$(PACKAGE_NAME) -MMD -c $< -o $@
+	$(AARCH64_CXX) $(ARM_CLANG_OPTS) $(AARCH64_CXX_FLAGS) -DTHIS_PKG_NAME=$(PACKAGE_NAME) -MMD -MP -c $< -o $@
 
 $(WORK)/aarch64-android/attention/%.o: $(ATTENTION_SRC_DIR)/%.cpp $(WORK)/aarch64-android/.build-config $(RULE_FILES) | $(WORK)/aarch64-android
-	$(AARCH64_CXX) $(ARM_CLANG_OPTS) $(AARCH64_CXX_FLAGS) -DTHIS_PKG_NAME=$(PACKAGE_NAME) -MMD -c $< -o $@
+	@mkdir -p $(@D)
+	$(AARCH64_CXX) $(ARM_CLANG_OPTS) $(AARCH64_CXX_FLAGS) -DTHIS_PKG_NAME=$(PACKAGE_NAME) -MMD -MP -c $< -o $@
 
 $(WORK)/aarch64-android/$(LIBRARY_NAME): $(addprefix $(WORK)/aarch64-android/,$(OTHER_OBJS) $(OP_OBJS)) $(WORK)/aarch64-android/.build-config $(RULE_FILES) | $(HFILES)
 	$(AARCH64_CXX) $(ARM_CLANG_OPTS) -fPIC -std=c++17 -g -shared -o $@ $(filter %.o,$^) $(AARCH64_LDFLAGS)
@@ -219,13 +260,14 @@ $(WORK)/hexagon-v$(1)/.build-config: FORCE | $(WORK)/hexagon-v$(1)
 	@python3 $(HTP_BUILD_ROOT)/write_build_config.py "$$@" HEXAGON_BUILD_CONFIG arch=$(1)
 
 $(WORK)/hexagon-v$(1)/%.o: $(SRC_DIR)/%.cpp $(WORK)/hexagon-v$(1)/.build-config $(RULE_FILES) | $(WORK)/hexagon-v$(1)
-	$$(HEXAGON_CXX) $$(HEXAGON_BASE_FLAGS) -mv$(1) -DQCOM_HTP_ARCH=$(1) -I$$(HEXAGON_SDK_ROOT)/rtos/qurt/computev$(1)/include/qurt -I$$(HEXAGON_SDK_ROOT)/rtos/qurt/computev$(1)/include/posix -I$$(HEXAGON_SDK_ROOT)/incs -I$$(HEXAGON_SDK_ROOT)/incs/stddef -DTHIS_PKG_NAME=$$(PACKAGE_NAME) -MMD -c $$< -o $$@
+	$$(HEXAGON_CXX) $$(HEXAGON_BASE_FLAGS) -mv$(1) -DQCOM_HTP_ARCH=$(1) -I$$(HEXAGON_SDK_ROOT)/rtos/qurt/computev$(1)/include/qurt -I$$(HEXAGON_SDK_ROOT)/rtos/qurt/computev$(1)/include/posix -I$$(HEXAGON_SDK_ROOT)/incs -I$$(HEXAGON_SDK_ROOT)/incs/stddef -DTHIS_PKG_NAME=$$(PACKAGE_NAME) -MMD -MP -c $$< -o $$@
 
 $(WORK)/hexagon-v$(1)/ops/%.o: $(OP_SRC_DIR)/%.cpp $(WORK)/hexagon-v$(1)/.build-config $(RULE_FILES) | $(WORK)/hexagon-v$(1)
-	$$(HEXAGON_CXX) $$(HEXAGON_BASE_FLAGS) -mv$(1) -DQCOM_HTP_ARCH=$(1) -I$$(HEXAGON_SDK_ROOT)/rtos/qurt/computev$(1)/include/qurt -I$$(HEXAGON_SDK_ROOT)/rtos/qurt/computev$(1)/include/posix -I$$(HEXAGON_SDK_ROOT)/incs -I$$(HEXAGON_SDK_ROOT)/incs/stddef -DTHIS_PKG_NAME=$$(PACKAGE_NAME) -MMD -c $$< -o $$@
+	$$(HEXAGON_CXX) $$(HEXAGON_BASE_FLAGS) -mv$(1) -DQCOM_HTP_ARCH=$(1) -I$$(HEXAGON_SDK_ROOT)/rtos/qurt/computev$(1)/include/qurt -I$$(HEXAGON_SDK_ROOT)/rtos/qurt/computev$(1)/include/posix -I$$(HEXAGON_SDK_ROOT)/incs -I$$(HEXAGON_SDK_ROOT)/incs/stddef -DTHIS_PKG_NAME=$$(PACKAGE_NAME) -MMD -MP -c $$< -o $$@
 
 $(WORK)/hexagon-v$(1)/attention/%.o: $(ATTENTION_SRC_DIR)/%.cpp $(WORK)/hexagon-v$(1)/.build-config $(RULE_FILES) | $(WORK)/hexagon-v$(1)
-	$$(HEXAGON_CXX) $$(HEXAGON_BASE_FLAGS) -mv$(1) -DQCOM_HTP_ARCH=$(1) -I$$(HEXAGON_SDK_ROOT)/rtos/qurt/computev$(1)/include/qurt -I$$(HEXAGON_SDK_ROOT)/rtos/qurt/computev$(1)/include/posix -I$$(HEXAGON_SDK_ROOT)/incs -I$$(HEXAGON_SDK_ROOT)/incs/stddef -DTHIS_PKG_NAME=$$(PACKAGE_NAME) -MMD -c $$< -o $$@
+	@mkdir -p $$(@D)
+	$$(HEXAGON_CXX) $$(HEXAGON_BASE_FLAGS) -mv$(1) -DQCOM_HTP_ARCH=$(1) -I$$(HEXAGON_SDK_ROOT)/rtos/qurt/computev$(1)/include/qurt -I$$(HEXAGON_SDK_ROOT)/rtos/qurt/computev$(1)/include/posix -I$$(HEXAGON_SDK_ROOT)/incs -I$$(HEXAGON_SDK_ROOT)/incs/stddef -DTHIS_PKG_NAME=$$(PACKAGE_NAME) -MMD -MP -c $$< -o $$@
 
 $(WORK)/hexagon-v$(1)/$(LIBRARY_NAME): $$(addprefix $(WORK)/hexagon-v$(1)/,$$(OTHER_OBJS) $$(OP_OBJS) $$(if $$(filter 81,$(1)),$$(HMX_OBJECTS))) $(WORK)/hexagon-v$(1)/.build-config $(RULE_FILES) | $$(HFILES)
 	$$(HEXAGON_CXX) -mv$(1) -fPIC -std=c++17 -g -shared -o $$@ $$(filter %.o,$$^) $$(HEXAGON_LDFLAGS)
@@ -243,19 +285,27 @@ $(eval $(call HEXAGON_RULES,85))
 
 $(WORK)/hexagon-v81/hmx/%.o: $(HMX_ROOT)/src/qhblas_hmx/%.c $(WORK)/hexagon-v81/.build-config $(RULE_FILES)
 	@mkdir -p $(@D)
-	$(HEXAGON_CC) -O3 -fPIC -mv81 -mhmx -mhvx -mhvx-length=128B -I$(HMX_ROOT)/inc/qhblas_hmx -I$(HEXAGON_SDK_ROOT)/libs/qhl_hvx/inc/internal -I$(HEXAGON_SDK_ROOT)/rtos/qurt/computev81/include/qurt -MMD -c $< -o $@
+	$(HEXAGON_CC) -O3 -fPIC -mv81 -mhmx -mhvx -mhvx-length=128B -I$(HMX_ROOT)/inc/qhblas_hmx -I$(HEXAGON_SDK_ROOT)/libs/qhl_hvx/inc/internal -I$(HEXAGON_SDK_ROOT)/rtos/qurt/computev81/include/qurt -MMD -MP -c $< -o $@
 
 $(WORK)/hexagon-v81/hmx/%.o: $(HMX_ROOT)/src/qhblas_hmx/%.S $(WORK)/hexagon-v81/.build-config $(RULE_FILES)
 	@mkdir -p $(@D)
-	$(HEXAGON_CC) -fPIC -mv81 -mhmx -MMD -c $< -o $@
+	$(HEXAGON_CC) -fPIC -mv81 -mhmx -MMD -MP -c $< -o $@
 
 clean:
 	-rm -rf $(WORK)
 
 FORCE:
 
-# Track local utility headers as well as SDK headers emitted by -MMD.
--include $(foreach target,x86_64-linux-clang aarch64-android hexagon-v79 hexagon-v81 hexagon-v85,\
+# Objects depend on RULE_FILES. Older dependency files are replaced by that
+# rebuild, and may still name headers removed by a source reorganization.
+DEP_FILES := $(foreach target,x86_64-linux-clang aarch64-android hexagon-v79 hexagon-v81 hexagon-v85,\
     $(addprefix $(WORK)/$(target)/,$(OTHER_OBJS:.o=.d) $(OP_OBJS:.o=.d)))
+-include $(shell for htp_dep in $(wildcard $(DEP_FILES)); do \
+    htp_stale=; \
+    for htp_rule in $(RULE_FILES); do \
+      if test "$$htp_rule" -nt "$$htp_dep"; then htp_stale=1; break; fi; \
+    done; \
+    if test -z "$$htp_stale"; then printf '%s\n' "$$htp_dep"; fi; \
+  done)
 
-.PHONY: all clean FORCE htp_x86 htp_aarch64 htp_v79 htp_v81 htp_v85 test-attention test-reduction test-reference-reduction test-fp16-register
+.PHONY: all clean FORCE htp_x86 htp_aarch64 htp_v79 htp_v81 htp_v85 test-attention test-attention-u16 test-attention-stream test-hmx-tile-layout test-chunk test-chunk-state-update test-reduction test-reference-reduction test-fp16-register test-op-package-interface

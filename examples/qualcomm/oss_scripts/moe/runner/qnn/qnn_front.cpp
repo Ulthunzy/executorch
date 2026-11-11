@@ -4,6 +4,23 @@
 #include "binary_weights.h"
 #include <cerrno>
 
+namespace {
+uint32_t power_option(const char* name, uint32_t minimum, uint32_t maximum) {
+  const char* text = getenv(name);
+  if (!text)
+    return 0;
+  char* end = nullptr;
+  errno = 0;
+  const unsigned long value = strtoul(text, &end, 10);
+  if (errno || *text < '0' || *text > '9' || *end || value < minimum ||
+      value > maximum)
+    throw std::runtime_error(
+        std::string(name) + " must be an integer in [" +
+        std::to_string(minimum) + ", " + std::to_string(maximum) + "]");
+  return static_cast<uint32_t>(value);
+}
+} // namespace
+
 std::map<std::string, EmbeddedBinary> embedded_binaries;
 
 void check(Qnn_ErrorHandle_t status, const char* action) {
@@ -126,6 +143,9 @@ void Runtime::set_power_active(bool active) {
   }
   if (power_id)
     return;
+  const uint32_t hmx_timeout_us =
+      power_option("QNN_HMX_TIMEOUT_US", 100, 1000000);
+  const bool ddr_perf_mode = power_option("QNN_DDR_PERF_MODE", 0, 1);
   try {
     check(perf.createPowerConfigId(0, 0, &power_id), "createPowerConfigId");
 
@@ -152,8 +172,22 @@ void Runtime::set_power_active(bool active) {
     poll.option =
         QNN_HTP_PERF_INFRASTRUCTURE_POWER_CONFIGOPTION_RPC_POLLING_TIME;
     poll.rpcPollingTimeConfig = 9999;
-    const QnnHtpPerfInfrastructure_PowerConfig_t* config[] = {
-        &dcvs, &latency, &poll, nullptr};
+    QnnHtpPerfInfrastructure_PowerConfig_t hmx{}, ddr{};
+    const QnnHtpPerfInfrastructure_PowerConfig_t* config[6] = {
+        &dcvs, &latency, &poll};
+    size_t count = 3;
+    if (hmx_timeout_us) {
+      hmx.option =
+          QNN_HTP_PERF_INFRASTRUCTURE_POWER_CONFIGOPTION_HMX_TIMEOUT_INTERVAL_US;
+      hmx.hmxTimeoutIntervalUsConfig = hmx_timeout_us;
+      config[count++] = &hmx;
+    }
+    if (ddr_perf_mode) {
+      // Android V81 LLMs require RPC polling and the maximum bus vote above.
+      ddr.option = QNN_HTP_PERF_INFRASTRUCTURE_POWER_CONFIGOPTION_DDR_PERF_MODE;
+      ddr.ddrPerfModeConfig = 1;
+      config[count++] = &ddr;
+    }
     check(perf.setPowerConfig(power_id, config), "setPowerConfig");
   } catch (...) {
     if (power_id)

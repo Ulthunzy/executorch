@@ -9,6 +9,11 @@
 #include <executorch/kernels/quantized/cpu/embeddingxb.h>
 #include <executorch/runtime/kernel/kernel_includes.h>
 #include <cinttypes>
+#include <type_traits>
+
+#if defined(__aarch64__)
+#include <arm_neon.h>
+#endif
 
 namespace torch {
 namespace executor {
@@ -19,6 +24,58 @@ using Scalar = executorch::aten::Scalar;
 using ScalarType = executorch::aten::ScalarType;
 
 namespace {
+
+#if defined(__aarch64__)
+template <typename CTYPE_INDICES>
+void embedding_4bit_float_neon(
+    const uint8_t* weight,
+    const float* scales,
+    const CTYPE_INDICES* indices,
+    float* out,
+    size_t num_indices,
+    int32_t embedding_dim,
+    int32_t num_groups,
+    int32_t group_size) {
+  const uint8x16_t mask = vdupq_n_u8(15);
+  const int8x16_t offset = vdupq_n_s8(8);
+  for (size_t i = 0; i < num_indices; ++i) {
+    const auto index = static_cast<size_t>(indices[i]);
+    const uint8_t* row = weight + index * (embedding_dim / 2);
+    const float* row_scales = scales + index * num_groups;
+    for (int32_t g = 0; g < num_groups; ++g) {
+      const float32x4_t scale = vdupq_n_f32(row_scales[g]);
+      for (int32_t j = 0; j < group_size; j += 32) {
+        const uint8x16_t packed = vld1q_u8(row);
+        row += 16;
+        const uint8x16_t high = vshrq_n_u8(packed, 4);
+        const uint8x16_t low = vandq_u8(packed, mask);
+        const int8x16_t first = vsubq_s8(
+            vreinterpretq_s8_u8(vzip1q_u8(high, low)), offset);
+        const int8x16_t second = vsubq_s8(
+            vreinterpretq_s8_u8(vzip2q_u8(high, low)), offset);
+        for (int half = 0; half < 2; ++half) {
+          const int8x16_t values = half == 0 ? first : second;
+          const int16x8_t lo = vmovl_s8(vget_low_s8(values));
+          const int16x8_t hi = vmovl_s8(vget_high_s8(values));
+          vst1q_f32(
+              out,
+              vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_low_s16(lo))), scale));
+          vst1q_f32(
+              out + 4,
+              vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_high_s16(lo))), scale));
+          vst1q_f32(
+              out + 8,
+              vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_low_s16(hi))), scale));
+          vst1q_f32(
+              out + 12,
+              vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_high_s16(hi))), scale));
+          out += 16;
+        }
+      }
+    }
+  }
+}
+#endif
 
 static inline int32_t
 weight_value(const unsigned char* w_data, int32_t index, int32_t weight_nbit) {
@@ -186,6 +243,24 @@ void embedding_xbit_per_channel(
   const CTYPE_INDICES* indices_ptr = indices.const_data_ptr<CTYPE_INDICES>();
 
   const CTYPE_PARAMS* scales = weight_scales.const_data_ptr<CTYPE_PARAMS>();
+#if defined(__aarch64__)
+  if constexpr (
+      std::is_same_v<CTYPE_PARAMS, float> && std::is_same_v<CTYPE_OUT, float>) {
+    if (weight_nbit == 4 && group_size > 0 && group_size % 32 == 0 &&
+        !opt_weight_zero_points.has_value()) {
+      embedding_4bit_float_neon(
+          weight.const_data_ptr<uint8_t>(),
+          scales,
+          indices_ptr,
+          out_data,
+          indices.numel(),
+          embedding_dim,
+          num_groups_per_channel,
+          group_size);
+      return;
+    }
+  }
+#endif
   const CTYPE_PARAMS* zero_points = nullptr;
   if (opt_weight_zero_points.has_value()) {
     zero_points = opt_weight_zero_points.value().const_data_ptr<CTYPE_PARAMS>();

@@ -50,6 +50,32 @@ def setup_gdn_op_package(args):
         workspace=DEVICE_WORKSPACE,
     )
     options, paths = setup_op_package(package_args, state_vtcm=True)
+    if arch == 81:
+        from executorch.examples.qualcomm.custom_op.attention_support.package import (
+            attention_package,
+        )
+        from executorch.examples.qualcomm.custom_op.deltanet_support.chunk import (
+            chunk_package,
+        )
+        from executorch.examples.qualcomm.custom_op.deltanet_support.decode_gate import (
+            decode_gate_package,
+        )
+        from executorch.examples.qualcomm.custom_op.deltanet_support.state_update import (
+            state_update_package,
+        )
+
+        host = (
+            Path(args.gdn_op_package_dir)
+            / "build/x86_64-linux-clang/libQnnDeltaNetOpPackage.so"
+        )
+        device = f"{DEVICE_WORKSPACE}/libQnnDeltaNetOpPackage_HTP.so"
+        for package in (
+            chunk_package,
+            decode_gate_package,
+            state_update_package,
+            attention_package,
+        ):
+            options.op_package_infos.extend(package(host, device).op_package_infos)
     required_paths = [
         *paths,
         str(

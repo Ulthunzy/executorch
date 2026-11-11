@@ -1,20 +1,20 @@
-#include "../../htp_arch.h"
-#include "integer_moe.h"
-#include "../expert_stream.h"
-#include "HTP/core/qhpi.h"
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include "../../htp_arch.h"
+#include "../expert_stream.h"
+#include "HTP/core/qhpi.h"
+#include "integer_moe.h"
 
-// 同层 token 按专家归并，HMX 始终以最多 32 行的 tile 计算。
+// 同层 token 按专家归并；每份权重可服务多个 32 行 HMX tile。
 // HVX 准备输入和后处理，HMX 集中执行矩阵乘；权重读取量由专家去重结果决定。
 #ifdef __hexagon__
+#include "HAP_perf.h"
 #include "hexagon_protos.h"
-#include "hvx_hexagon_protos.h"
 #include "hmx_integer.h"
 #include "hvx-sigmoid.h"
-#include "HAP_perf.h"
+#include "hvx_hexagon_protos.h"
 #include "qurt_pimutex.h"
 #define vmem(p)                    \
   (*reinterpret_cast<HVX_Vector*>( \
@@ -25,6 +25,7 @@
 
 uint64_t metrics[10][8];
 uint32_t execution_counts[4];
+uint64_t transfer_metrics[kWorkers][kTransferCounters];
 
 struct alignas(128) DmaDescriptor {
   void* next;
@@ -112,13 +113,35 @@ static void prepare_activations(
           vmem(packed + (m * width + g * grid + k) * 4) = code;
           continue;
         }
-        auto* target = packed + (g * grid + k) / 32 * 2048 + (m / 2) * 128;
+        auto* target = packed + (m / 32) * width * 64 +
+            (g * grid + k) / 32 * 2048 + (m % 32 / 2) * 128;
         if (m % 2)
           vmem(target) = Q6_V_vor_VV(vmem(target), Q6_Vw_vasl_VwR(code, 24));
         else
           vmem(target) = Q6_Vw_vasl_VwR(code, 8);
       }
     }
+}
+
+static void pack_a8_pair(
+    uint8_t* packed,
+    const uint8_t* first,
+    const uint8_t* second,
+    int row,
+    int width) {
+  for (int k = 0; k < width; k += 128) {
+    const auto a = vmem(first + k);
+    const auto b = second ? vmem(second + k) : Q6_V_vzero();
+    const auto interleaved = Q6_W_vshuff_VVR(b, a, -1);
+    const auto lo = Q6_Wuh_vunpack_Vub(Q6_V_lo_W(interleaved));
+    const auto hi = Q6_Wuh_vunpack_Vub(Q6_V_hi_W(interleaved));
+    auto* target = packed + (row / 32) * width * 64 + (k / 32) * 2048 +
+        (row % 32 / 2) * 128;
+    vmem(target) = Q6_Vh_vasl_VhR(Q6_V_lo_W(lo), 8);
+    vmem(target + 2048) = Q6_Vh_vasl_VhR(Q6_V_hi_W(lo), 8);
+    vmem(target + 4096) = Q6_Vh_vasl_VhR(Q6_V_lo_W(hi), 8);
+    vmem(target + 6144) = Q6_Vh_vasl_VhR(Q6_V_hi_W(hi), 8);
+  }
 }
 
 // 双缓冲权重 tile，把下一块 DMA 与当前块 HMX 交叠；N2 仅在 VTCM 展开为 N4。
@@ -133,14 +156,14 @@ template <
 static void projection(
     Request* request,
     const uint8_t* codes,
-    const float* scales,
+    const float* __restrict scales,
     const int16_t* sums,
     int n,
     int padded_k,
     int grid,
     int rows,
-    const float* activation_scales,
-    float* destination,
+    const float* __restrict activation_scales,
+    float* __restrict destination,
     int destination_stride,
     bool routed,
     const int* token,
@@ -159,11 +182,22 @@ static void projection(
   const float factor = grid == 1024 ? 32.f : 16.f;
   request->k = std::min(grid, padded_k);
   request->groups = groups;
+  request->row_tiles = (rows + 31) / 32;
   auto* weight_buffers = request->w;
   constexpr int transfer_bytes = 65536;
   const int block_bytes = padded_k * 16,
             blocks_per_transfer = transfer_bytes / block_bytes;
   DmaDescriptor transfer[2]{};
+#if SM_MOE_PROFILE
+  auto& counters = transfer_metrics[request->worker];
+  for (int first = 0; first < n / 32; first += blocks_per_transfer) {
+    const int expanded =
+        std::min(transfer_bytes, (n / 32 - first) * block_bytes);
+    counters[kWeightDmaBytes] += expanded / 2;
+    ++counters[kWeightDmaCalls];
+    counters[kExpandedWeightBytes] += expanded;
+  }
+#endif
   dma_start(
       transfer[0],
       weight_buffers,
@@ -224,49 +258,60 @@ static void projection(
     await(&request->ready, 2);
     metrics[request->worker][3] += tick() - stamp;
     stamp = tick();
-    for (int b = 0; b < blocks; b++)
-      for (int m = 0; m < rows; m++) {
-        const int block = nb + b;
-        HVX_Vector accum = Q6_V_vzero();
-        for (int g = 0; g < groups; g++) {
-          const auto raw =
-              vmem(request->raw + (b * groups + g) * 1024 + (m / 2) * 64);
-          const auto integers = Q6_Vw_vdmpy_VhRh_sat(raw, m % 2 ? 0x10000 : 1);
-          const auto sw = vmem(scales + (block * groups + g) * 32);
-          const auto sa =
-              hvx_vec_splat_f32(factor * activation_scales[m * 2 + g]);
-          auto v = Q6_Vsf_vmpy_VsfVsf(Q6_Vsf_equals_Vw(integers), sw);
-          v = Q6_Vsf_vmpy_VsfVsf(v, sa);
-          accum = Q6_Vsf_vadd_VsfVsf(accum, v);
-        }
-        float* target;
-        if (routed) {
-#if SM_MOE_ACCUMULATE
-          target = destination + size_t(m) * 2048 + block * 32;
-#else
-          target =
-              destination + size_t(token[m] * 8 + slot[m]) * 2048 + block * 32;
-#endif
-          accum = Q6_Vsf_vmpy_VsfVsf(
-              accum, hvx_vec_splat_f32(scores[token[m] * 8 + slot[m]]));
-        } else {
-          int column = block * 32;
-          if (column >= n / 2) {
-            column -= n / 2;
-            const auto gate =
-                vmem(destination + m * destination_stride + column);
-            const auto sigmoid = hvx_vec_fast_sigmoid_f32_guard(
-                gate,
-                hvx_vec_splat_f32(1.f),
-                hvx_vec_splat_f32(87.f),
-                hvx_vec_splat_f32(-87.f));
-            accum =
-                Q6_Vsf_vmpy_VsfVsf(Q6_Vsf_vmpy_VsfVsf(gate, sigmoid), accum);
+    for (int first_row = 0; first_row < rows; first_row += 32) {
+      const int tile_rows = std::min(32, rows - first_row);
+      const auto* raw_rows =
+          request->raw + (first_row / 32) * blocks * groups * 1024;
+      const auto* scale_rows = activation_scales + first_row * 2;
+      const auto* token_rows = token ? token + first_row : nullptr;
+      const auto* slot_rows = slot ? slot + first_row : nullptr;
+      auto* destination_rows =
+          routed ? destination : destination + first_row * destination_stride;
+      for (int b = 0; b < blocks; b++)
+        for (int m = 0; m < tile_rows; m++) {
+          const int block = nb + b;
+          HVX_Vector accum = Q6_V_vzero();
+          for (int g = 0; g < groups; g++) {
+            const auto raw =
+                vmem(raw_rows + (b * groups + g) * 1024 + (m / 2) * 64);
+            const auto integers =
+                Q6_Vw_vdmpy_VhRh_sat(raw, m % 2 ? 0x10000 : 1);
+            const auto sw = vmem(scales + (block * groups + g) * 32);
+            const auto sa = hvx_vec_splat_f32(factor * scale_rows[m * 2 + g]);
+            auto v = Q6_Vsf_vmpy_VsfVsf(Q6_Vsf_equals_Vw(integers), sw);
+            v = Q6_Vsf_vmpy_VsfVsf(v, sa);
+            accum = Q6_Vsf_vadd_VsfVsf(accum, v);
           }
-          target = destination + m * destination_stride + column;
+          float* target;
+          if (routed) {
+#if SM_MOE_ACCUMULATE
+            target = destination + size_t(first_row + m) * 2048 + block * 32;
+#else
+            target = destination +
+                size_t(token_rows[m] * 8 + slot_rows[m]) * 2048 + block * 32;
+#endif
+            accum = Q6_Vsf_vmpy_VsfVsf(
+                accum,
+                hvx_vec_splat_f32(scores[token_rows[m] * 8 + slot_rows[m]]));
+          } else {
+            int column = block * 32;
+            if (column >= n / 2) {
+              column -= n / 2;
+              const auto gate =
+                  vmem(destination_rows + m * destination_stride + column);
+              const auto sigmoid = hvx_vec_fast_sigmoid_f32_guard(
+                  gate,
+                  hvx_vec_splat_f32(1.f),
+                  hvx_vec_splat_f32(87.f),
+                  hvx_vec_splat_f32(-87.f));
+              accum =
+                  Q6_Vsf_vmpy_VsfVsf(Q6_Vsf_vmpy_VsfVsf(gate, sigmoid), accum);
+            }
+            target = destination_rows + m * destination_stride + column;
+          }
+          vmem(target) = accum;
         }
-        vmem(target) = accum;
-      }
+    }
     write(&request->ready, 0);
     metrics[request->worker][4] += tick() - stamp;
     nb += blocks;
@@ -274,15 +319,19 @@ static void projection(
   request->w = weight_buffers;
 }
 
-uint32_t execute_integer_moe(
+template <bool Grouped>
+static uint32_t execute_integer_moe_impl(
     QHPI_RuntimeHandle* handle,
     uint32_t,
     QHPI_Tensor** outputs,
     uint32_t,
     const QHPI_Tensor* const* inputs) {
+  using Layout = moe_prefill_vtcm::Layout<Grouped>;
   auto* sync = static_cast<Sync*>(native_qhpi::sync_block(handle));
-  auto* workspace = static_cast<uint8_t*>(native_qhpi::tensor_raw_data(outputs[1]));
-  auto* route_output = static_cast<float*>(native_qhpi::tensor_raw_data(outputs[2]));
+  auto* workspace =
+      static_cast<uint8_t*>(native_qhpi::tensor_raw_data(outputs[1]));
+  auto* route_output =
+      static_cast<float*>(native_qhpi::tensor_raw_data(outputs[2]));
   const auto* descriptor =
       static_cast<const int32_t*>(native_qhpi::tensor_raw_data(inputs[4]));
   const bool streaming = descriptor[4] == expert_stream::kPhase ||
@@ -290,7 +339,8 @@ uint32_t execute_integer_moe(
   const int phase = streaming ? 0 : descriptor[4];
   const int tokens_count = expert_stream::token_count(descriptor[3]);
   const int valid_tokens = expert_stream::valid_token_count(descriptor[3]);
-  const auto* x = static_cast<const float*>(native_qhpi::tensor_raw_data(inputs[0]));
+  const auto* x =
+      static_cast<const float*>(native_qhpi::tensor_raw_data(inputs[0]));
   const auto* ids_ddr =
       static_cast<const int32_t*>(native_qhpi::tensor_raw_data(inputs[1]));
   const auto* scores_ddr =
@@ -311,7 +361,8 @@ uint32_t execute_integer_moe(
       output[1] = native_qhpi::slice_number(handle);
       output[2] = resource;
     } else if (resource == QHPI_RESOURCE_HVX)
-      output[4 + native_qhpi::slice_number(handle)] = native_qhpi::num_slices(handle);
+      output[4 + native_qhpi::slice_number(handle)] =
+          native_qhpi::num_slices(handle);
     return 0;
   }
   const auto started = tick();
@@ -332,13 +383,15 @@ uint32_t execute_integer_moe(
           continue;
         const auto stamp = tick();
         for (unsigned b = 0; b < r->nblocks; b++)
-          for (unsigned g = 0; g < r->groups; g++)
-            integer_hmx(
-                r->a + g * r->k * 64,
-                r->w + b * r->block_bytes + g * r->k * 16,
-                r->bias + (b * r->groups + g) * 64,
-                r->raw + (b * r->groups + g) * 1024,
-                r->k);
+          for (unsigned g = 0; g < r->groups; g++) {
+            Q6_bias_mxmem2_A((void*)(r->bias + (b * r->groups + g) * 64));
+            for (unsigned row = 0; row < r->row_tiles; row++)
+              integer_hmx(
+                  r->a + (row * r->groups + g) * r->k * 64,
+                  r->w + b * r->block_bytes + g * r->k * 16,
+                  r->raw + ((row * r->nblocks + b) * r->groups + g) * 1024,
+                  r->k);
+          }
         metrics[9][0] += tick() - stamp;
         write(&r->ready, 2);
       }
@@ -385,17 +438,20 @@ uint32_t execute_integer_moe(
   const uint32_t worker = increment(&sync->arrived);
   if (count > unsigned(kWorkers))
     return 23;
-  auto* base = reinterpret_cast<uint8_t*>(
-                   (uintptr_t(workspace) + moe_prefill_vtcm::kWorkspaceAlignment - 1) &
-                   ~uintptr_t(moe_prefill_vtcm::kWorkspaceAlignment - 1)) +
-      worker * moe_prefill_vtcm::kWorkerBytes;
-  uint8_t* packed = base;
-  float* gu = reinterpret_cast<float*>(base + 131072);
+  auto* aligned = reinterpret_cast<uint8_t*>(
+      (uintptr_t(workspace) + moe_prefill_vtcm::kWorkspaceAlignment - 1) &
+      ~uintptr_t(moe_prefill_vtcm::kWorkspaceAlignment - 1));
+  auto* hmx = aligned + worker * Layout::kHmxWorkerBytes;
+  auto* shared_aux =
+      aligned + (Layout::kWide ? count * Layout::kHmxWorkerBytes : 0);
+  auto* base = shared_aux + worker * Layout::kAuxWorkerBytes;
+  uint8_t* packed = hmx;
+  float* gu = reinterpret_cast<float*>(base + Layout::kGuOffset);
   float* middle = gu;
-  uint8_t* weights = base + 196608;
-  uint32_t* bias = reinterpret_cast<uint32_t*>(base + 385024);
-  uint16_t* raw = reinterpret_cast<uint16_t*>(base + 368640);
-  float activation_scales[64] __attribute__((aligned(128)));
+  uint8_t* weights = hmx + Layout::kWeightsOffset;
+  uint32_t* bias = reinterpret_cast<uint32_t*>(hmx + Layout::kBiasOffset);
+  uint16_t* raw = reinterpret_cast<uint16_t*>(hmx + Layout::kRawOffset);
+  float activation_scales[Layout::kBatchRows * 2] __attribute__((aligned(128)));
   Request* request = &sync->requests[worker];
   request->worker = worker;
   request->a = packed;
@@ -403,8 +459,8 @@ uint32_t execute_integer_moe(
   request->bias = bias;
   request->raw = raw;
   await(&sync->go, 1);
-  auto* ids = reinterpret_cast<int32_t*>(base + 389248);
-  auto* scores = reinterpret_cast<float*>(base + 393344);
+  auto* ids = reinterpret_cast<int32_t*>(base + Layout::kIdsOffset);
+  auto* scores = reinterpret_cast<float*>(base + Layout::kScoresOffset);
   // AR128 uses worker-local routing copies; larger groups use the mapped
   // read-only tables. Each worker retains the same fixed tile workspace.
   if (tokens_count == 128) {
@@ -420,16 +476,19 @@ uint32_t execute_integer_moe(
   const float* all_scores = tokens_count == 128 ? scores : scores_ddr;
   const uint8_t* bank = sync->bank;
   const auto* offsets = reinterpret_cast<const uint64_t*>(bank + 32);
-  auto* input_codes = workspace + moe_prefill_vtcm::inputCodesOffset(tokens_count);
-  auto* input_scales = reinterpret_cast<float*>(workspace + 447488);
+  auto* input_codes =
+      workspace + moe_prefill_vtcm::inputCodesOffset(tokens_count);
+  auto* input_scales =
+      reinterpret_cast<float*>(shared_aux + Layout::kInputScalesOffset);
   const int first_token = worker * (tokens_count / count);
-  int local[32];
-  for (int i = 0; i < 32; i++)
+  int local[Layout::kBatchRows];
+  for (unsigned i = 0; i < Layout::kBatchRows; i++)
     local[i] = i;
-  // Worker 0 padding holds the shared CSR (up to 8192 assignments). Its end
-  // at 414976 precedes the per-worker stream scratch at 415104.
-  auto* route_offsets = reinterpret_cast<uint32_t*>(workspace + 397440);
-  auto* assignments = reinterpret_cast<uint16_t*>(workspace + 398592);
+  // Worker 0 owns the shared CSR; stream scratch remains private per worker.
+  auto* route_offsets =
+      reinterpret_cast<uint32_t*>(shared_aux + Layout::kRouteOffsetsOffset);
+  auto* assignments =
+      reinterpret_cast<uint16_t*>(shared_aux + Layout::kAssignmentsOffset);
   auto prepared_at = tick();
   if (worker == 0) {
     unsigned counts[256]{}, cursor[256];
@@ -471,11 +530,23 @@ uint32_t execute_integer_moe(
         1024,
         true);
     for (int m = 0; m < 16; m++)
-      for (int k = 0; k < 2048; k += 64) {
-        const auto first_code = vmem(packed + (m * 2048 + k) * 4),
-                   second_code = vmem(packed + (m * 2048 + k + 32) * 4);
-        vmem(input_codes + ((first + m) * 2048 + k) * 2) =
-            Q6_Vh_vpacke_VwVw(second_code, first_code);
+      if constexpr (Layout::kInputCodeBytes == 1) {
+        for (int k = 0; k < 2048; k += 128) {
+          const auto a = Q6_Vh_vpacke_VwVw(
+              vmem(packed + (m * 2048 + k + 32) * 4),
+              vmem(packed + (m * 2048 + k) * 4));
+          const auto b = Q6_Vh_vpacke_VwVw(
+              vmem(packed + (m * 2048 + k + 96) * 4),
+              vmem(packed + (m * 2048 + k + 64) * 4));
+          vmem(input_codes + (first + m) * 2048 + k) = Q6_Vb_vpacke_VhVh(b, a);
+        }
+      } else {
+        for (int k = 0; k < 2048; k += 64) {
+          const auto first_code = vmem(packed + (m * 2048 + k) * 4),
+                     second_code = vmem(packed + (m * 2048 + k + 32) * 4);
+          vmem(input_codes + ((first + m) * 2048 + k) * 2) =
+              Q6_Vh_vpacke_VwVw(second_code, first_code);
+        }
       }
   }
 #if SM_MOE_ACCUMULATE
@@ -487,8 +558,8 @@ uint32_t execute_integer_moe(
   await(&sync->prepared, count);
   metrics[worker][0] += tick() - prepared_at;
   auto error = read(&sync->error);
-  auto* expert_order = reinterpret_cast<uint16_t*>(base + 415104);
-  auto* ready = reinterpret_cast<uint32_t*>(base + 415616);
+  auto* expert_order = reinterpret_cast<uint16_t*>(base + Layout::kOrderOffset);
+  auto* ready = reinterpret_cast<uint32_t*>(base + Layout::kReadyOffset);
   if (streaming && !error) {
     dma_copy(expert_order, bank + expert_stream::kOrderOffset, 512);
     dma_copy(ready, bank + expert_stream::kReadyOffset, 1024);
@@ -550,34 +621,65 @@ uint32_t execute_integer_moe(
     const uint8_t* expert_data = (offset & expert_stream::kResident)
         ? sync->resident_bank + (offset & ~expert_stream::kResident)
         : bank + offset;
-    auto* header = reinterpret_cast<uint32_t*>(base + 389120);
+    auto* header = reinterpret_cast<uint32_t*>(base + Layout::kHeaderOffset);
     // 专家头与 prepare_experts.py 的 12×UINT32 ABI 一致；
     // GU 的 codes/scales/sums 在 [4/5/6]，down 在
     // [7/8/9]，偏移以专家起点为基准。
     dma_copy(header, expert_data, 128);
     const int width = header[1], down_k = (width + 127) / 128 * 128;
-    auto* gu_meta = base + 327680;
-    auto* down_meta = gu_meta;
-    for (int begin = 0; begin < total; begin += 32) {
-      const int rows = std::min(32, total - begin);
-      dma_copy(gu_meta, expert_data + header[5], header[7] - header[5]);
+    auto* gu_meta = base + Layout::kMetaOffset;
+    auto* down_meta = base + Layout::kDownMetaOffset;
+    dma_copy(gu_meta, expert_data + header[5], header[7] - header[5]);
+    dma_copy(down_meta, expert_data + header[8], header[3] - header[8]);
+#if SM_MOE_PROFILE
+    transfer_metrics[worker][kMetadataDmaBytes] +=
+        128 + header[7] - header[5] + header[3] - header[8];
+    transfer_metrics[worker][kMetadataDmaCalls] += 3;
+#endif
+    for (int begin = 0; begin < total; begin += Layout::kBatchRows) {
+      const int rows = std::min(int(Layout::kBatchRows), total - begin);
+#if SM_MOE_PROFILE
+      ++transfer_metrics[worker][kExpertBatches];
+#endif
       auto stamp = tick();
-      for (int m = 0; m < rows; m++) {
-        const int token = tokens[begin + m];
-        activation_scales[m * 2] = input_scales[token * 2];
-        activation_scales[m * 2 + 1] = input_scales[token * 2 + 1];
-        for (int k = 0; k < 2048; k += 64) {
-          const auto pair =
-              Q6_Ww_vunpack_Vh(vmem(input_codes + (token * 2048 + k) * 2));
-          auto* target = packed + k / 32 * 2048 + (m / 2) * 128;
-          if (m % 2) {
-            vmem(target) =
-                Q6_V_vor_VV(vmem(target), Q6_Vw_vasl_VwR(Q6_V_lo_W(pair), 24));
-            vmem(target + 2048) = Q6_V_vor_VV(
-                vmem(target + 2048), Q6_Vw_vasl_VwR(Q6_V_hi_W(pair), 24));
-          } else {
-            vmem(target) = Q6_Vw_vasl_VwR(Q6_V_lo_W(pair), 8);
-            vmem(target + 2048) = Q6_Vw_vasl_VwR(Q6_V_hi_W(pair), 8);
+      if constexpr (Layout::kInputCodeBytes == 1) {
+        for (int m = 0; m < rows; m += 2) {
+          for (int r = m; r < std::min(m + 2, rows); ++r) {
+            const int token = tokens[begin + r];
+            activation_scales[r * 2] = input_scales[token * 2];
+            activation_scales[r * 2 + 1] = input_scales[token * 2 + 1];
+          }
+          pack_a8_pair(
+              packed,
+              input_codes + tokens[begin + m] * 2048,
+              m + 1 < rows ? input_codes + tokens[begin + m + 1] * 2048
+                           : nullptr,
+              m,
+              2048);
+        }
+      } else {
+        for (int m = 0; m < rows; m++) {
+          const int token = tokens[begin + m];
+          activation_scales[m * 2] = input_scales[token * 2];
+          activation_scales[m * 2 + 1] = input_scales[token * 2 + 1];
+          for (int k = 0; k < 2048; k += 128) {
+            const HVX_Vector codes[] = {
+                vmem(input_codes + (token * 2048 + k) * 2),
+                vmem(input_codes + (token * 2048 + k + 64) * 2)};
+            for (int half = 0; half < 2; half++) {
+              const auto pair = Q6_Ww_vunpack_Vh(codes[half]);
+              auto* target = packed + (m / 32) * 2048 * 64 +
+                  (k + half * 64) / 32 * 2048 + (m % 32 / 2) * 128;
+              if (m % 2) {
+                vmem(target) = Q6_V_vor_VV(
+                    vmem(target), Q6_Vw_vasl_VwR(Q6_V_lo_W(pair), 24));
+                vmem(target + 2048) = Q6_V_vor_VV(
+                    vmem(target + 2048), Q6_Vw_vasl_VwR(Q6_V_hi_W(pair), 24));
+              } else {
+                vmem(target) = Q6_Vw_vasl_VwR(Q6_V_lo_W(pair), 8);
+                vmem(target + 2048) = Q6_Vw_vasl_VwR(Q6_V_hi_W(pair), 8);
+              }
+            }
           }
         }
       }
@@ -618,10 +720,7 @@ uint32_t execute_integer_moe(
             nullptr,
             nullptr,
             nullptr);
-      // GU consumes gate first, then overwrites it with SwiGLU when the up
-      // block arrives. GU and down metadata have disjoint lifetimes and share
-      // the same 40 KiB region.
-      dma_copy(down_meta, expert_data + header[8], header[3] - header[8]);
+      // GU overwrites gate with SwiGLU when its matching up block arrives.
       stamp = tick();
       for (int m = 0; m < rows; m++)
         memset(middle + m * 512 + width, 0, (512 - width) * 4);
@@ -725,6 +824,22 @@ uint32_t execute_integer_moe(
   increment(&sync->departed);
   return error;
 }
+uint32_t execute_integer_moe(
+    QHPI_RuntimeHandle* handle,
+    uint32_t output_count,
+    QHPI_Tensor** outputs,
+    uint32_t input_count,
+    const QHPI_Tensor* const* inputs) {
+  const auto* descriptor =
+      static_cast<const int32_t*>(native_qhpi::tensor_raw_data(inputs[4]));
+  if constexpr (moe_prefill_vtcm::kCompact)
+    if (expert_stream::token_count(descriptor[3]) > 128)
+      return execute_integer_moe_impl<true>(
+          handle, output_count, outputs, input_count, inputs);
+  return execute_integer_moe_impl<false>(
+      handle, output_count, outputs, input_count, inputs);
+}
+
 #else
 uint32_t execute_integer_moe(
     QHPI_RuntimeHandle*,

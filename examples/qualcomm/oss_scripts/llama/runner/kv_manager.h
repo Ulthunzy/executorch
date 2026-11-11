@@ -33,6 +33,7 @@ class KVManager {
       kAppend,
       kCircular,
       kFullOverwrite,
+      kMappedAppend,
     };
 
     struct CacheSpec {
@@ -43,6 +44,7 @@ class KVManager {
       CacheUpdateMode update_mode;
       int32_t k_zero_point = 0;
       int32_t v_zero_point = 0;
+      int32_t mapped_capacity = 0;
     };
 
     int32_t context_len;
@@ -79,6 +81,8 @@ class KVManager {
   void reset_state(int32_t ar_len, bool clear_buffers = false);
 
   bool has_inplace_cache_updates() const;
+  void
+  prepare_attention_lengths(std::byte* lengths, int32_t valid, int32_t history);
 
   /**
    * @brief Switch key and value cache from AR-cur to AR-dst.
@@ -192,7 +196,8 @@ class KVManager {
    * For non-SWA layers, this uses metadata_.max_cache_len to preserve the
    * existing pack/rearrange behavior across different AR lengths.
    *
-   * @param layer_cache_len Length of cache (last dim) for each layer's KV input.
+   * @param layer_cache_len Length of cache (last dim) for each layer's KV
+   * input.
    * @param layer_is_swa Indicates whether each layer uses SWA cache update.
    */
   void init_cache_swa(
@@ -360,5 +365,13 @@ class KVManager {
   std::vector<size_t> v_cache_out_nbytes_;
   std::vector<int64_t> k_head_dim_;
   std::vector<int64_t> v_head_dim_;
+  struct MappedCache {
+    IMemAlloc::MappedBuffer key{nullptr, -1};
+    IMemAlloc::MappedBuffer value{nullptr, -1};
+    uint32_t epoch{1};
+    int32_t history{0};
+    bool has_packed_storage{false};
+  };
+  std::vector<MappedCache> mapped_caches_;
 };
 } // namespace example

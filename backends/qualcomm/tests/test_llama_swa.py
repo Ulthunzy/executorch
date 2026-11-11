@@ -299,6 +299,26 @@ def test_native_kv_manager(tmp_path):
                 torch.zeros(1, 1, 1, 4, dtype=torch.uint8),
             )
 
+    class MappedCacheFixture(torch.nn.Module):
+        def __init__(self, dtype=torch.uint16, head_dim=4):
+            super().__init__()
+            self.dtype = dtype
+            self.head_dim = head_dim
+            self.inputs = (
+                torch.zeros(1, 128, 8),
+                torch.zeros(1, 1, 1, 3, dtype=torch.int32),
+                torch.zeros(1, 128, dtype=torch.int32),
+                torch.zeros(1, 1, 1, 3, dtype=torch.int32),
+                torch.zeros(1, 1, 1, 3, dtype=torch.int32),
+            )
+
+        def forward(self, hidden, lengths, pos, key, value):
+            return (
+                hidden,
+                torch.zeros(1, 1, self.head_dim, 128, dtype=self.dtype),
+                torch.zeros(1, 1, 128, self.head_dim, dtype=self.dtype),
+            )
+
     fixtures = {
         "prefill": CacheFixture(128, 128),
         "decode": CacheFixture(1, 255),
@@ -306,6 +326,10 @@ def test_native_kv_manager(tmp_path):
         "circular_float": CacheFixture(16, 7),
         "circular_uint16": CacheFixture(16, 7, mask_dtype=torch.uint16),
         "mixed": MixedCacheFixture(),
+        "mapped": MappedCacheFixture(),
+        "mapped_uint8": MappedCacheFixture(torch.uint8),
+        "mapped_hmx8": MappedCacheFixture(torch.uint8, 256),
+        "mapped_hmx16": MappedCacheFixture(torch.uint16, 256),
     }
     pte = to_edge(
         {

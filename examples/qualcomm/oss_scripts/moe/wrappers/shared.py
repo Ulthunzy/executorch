@@ -30,7 +30,13 @@ def main():
     parser.add_argument("--op-package-device", required=True)
     parser.add_argument(
         "--prefill-gdn-core",
-        choices=("chunked_mixed_fp16", "custom_fp16", "custom_fp32", "custom_u16"),
+        choices=(
+            "chunked_mixed_fp16",
+            "chunk128_hmx",
+            "custom_fp16",
+            "custom_fp32",
+            "custom_u16",
+        ),
         default="chunked_mixed_fp16",
     )
     parser.add_argument("--gdn-state-vtcm", action="store_true")
@@ -42,9 +48,15 @@ def main():
         parser.error("GDN VTCM layout requires a UINT16 core")
     args.layers = args.layers or [0, 1, 2, 3]
     settings = load_model_config(args.model_config)
+    if (
+        args.prefill_gdn_core == "chunk128_hmx"
+        and settings.target.soc_model != "SM8850"
+    ):
+        parser.error("Chunk128 HMX requires SM8850 (HTP v81)")
     fp16_state = settings.cache.gdn_state_dtype == "float16"
     if fp16_state and (
-        args.prefill_gdn_core != "chunked_mixed_fp16" or args.gdn_state_vtcm
+        args.prefill_gdn_core not in ("chunked_mixed_fp16", "chunk128_hmx")
+        or args.gdn_state_vtcm
     ):
         parser.error(
             "Typed FP16 GDN state currently requires chunked prefill and DDR state"
@@ -111,7 +123,7 @@ def main():
     torch.set_grad_enabled(False)
     torch.set_num_threads(4)
     models, examples, router_calibration = {}, {}, {}
-    attention_cache = {}
+    attention_cache, prefill_chunk_calls = {}, {}
     for layer in args.layers:
         if settings.quantization.attention == "gptq":
             calibration = json.loads(
@@ -154,6 +166,16 @@ def main():
             prefill, prefill_inputs = padded_prefill_front(
                 prefill, prefill_inputs, args.capacity, args.prefill_gdn_core
             )
+        prefill_chunk_calls[str(layer)] = sum(
+            str(node.target) == "qnn_custom_ops.chunk.default"
+            for node in prefill.graph.nodes
+        )
+        if (
+            args.prefill_gdn_core == "chunk128_hmx"
+            and layer % 4 != 3
+            and prefill_chunk_calls[str(layer)] != 1
+        ):
+            raise ValueError(f"Layer {layer}: expected one fused AR128 Chunk")
         decode = torch.export.load(
             args.decode_source / f"layer{layer}/decode-qdq.pt2"
         ).module()
@@ -214,6 +236,14 @@ def main():
         fp16_state=fp16_state,
         state_vtcm=args.gdn_state_vtcm,
     )
+    if args.prefill_gdn_core == "chunk128_hmx":
+        from executorch.examples.qualcomm.custom_op.deltanet_support.chunk import (
+            chunk_package,
+        )
+
+        package.op_package_infos.extend(
+            chunk_package(args.op_package_host, args.op_package_device).op_package_infos
+        )
     if attention_cache:
         from executorch.examples.qualcomm.custom_op.attention_support.package import (
             attention_package,
@@ -316,6 +346,7 @@ def main():
         router_calibration=router_calibration,
         weight_sharing=True,
         prefill_core=args.prefill_gdn_core,
+        prefill_chunk_calls=prefill_chunk_calls,
         attention_core=args.attention_core,
         attention_cache=attention_cache,
         gdn_state_dtype=settings.cache.gdn_state_dtype,

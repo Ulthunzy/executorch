@@ -19,6 +19,7 @@
             <Input>
                 <Name>new_key</Name>
                 <Mandatory>true</Mandatory>
+                <Datatype>QNN_DATATYPE_UFIXED_POINT_8</Datatype>
                 <Datatype>QNN_DATATYPE_UFIXED_POINT_16</Datatype>
                 <Shape><Rank>4D</Rank><Text>[B,Hkv,D,Q]</Text></Shape>
             </Input>
@@ -31,6 +32,7 @@
             <Input>
                 <Name>new_value</Name>
                 <Mandatory>true</Mandatory>
+                <Datatype>QNN_DATATYPE_UFIXED_POINT_8</Datatype>
                 <Datatype>QNN_DATATYPE_UFIXED_POINT_16</Datatype>
                 <Shape><Rank>4D</Rank><Text>[B,Hkv,Q,D]</Text></Shape>
             </Input>

@@ -119,4 +119,16 @@ PYTHONPATH="$PWD/.." python examples/qualcomm/oss_scripts/moe/run_chat.py \
 
 `--build-dir` 可覆盖设备配置中的 runner 构建目录。构建与详细调用链见 [ARCHITECTURE.md](ARCHITECTURE.md)；Android 见 [JNI 文档](../../../../extension/android/jni/moe/README.md)。旧模型包的 entry 名称与 Java 方法签名保持兼容，应用加载库名改为 `et_infer`。
 
+Native QNN runtime 可在设备进程启动前设置 `QNN_HMX_TIMEOUT_US=1000000`
+和 `QNN_DDR_PERF_MODE=1`，用于减少短间隔调用的资源恢复开销。前者接受
+100～1000000 微秒，延长 HMX 空闲保活；后者接受 0/1，仅适用于 SDK 支持的
+Android V81 LLM，并依赖 runtime 已启用的 RPC polling 和最高 bus 性能档位。
+两项均默认不设置；SDK 拒绝配置时会报错，不会静默忽略。这些选项在性能投票
+建立时设置，不执行预热，也不在每次图调用前重复设置。延长保活会增加空闲
+功耗，超过保活窗口仍可能需要恢复资源。已验证 SDK 2.51 的 AR128 GDN 小图；
+这些开关只作用于 `runner/qnn/qnn_front.cpp`，不作用于通用 `QnnBackend`
+或 `qnn_llama_runner`，不代表整模吞吐已经提升。
+
+异步专家 IO 默认使用 `startup_prefetch=overlap`：模型加载时按启动表为每层预填当前容量对应的专家，与 QNN context 恢复重叠；SM8850 优先使用文本或图文对应的启动表。预填直接写入原有专家槽，加载完成前会等待读取结束并同步权重。真实计算仍使用当前 Router 的 Top8，未命中的专家正常读取，预填槽继续参与原 LRU 替换。`STARTUP_COLD_PRELOAD` 分别记录预填字节、IO 窗口、context 恢复、重叠和末尾等待，预填成本计入加载时间。用 `--startup-prefetch none` 可关闭预填做对照；未开启异步 IO 的低层入口默认不预填。
+
 本机两库构建目录为 `build/moe/qwen35-two-libs-sm8850`，运行已有导出包时可增加 `--build-dir build/moe/qwen35-two-libs-sm8850`。JNI 安装产物位于该目录的 `install/jniLibs/arm64-v8a`。性能与内存对照见 [两库验证记录](docs/two-libraries-validation-20261029.json)；此前目录重构记录见 [结构验证](docs/layout-validation-20261029.json)。

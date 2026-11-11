@@ -10,6 +10,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <initializer_list>
+#include "../../../../../attention_support/cache.h"
 
 namespace attention {
 
@@ -32,7 +33,8 @@ struct Geometry {
 
   bool fast() const {
     return valid() && batch == 1 && kv_heads <= max_workers &&
-        heads / kv_heads == 8 && dimension == 256 && queries <= 256;
+        (heads / kv_heads == 4 || heads / kv_heads == 8) && dimension == 256 &&
+        queries <= 256;
   }
 };
 
@@ -57,21 +59,29 @@ struct Quantization {
 struct Configuration {
   Geometry geometry{};
   unsigned capacity = 0, valid = 0, first = 0, history = 0;
+  unsigned element_bytes = 2;
 
   bool configure(
       const int32_t* key,
       const int32_t* value,
       const int32_t* lengths,
-      const float* grids) {
+      const float* grids,
+      unsigned cache_element_bytes = 2) {
+    if (cache_element_bytes != 1 && cache_element_bytes != 2) {
+      return false;
+    }
+    element_bytes = cache_element_bytes;
     if (!geometry.valid() || key[0] < 0 || value[0] < 0 || key[0] == value[0] ||
-        uint32_t(key[1]) >> 31 || uint32_t(value[1]) >> 31 ||
-        key[1] != value[1] || key[2] != value[2] || lengths[0] < 1 ||
+        (uint32_t(value[1]) & attention_cache::packed_storage_flag) ||
+        (uint32_t(key[1]) & ~attention_cache::packed_storage_flag) !=
+            uint32_t(value[1]) ||
+        key[2] != value[2] || lengths[0] < 1 ||
         unsigned(lengths[0]) > geometry.queries || lengths[1] < 0 ||
         lengths[2] < 0) {
       return false;
     }
     const uint64_t row_bytes = uint64_t(geometry.batch) * geometry.kv_heads *
-        geometry.dimension * sizeof(uint16_t);
+        geometry.dimension * element_bytes;
     const unsigned bytes = uint32_t(key[1]) & logical_size_mask;
     if (!bytes || row_bytes > bytes || bytes % row_bytes) {
       return false;
@@ -96,6 +106,9 @@ struct Configuration {
           std::floor(grids[i + 1]) != grids[i + 1]) {
         return false;
       }
+    }
+    if (element_bytes == 1 && (grids[10] > 255 || grids[12] > 255)) {
+      return false;
     }
     return true;
   }

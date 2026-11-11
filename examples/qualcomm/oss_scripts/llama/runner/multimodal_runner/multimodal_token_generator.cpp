@@ -196,6 +196,7 @@ void MultimodalTokenGenerator::init_io(
 void MultimodalTokenGenerator::prepare_io(
     uint64_t cur_token,
     int64_t start_pos) {
+  kv_manager_->prepare_attention_lengths(attention_mask_.data, 1, start_pos);
   // Generate embedding for current token using embedding runner
   tok_embedding_runner_->prefill({cur_token});
   const TensorStruct<float>& text_embeddings =

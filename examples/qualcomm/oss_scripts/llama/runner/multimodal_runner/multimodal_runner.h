@@ -98,6 +98,7 @@ class QNNMultimodalRunner
       const float repetition_penalty = 1.0f);
 
   bool is_loaded() const override;
+  ~QNNMultimodalRunner() override;
   executorch::runtime::Error load() override;
   void stop() override;
   void reset() override;

@@ -8,15 +8,19 @@
 #include <algorithm>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <new>
 #include "../../../../htp_arch.h"
 #include "HTP/core/qhpi.h"
 #include "attention/AttentionConfig.h"
+#include "attention/GroupedScratch.h"
+#include "attention/GroupedScratchU16.h"
+#include "attention/PackedKv8.h"
 #include "attention/Reference.h"
 #ifdef __hexagon__
-#include "HvxUtils.h"
 #include "HAP_compute_res.h"
 #include "HAP_mem.h"
+#include "HvxUtils.h"
 #include "attention/HmxApi.h"
 #include "attention/HmxQueue.h"
 static_assert(sizeof(attention_hmx::Queue) <= 1536);
@@ -30,7 +34,9 @@ struct InlineSync {
 constexpr unsigned workers = max_workers, rows = 32, stride = fast_kv_rows;
 [[maybe_unused]] constexpr unsigned tile = 256;
 constexpr unsigned per_worker = 262144, header = 2048, worker_start = header;
-[[maybe_unused]] constexpr unsigned kv_rows = fast_kv_rows;
+constexpr unsigned integer_mode_offset = 1540;
+constexpr unsigned grouped_worker_bytes = sizeof(GroupedScratch);
+static_assert(sizeof(GroupedScratchU16) == grouped_worker_bytes);
 constexpr unsigned score_bytes = rows * stride * 2;
 static bool shape_is(
     const QHPI_Shape& shape,
@@ -71,11 +77,22 @@ configuration(uint32_t n, const QHPI_Tensor* const* in, Configuration& c) {
     if (!Quantization{q.stepsize, q.zero_offset}.valid())
       return false;
   }
+  const auto cache_type = qhpi_tensor_type(in[2]);
+  if ((cache_type != QHPI_QUINT8 && cache_type != QHPI_QUINT16) ||
+      qhpi_tensor_type(in[4]) != cache_type)
+    return false;
+  const unsigned element_bytes = cache_type == QHPI_QUINT8 ? 1 : 2;
+  for (unsigned i : {2u, 4u}) {
+    if (unsigned(qhpi_tensor_quant_parameters(in[i]).zero_offset) >
+        (element_bytes == 1 ? 255u : 65535u))
+      return false;
+  }
   return c.configure(
       static_cast<const int32_t*>(qhpi_tensor_raw_data(in[1])),
       static_cast<const int32_t*>(qhpi_tensor_raw_data(in[3])),
       static_cast<const int32_t*>(qhpi_tensor_raw_data(in[5])),
-      static_cast<const float*>(qhpi_tensor_raw_data(in[6])));
+      static_cast<const float*>(qhpi_tensor_raw_data(in[6])),
+      element_bytes);
 }
 static QHPI_OutputDef scratch(unsigned bytes) {
   QHPI_OutputDef d{};
@@ -99,8 +116,15 @@ static const QHPI_Op* rewrite(const QHPI_Op* op) {
   if (!shape_is(y.shape, g.batch, g.heads, g.queries, g.dimension))
     return nullptr;
   const bool decode = g.queries == 1, fast = g.fast();
+  int32_t tcm_bytes = 0;
+  const bool grouped = !decode && fast && g.heads / g.kv_heads == 4 &&
+      qhpi_option_int(op, "tcm_size_for_tiling", &tcm_bytes) == QHPI_SUCCESS &&
+      tcm_bytes >= int32_t(worker_start + workers * grouped_worker_bytes);
+  const unsigned prefill_worker_bytes =
+      grouped ? grouped_worker_bytes : per_worker;
   const unsigned work_bytes = fast
-      ? worker_start + (decode ? g.kv_heads : workers) * per_worker
+      ? worker_start +
+          (decode ? g.kv_heads * per_worker : workers * prefill_worker_bytes)
       : workers * ((g.dimension + 256 + 31) & ~31u) * sizeof(float);
   QHPI_OutputDef storage[2] = {
       scratch(work_bytes),
@@ -138,11 +162,28 @@ struct CacheMappings {
     Slot* next = nullptr;
     unsigned history = 0, last_valid = 0;
     bool last_exact = false, short_dense = false, mapped_by_get = false;
+    bool preallocated = false;
+    bool integer_packed = false;
+    uint32_t pack_arrived = 0, pack_epoch = 0;
+    unsigned logical_bytes = 0;
     uint32_t epoch = 0, coherent_epoch = 0;
     unsigned coherent_history = 0;
     alignas(128) uint16_t pending_k[2048]{}, pending_v[2048]{};
-    alignas(128) uint32_t dma_words[8][32]{};
+    alignas(128) uint32_t dma_words[8][64]{};
     alignas(16) InlineSync inline_sync{};
+
+    bool can_append(
+        const int32_t* descriptor,
+        unsigned first,
+        unsigned next_history,
+        bool use_integer) const {
+      return integer_packed == use_integer &&
+          epoch == uint32_t(descriptor[2]) &&
+          (uint32_t(descriptor[1]) & exact_append_flag) && last_exact &&
+          !first && next_history &&
+          next_history == __atomic_load_n(&history, __ATOMIC_ACQUIRE) &&
+          !short_dense;
+    }
   };
   qurt_mutex_t lock;
   Slot* entries = nullptr;
@@ -154,10 +195,15 @@ static CacheMappings& cache_mappings() {
   static CacheMappings maps;
   return maps;
 }
-static uint16_t* cache_pointer(const int32_t* descriptor) {
+static uint16_t* cache_pointer(
+    const int32_t* descriptor,
+    unsigned packed_bytes = 0) {
   auto& maps = cache_mappings();
-  const unsigned bytes =
-      ((uint32_t(descriptor[1]) & logical_size_mask) + 4095u) & ~4095u;
+  const unsigned logical_bytes = uint32_t(descriptor[1]) & logical_size_mask;
+  const bool preallocated =
+      uint32_t(descriptor[1]) & attention_cache::packed_storage_flag;
+  const unsigned bytes = attention_cache::packed_offset(logical_bytes) +
+      (preallocated ? packed_bytes : 0);
   for (auto* slot = __atomic_load_n(&maps.entries, __ATOMIC_ACQUIRE); slot;
        slot = slot->next)
     if (slot->fd == descriptor[0])
@@ -186,6 +232,8 @@ static uint16_t* cache_pointer(const int32_t* descriptor) {
         auto* slot = new (memory) CacheMappings::Slot{};
         slot->fd = descriptor[0];
         slot->bytes = bytes;
+        slot->logical_bytes = logical_bytes;
+        slot->preallocated = preallocated;
         slot->p = static_cast<uint16_t*>(raw);
         slot->mapped_by_get = by_get;
         slot->next = maps.entries;
@@ -215,10 +263,15 @@ static CacheMappings::Slot* packed_cache(int fd, unsigned kv_bytes) {
     if (slot->packed && slot->packed_bytes != 2 * kv_bytes)
       break;
     if (!slot->packed) {
+      const size_t offset = attention_cache::packed_offset(slot->logical_bytes);
+      if (slot->preallocated && slot->bytes < offset + 2 * kv_bytes)
+        break;
       slot->packed_bytes = 2 * kv_bytes;
       __atomic_store_n(
           &slot->packed,
-          static_cast<uint8_t*>(memalign(2048, 2 * kv_bytes)),
+          slot->preallocated
+              ? reinterpret_cast<uint8_t*>(slot->p) + offset
+              : static_cast<uint8_t*>(memalign(2048, 2 * kv_bytes)),
           __ATOMIC_RELEASE);
     }
     if (slot->packed)
@@ -228,7 +281,8 @@ static CacheMappings::Slot* packed_cache(int fd, unsigned kv_bytes) {
   qurt_pimutex_unlock(&maps.lock);
   return found;
 }
-static void invalidate(uint16_t* p, unsigned offset, unsigned count) {
+template <typename Code>
+static void invalidate(Code* p, unsigned offset, unsigned count) {
   if (!count)
     return;
   uintptr_t begin = uintptr_t(p + offset) & ~uintptr_t(127);
@@ -257,11 +311,13 @@ static uint32_t generic_execute(
   for (unsigned head = 0; head < g.batch * g.kv_heads; ++head) {
     for (unsigned d = 0; d < g.dimension; ++d)
       invalidate(
-          key, (head * g.dimension + d) * c.capacity + c.first, c.history);
+          reinterpret_cast<uint8_t*>(key),
+          ((head * g.dimension + d) * c.capacity + c.first) * c.element_bytes,
+          c.history * c.element_bytes);
     invalidate(
-        value,
-        (head * c.capacity + c.first) * g.dimension,
-        c.history * g.dimension);
+        reinterpret_cast<uint8_t*>(value),
+        (head * c.capacity + c.first) * g.dimension * c.element_bytes,
+        c.history * g.dimension * c.element_bytes);
   }
   const auto qq = qhpi_tensor_quant_parameters(in[1]),
              kq = qhpi_tensor_quant_parameters(in[3]),
@@ -340,14 +396,25 @@ static float reduce(HVX_Vector v, bool maximum) {
   } value{uint32_t(Q6_R_vextract_VR(v, 0))};
   return value.f;
 }
+template <typename Code>
+static HVX_Vector load_codes(const Code* src) {
+  if constexpr (sizeof(Code) == 2)
+    return vmemu(src);
+  else {
+    alignas(128) uint8_t bytes[128]{};
+    std::memcpy(bytes, src, 64);
+    return Q6_V_lo_W(Q6_Wuh_vunpack_Vub(*reinterpret_cast<HVX_Vector*>(bytes)));
+  }
+}
+template <typename Code>
 static void to_half(
     uint16_t* dst,
-    const uint16_t* src,
+    const Code* src,
     unsigned count,
     QHPI_Quant_Parameters q,
     bool is_signed = false) {
   for (unsigned i = 0; i < count; i += 64) {
-    const auto raw = vmemu(src + i);
+    const auto raw = load_codes(src + i);
     auto u = is_signed ? Q6_Ww_vunpack_Vh(raw) : Q6_Wuw_vunpack_Vuh(raw);
     auto a = hvxMulF32(
         Q6_Vsf_equals_Vw(
@@ -378,6 +445,10 @@ struct alignas(16) DmaDescriptor {
   void* destination;
 };
 static_assert(sizeof(DmaDescriptor) == 16);
+static void dma_start(DmaDescriptor* descriptor) {
+  asm volatile("release(%0):at" ::"r"(descriptor) : "memory");
+  asm volatile("dmstart(%0)" ::"r"(descriptor) : "memory");
+}
 static void dma_start(
     uint8_t* destination,
     const uint8_t* source,
@@ -405,6 +476,7 @@ static bool dma_copy(
 }
 static void
 pack_decode_a(const uint16_t* source, uint8_t* destination, unsigned width) {
+  // HMX keeps eight tile rows; four-head groups zero the unused query rows.
   for (unsigned row = 0; row < 8; row += 2)
     for (unsigned col = 0; col < width; col += 64) {
       const auto a =
@@ -419,9 +491,58 @@ pack_decode_a(const uint16_t* source, uint8_t* destination, unsigned width) {
           Q6_V_hi_W(pair);
     }
 }
+#include "attention/ExpLut.h"
+#include "attention/Fixed32.h"
+#include "attention/HmxU16.h"
+#include "attention/IntegerInitialize.h"
 #include "attention/ShortAttention.h"
+#include "attention/StreamKv.h"
 #endif
-static uint32_t initialize(
+#ifdef __hexagon__
+static bool integer_attention(
+    const QHPI_Tensor* query,
+    const QHPI_Tensor* key,
+    const QHPI_Tensor* value,
+    const QHPI_Tensor* grids,
+    unsigned work_bytes,
+    unsigned slices) {
+  const auto qshape = qhpi_tensor_shape(query), kshape = qhpi_tensor_shape(key);
+  if (!QCOM_HTP_V81 || qshape.rank != 4 || kshape.rank != 4 ||
+      qshape.dims[0] != 1 || qshape.dims[2] < 1 || qshape.dims[2] > 256 ||
+      qshape.dims[3] != 256 || qshape.dims[1] != kshape.dims[1] * 4 ||
+      qhpi_tensor_type(query) != QHPI_QUINT16 ||
+      qhpi_tensor_type(key) != QHPI_QUINT8)
+    return false;
+  if (qshape.dims[2] == 1) {
+    if (kshape.dims[1] != 2 || slices < 2 || slices > 8 ||
+        (slices & (slices - 1)) ||
+        work_bytes < worker_start + kshape.dims[1] * per_worker)
+      return false;
+  } else if (work_bytes < worker_start + workers * grouped_worker_bytes) {
+    return false;
+  }
+  const auto* meta = static_cast<const float*>(qhpi_tensor_raw_data(grids));
+  const auto qq = qhpi_tensor_quant_parameters(query);
+  const auto kq = qhpi_tensor_quant_parameters(key);
+  const auto vq = qhpi_tensor_quant_parameters(value);
+  const double raw_ratio = double(qq.stepsize) * meta[9] / meta[0],
+               logits_ratio = double(meta[0]) * meta[2] / meta[5];
+  if (!(raw_ratio >= 1. / (1ULL << 30) && raw_ratio <= 128) ||
+      !(logits_ratio >= 1. / (1ULL << 30) && logits_ratio <= 128))
+    return false;
+  if (vq.stepsize != meta[11] || vq.zero_offset != int(meta[12]) ||
+      kq.stepsize != meta[9] || kq.zero_offset != int(meta[10]) ||
+      meta[3] != meta[0] * meta[2] || meta[4] != meta[1] ||
+      uint64_t(std::max(qq.zero_offset, 65535 - qq.zero_offset)) *
+              std::max(int(meta[10]), 255 - int(meta[10])) * 256 >
+          INT32_MAX)
+    return false;
+  auto parameters = attention_exp::Parameters::make(meta[5]);
+  return parameters.coefficient >= 1024 && parameters.coefficient <= 32767;
+}
+#endif
+template <typename Code>
+static uint32_t initialize_typed(
     QHPI_RuntimeHandle* handle,
     uint32_t no,
     QHPI_Tensor** out,
@@ -433,12 +554,13 @@ static uint32_t initialize(
   const auto shape = qhpi_tensor_shape(in[0]);
   const unsigned qheads = shape.dims[1],
                  kvheads = qhpi_tensor_shape(in[2]).dims[1];
-  const unsigned kv_bytes = kvheads * kv_rows * 256 * 2;
   Configuration config{};
   if (!configuration(ni, in, config))
     return QHPI_UNSUPPORTED;
   if (!config.fast() || !QCOM_HTP_V81)
     return QHPI_SUCCESS;
+  const unsigned kv_rows = attention_cache::packed_rows(config.capacity),
+                 kv_bytes = kvheads * kv_rows * 256 * 2;
   unsigned slice = qhpi_slice_number(handle), slices = qhpi_num_slices(handle);
   if (!slices || slices > max_workers || slice >= slices)
     return QHPI_UNSUPPORTED;
@@ -455,11 +577,7 @@ static uint32_t initialize(
   }
   const auto* l = static_cast<const int32_t*>(qhpi_tensor_raw_data(in[5]));
   const unsigned qrows = qhpi_tensor_shape(in[0]).dims[2],
-                 columns = (unsigned(static_cast<const int32_t*>(
-                                qhpi_tensor_raw_data(in[1]))[1]) &
-                            logical_size_mask) /
-      (kvheads * 256 * 2),
-                 capacity = columns;
+                 columns = config.capacity, capacity = columns;
   if (!config.fast() || l[0] < 1 || unsigned(l[0]) > qrows || l[1] < 0 ||
       l[2] < 0 || unsigned(l[1] + l[2]) > capacity)
     return QHPI_UNSUPPORTED;
@@ -468,16 +586,16 @@ static uint32_t initialize(
       work + worker_start + slice * (qrows == 1 ? 32768u : per_worker));
   uint8_t* kpack = nullptr;
   uint8_t* vpack = nullptr;
-  auto* k =
-      cache_pointer(static_cast<const int32_t*>(qhpi_tensor_raw_data(in[1])));
+  auto* k = reinterpret_cast<Code*>(cache_pointer(
+      static_cast<const int32_t*>(qhpi_tensor_raw_data(in[1])), 2 * kv_bytes));
   const auto* meta = static_cast<const float*>(qhpi_tensor_raw_data(in[6]));
   QHPI_Quant_Parameters kq{int(meta[10]), meta[9]};
-  auto* v =
-      cache_pointer(static_cast<const int32_t*>(qhpi_tensor_raw_data(in[3])));
+  auto* v = reinterpret_cast<Code*>(
+      cache_pointer(static_cast<const int32_t*>(qhpi_tensor_raw_data(in[3]))));
   QHPI_Quant_Parameters vq{int(meta[12]), meta[11]};
-  const auto* nk = static_cast<const uint16_t*>(qhpi_tensor_raw_data(in[2]));
+  const auto* nk = static_cast<const Code*>(qhpi_tensor_raw_data(in[2]));
   auto nkq = qhpi_tensor_quant_parameters(in[2]);
-  const auto* nv = static_cast<const uint16_t*>(qhpi_tensor_raw_data(in[4]));
+  const auto* nv = static_cast<const Code*>(qhpi_tensor_raw_data(in[4]));
   auto nvq = qhpi_tensor_quant_parameters(in[4]);
   if (!k || !v)
     return QHPI_ERROR_FATAL;
@@ -490,11 +608,7 @@ static uint32_t initialize(
   const auto* fd_header =
       static_cast<const int32_t*>(qhpi_tensor_raw_data(in[1]));
   const bool same_epoch = cached->epoch == uint32_t(fd_header[2]);
-  const bool incremental = same_epoch &&
-      (unsigned(fd_header[1]) & exact_append_flag) && cached->last_exact &&
-      l[1] == 0 &&
-      unsigned(l[2]) == __atomic_load_n(&cached->history, __ATOMIC_ACQUIRE) &&
-      l[2] != 0 && !cached->short_dense;
+  const bool incremental = cached->can_append(fd_header, l[1], l[2], false);
   const unsigned first_block = incremental ? unsigned(l[2]) / 64 : 0,
                  first_tile = incremental ? unsigned(l[2]) / 256 : 0;
 
@@ -505,7 +619,9 @@ static uint32_t initialize(
   const bool retained = exact && cached->last_exact;
   unsigned recent = incremental ? std::min(unsigned(l[2]), cached->last_valid)
                                 : unsigned(l[2]);
-  if (!append_one && !(qrows == 1 && keys <= short_key_limit && qheads == 16)) {
+  if (!append_one &&
+      !(qrows == 1 && keys <= short_key_limit &&
+        (qheads == 16 && kvheads == 2))) {
     for (unsigned d = slice; d < kvheads * 256; d += slices)
       invalidate(k, d * columns + l[1] + l[2] - recent, recent);
     for (unsigned head = slice; head < kvheads; head += slices)
@@ -513,7 +629,7 @@ static uint32_t initialize(
           v, (head * columns + l[1] + l[2] - recent) * 256, recent * 256);
   }
 
-  if (qrows == 1 && keys <= short_key_limit && qheads == 16) {
+  if (qrows == 1 && keys <= short_key_limit && (qheads == 16 && kvheads == 2)) {
     const bool dense_append = same_epoch && retained && l[1] == 0 && l[2] > 0 &&
         unsigned(l[2]) == __atomic_load_n(&cached->history, __ATOMIC_ACQUIRE) &&
         cached->short_dense;
@@ -526,7 +642,8 @@ static uint32_t initialize(
         const bool old = row < unsigned(l[2]);
         alignas(128) uint16_t kcodes[64];
         if (!old)
-          *reinterpret_cast<HVX_Vector*>(kcodes) = vmemu(nk + kv * 256 + col);
+          *reinterpret_cast<HVX_Vector*>(kcodes) =
+              load_codes(nk + kv * 256 + col);
         else if (retained && dense_append && row == unsigned(l[2]) - 1)
           *reinterpret_cast<HVX_Vector*>(kcodes) =
               *reinterpret_cast<const HVX_Vector*>(
@@ -538,23 +655,26 @@ static uint32_t initialize(
             kcodes[d] = k[at];
           }
         to_half(kd + row * 256 + col, kcodes, 64, old ? kq : nkq);
-        const uint16_t* vs;
+        alignas(128) uint16_t vcodes[64];
         if (!old)
-          vs = nv + kv * 256 + col;
+          *reinterpret_cast<HVX_Vector*>(vcodes) =
+              load_codes(nv + kv * 256 + col);
         else if (retained && dense_append && row == unsigned(l[2]) - 1)
-          vs = cached->pending_v + kv * 256 + col;
+          *reinterpret_cast<HVX_Vector*>(vcodes) =
+              *reinterpret_cast<const HVX_Vector*>(
+                  cached->pending_v + kv * 256 + col);
         else {
           const unsigned at = (kv * columns + l[1] + row) * 256 + col;
           invalidate(v, at, 64);
-          vs = v + at;
+          *reinterpret_cast<HVX_Vector*>(vcodes) = load_codes(v + at);
         }
-        to_half(vd + row * 256 + col, vs, 64, old ? vq : nvq);
+        to_half(vd + row * 256 + col, vcodes, 64, old ? vq : nvq);
       }
       if (exact) {
         *reinterpret_cast<HVX_Vector*>(cached->pending_k + task * 64) =
-            vmemu(nk + task * 64);
+            load_codes(nk + task * 64);
         *reinterpret_cast<HVX_Vector*>(cached->pending_v + task * 64) =
-            vmemu(nv + task * 64);
+            load_codes(nv + task * 64);
       }
     }
     return QHPI_SUCCESS;
@@ -589,7 +709,8 @@ static uint32_t initialize(
               codes[d] = k[offset];
             }
         } else
-          *reinterpret_cast<HVX_Vector*>(codes) = vmemu(nk + kv * 256 + d0);
+          *reinterpret_cast<HVX_Vector*>(codes) =
+              load_codes(nk + kv * 256 + d0);
         to_half(values, codes, 64, old ? kq : nkq);
         auto* dst = head + (logical / 64) * 64 * 256 +
             ((logical % 64) / 32) * 256 * 32 + (d0 / 2) * 64 +
@@ -680,13 +801,15 @@ static uint32_t initialize(
         alignas(128) uint16_t values[64];
         if (old && !retained)
           invalidate(v, (kv * columns + logical) * 256 + col, 64);
-        to_half(
-            values,
-            old ? (retained ? cached->pending_v + kv * 256 + col
-                            : v + (kv * columns + logical) * 256 + col)
-                : nv + kv * 256 + col,
-            64,
-            old ? vq : nvq);
+        if (old && retained)
+          to_half(values, cached->pending_v + kv * 256 + col, 64, vq);
+        else
+          to_half(
+              values,
+              old ? v + (kv * columns + logical) * 256 + col
+                  : nv + kv * 256 + col,
+              64,
+              old ? vq : nvq);
         const auto halves = Q6_W_vshuff_VVR(
             Q6_V_vzero(), *reinterpret_cast<const HVX_Vector*>(values), -2);
         const unsigned part = logical / 256, row = logical % 256,
@@ -738,9 +861,9 @@ static uint32_t initialize(
   if (qrows == 1 && exact)
     for (unsigned task = slice; task < kvheads * 4; task += slices) {
       *reinterpret_cast<HVX_Vector*>(cached->pending_k + task * 64) =
-          vmemu(nk + task * 64);
+          load_codes(nk + task * 64);
       *reinterpret_cast<HVX_Vector*>(cached->pending_v + task * 64) =
-          vmemu(nv + task * 64);
+          load_codes(nv + task * 64);
     }
 
   return QHPI_SUCCESS;
@@ -748,26 +871,54 @@ static uint32_t initialize(
   return QHPI_UNSUPPORTED;
 #endif
 }
-#ifdef __hexagon__
-#include "attention/OnlineAttention.h"
-#endif
-static uint32_t execute(
+static uint32_t initialize(
     QHPI_RuntimeHandle* handle,
     uint32_t no,
     QHPI_Tensor** out,
     uint32_t ni,
     const QHPI_Tensor* const* in) {
+  if (ni != 7)
+    return QHPI_ERROR_FATAL;
+#ifdef __hexagon__
+  Configuration config{};
+  if (!configuration(ni, in, config))
+    return QHPI_UNSUPPORTED;
+  if (integer_attention(
+          in[0], in[2], in[4], in[6], qhpi_tensor_shape(out[0]).dims[3] * 2,
+          qhpi_num_slices(handle)))
+    return initialize_integer(handle, no, out, ni, in);
+#endif
+  return qhpi_tensor_type(in[2]) == QHPI_QUINT8
+      ? initialize_typed<uint8_t>(handle, no, out, ni, in)
+      : initialize_typed<uint16_t>(handle, no, out, ni, in);
+}
+#ifdef __hexagon__
+#include "attention/GroupedPrefill.h"
+#include "attention/GroupedPrefillU16.h"
+#include "attention/OnlineAttention.h"
+#include "attention/IntegerDecode.h"
+#endif
+#ifdef __hexagon__
+static uint32_t execute_impl(
+    QHPI_RuntimeHandle* handle,
+    uint32_t no,
+    QHPI_Tensor** out,
+    uint32_t ni,
+    const QHPI_Tensor* const* in,
+    const Configuration* supplied_config,
+    CacheMappings::Slot* supplied_cache) {
 #ifdef __hexagon__
   if (no != 1 || ni != 9)
     return QHPI_ERROR_FATAL;
   const auto shape = qhpi_tensor_shape(in[1]);
   const unsigned qheads = shape.dims[1],
-                 kvheads = qhpi_tensor_shape(in[3]).dims[1];
-  const unsigned kv_bytes = kvheads * kv_rows * 256 * 2;
+                 kvheads = qhpi_tensor_shape(in[3]).dims[1],
+                 groups = qheads / kvheads;
   const QHPI_Tensor* original[] = {
       in[1], in[2], in[3], in[4], in[5], in[6], in[7]};
-  Configuration config{};
-  if (!configuration(7, original, config))
+  Configuration parsed{};
+  const auto& config = supplied_config ? *supplied_config : parsed;
+  if (!supplied_config && !configuration(7, original, parsed))
     return QHPI_UNSUPPORTED;
   const auto oq_check = qhpi_tensor_quant_parameters(out[0]);
   if (!shape_is(
@@ -780,45 +931,58 @@ static uint32_t execute(
     return QHPI_UNSUPPORTED;
   if (!config.fast() || !QCOM_HTP_V81)
     return generic_execute(handle, out, in, config);
+  const unsigned kv_rows = attention_cache::packed_rows(config.capacity),
+                 kv_bytes = kvheads * kv_rows * 256 * 2;
 
   auto* work = static_cast<uint8_t*>(qhpi_tensor_raw_data(in[0]));
   auto& queue = *reinterpret_cast<attention_hmx::Queue*>(work);
+  const bool use_integer = __atomic_load_n(
+      reinterpret_cast<uint32_t*>(work + integer_mode_offset), __ATOMIC_ACQUIRE);
+  const bool integer_decode = use_integer && shape.dims[2] == 1;
   const unsigned resource = qhpi_thread_resources(handle);
   if (resource == 0) {
-    auto* cached = packed_cache(
-        static_cast<const int32_t*>(qhpi_tensor_raw_data(in[2]))[0], kv_bytes);
+    auto* cached = supplied_cache
+        ? supplied_cache
+        : packed_cache(
+              static_cast<const int32_t*>(qhpi_tensor_raw_data(in[2]))[0],
+              kv_bytes);
     const auto* l = static_cast<const int32_t*>(qhpi_tensor_raw_data(in[6]));
     if (qhpi_tensor_shape(in[1]).dims[2] > 1 ||
-        (unsigned(l[0] + l[2]) > short_key_limit || qheads != 16)) {
+        (unsigned(l[0] + l[2]) > short_key_limit ||
+         (qheads != 16 || kvheads != 2))) {
       const unsigned padded = (unsigned(l[0] + l[2]) + 63) & ~63u;
       const auto* descriptor =
           static_cast<const int32_t*>(qhpi_tensor_raw_data(in[2]));
       const bool incremental = cached &&
-          cached->epoch == uint32_t(descriptor[2]) &&
-          (unsigned(descriptor[1]) & exact_append_flag) && cached->last_exact &&
-          l[1] == 0 &&
-          unsigned(l[2]) ==
-              __atomic_load_n(&cached->history, __ATOMIC_ACQUIRE) &&
-          l[2] != 0 && !cached->short_dense &&
+          cached->can_append(descriptor, l[1], l[2], use_integer) &&
           cached->coherent_epoch == uint32_t(descriptor[2]) &&
           cached->coherent_history == unsigned(l[2]);
       const unsigned first_key = incremental ? unsigned(l[2]) & ~63u : 0,
                      first_value = incremental ? unsigned(l[2]) & ~255u : 0;
+      const unsigned element_bytes = use_integer ? 1 : 2;
       if (cached && cached->packed) {
         for (unsigned h = 0; h < kvheads; ++h) {
           qurt_mem_cache_clean(
-              uintptr_t(cached->packed + (h * kv_rows + first_key) * 256 * 2),
-              (padded - first_key) * 256 * 2,
+              uintptr_t(
+                  cached->packed +
+                  (h * kv_rows + first_key) * 256 * element_bytes),
+              (padded - first_key) * 256 * element_bytes,
               QURT_MEM_CACHE_FLUSH,
               QURT_MEM_DCACHE);
           qurt_mem_cache_clean(
               uintptr_t(
                   cached->packed + kv_bytes +
-                  (h * kv_rows + first_value) * 256 * 2),
-              (padded - first_value) * 256 * 2,
+                  (h * kv_rows + first_value) * 256 * element_bytes),
+              (padded - first_value) * 256 * element_bytes,
               QURT_MEM_CACHE_FLUSH,
               QURT_MEM_DCACHE);
         }
+        if (use_integer)
+          qurt_mem_cache_clean(
+              uintptr_t(cached->packed + kv_bytes / 2),
+              kvheads * kv_rows * 2,
+              QURT_MEM_CACHE_FLUSH,
+              QURT_MEM_DCACHE);
         cached->coherent_epoch = uint32_t(descriptor[2]);
         cached->coherent_history = unsigned(l[0] + l[2]);
       }
@@ -826,8 +990,10 @@ static uint32_t execute(
           reinterpret_cast<uint32_t*>(work + 1536), 1u, __ATOMIC_RELEASE);
     }
     if (cached) {
+      cached->integer_packed = use_integer;
       cached->short_dense = qhpi_tensor_shape(in[1]).dims[2] == 1 &&
-          unsigned(l[0] + l[2]) <= short_key_limit && qheads == 16;
+          unsigned(l[0] + l[2]) <= short_key_limit &&
+          (qheads == 16 && kvheads == 2);
       cached->last_exact = (unsigned(static_cast<const int32_t*>(
                                 qhpi_tensor_raw_data(in[2]))[1]) &
                             exact_append_flag) != 0;
@@ -837,27 +1003,76 @@ static uint32_t execute(
       __atomic_store_n(
           &cached->history, unsigned(l[0] + l[2]), __ATOMIC_RELEASE);
     }
+    if (integer_decode) {
+      const unsigned active = __atomic_load_n(&queue.workers, __ATOMIC_ACQUIRE);
+      for (unsigned s = 0; s < active; ++s)
+        while (!__atomic_load_n(&queue.jobs[s].finished, __ATOMIC_ACQUIRE))
+          attention_hmx::pause();
+      return __atomic_load_n(&queue.error, __ATOMIC_ACQUIRE)
+          ? QHPI_ERROR_FATAL : QHPI_SUCCESS;
+    }
     const bool hvx_only = qhpi_tensor_shape(in[1]).dims[2] == 1 &&
-        unsigned(l[0] + l[2]) <= short_key_limit && qheads == 16;
+        unsigned(l[0] + l[2]) <= short_key_limit &&
+        (qheads == 16 && kvheads == 2);
     unsigned context = qhpi_srm_context(handle);
     bool locked =
         hvx_only || (context && HAP_compute_res_hmx_lock(context) == 0);
 
     if (!locked)
       __atomic_store_n(&queue.error, 1u, __ATOMIC_RELEASE);
-    bool okay = attention_hmx::serve(queue, [&](const attention_hmx::Job& j) {
-      for (unsigned c = 0; c < j.n; c += 32)
-        qhblas_hmx_matrix_matrix_mpy_hf_sm(
-            j.a,
-            ((j.k / 32) << 11) | ((j.m - 1) << 2),
-            j.b + c * j.k * 2,
-            ((j.k / 32) << 11) - 1,
-            j.c + c * 64,
-            0,
-            j.bias);
-      return true;
-    });
+    const unsigned stream_columns = (unsigned(l[0] + l[2]) + 31) & ~31u;
+    attention_stream::Cache stream(
+        work,
+        reinterpret_cast<DmaDescriptor*>(cached->dma_words[0]),
+        PackedKv8(cached->packed, kvheads, kv_rows),
+        stream_columns,
+        (unsigned(l[0] + l[2]) + 63) & ~63u,
+        kvheads,
+        2 * ((unsigned(l[0]) + 31) / 32),
+        unsigned(l[2]),
+        unsigned(l[0]));
+    bool okay = attention_hmx::serve(
+        queue, [&](const attention_hmx::Job& j) -> attention_hmx::Status {
+          if (j.panel) {
+            const auto status = stream.prepare(j.panel);
+            if (status != attention_hmx::Status::Done)
+              return status;
+          }
+          if (j.high) {
+            const auto matrix = j;
+            if (matrix.k && matrix.n)
+              for (unsigned batch = 0; batch < matrix.batches; ++batch)
+                for (unsigned c = 0; c < matrix.n; c += 32)
+                  attention_u16::multiply(
+                      matrix.a + batch * matrix.a_stride,
+                      matrix.b + c * matrix.b_stride,
+                      reinterpret_cast<uint16_t*>(
+                          matrix.c + batch * matrix.c_stride + c * 64),
+                      reinterpret_cast<uint16_t*>(
+                          matrix.high + batch * matrix.c_stride + c * 64),
+                      reinterpret_cast<const uint32_t*>(
+                          matrix.bias + (c / 32) * matrix.bias_stride),
+                      matrix.k);
+            if (j.panel)
+              stream.consume(j.panel, unsigned(&j - queue.jobs));
+            return attention_hmx::Status::Done;
+          }
+          const auto matrix = j;
+          for (unsigned batch = 0; batch < matrix.batches; ++batch)
+            for (unsigned c = 0; c < matrix.n; c += 32)
+              qhblas_hmx_matrix_matrix_mpy_hf_sm(
+                  matrix.a + batch * matrix.a_stride,
+                  ((matrix.k / 32) << 11) | ((matrix.m - 1) << 2),
+                  matrix.b + c * matrix.k * 2,
+                  ((matrix.k / 32) << 11) - 1,
+                  matrix.c + batch * matrix.c_stride + c * 64,
+                  0,
+                  matrix.bias);
+          return attention_hmx::Status::Done;
+        });
 
+    if (!stream.finish())
+      okay = false;
     if (locked && !hvx_only)
       HAP_compute_res_hmx_unlock(context);
     return okay && locked ? QHPI_SUCCESS : QHPI_ERROR_FATAL;
@@ -874,10 +1089,7 @@ static uint32_t execute(
       static_cast<const int32_t*>(qhpi_tensor_raw_data(in[6]));
   const auto* meta = static_cast<const float*>(qhpi_tensor_raw_data(in[7]));
   const unsigned qrows = qhpi_tensor_shape(in[1]).dims[2],
-                 columns = (unsigned(static_cast<const int32_t*>(
-                                qhpi_tensor_raw_data(in[2]))[1]) &
-                            logical_size_mask) /
-      (kvheads * 256 * 2);
+                 columns = config.capacity;
   int valid = lengths[0], first = lengths[1], history = lengths[2],
       capacity = columns;
   if (valid < 1 || unsigned(valid) > qrows || first < 0 || history < 0 ||
@@ -887,18 +1099,28 @@ static uint32_t execute(
     return QHPI_UNSUPPORTED;
   }
   const unsigned keys = history + valid, padded = (keys + 63) & ~63u;
-  if (qrows > 1 || keys > short_key_limit || qheads != 16) {
+  if (qrows > 1 || keys > short_key_limit || (qheads != 16 || kvheads != 2)) {
     while (!__atomic_load_n(
         reinterpret_cast<uint32_t*>(work + 1536), __ATOMIC_ACQUIRE))
       attention_hmx::pause();
   }
+  if (integer_decode)
+    return attention::integer_decode(handle, out, in, kv_rows, supplied_cache);
+  if (use_integer)
+    return grouped_prefill_u16(handle, out, in, kv_rows);
+  if (qrows > 1 && groups == 4 && valid >= 64 && keys >= 1024 &&
+      (unsigned(valid) == qrows || keys >= online_threshold) &&
+      kvheads * 2 * ((unsigned(valid) + rows - 1) / rows) >= workers &&
+      qhpi_tensor_shape(in[0]).dims[3] * 2 >=
+          worker_start + workers * grouped_worker_bytes)
+    return grouped_prefill(handle, out, in, kv_rows);
   if (keys >= online_threshold) {
     while (!__atomic_load_n(
         reinterpret_cast<uint32_t*>(work + 1536), __ATOMIC_ACQUIRE))
       attention_hmx::pause();
-    return online_prefill(handle, out, in);
+    return online_prefill(handle, out, in, kv_rows);
   }
-  if (qrows == 1 && keys <= short_key_limit && qheads == 16) {
+  if (qrows == 1 && keys <= short_key_limit && (qheads == 16 && kvheads == 2)) {
     auto* cached = packed_cache(
         static_cast<const int32_t*>(qhpi_tensor_raw_data(in[2]))[0], kv_bytes);
     for (unsigned shard = slice; shard < max_workers; shard += workers)
@@ -908,6 +1130,7 @@ static uint32_t execute(
           cached->packed,
           cached->packed + kv_bytes,
           keys,
+          kv_rows,
           shard,
           work,
           qhpi_tensor_quant_parameters(in[1]),
@@ -952,8 +1175,8 @@ static uint32_t execute(
   auto* y = static_cast<uint16_t*>(qhpi_tensor_raw_data(out[0]));
   for (unsigned head = slice; head < (qrows == 1 ? kvheads : qheads);
        head += workers) {
-    unsigned kv = qrows == 1 ? head : head / 8;
-    const unsigned queries = qrows == 1 ? 8u : unsigned(valid);
+    unsigned kv = qrows == 1 ? head : head / groups;
+    const unsigned queries = qrows == 1 ? groups : unsigned(valid);
     for (unsigned begin = 0; begin < queries; begin += rows) {
       unsigned actual = std::min(rows, queries - begin);
       if (k_pipeline) {
@@ -968,7 +1191,9 @@ static uint32_t execute(
         if (r < actual)
           to_half(
               qa + r * 256,
-              q + (qrows == 1 ? kv * 8 + r : head * qrows + begin + r) * 256,
+              q +
+                  (qrows == 1 ? kv * groups + r : head * qrows + begin + r) *
+                      256,
               256,
               qquant);
         else
@@ -1363,7 +1588,8 @@ static uint32_t execute(
               hvxMulF32(b, hvxSplatF32(1.f / oq.stepsize)),
               hvxSplatF32(oq.zero_offset + .5f));
           *reinterpret_cast<HVX_Vector*>(
-              y + (qrows == 1 ? kv * 8 + r : head * qrows + begin + r) * 256 +
+              y +
+              (qrows == 1 ? kv * groups + r : head * qrows + begin + r) * 256 +
               c) =
               Q6_Vuh_vpack_VwVw_sat(Q6_Vw_equals_Vsf(b), Q6_Vw_equals_Vsf(a));
         }
@@ -1386,6 +1612,19 @@ done:
 #endif
 }
 
+#endif
+static uint32_t execute(
+    QHPI_RuntimeHandle* handle,
+    uint32_t no,
+    QHPI_Tensor** out,
+    uint32_t ni,
+    const QHPI_Tensor* const* in) {
+#ifdef __hexagon__
+  return execute_impl(handle, no, out, ni, in, nullptr, nullptr);
+#else
+  return QHPI_UNSUPPORTED;
+#endif
+}
 static uint32_t reserve_scratch(
     QHPI_RuntimeHandle*,
     uint32_t,
@@ -1406,7 +1645,6 @@ static uint32_t inline_execute(
   const auto shape = qhpi_tensor_shape(in[1]);
   const unsigned qheads = shape.dims[1],
                  kvheads = qhpi_tensor_shape(in[3]).dims[1];
-  const unsigned kv_bytes = kvheads * kv_rows * 256 * 2;
   const QHPI_Tensor* original[] = {
       in[1], in[2], in[3], in[4], in[5], in[6], in[7]};
   Configuration config{};
@@ -1423,13 +1661,15 @@ static uint32_t inline_execute(
     return QHPI_UNSUPPORTED;
   if (!config.fast() || !QCOM_HTP_V81)
     return generic_execute(handle, out, in, config);
+  const unsigned kv_rows = attention_cache::packed_rows(config.capacity),
+                 kv_bytes = kvheads * kv_rows * 256 * 2;
 
   const auto resource = qhpi_thread_resources(handle);
   if (resource != 0 && resource != QHPI_RESOURCE_HVX)
     return QHPI_SUCCESS;
   const auto* descriptor =
       static_cast<const int32_t*>(qhpi_tensor_raw_data(in[2]));
-  if (!cache_pointer(descriptor))
+  if (!cache_pointer(descriptor, 2 * kv_bytes))
     return QHPI_ERROR_FATAL;
   auto* cached = packed_cache(descriptor[0], kv_bytes);
   if (!cached || !cached->packed)
@@ -1441,8 +1681,9 @@ static uint32_t inline_execute(
              vq = qhpi_tensor_quant_parameters(in[5]);
   if (resource == QHPI_RESOURCE_HVX)
     __atomic_store_n(&sync.expected, qhpi_num_slices(handle), __ATOMIC_RELEASE);
-  const bool short_direct = l[0] == 1 && l[1] == 0 && l[2] >= 0 &&
-      unsigned(l[2] + 1) <= short_key_limit && qheads == 16 &&
+  const bool short_direct = config.element_bytes == 2 && l[0] == 1 &&
+      l[1] == 0 && l[2] >= 0 && unsigned(l[2] + 1) <= short_key_limit &&
+      (qheads == 16 && kvheads == 2) &&
       (unsigned(descriptor[1]) & exact_append_flag) && kq.stepsize == meta[9] &&
       kq.zero_offset == int(meta[10]) && vq.stepsize == meta[11] &&
       vq.zero_offset == int(meta[12]) &&
@@ -1466,6 +1707,7 @@ static uint32_t inline_execute(
             cached->packed,
             cached->packed + kv_bytes,
             unsigned(l[2] + 1),
+            kv_rows,
             shard,
             static_cast<uint8_t*>(qhpi_tensor_raw_data(in[0])),
             qhpi_tensor_quant_parameters(in[1]),
@@ -1499,7 +1741,17 @@ static uint32_t inline_execute(
       const_cast<QHPI_Tensor*>(in[0]), const_cast<QHPI_Tensor*>(in[8])};
   const QHPI_Tensor* args[] = {in[1], in[2], in[3], in[4], in[5], in[6], in[7]};
   if (resource == QHPI_RESOURCE_HVX) {
-    auto status = initialize(handle, 2, storage, 7, args);
+    uint32_t status = QHPI_SUCCESS;
+    if (integer_attention(
+            in[1],
+            in[3],
+            in[5],
+            in[7],
+            qhpi_tensor_shape(in[0]).dims[3] * 2,
+            qhpi_num_slices(handle)))
+      status = initialize_integer(handle, 2, storage, 7, args, &config, cached);
+    else
+      status = initialize(handle, 2, storage, 7, args);
     if (status != QHPI_SUCCESS)
       __atomic_store_n(&sync.status, status, __ATOMIC_RELEASE);
     __atomic_add_fetch(&sync.prepared, 1u, __ATOMIC_RELEASE);
@@ -1507,7 +1759,7 @@ static uint32_t inline_execute(
       attention_hmx::pause();
     status = __atomic_load_n(&sync.status, __ATOMIC_ACQUIRE);
     if (status == QHPI_SUCCESS)
-      status = execute(handle, 1, out, 9, in);
+      status = execute_impl(handle, 1, out, 9, in, &config, cached);
     if (status != QHPI_SUCCESS)
       __atomic_store_n(&sync.status, status, __ATOMIC_RELEASE);
     __atomic_add_fetch(&sync.departed, 1u, __ATOMIC_RELEASE);
@@ -1520,7 +1772,7 @@ static uint32_t inline_execute(
   auto status = __atomic_load_n(&sync.status, __ATOMIC_ACQUIRE);
   __atomic_store_n(&sync.ready, 1u, __ATOMIC_RELEASE);
   if (status == QHPI_SUCCESS)
-    status = execute(handle, 1, out, 9, in);
+    status = execute_impl(handle, 1, out, 9, in, &config, cached);
   while (__atomic_load_n(&sync.departed, __ATOMIC_ACQUIRE) !=
          __atomic_load_n(&sync.expected, __ATOMIC_ACQUIRE))
     attention_hmx::pause();
@@ -1538,6 +1790,26 @@ static uint32_t inline_execute(
   { T, QHPI_LAYOUT_FLAT_4, QHPI_STORAGE_DIRECT, W }
 #define D(T) S(T, QHPI_MEM_LOC_DDR_ONLY)
 #define V(T) S(T, QHPI_MEM_LOC_TCM_ONLY)
+#define A(T) S(T, QHPI_MEM_LOC_DDR_OR_TCM)
+static QHPI_Tensor_Signature_v1 generic_init_in[] = {
+    A(QHPI_QUINT16),
+    D(QHPI_INT32),
+    A(QHPI_QUINT16),
+    D(QHPI_INT32),
+    A(QHPI_QUINT16),
+    D(QHPI_INT32),
+    D(QHPI_FLOAT32)};
+static QHPI_Tensor_Signature_v1 generic_exec_in[] = {
+    V(QHPI_FLOAT16),
+    A(QHPI_QUINT16),
+    D(QHPI_INT32),
+    A(QHPI_QUINT16),
+    D(QHPI_INT32),
+    A(QHPI_QUINT16),
+    D(QHPI_INT32),
+    D(QHPI_FLOAT32),
+    D(QHPI_FLOAT16)};
+static QHPI_Tensor_Signature_v1 generic_exec_out[] = {A(QHPI_QUINT16)};
 static QHPI_Tensor_Signature_v1 init_in[] = {
     D(QHPI_QUINT16),
     D(QHPI_INT32),
@@ -1580,6 +1852,42 @@ static QHPI_Tensor_Signature_v1 decode_exec_in[] = {
     D(QHPI_FLOAT32),
     V(QHPI_FLOAT16)};
 static QHPI_Tensor_Signature_v1 decode_exec_out[] = {V(QHPI_QUINT16)};
+static QHPI_Tensor_Signature_v1 generic_init_in_kv8[] = {
+    A(QHPI_QUINT16),
+    D(QHPI_INT32),
+    A(QHPI_QUINT8),
+    D(QHPI_INT32),
+    A(QHPI_QUINT8),
+    D(QHPI_INT32),
+    D(QHPI_FLOAT32)};
+static QHPI_Tensor_Signature_v1 generic_exec_in_kv8[] = {
+    V(QHPI_FLOAT16),
+    A(QHPI_QUINT16),
+    D(QHPI_INT32),
+    A(QHPI_QUINT8),
+    D(QHPI_INT32),
+    A(QHPI_QUINT8),
+    D(QHPI_INT32),
+    D(QHPI_FLOAT32),
+    D(QHPI_FLOAT16)};
+static QHPI_Tensor_Signature_v1 decode_init_in_kv8[] = {
+    V(QHPI_QUINT16),
+    D(QHPI_INT32),
+    V(QHPI_QUINT8),
+    D(QHPI_INT32),
+    V(QHPI_QUINT8),
+    D(QHPI_INT32),
+    D(QHPI_FLOAT32)};
+static QHPI_Tensor_Signature_v1 decode_exec_in_kv8[] = {
+    V(QHPI_FLOAT16),
+    V(QHPI_QUINT16),
+    D(QHPI_INT32),
+    V(QHPI_QUINT8),
+    D(QHPI_INT32),
+    V(QHPI_QUINT8),
+    D(QHPI_INT32),
+    D(QHPI_FLOAT32),
+    V(QHPI_FLOAT16)};
 static uint32_t
 init_decode(const QHPI_Op*, uint32_t n, const QHPI_Tensor* const* in) {
   Geometry g{};
@@ -1607,8 +1915,60 @@ init_prefill(const QHPI_Op* op, uint32_t n, const QHPI_Tensor* const* in) {
   return !init_decode(op, n, in);
 }
 static uint32_t
+init_generic(const QHPI_Op*, uint32_t n, const QHPI_Tensor* const* in) {
+  Geometry g{};
+  return n == 7 &&
+      geometry(
+             qhpi_tensor_shape(in[0]),
+             qhpi_tensor_shape(in[2]),
+             qhpi_tensor_shape(in[4]),
+             g) &&
+      !g.fast();
+}
+static uint32_t
+exec_generic(const QHPI_Op*, uint32_t n, const QHPI_Tensor* const* in) {
+  Geometry g{};
+  return n == 9 &&
+      geometry(
+             qhpi_tensor_shape(in[1]),
+             qhpi_tensor_shape(in[3]),
+             qhpi_tensor_shape(in[5]),
+             g) &&
+      !g.fast();
+}
+static uint32_t
 exec_prefill(const QHPI_Op* op, uint32_t n, const QHPI_Tensor* const* in) {
   return !exec_decode(op, n, in);
+}
+static uint32_t
+init_hmx4(const QHPI_Op*, uint32_t n, const QHPI_Tensor* const* in) {
+  Geometry g{};
+  return n == 7 &&
+      geometry(
+             qhpi_tensor_shape(in[0]),
+             qhpi_tensor_shape(in[2]),
+             qhpi_tensor_shape(in[4]),
+             g) &&
+      g.fast() && g.heads / g.kv_heads == 4 && g.queries > 1;
+}
+static uint32_t
+exec_hmx4(const QHPI_Op*, uint32_t n, const QHPI_Tensor* const* in) {
+  Geometry g{};
+  return n == 9 &&
+      geometry(
+             qhpi_tensor_shape(in[1]),
+             qhpi_tensor_shape(in[3]),
+             qhpi_tensor_shape(in[5]),
+             g) &&
+      g.fast() && g.heads / g.kv_heads == 4 && g.queries > 1;
+}
+static uint32_t
+init_kv8_prefill(const QHPI_Op* op, uint32_t n, const QHPI_Tensor* const* in) {
+  return !init_decode(op, n, in) && !init_generic(op, n, in);
+}
+static uint32_t
+exec_kv8_prefill(const QHPI_Op* op, uint32_t n, const QHPI_Tensor* const* in) {
+  return !exec_decode(op, n, in) && !exec_generic(op, n, in);
 }
 #define K(NAME, FN, RES, MT, NUM, NOUT, IS, OS, PRED)                       \
   {                                                                         \
@@ -1621,13 +1981,22 @@ exec_prefill(const QHPI_Op* op, uint32_t n, const QHPI_Tensor* const* in) {
 static QHPI_Kernel_v1 init_k[] = {
     K("AttentionInitialize.decode_scratch",
       reserve_scratch,
-      0,
+      QHPI_RESOURCE_HVX,
       false,
       7,
       2,
       decode_init_in,
       decode_init_out,
       init_decode),
+    K("AttentionInitialize.generic",
+      initialize,
+      QHPI_RESOURCE_HVX,
+      true,
+      7,
+      2,
+      generic_init_in,
+      init_out,
+      init_generic),
     K("AttentionInitialize.hvx",
       initialize,
       QHPI_RESOURCE_HVX,
@@ -1636,7 +2005,43 @@ static QHPI_Kernel_v1 init_k[] = {
       2,
       init_in,
       init_out,
-      init_prefill)};
+      init_prefill),
+    K("AttentionInitialize.hmx4",
+      initialize,
+      QHPI_RESOURCE_HVX,
+      true,
+      7,
+      2,
+      generic_init_in,
+      init_out,
+      init_hmx4),
+    K("AttentionInitialize.kv8_decode",
+      reserve_scratch,
+      QHPI_RESOURCE_HVX,
+      false,
+      7,
+      2,
+      decode_init_in_kv8,
+      decode_init_out,
+      init_decode),
+    K("AttentionInitialize.kv8_generic",
+      initialize,
+      QHPI_RESOURCE_HVX,
+      true,
+      7,
+      2,
+      generic_init_in_kv8,
+      init_out,
+      init_generic),
+    K("AttentionInitialize.kv8_prefill",
+      initialize,
+      QHPI_RESOURCE_HVX,
+      true,
+      7,
+      2,
+      generic_init_in_kv8,
+      init_out,
+      init_kv8_prefill)};
 static QHPI_Kernel_v1 exec_k[] = {
     {.function_name = "DeltaNetOpPackage::AttentionExecute.decode_inline",
      .function = inline_execute,
@@ -1651,6 +2056,15 @@ static QHPI_Kernel_v1 exec_k[] = {
      .output_signature = decode_exec_out,
      .sync_block_size = 0,
      .predicate = exec_decode},
+    K("AttentionExecute.generic",
+      execute,
+      QHPI_RESOURCE_EXCLUSIVE,
+      true,
+      9,
+      1,
+      generic_exec_in,
+      generic_exec_out,
+      exec_generic),
     K("AttentionExecute.exclusive",
       execute,
       QHPI_RESOURCE_EXCLUSIVE,
@@ -1659,17 +2073,53 @@ static QHPI_Kernel_v1 exec_k[] = {
       1,
       exec_in,
       exec_out,
-      exec_prefill)};
+      exec_prefill),
+    K("AttentionExecute.hmx4",
+      execute,
+      QHPI_RESOURCE_EXCLUSIVE,
+      true,
+      9,
+      1,
+      generic_exec_in,
+      generic_exec_out,
+      exec_hmx4),
+    K("AttentionExecute.kv8_decode",
+      inline_execute,
+      QHPI_RESOURCE_EXCLUSIVE,
+      true,
+      9,
+      1,
+      decode_exec_in_kv8,
+      decode_exec_out,
+      exec_decode),
+    K("AttentionExecute.kv8_generic",
+      execute,
+      QHPI_RESOURCE_EXCLUSIVE,
+      true,
+      9,
+      1,
+      generic_exec_in_kv8,
+      generic_exec_out,
+      exec_generic),
+    K("AttentionExecute.kv8_prefill",
+      execute,
+      QHPI_RESOURCE_EXCLUSIVE,
+      true,
+      9,
+      1,
+      generic_exec_in_kv8,
+      generic_exec_out,
+      exec_kv8_prefill)};
 static QHPI_OpInfo_v1 ops[] = {
     {.name = "DeltaNetOpPackage::AttentionValid",
      .num_kernels = 0,
      .kernels = nullptr,
      .early_rewrite = rewrite},
     {.name = "DeltaNetOpPackage::AttentionInitialize",
-     .num_kernels = 2,
+     .num_kernels = 7,
      .kernels = init_k},
     {.name = "DeltaNetOpPackage::AttentionExecute",
-     .num_kernels = 2,
+     .num_kernels = 7,
      .kernels = exec_k}};
 } // namespace attention
 void register_attention_qhpi_ops() {
@@ -1691,7 +2141,8 @@ extern "C" void release_attention_cache_maps() {
       HAP_mmap_put(slot->fd);
     else
       HAP_munmap(slot->p, slot->bytes);
-    free(slot->packed);
+    if (!slot->preallocated)
+      free(slot->packed);
     slot->~Slot();
     free(slot);
     slot = next;

@@ -10,6 +10,7 @@
 #include <executorch/examples/qualcomm/oss_scripts/llama/runner/imem_alloc.h>
 #include <unordered_map>
 #include <unordered_set>
+#include <vector>
 
 namespace example {
 /**
@@ -51,6 +52,7 @@ I/O.    */
    * @return Pointer to the allocated buffer.
    */
   std::byte* allocate(size_t size) override;
+  MappedBuffer allocate_mapped(size_t size) override;
 
   /**
    * @brief Add memory information into QNN Backend to register RpcMem to the
@@ -71,6 +73,16 @@ tensor.
   size_t calculated_offsets_;
   std::unordered_map<std::byte*, size_t> io_pos_map_;
   std::unordered_set<void*> binded_tensor_addr_set_;
+  void* rpc_library_{nullptr};
+  void (*mapped_free_)(void*){nullptr};
+  int (*mapped_unmap_)(int, int, void*, size_t){nullptr};
+  int mapped_domain_{-1};
+  struct MappedAllocation {
+    void* data;
+    int fd;
+    size_t bytes;
+  };
+  std::vector<MappedAllocation> mapped_buffers_;
 };
 
 } // namespace example

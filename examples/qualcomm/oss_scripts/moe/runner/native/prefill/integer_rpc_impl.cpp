@@ -117,6 +117,7 @@ struct State {
   int capacity = 128;
   ComputeResources grouped, complete, partitioned;
   uint64_t profile_totals[10][8]{}, profile_calls = 0;
+  uint64_t transfer_totals[kTransferCounters]{};
   void* stacks[kWorkers + 1]{};
   qurt_mutex_t token_locks[128];
   PoolEntry entries[kWorkers + 1];
@@ -235,6 +236,7 @@ et_prefill_rpc_counts(remote_handle64, int* output, int count) {
 
 extern "C" AEEResult
 et_prefill_rpc_profile(remote_handle64 handle, float* output, int count) {
+  static_assert(82 + kTransferCounters <= 88);
   auto* state = reinterpret_cast<State*>(uintptr_t(handle));
   if (count != 80 && count != 88)
     return 1;
@@ -246,6 +248,9 @@ et_prefill_rpc_profile(remote_handle64 handle, float* output, int count) {
     std::fill(output + 80, output + 88, 0.f);
     output[80] = SM_MOE_PROFILE;
     output[81] = state->profile_calls;
+    // Transfer counters use bytes/counts rather than qtimer milliseconds.
+    for (unsigned i = 0; i < kTransferCounters; ++i)
+      output[82 + i] = state->transfer_totals[i];
   }
   HAP_power_response_t clock{};
   clock.type = HAP_power_get_clk_Freq;
@@ -287,6 +292,9 @@ extern "C" AEEResult et_prefill_rpc_run(
   const auto start = tick();
   auto stamp = start;
   memset(metrics, 0, sizeof(metrics));
+#if SM_MOE_PROFILE
+  memset(transfer_metrics, 0, sizeof(transfer_metrics));
+#endif
   if (descriptor_len != 8)
     return 14;
   const int tokens = expert_stream::token_count(descriptor[3]);
@@ -400,6 +408,9 @@ extern "C" AEEResult et_prefill_rpc_run(
     for (int column = 0; column < 8; ++column)
       state->profile_totals[row][column] += metrics[row][column];
   ++state->profile_calls;
+  for (unsigned worker = 0; worker < moe_prefill_vtcm::kWorkers; ++worker)
+    for (unsigned counter = 0; counter < kTransferCounters; ++counter)
+      state->transfer_totals[counter] += transfer_metrics[worker][counter];
 #endif
   return error ? error : released;
 }

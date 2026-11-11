@@ -8,6 +8,7 @@
 
 #include <executorch/examples/qualcomm/oss_scripts/llama/runner/client_mem.h>
 #include <executorch/examples/qualcomm/oss_scripts/llama/runner/kv_manager.h>
+#include <executorch/examples/qualcomm/oss_scripts/llama/runner/multimodal_runner/multimodal_prompt_processor.h>
 #include <executorch/extension/data_loader/file_data_loader.h>
 #include <executorch/runtime/executor/program.h>
 #include <executorch/runtime/platform/runtime.h>
@@ -133,13 +134,146 @@ void check_masks_and_cache(const MethodMeta& meta, T visible) {
   }
 }
 
+template <typename Code>
+void check_mapped_cache(const MethodMeta& meta) {
+  class MappedMemory final : public example::IMemAlloc {
+   public:
+    std::vector<std::vector<std::byte>> buffers;
+    std::vector<std::vector<std::byte>> mapped;
+    std::byte* allocate(size_t size) override {
+      buffers.emplace_back(size);
+      return buffers.back().data();
+    }
+    MappedBuffer allocate_mapped(size_t size) override {
+      mapped.emplace_back(size);
+      return {mapped.back().data(), static_cast<int32_t>(16 + mapped.size())};
+    }
+    void add_memory_info(void*, size_t, executorch::runtime::TensorInfo)
+        override {}
+  } memory;
+  const auto mode = KVManager::infer_cache_update_mode(
+      meta.input_tensor_meta(3).get(),
+      meta.input_tensor_meta(4).get(),
+      meta.output_tensor_meta(1).get(),
+      meta.output_tensor_meta(2).get(),
+      false);
+  check(
+      mode == KVManager::Metadata::kMappedAppend, "mapped cache misclassified");
+  const int head_dim = meta.output_tensor_meta(1)->sizes()[2];
+  const size_t raw_bytes = 256 * head_dim * sizeof(Code);
+  KVManager::Metadata::CacheSpec spec{
+      12,
+      128 * head_dim * sizeof(Code),
+      12,
+      128 * head_dim * sizeof(Code),
+      mode,
+      120,
+      121,
+      256};
+  KVManager manager(
+      {256, 128, 256, 1, 1, {spec}}, std::make_unique<MethodMeta>(meta));
+  manager.init_cache(&memory, 128);
+  const auto& key = manager.get_k_cache_()[0];
+  const auto& value = manager.get_v_cache_()[0];
+  int32_t lengths[3]{};
+  const auto* kd = reinterpret_cast<const int32_t*>(key.buffer);
+  const auto* vd = reinterpret_cast<const int32_t*>(value.buffer);
+  manager.prepare_attention_lengths(
+      reinterpret_cast<std::byte*>(lengths), 3, 0);
+  check(
+      lengths[0] == 3 && lengths[1] == 0 && lengths[2] == 0,
+      "tail lengths mismatch");
+  check(
+      kd[0] == 17 && vd[0] == 18 &&
+          uint32_t(kd[1]) ==
+              uint32_t(
+                  (1u << 30) | raw_bytes | (head_dim == 256 ? (1u << 31) : 0u)),
+      "FD descriptor mismatch");
+  check(
+      uint32_t(vd[1]) == ((1u << 30) | raw_bytes),
+      "value descriptor flags mismatch");
+  const size_t expected_key_bytes = head_dim == 256
+      ? ((raw_bytes + 4095) & ~size_t(4095)) + 1 * 256 * 512 * 4
+      : raw_bytes;
+  check(
+      memory.mapped[0].size() == expected_key_bytes,
+      "packed allocation size mismatch");
+  check(memory.mapped[1].size() == raw_bytes, "value allocation size mismatch");
+  const int32_t epoch = kd[2];
+  for (int dim = 0; dim < head_dim; ++dim) {
+    for (int token = 0; token < 128; ++token) {
+      reinterpret_cast<Code*>(key.output_buffer)[dim * 128 + token] =
+          20 * dim + token;
+      reinterpret_cast<Code*>(value.output_buffer)[token * head_dim + dim] =
+          20 * dim + token;
+    }
+  }
+  manager.update_cache(128, 0, 3, {});
+  manager.rearrange_cache(1);
+  manager.prepare_attention_lengths(
+      reinterpret_cast<std::byte*>(lengths), 1, 3);
+  for (int dim = 0; dim < head_dim; ++dim) {
+    reinterpret_cast<Code*>(key.output_buffer)[dim] = 20 * dim + 3;
+    reinterpret_cast<Code*>(value.output_buffer)[dim] = 20 * dim + 3;
+  }
+  manager.update_cache(1, 3, 1, {});
+  const auto* raw_k = reinterpret_cast<const Code*>(memory.mapped[0].data());
+  const auto* raw_v = reinterpret_cast<const Code*>(memory.mapped[1].data());
+  for (int dim = 0; dim < head_dim; ++dim) {
+    for (int token = 0; token < 256; ++token) {
+      check(
+          raw_k[dim * 256 + token] ==
+              (token < 4 ? Code(20 * dim + token) : Code(120)),
+          "mapped K stride or tail mismatch");
+      check(
+          raw_v[token * head_dim + dim] ==
+              (token < 4 ? Code(20 * dim + token) : Code(121)),
+          "mapped V stride or tail mismatch");
+    }
+  }
+  manager.reset_state(128, true);
+  manager.prepare_attention_lengths(
+      reinterpret_cast<std::byte*>(lengths), 7, 0);
+  check(
+      kd[2] == epoch + 1 && vd[2] == kd[2],
+      "reset did not invalidate packed KV");
+}
+
 int main(int argc, char** argv) {
   executorch::runtime::runtime_init();
+  example::MultimodalPromptProcessor::Metadata bounds{};
+  bounds.context_len = 1000;
+  bounds.ar_len = 128;
+  bounds.max_prefill_past = 1000;
+  bounds.position_capacity = 1128;
+  for (int length : {1, 896, 897, 999, 1000}) {
+    check(bounds.can_prefill(0, length, 1000), "valid tail block rejected");
+  }
+  check(bounds.can_prefill(950, 50, 1000), "valid unaligned turn rejected");
+  check(!bounds.can_prefill(950, 51, 1000), "turn exceeds mapped KV capacity");
+  check(
+      !bounds.can_prefill(0, 1001, 1000), "prompt exceeds mapped KV capacity");
+  check(!bounds.can_prefill(0, 0, 1000), "empty prompt accepted");
+  check(!bounds.can_prefill(-1, 10, 1000), "negative start accepted");
+  bounds.position_capacity = 1024;
+  check(bounds.can_prefill(0, 999, 1000), "rounded position capacity rejected");
+  check(!bounds.can_prefill(950, 50, 1000), "position table overflow accepted");
+  bounds.position_capacity = 0;
+  check(!bounds.can_prefill(0, 1, 1000), "missing position capacity accepted");
+  bounds.context_len = 1128;
+  bounds.position_capacity = 1128;
+  bounds.max_prefill_past = 896;
+  check(bounds.can_prefill(0, 999, 1127), "SDK prefill capacity regressed");
+  check(!bounds.can_prefill(900, 50, 1127), "SDK past limit was bypassed");
   check(argc == 2, "expected fixture PTE path");
   auto loader = executorch::extension::FileDataLoader::from(argv[1]);
   check(loader.ok(), "fixture file load failed");
   auto program = Program::load(&loader.get());
   check(program.ok(), "fixture program load failed");
+  check_mapped_cache<uint16_t>(program->method_meta("mapped").get());
+  check_mapped_cache<uint8_t>(program->method_meta("mapped_uint8").get());
+  check_mapped_cache<uint8_t>(program->method_meta("mapped_hmx8").get());
+  check_mapped_cache<uint16_t>(program->method_meta("mapped_hmx16").get());
 
   for (const char* name :
        {"prefill",
@@ -207,8 +341,8 @@ int main(int argc, char** argv) {
                 step + dim * 10,
             "mixed cache K append used the wrong byte stride");
         check(
-            reinterpret_cast<const uint8_t*>(values[1].buffer)[step * 4 + dim] ==
-                step + dim * 20,
+            reinterpret_cast<const uint8_t*>(
+                values[1].buffer)[step * 4 + dim] == step + dim * 20,
             "mixed cache V append used the wrong byte stride");
       }
     }

@@ -5,15 +5,17 @@
 #include "cold_start.h"
 
 PrefillSession::PrefillSession(
-    const std::string& path, int plan_tokens, bool resident_chat)
+    const std::string& path, int plan_tokens, bool resident_chat, int layer_count)
     : root(path),
       core(runtime, path, plan_tokens >= 512 ? plan_tokens : 128),
       embedding(path) {
   runtime.defer_contexts = true;
   if (!core.mapped || !core.fuse_residual)
     throw std::runtime_error("native mapped residual required");
+  if (layer_count < 4 || layer_count > 40 || layer_count % 4)
+    throw std::runtime_error("prefill layers must contain complete hybrid groups");
 
-  for (int layer = 0; layer < 40; layer++) {
+  for (int layer = 0; layer < layer_count; layer++) {
     banks.emplace_back(new Bank(root, layer));
     stride = std::max(stride, align4096(banks.back()->maximum + 4095));
   }
@@ -48,7 +50,7 @@ PrefillSession::PrefillSession(
       "PREFILL_SCHEDULE plan_tokens=%d ar_len=128 layer_major=1 memo_bytes=%zu\n",
       sequence_tokens,
       layer_memo ? layer_memo->size : 0);
-  pool_count = reuse ? 40 : 4;
+  pool_count = reuse ? layer_count : 4;
   if (!reuse)
     throw std::runtime_error("all-LRU cache requires direct buffer reuse");
 
@@ -108,7 +110,7 @@ PrefillSession::PrefillSession(
     if (table.size() != 40 * kMaxExpertSlots * 4)
       throw std::runtime_error("cold table dimensions");
     const auto* ids = reinterpret_cast<const int32_t*>(table.data());
-    for (int layer = 0; layer < 40; layer++) {
+    for (int layer = 0; layer < layer_count; layer++) {
       std::set<int> seen;
       for (int i = 0; i < capacity; i++) {
         const int expert = ids[layer * kMaxExpertSlots + i], slot = i;
@@ -155,7 +157,7 @@ PrefillSession::PrefillSession(
   check(qwen35_shared_prepare_vision(
       with_vision ? (root + "/vision.bin").c_str() : nullptr),
       "prepare shared vision");
-  for (int layer = 0; layer < 40; layer++) {
+  for (int layer = 0; layer < layer_count; layer++) {
     attention.emplace_back(
         new Attention(
             runtime, root, layer, layer % 4 != 3, false, resident_capacity));
@@ -211,7 +213,7 @@ PrefillSession::PrefillSession(
   plan_residual = core.residual;
   head = std::make_unique<Graph>(runtime, root + "/head.bin");
   std::vector<Graph*> graphs;
-  for (int i = 0; i < 40; i++) {
+  for (int i = 0; i < layer_count; i++) {
     graphs.push_back(&attention[i]->graph);
     graphs.push_back(router[i].get());
   }
@@ -268,7 +270,7 @@ PrefillSession::PrefillSession(
     startup_seed_pending = true;
   }
   printf(
-      "STARTUP_COLD_PRELOAD enabled=%d overlap=%d experts=%zu read_bytes=%llu io_ms=%.6f context_ms=%.6f overlap_ms=%.6f wait_ms=%.6f included_in_setup=1\n",
+      "STARTUP_COLD_PRELOAD enabled=%d overlap=%d experts=%zu read_bytes=%llu io_ms=%.6f context_ms=%.6f overlap_ms=%.6f wait_ms=%.6f included_in_setup=1 slots_per_layer=%d\n",
       startup_policy != "none",
       startup_policy == "overlap",
       startup_reads.size(),
@@ -278,7 +280,8 @@ PrefillSession::PrefillSession(
           context_finished - context_started)
           .count(),
       cold_overlap_ms,
-      cold_wait_ms);
+      cold_wait_ms,
+      capacity);
   if (startup_workers != io_workers) {
     readers.reset();
     readers = std::make_unique<ExpertReaders>(io_workers, stride);
@@ -434,7 +437,7 @@ void PrefillSession::attend(
       staged_router_layer = -1;
     execute_route(
         layer,
-        norm,
+        a.hidden(),
         staged_ids.data() + offset * 8,
         staged_scores.data() + offset * 8,
         staged_shared.data() + offset * 2048);
@@ -473,21 +476,31 @@ void PrefillSession::execute_route(
     throw std::runtime_error("router layer order");
   auto t = Clock::now();
   auto& r = *router[layer];
-  memcpy(r.input(r.index(true, 0)), x, 128 * 2048 * 4);
+  auto* input = r.input(r.index(true, 0));
+  if (input != x) {
+    const auto copied = Clock::now();
+    memcpy(input, x, 128 * 2048 * 4);
+    metrics.router_input_copy += elapsed(copied);
+    metrics.router_input_copy_bytes += 128 * 2048 * 4;
+  }
   r.execute();
   memcpy(ids, r.output(r.index(false, 0)), 128 * 8 * 4);
+  double prefetch_ms = 0;
+  if (layer_memo) {
+    const auto submitted = Clock::now();
+    if (chunk_start == sequence_start)
+      finish_memo_copy();
+    prefetch_route(layer, ids);
+    prefetch_ms = elapsed(submitted);
+  }
   memcpy(scores, r.output(r.index(false, 1)), 128 * 8 * 4);
   memcpy(shared, r.output(r.index(false, 2)), 128 * 2048 * 4);
-  metrics.router += elapsed(t);
+  metrics.router += elapsed(t) - prefetch_ms;
   metrics.calls[2]++;
   if (memo_copy != MemoCopy::None)
     copy_compute_spans.emplace_back(t, Clock::now());
   if (!route_reads.empty())
     route_io_spans.emplace_back(t, Clock::now());
-  if (layer_memo && chunk_start == sequence_start)
-    finish_memo_copy();
-  if (layer_memo)
-    prefetch_route(layer, ids);
 }
 
 void PrefillSession::prefetch_route(int layer, const int32_t* ids) {
@@ -1231,7 +1244,7 @@ void PrefillSession::experts(
 }
 
 void PrefillSession::project(const float* x, float* logits) {
-  if (next_layer != 40)
+  if (next_layer != int(attention.size()))
     throw std::runtime_error("incomplete prefill graph");
   auto t = Clock::now();
   core.end_output_read();

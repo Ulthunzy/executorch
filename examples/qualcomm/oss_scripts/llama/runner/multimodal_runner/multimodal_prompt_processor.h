@@ -29,6 +29,7 @@ class MultimodalPromptProcessor : public example::PromptProcessor {
     bool use_int64_token;
     int sliding_window;
     CacheMode cache_mode;
+    int32_t position_capacity;
     int32_t embedding_dim = 0;
     int32_t position_id_dim = 1;
     int32_t max_prefill_past = INT32_MAX;
@@ -37,15 +38,15 @@ class MultimodalPromptProcessor : public example::PromptProcessor {
         int64_t start_pos,
         int64_t num_tokens,
         int64_t max_cache_len) const {
-      if (ar_len <= 0 || context_len < ar_len || start_pos < 0 ||
-          num_tokens <= 0 || start_pos > max_cache_len ||
+      if (ar_len <= 0 || context_len < ar_len || position_capacity < ar_len ||
+          start_pos < 0 || num_tokens <= 0 || start_pos > max_cache_len ||
           num_tokens > max_cache_len - start_pos) {
         return false;
       }
       const int64_t last_chunk_pos =
           start_pos + ((num_tokens - 1) / ar_len) * ar_len;
-      // Padding positions and past slots must fit the compiled prefill graph.
-      return last_chunk_pos <= std::min(max_prefill_past, context_len - ar_len);
+      return last_chunk_pos <=
+          std::min(max_prefill_past, position_capacity - ar_len);
     }
   };
 

@@ -296,6 +296,13 @@ QNNMultimodalRunner::QNNMultimodalRunner(
   ET_LOG(Info, "eval mode=%d", eval_mode_);
 }
 
+QNNMultimodalRunner::~QNNMultimodalRunner() {
+  // Release QNN modules before their mapped KV allocations.
+  text_decoder_.reset();
+  tok_embedding_.reset();
+  encoder_.reset();
+}
+
 bool QNNMultimodalRunner::is_loaded() const {
   return encoder_->is_loaded() && tok_embedding_->is_loaded() &&
       text_decoder_->is_loaded() && embedding_merger_ && tokenizer_ &&
@@ -426,6 +433,17 @@ Error QNNMultimodalRunner::load() {
   auto atten_mask_meta_token = method_meta->input_tensor_meta(1);
   token_generator_ar_len = atten_mask_meta_token->sizes()[2];
   context_len_ = atten_mask_meta_token->sizes()[3];
+  const bool mapped_attention =
+      text_decoder_->method_names()->count("get_attention_valid") != 0;
+  if (mapped_attention) {
+    ET_CHECK_OR_RETURN_ERROR(
+        shared_buffer_,
+        InvalidArgument,
+        "Mapped attention requires shared RPC buffers");
+    context_len_ = read_required_int_metadata(
+        text_decoder_.get(), "get_attention_cache_capacity");
+    token_generator_ar_len = method_meta->input_tensor_meta(0)->sizes()[1];
+  }
   if (eval_mode_ == EvalMode::kKVCached) {
     prompt_processor_ar_len = token_generator_ar_len;
   } else if (
@@ -433,6 +451,10 @@ Error QNNMultimodalRunner::load() {
       eval_mode_ == EvalMode::kLookaheadDecoding) {
     auto atten_mask_meta_prompt = prompt_method_meta->input_tensor_meta(1);
     prompt_processor_ar_len = atten_mask_meta_prompt->sizes()[2];
+    if (mapped_attention) {
+      prompt_processor_ar_len =
+          prompt_method_meta->input_tensor_meta(0)->sizes()[1];
+    }
   }
   if (prompt_processor_ar_len == context_len_)
     max_cache_len = context_len_;
@@ -440,6 +462,9 @@ Error QNNMultimodalRunner::load() {
     max_cache_len = context_len_ -
         std::min(token_generator_ar_len, prompt_processor_ar_len);
   max_ar_len = std::max(token_generator_ar_len, prompt_processor_ar_len);
+  if (mapped_attention) {
+    max_cache_len = context_len_;
+  }
   prompt_ar_len_ = prompt_processor_ar_len;
 
   const size_t input_pos_idx = cache_mode_ == CacheMode::HybridCache ? 3 : 2;
@@ -586,6 +611,9 @@ Error QNNMultimodalRunner::load() {
             k_out.get(),
             v_out.get(),
             !layer_is_swa.empty() && layer_is_swa[layer]);
+        if (spec.update_mode == KVManager::Metadata::kMappedAppend) {
+          spec.mapped_capacity = context_len_;
+        }
         spec.k_zero_point =
             executorch::runtime::isFloatingType(k_in->scalar_type())
             ? 0
@@ -687,10 +715,15 @@ Error QNNMultimodalRunner::load() {
           text_decoder_->method_meta(token_generator_method_name).get())));
 
   int32_t max_prefill_past = INT32_MAX;
-  if (prompt_processor_method_name == "prefill_forward" &&
-      text_decoder_->method_names()->count("get_prefill_max_past") != 0) {
+  int32_t prefill_position_capacity = context_len_;
+  if (is_qwen35_family_vlm(model_version_) &&
+      prompt_processor_method_name == "prefill_forward") {
     max_prefill_past =
         read_required_int_metadata(text_decoder_.get(), "get_prefill_max_past");
+  }
+  if (mapped_attention && prompt_processor_method_name == "prefill_forward") {
+    prefill_position_capacity = read_required_int_metadata(
+        text_decoder_.get(), "get_prefill_position_capacity");
   }
   prompt_processor_ = std::make_unique<MultimodalPromptProcessor>(
       decoder_runner_.get(),
@@ -705,6 +738,7 @@ Error QNNMultimodalRunner::load() {
           use_int64_token,
           sliding_window,
           cache_mode_,
+          prefill_position_capacity,
           static_cast<int32_t>(dim),
           position_id_dim_,
           max_prefill_past},

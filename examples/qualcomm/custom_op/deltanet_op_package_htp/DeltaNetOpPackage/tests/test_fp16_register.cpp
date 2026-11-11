@@ -9,7 +9,7 @@
 #include <cstring>
 #include <iterator>
 #include <random>
-#include "../src/ops/DeltaNetQhpi.cpp"
+#include "../src/kernels/DeltaNetFloat.h"
 
 int main(int argc, char** argv) {
   if (argc != 2)

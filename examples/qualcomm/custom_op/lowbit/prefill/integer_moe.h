@@ -22,7 +22,7 @@ struct Request {
   uint8_t *a, *w;
   uint32_t* bias;
   uint16_t* raw;
-  uint32_t k, groups, worker, nblocks, block_bytes;
+  uint32_t k, groups, worker, nblocks, block_bytes, row_tiles;
 };
 
 struct Sync {
@@ -39,6 +39,16 @@ struct Sync {
 
 extern uint64_t metrics[10][8];
 extern uint32_t execution_counts[4];
+enum TransferCounter {
+  kWeightDmaBytes,
+  kWeightDmaCalls,
+  kMetadataDmaBytes,
+  kMetadataDmaCalls,
+  kExpandedWeightBytes,
+  kExpertBatches,
+  kTransferCounters
+};
+extern uint64_t transfer_metrics[kWorkers][kTransferCounters];
 
 inline uint64_t tick() {
 #if SM_MOE_PROFILE

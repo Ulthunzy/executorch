@@ -88,11 +88,16 @@ void TokenEmbeddingProcessor::prefill(
     const std::vector<uint64_t>& prompt_tokens) {
   int64_t prompt_pos = 0;
   int32_t num_prompt_tokens = prompt_tokens.size();
+  const int32_t num_iters = 1 + ((num_prompt_tokens - 1) / metadata_.ar_len);
+  const bool direct_output = metadata_.use_int64_token;
   prompt_embeddings_.size =
       num_prompt_tokens * metadata_.embedding_dim * sizeof(float);
 
   // Allocate memory using std::vector for smart pointer management
-  prompt_embeddings_buffer_.resize(num_prompt_tokens * metadata_.embedding_dim);
+  const size_t buffer_tokens = direct_output
+      ? static_cast<size_t>(num_iters) * metadata_.ar_len
+      : num_prompt_tokens;
+  prompt_embeddings_buffer_.resize(buffer_tokens * metadata_.embedding_dim);
   prompt_embeddings_.data = prompt_embeddings_buffer_.data();
 
   prompt_embeddings_sizes_ = {
@@ -106,8 +111,6 @@ void TokenEmbeddingProcessor::prefill(
       prompt_embeddings_sizes_.data(),
       prompt_embeddings_.data);
 
-  int num_iters = 1 + ((num_prompt_tokens - 1) / metadata_.ar_len);
-
   ET_CHECK_MSG(
       tok_embedding_runner_->set_outputs(method_name_, output_tensors_) ==
           executorch::runtime::Error::Ok,
@@ -117,12 +120,31 @@ void TokenEmbeddingProcessor::prefill(
   for (int32_t i = 0; i < num_iters; ++i) {
     prepare_io(prompt_tokens, prompt_pos);
 
+    if (direct_output) {
+      embeddings_.tensor->set_data(
+          prompt_embeddings_.data + prompt_pos * metadata_.embedding_dim);
+      ET_CHECK_MSG(
+          tok_embedding_runner_->set_outputs(method_name_, output_tensors_) ==
+              executorch::runtime::Error::Ok,
+          "Failed to set output tensor for module %s",
+          method_name_.c_str());
+    }
     tok_embedding_runner_->step(method_name_, inputs_);
 
     // Update prompt_embedding
-    update_prompt_embedding(num_prompt_tokens, prompt_pos);
+    if (!direct_output) {
+      update_prompt_embedding(num_prompt_tokens, prompt_pos);
+    }
 
     prompt_pos += metadata_.ar_len;
+  }
+  if (direct_output) {
+    embeddings_.tensor->set_data(embeddings_.data);
+    ET_CHECK_MSG(
+        tok_embedding_runner_->set_outputs(method_name_, output_tensors_) ==
+            executorch::runtime::Error::Ok,
+        "Failed to set output tensor for module %s",
+        method_name_.c_str());
   }
 }
 

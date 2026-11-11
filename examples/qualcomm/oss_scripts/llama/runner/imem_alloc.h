@@ -9,6 +9,7 @@
 #pragma once
 #include <executorch/runtime/executor/method_meta.h>
 #include <cstddef>
+#include <cstdint>
 
 namespace example {
 
@@ -24,9 +25,16 @@ inline size_t align_shared_buffer_allocation_size(size_t data_size) {
  */
 class IMemAlloc {
  public:
+  struct MappedBuffer {
+    std::byte* data;
+    int32_t fd;
+  };
   IMemAlloc(){};
   virtual ~IMemAlloc(){};
   virtual std::byte* allocate(size_t data_size) = 0;
+  virtual MappedBuffer allocate_mapped(size_t data_size) {
+    return {nullptr, -1};
+  }
   virtual void add_memory_info(
       void* data_ptr,
       size_t data_size,

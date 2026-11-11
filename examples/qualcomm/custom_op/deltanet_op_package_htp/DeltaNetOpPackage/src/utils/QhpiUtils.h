@@ -16,22 +16,34 @@
 // QHPI 仿射量化及 B/T/H 张量索引工具；不依赖 recurrence 或 state 布局。
 namespace op_utils {
 
+static inline bool hasShape(
+    const QHPI_Shape& shape,
+    uint32_t batch,
+    uint32_t heads,
+    uint32_t rows,
+    uint32_t columns) {
+  return shape.rank == 4 && shape.dims[0] == batch && shape.dims[1] == heads &&
+      shape.dims[2] == rows && shape.dims[3] == columns;
+}
+
+static inline size_t numElements(const QHPI_Shape& shape) {
+  size_t result = 1;
+  for (unsigned i = 0; i < shape.rank; ++i)
+    result *= shape.dims[i];
+  return result;
+}
+
 // 将 U16 量化 code 转成浮点实值：real=(code-zero_offset)*stepsize。
-static inline float dequantU16(
-    uint16_t value,
-    QHPI_Quant_Parameters qparams) {
-  return (static_cast<float>(value) -
-          static_cast<float>(qparams.zero_offset)) *
+static inline float dequantU16(uint16_t value, QHPI_Quant_Parameters qparams) {
+  return (static_cast<float>(value) - static_cast<float>(qparams.zero_offset)) *
       qparams.stepsize;
 }
 
-// 将浮点实值映射为 round(zero_offset+real/stepsize)，饱和到 [0,65535] 后写入 U16。
-static inline uint16_t quantU16(
-    float value,
-    QHPI_Quant_Parameters qparams) {
-  const float scaled =
-      std::round(static_cast<float>(qparams.zero_offset) +
-                 value / qparams.stepsize);
+// 将浮点实值映射为 round(zero_offset+real/stepsize)，饱和到 [0,65535] 后写入
+// U16。
+static inline uint16_t quantU16(float value, QHPI_Quant_Parameters qparams) {
+  const float scaled = std::round(
+      static_cast<float>(qparams.zero_offset) + value / qparams.stepsize);
   const float clamped = std::min(std::max(scaled, 0.0f), 65535.0f);
   return static_cast<uint16_t>(clamped);
 }
@@ -52,8 +64,7 @@ static inline int32_t centeredU16(
 
 // 检查零点是否位于 U16 code 范围 [0,65535]。
 // 这不保证未缩位的 code-z 可以放进 int16；调用方另行检查数值范围。
-static inline bool hasU16ZeroOffset(
-    QHPI_Quant_Parameters qparams) {
+static inline bool hasU16ZeroOffset(QHPI_Quant_Parameters qparams) {
   return qparams.zero_offset >= 0 && qparams.zero_offset <= 65535;
 }
 
@@ -74,25 +85,19 @@ static inline size_t timeHeadIndex(
     }
   }
   if (shape.rank == 4) {
-    if (shape.dims[1] > token && shape.dims[2] == 1 &&
-        shape.dims[3] > head) {
-      return ((batch * shape.dims[1] + token) * shape.dims[2]) *
-          shape.dims[3] +
+    if (shape.dims[1] > token && shape.dims[2] == 1 && shape.dims[3] > head) {
+      return ((batch * shape.dims[1] + token) * shape.dims[2]) * shape.dims[3] +
           head;
     }
-    if (shape.dims[1] == 1 && shape.dims[2] > token &&
-        shape.dims[3] > head) {
-      return ((batch * shape.dims[1]) * shape.dims[2] + token) *
-          shape.dims[3] +
+    if (shape.dims[1] == 1 && shape.dims[2] > token && shape.dims[3] > head) {
+      return ((batch * shape.dims[1]) * shape.dims[2] + token) * shape.dims[3] +
           head;
     }
-    if (shape.dims[1] > token && shape.dims[2] > head &&
-        shape.dims[3] == 1) {
+    if (shape.dims[1] > token && shape.dims[2] > head && shape.dims[3] == 1) {
       return ((batch * shape.dims[1] + token) * shape.dims[2] + head) *
           shape.dims[3];
     }
-    if (shape.dims[1] > head && shape.dims[2] > token &&
-        shape.dims[3] == 1) {
+    if (shape.dims[1] > head && shape.dims[2] > token && shape.dims[3] == 1) {
       return ((batch * shape.dims[1] + head) * shape.dims[2] + token) *
           shape.dims[3];
     }

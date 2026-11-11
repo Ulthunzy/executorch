@@ -10,6 +10,7 @@
 #include <thread>
 #include <vector>
 #include "../src/ops/attention/HmxQueue.h"
+#include "../src/ops/attention/GroupedScratch.h"
 #include "../src/ops/attention/Reference.h"
 
 using attention::Configuration;
@@ -32,27 +33,39 @@ static float grids[] = {
     1.f / 4096,
     32768};
 
+template <typename Code = uint16_t>
 static void run_case(
     Geometry g,
     unsigned capacity,
     unsigned valid,
     unsigned first,
     unsigned history) {
-  const unsigned bytes = g.batch * g.kv_heads * g.dimension * capacity * 2;
+  float grids[13];
+  std::copy_n(::grids, 13, grids);
+  if (sizeof(Code) == 1) {
+    grids[9] = grids[11] = 1.f / 16;
+    grids[10] = grids[12] = 128;
+  }
+  const unsigned bytes =
+      g.batch * g.kv_heads * g.dimension * capacity * sizeof(Code);
   const int32_t kd[] = {3, int32_t(bytes | attention::exact_append_flag), 7};
   const int32_t vd[] = {4, kd[1], 7};
   const int32_t lengths[] = {int32_t(valid), int32_t(first), int32_t(history)};
   Configuration c{g};
-  assert(c.configure(kd, vd, lengths, grids));
+  assert(c.configure(kd, vd, lengths, grids, sizeof(Code)));
   std::mt19937 random(capacity + history + g.dimension);
   std::vector<uint16_t> q(g.batch * g.heads * g.queries * g.dimension),
-      k(bytes / 2), v(bytes / 2),
-      nk(g.batch * g.kv_heads * g.queries * g.dimension), nv(nk.size()),
       y(q.size()), again(q.size());
-  for (auto* data : {&q, &k, &v, &nk, &nv})
+  std::vector<Code> k(bytes / sizeof(Code)), v(k.size()),
+      nk(g.batch * g.kv_heads * g.queries * g.dimension), nv(nk.size());
+  for (auto& x : q)
+    x = uint16_t(32768 + int(random() % 4096) - 2048);
+  for (auto* data : {&k, &v, &nk, &nv})
     for (auto& x : *data)
-      x = uint16_t(32768 + int(random() % 4096) - 2048);
-  const Quantization quant{1.f / 4096, 32768}, outq{1.f / 16384, 32768};
+      x = sizeof(Code) == 1 ? Code(128 + int(random() % 16) - 8)
+                            : Code(32768 + int(random() % 4096) - 2048);
+  const Quantization quant{1.f / 4096, 32768},
+      cache_quant{grids[9], int(grids[10])}, outq{1.f / 16384, 32768};
   const Inputs inputs{
       q.data(),
       k.data(),
@@ -61,8 +74,8 @@ static void run_case(
       nv.data(),
       grids,
       quant,
-      quant,
-      quant,
+      cache_quant,
+      cache_quant,
       outq};
   std::vector<float> work(g.dimension + 256);
   for (unsigned b = 0; b < g.batch; ++b)
@@ -85,8 +98,8 @@ static void run_case(
             const auto code = col < history
                 ? k[(kv * g.dimension + d) * capacity + first + col]
                 : nk[(kv * g.dimension + d) * g.queries + col - history];
-            score +=
-                double(quant.dequantize(q[at + d])) * quant.dequantize(code);
+            score += double(quant.dequantize(q[at + d])) *
+                cache_quant.dequantize(code);
           }
           // Independent dense score matrix, double softmax and PV accumulation.
           for (unsigned stage : {0u, 3u}) {
@@ -113,7 +126,7 @@ static void run_case(
             const auto code = col < history
                 ? v[(kv * capacity + first + col) * g.dimension + d]
                 : nv[(kv * g.queries + col - history) * g.dimension + d];
-            expected[d] += p * quant.dequantize(code);
+            expected[d] += p * cache_quant.dequantize(code);
           }
         }
         for (unsigned d = 0; d < g.dimension; ++d)
@@ -127,12 +140,14 @@ static void run_case(
     for (unsigned col = 0; col < capacity; ++col)
       if (col < first || col >= first + history)
         for (unsigned d = 0; d < g.dimension; ++d) {
-          k[(head * g.dimension + d) * capacity + col] = 65535;
+          k[(head * g.dimension + d) * capacity + col] =
+              std::numeric_limits<Code>::max();
           v[(head * capacity + col) * g.dimension + d] = 0;
         }
     for (unsigned r = valid; r < g.queries; ++r)
       for (unsigned d = 0; d < g.dimension; ++d) {
-        nk[(head * g.dimension + d) * g.queries + r] = 65535;
+        nk[(head * g.dimension + d) * g.queries + r] =
+            std::numeric_limits<Code>::max();
         nv[(head * g.queries + r) * g.dimension + d] = 0;
       }
   }
@@ -150,11 +165,17 @@ static void test_queue(unsigned workers, bool fail) {
     std::vector<std::thread> threads;
     for (unsigned worker = 0; worker < workers; ++worker) {
       threads.emplace_back([&, worker] {
-        uint8_t a = 1, b = 2, c = 0, bias = 0;
+        uint8_t a[8]{1, 0, 2, 0, 3, 0, 4, 0}, b = 2, c[8]{}, bias = 0;
         for (unsigned job = 0; job < 5; ++job) {
-          if (!attention_hmx::submit(queue, worker, &a, &b, &c, &bias, 1, 1, 1))
+          const unsigned batches = job % 2 ? 4 : 1;
+          std::fill_n(c, 8, uint8_t(0));
+          if (!attention_hmx::submit(
+                  queue, worker, a, &b, c, &bias, 1, 1, 1, batches, 2, 2))
             break;
-          assert(c == 3);
+          for (unsigned batch = 0; batch < 4; ++batch) {
+            assert(c[batch * 2] == (batch < batches ? batch + 3 : 0));
+            assert(c[batch * 2 + 1] == 0);
+          }
         }
         __atomic_store_n(&queue.jobs[worker].finished, 1u, __ATOMIC_RELEASE);
       });
@@ -163,7 +184,8 @@ static void test_queue(unsigned workers, bool fail) {
         attention_hmx::serve(queue, [&](const attention_hmx::Job& job) {
           if (fail)
             return false;
-          *job.c = *job.a + *job.b;
+          for (unsigned batch = 0; batch < job.batches; ++batch)
+            job.c[batch * job.c_stride] = job.a[batch * job.a_stride] + *job.b;
           return true;
         });
     for (auto& thread : threads)
@@ -187,8 +209,37 @@ int main() {
   run_case({1, 4, 1, 32, 1}, 16384, 1, 0, 8191);
   run_case({1, 1, 1, 1, 1}, 1, 1, 0, 0);
   run_case({1, 1, 3, 8, 1}, 99, 3, 0, 99);
+  run_case({1, 8, 128, 256, 2}, 8192, 37, 0, 0);
+  run_case({1, 8, 128, 256, 2}, 8192, 37, 7, 193);
+  run_case({1, 8, 1, 256, 2}, 8192, 1, 0, 8191);
+  run_case<uint8_t>({1, 8, 128, 256, 2}, 8192, 37, 0, 0);
+  run_case<uint8_t>({1, 8, 128, 256, 2}, 8192, 37, 7, 193);
+  run_case<uint8_t>({1, 8, 128, 256, 2}, 8192, 128, 0, 129);
+  run_case<uint8_t>({1, 8, 1, 256, 2}, 8192, 1, 0, 8191);
+  run_case<uint8_t>({1, 16, 1, 256, 2}, 64, 1, 0, 3);
+  run_case<uint8_t>({2, 6, 7, 63, 2}, 512, 5, 3, 259);
+  {
+    Configuration packed{{1, 8, 128, 256, 2}};
+    int32_t key[] = {
+        3,
+        int32_t(
+            8388608u | attention::exact_append_flag |
+            attention_cache::packed_storage_flag),
+        1};
+    int32_t value[] = {4, int32_t(8388608u | attention::exact_append_flag), 1};
+    int32_t lengths[] = {128, 0, 0};
+    assert(packed.configure(key, value, lengths, grids));
+    assert(packed.capacity == 8192);
+    value[1] = key[1];
+    assert(!packed.configure(key, value, lengths, grids));
+    assert(attention_cache::packed_rows(8192) == 8448);
+    assert(attention_cache::packed_rows(16384) == 16640);
+    assert(attention_cache::packed_offset(17) == 4096);
+  }
   assert((!Geometry{UINT32_MAX, UINT32_MAX, UINT32_MAX, 256, 1}.valid()));
   assert((!Geometry{1, 7, 128, 128, 2}.valid()));
+  assert((Geometry{1, 8, 128, 256, 2}.fast()));
+  assert((!Geometry{1, 4, 128, 256, 2}.fast()));
   Configuration c{{1, 16, 128, 256, 2}};
   int32_t k[] = {3, 1024 * 16384, 1}, v[] = {4, k[1], 1}, l[] = {128, 0, 16384};
   assert(c.configure(k, v, l, grids) && c.fast());
@@ -208,5 +259,5 @@ int main() {
   assert(!c.configure(k, v, l, grids));
   grids[9] = 1.f / 4096;
   std::cout
-      << "Attention: 17 numerical/poisoned-capacity cases and invalid-parameter checks passed\n";
+      << "Attention: 26 numerical/poisoned-capacity cases and invalid-parameter checks passed\n";
 }

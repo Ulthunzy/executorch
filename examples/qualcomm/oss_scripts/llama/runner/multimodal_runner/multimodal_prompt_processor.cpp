@@ -219,6 +219,10 @@ void MultimodalPromptProcessor::prepare_io(
     int64_t prompt_pos,
     int64_t start_pos,
     const std::vector<int32_t>* position_ids) {
+  kv_manager_->prepare_attention_lengths(
+      attention_mask_.data,
+      std::min<int64_t>(metadata_.ar_len, num_prompt_tokens - prompt_pos),
+      start_pos);
   if (last_token_index_.size > 0) {
     *last_token_index_.data =
         std::min<int64_t>(metadata_.ar_len, num_prompt_tokens - prompt_pos) - 1;

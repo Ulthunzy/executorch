@@ -223,10 +223,20 @@ def check_artifacts(args):
                 or manifest["capacity"] != args.decode_capacity
                 or not manifest["weight_sharing"]
                 or manifest.get("prefill_core")
-                not in {"chunked_mixed_fp16", "custom_fp16", "custom_u16"}
+                not in {
+                    "chunked_mixed_fp16",
+                    "chunk128_hmx",
+                    "custom_fp16",
+                    "custom_u16",
+                }
                 or manifest["router"] != args.model_settings.quantization.router_shared
             ):
                 raise ValueError(f"Shared group {group}: layer/capacity mismatch")
+            if (
+                manifest.get("prefill_core") == "chunk128_hmx"
+                and args.model_settings.target.soc_model != "SM8850"
+            ):
+                raise ValueError("Chunk128 HMX requires SM8850 (HTP v81)")
             if (
                 "compile_settings" in manifest
                 or args.model_settings.quantization.attention == "gptq"

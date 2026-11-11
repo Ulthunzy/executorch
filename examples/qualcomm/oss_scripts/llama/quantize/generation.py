@@ -140,12 +140,16 @@ def specialize_decode(module, inputs, sliding_layers=()):
     return result, tuple(values)
 
 
-def replace_prefill_cores(module):
+def replace_prefill_cores(module, fused_state_update=False, fused_chunk=False):
     core_target = torch.ops.qnn_custom_ops.deltanet_core.default
     cores = [n for n in module.graph.nodes if n.target == core_target]
     assert cores, "Expected GDN cores in the prefill graph"
     inputs = tuple(torch.zeros(tuple(n.meta["val"].shape)) for n in cores[0].args)
-    replacement = torch.export.export(ChunkGDN().eval(), inputs, strict=False).module()
+    replacement = torch.export.export(
+        ChunkGDN(
+            fused_state_update=fused_state_update, fused_chunk=fused_chunk
+        ).eval(), inputs, strict=False
+    ).module()
     remove_export_checks(replacement)
     buffers = dict(replacement.named_buffers())
     for ordinal, core in enumerate(cores):

@@ -6,6 +6,7 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+#include <executorch/examples/qualcomm/custom_op/attention_support/cache.h>
 #include <executorch/examples/qualcomm/oss_scripts/llama/runner/kv_manager.h>
 #include <executorch/runtime/core/exec_aten/util/scalar_type_util.h>
 #include <executorch/runtime/platform/assert.h>
@@ -222,6 +223,19 @@ KVManager::Metadata::CacheUpdateMode KVManager::infer_cache_update_mode(
     const TensorInfo& k_output,
     const TensorInfo& v_output,
     bool is_swa) {
+  if (k_input.scalar_type() == executorch::aten::ScalarType::Int &&
+      k_input.nbytes() == 3 * sizeof(int32_t) &&
+      v_input.scalar_type() == executorch::aten::ScalarType::Int &&
+      v_input.nbytes() == 3 * sizeof(int32_t)) {
+    ET_CHECK_MSG(
+        !is_swa &&
+            (k_output.scalar_type() == executorch::aten::ScalarType::UInt16 ||
+             k_output.scalar_type() == executorch::aten::ScalarType::Byte) &&
+            v_output.scalar_type() == k_output.scalar_type() &&
+            k_output.sizes().size() == 4 && v_output.sizes().size() == 4,
+        "Mapped attention requires matching UINT8 or UINT16 K/V outputs");
+    return Metadata::kMappedAppend;
+  }
   // Qwen3.5's convolution state is 3D; attention K/V caches are 4D.
   if (k_input.sizes().size() == 3) {
     ET_CHECK_MSG(
@@ -261,6 +275,7 @@ KVManager::KVManager(Metadata metadata, std::unique_ptr<MethodMeta> method_meta)
   v_cache_dtypes_.resize(metadata_.num_layers);
   layer_is_swa_.assign(metadata_.num_layers, false);
   layer_cache_len_swa_.assign(metadata_.num_layers, 0);
+  mapped_caches_.resize(metadata_.num_layers);
 
   ET_CHECK_MSG(
       metadata_.cache_specs.empty() ||
@@ -281,9 +296,8 @@ KVManager::KVManager(Metadata metadata, std::unique_ptr<MethodMeta> method_meta)
         "Failed to read KV output metadata for layer %d",
         layer);
 
-    const Metadata::CacheSpec* spec = metadata_.cache_specs.empty()
-        ? nullptr
-        : &metadata_.cache_specs[layer];
+    const Metadata::CacheSpec* spec =
+        metadata_.cache_specs.empty() ? nullptr : &metadata_.cache_specs[layer];
     const bool full_overwrite =
         spec != nullptr && spec->update_mode == Metadata::kFullOverwrite;
     if (!full_overwrite &&
@@ -352,10 +366,10 @@ KVManager::KVManager(Metadata metadata, std::unique_ptr<MethodMeta> method_meta)
         layer_cache_len_swa_[layer] = k_cache_len;
       }
     } else {
-      k_cache_out_nbytes_[layer] = metadata_.num_heads * k_head_dim *
-          metadata_.max_ar_len * dtype_size;
-      v_cache_out_nbytes_[layer] = metadata_.num_heads * v_head_dim *
-          metadata_.max_ar_len * dtype_size;
+      k_cache_out_nbytes_[layer] =
+          metadata_.num_heads * k_head_dim * metadata_.max_ar_len * dtype_size;
+      v_cache_out_nbytes_[layer] =
+          metadata_.num_heads * v_head_dim * metadata_.max_ar_len * dtype_size;
       k_cache_in_nbytes_[layer] = metadata_.num_heads * k_head_dim *
           metadata_.max_cache_len * dtype_size;
       v_cache_in_nbytes_[layer] = metadata_.num_heads * v_head_dim *
@@ -449,6 +463,10 @@ void KVManager::init_attention_mask(
     const std::vector<int32_t>& attention_map,
     int32_t ar_len,
     int32_t n_past) {
+  if (attention_mask_dtype_ == executorch::aten::ScalarType::Int) {
+    prepare_attention_lengths(attention_mask, ar_len, n_past);
+    return;
+  }
   ET_CHECK_MSG(
       attention_map.size() <= ar_len,
       "The size of attention_map (%zu) doesn't match with ar_len (%d)",
@@ -573,6 +591,10 @@ void KVManager::update_attention_mask(
     int32_t ar_len,
     int32_t n_past,
     int32_t n_update) {
+  if (attention_mask_dtype_ == executorch::aten::ScalarType::Int) {
+    prepare_attention_lengths(attention_mask, ar_len, n_past + n_update);
+    return;
+  }
   std::byte* cur_ptr =
       attention_mask + n_past * getDtypeSize(attention_mask_dtype_);
 
@@ -633,11 +655,13 @@ void KVManager::init_cache(IMemAlloc* buffer_manager, int32_t ar_len) {
   for (int layer = 0; layer < metadata_.num_layers; ++layer) {
     const bool full_overwrite = !metadata_.cache_specs.empty() &&
         metadata_.cache_specs[layer].update_mode == Metadata::kFullOverwrite;
-    k_cache_[layer].buffer = buffer_manager->allocate(k_cache_in_nbytes_[layer]);
+    k_cache_[layer].buffer =
+        buffer_manager->allocate(k_cache_in_nbytes_[layer]);
     k_cache_[layer].output_buffer = full_overwrite
         ? k_cache_[layer].buffer
         : buffer_manager->allocate(k_cache_out_nbytes_[layer]);
-    v_cache_[layer].buffer = buffer_manager->allocate(v_cache_in_nbytes_[layer]);
+    v_cache_[layer].buffer =
+        buffer_manager->allocate(v_cache_in_nbytes_[layer]);
     v_cache_[layer].output_buffer = full_overwrite
         ? v_cache_[layer].buffer
         : buffer_manager->allocate(v_cache_out_nbytes_[layer]);
@@ -659,10 +683,33 @@ void KVManager::init_cache(IMemAlloc* buffer_manager, int32_t ar_len) {
         v_cache_in_nbytes_[layer],
         v_zero_point);
     if (!full_overwrite) {
-      std::memset(
-          k_cache_[layer].output_buffer, 0, k_cache_out_nbytes_[layer]);
-      std::memset(
-          v_cache_[layer].output_buffer, 0, v_cache_out_nbytes_[layer]);
+      std::memset(k_cache_[layer].output_buffer, 0, k_cache_out_nbytes_[layer]);
+      std::memset(v_cache_[layer].output_buffer, 0, v_cache_out_nbytes_[layer]);
+    }
+    if (!metadata_.cache_specs.empty() &&
+        metadata_.cache_specs[layer].update_mode == Metadata::kMappedAppend) {
+      const auto& spec = metadata_.cache_specs[layer];
+      ET_CHECK_MSG(spec.mapped_capacity > 0, "Missing mapped KV capacity");
+      const size_t bytes = metadata_.num_heads * k_head_dim_[layer] *
+          spec.mapped_capacity * getDtypeSize(k_cache_dtypes_[layer]);
+      ET_CHECK_MSG(bytes < (1u << 30), "Mapped KV cache is too large");
+      auto& cache = mapped_caches_[layer];
+      cache.has_packed_storage = k_head_dim_[layer] == 256 &&
+          metadata_.num_heads <= 8 && spec.mapped_capacity <= 16384;
+      const size_t key_bytes = cache.has_packed_storage
+          ? attention_cache::packed_offset(bytes) +
+              attention_cache::packed_bytes(
+                  metadata_.num_heads, k_head_dim_[layer], spec.mapped_capacity)
+          : bytes;
+      cache.key = buffer_manager->allocate_mapped(key_bytes);
+      cache.value = buffer_manager->allocate_mapped(bytes);
+      ET_CHECK_MSG(
+          cache.key.data && cache.value.data,
+          "Mapped attention requires RPC memory");
+      fill_cache_input(
+          k_cache_dtypes_[layer], cache.key.data, bytes, k_zero_point);
+      fill_cache_input(
+          v_cache_dtypes_[layer], cache.value.data, bytes, v_zero_point);
     }
   }
 }
@@ -671,6 +718,13 @@ void KVManager::reset_state(int32_t ar_len, bool clear_buffers) {
   cur_ar_len_ = ar_len;
   swa_write_pos_swa_ = 0;
   swa_valid_len_swa_ = 0;
+  for (auto& cache : mapped_caches_) {
+    if (cache.key.data) {
+      ET_CHECK_MSG(cache.epoch < UINT32_MAX, "Mapped KV epoch exhausted");
+      ++cache.epoch;
+      cache.history = 0;
+    }
+  }
 
   if (!clear_buffers) {
     return;
@@ -694,12 +748,10 @@ void KVManager::reset_state(int32_t ar_len, bool clear_buffers) {
         v_cache_in_nbytes_[layer],
         v_zero_point);
     if (k_cache_[layer].output_buffer != k_cache_[layer].buffer) {
-      std::memset(
-          k_cache_[layer].output_buffer, 0, k_cache_out_nbytes_[layer]);
+      std::memset(k_cache_[layer].output_buffer, 0, k_cache_out_nbytes_[layer]);
     }
     if (v_cache_[layer].output_buffer != v_cache_[layer].buffer) {
-      std::memset(
-          v_cache_[layer].output_buffer, 0, v_cache_out_nbytes_[layer]);
+      std::memset(v_cache_[layer].output_buffer, 0, v_cache_out_nbytes_[layer]);
     }
   }
 }
@@ -711,8 +763,7 @@ void KVManager::rearrange_cache(int32_t ar_len_dst) {
   for (int layer = 0; layer < metadata_.num_layers; ++layer) {
     const bool state_or_circular = !metadata_.cache_specs.empty() &&
         metadata_.cache_specs[layer].update_mode != Metadata::kAppend;
-    if (state_or_circular ||
-        (!layer_is_swa_.empty() && layer_is_swa_[layer])) {
+    if (state_or_circular || (!layer_is_swa_.empty() && layer_is_swa_[layer])) {
       continue;
     }
     rearrange_key(k_cache_[layer], ar_len_dst, k_head_dim_[layer]);
@@ -831,6 +882,32 @@ void KVManager::update_cache(
   }
   bool updated_circular_cache = false;
   for (int layer = 0; layer < metadata_.num_layers; ++layer) {
+    if (mapped_caches_[layer].key.data) {
+      const int32_t capacity = metadata_.cache_specs[layer].mapped_capacity;
+      ET_CHECK_MSG(
+          selected.empty() && n_past >= 0 && n_update >= 0 &&
+              n_update <= cur_ar_len_ && n_past + n_update <= capacity,
+          "Mapped KV update requires an append-only causal prefix");
+      auto& cache = mapped_caches_[layer];
+      const size_t head_dim = k_head_dim_[layer];
+      const size_t element = getDtypeSize(k_cache_dtypes_[layer]);
+      for (int64_t head = 0; head < metadata_.num_heads; ++head) {
+        for (size_t dim = 0; dim < head_dim; ++dim) {
+          const size_t row = head * head_dim + dim;
+          std::memcpy(
+              cache.key.data + (row * capacity + n_past) * element,
+              k_cache_[layer].output_buffer + row * cur_ar_len_ * element,
+              n_update * element);
+        }
+        std::memcpy(
+            cache.value.data + (head * capacity + n_past) * head_dim * element,
+            v_cache_[layer].output_buffer +
+                head * cur_ar_len_ * head_dim * element,
+            n_update * head_dim * element);
+      }
+      cache.history = n_past + n_update;
+      continue;
+    }
     if (!metadata_.cache_specs.empty() &&
         metadata_.cache_specs[layer].update_mode == Metadata::kFullOverwrite) {
       update_full_overwrite_cache(k_cache_[layer], v_cache_[layer], layer);
@@ -875,10 +952,49 @@ void KVManager::update_cache(
   }
   cur_ar_len_ = cache_ar_len;
   if (updated_circular_cache && swa_cache_len_swa_ > 0 && n_update > 0) {
-    swa_write_pos_swa_ =
-        (swa_write_pos_swa_ + n_update) % swa_cache_len_swa_;
+    swa_write_pos_swa_ = (swa_write_pos_swa_ + n_update) % swa_cache_len_swa_;
     swa_valid_len_swa_ =
         std::min(swa_cache_len_swa_, swa_valid_len_swa_ + n_update);
+  }
+}
+
+void KVManager::prepare_attention_lengths(
+    std::byte* lengths,
+    int32_t valid,
+    int32_t history) {
+  if (attention_mask_dtype_ != executorch::aten::ScalarType::Int) {
+    return;
+  }
+  ET_CHECK_MSG(valid > 0 && history >= 0, "Invalid attention lengths");
+  const int32_t values[] = {valid, 0, history};
+  std::memcpy(lengths, values, sizeof(values));
+  for (int layer = 0; layer < metadata_.num_layers; ++layer) {
+    auto& cache = mapped_caches_[layer];
+    if (!cache.key.data) {
+      continue;
+    }
+    ET_CHECK_MSG(history <= cache.history, "Mapped KV history is unavailable");
+    if (history < cache.history) {
+      ET_CHECK_MSG(cache.epoch < UINT32_MAX, "Mapped KV epoch exhausted");
+      ++cache.epoch;
+      cache.history = history;
+    }
+    const size_t bytes = metadata_.num_heads * k_head_dim_[layer] *
+        metadata_.cache_specs[layer].mapped_capacity *
+        getDtypeSize(k_cache_dtypes_[layer]);
+    const int32_t key[] = {
+        cache.key.fd,
+        static_cast<int32_t>(
+            uint32_t(bytes) | (1u << 30) |
+            (cache.has_packed_storage ? attention_cache::packed_storage_flag
+                                      : 0u)),
+        static_cast<int32_t>(cache.epoch)};
+    const int32_t value[] = {
+        cache.value.fd,
+        static_cast<int32_t>(uint32_t(bytes) | (1u << 30)),
+        key[2]};
+    std::memcpy(k_cache_[layer].buffer, key, sizeof(key));
+    std::memcpy(v_cache_[layer].buffer, value, sizeof(value));
   }
 }
 
@@ -912,9 +1028,7 @@ void KVManager::update_key(
       auto wp = write_ptr, rp = read_ptr;
       for (int32_t ind : selected_indices) {
         std::memmove(
-            wp,
-            rp + static_cast<size_t>(ind) * element_size,
-            element_size);
+            wp, rp + static_cast<size_t>(ind) * element_size, element_size);
         wp += element_size;
       }
       write_ptr += iter_size;
@@ -935,7 +1049,8 @@ void KVManager::update_value(
   const size_t element_size = getDtypeSize(kv_cache_dtype_);
   const size_t copy_size =
       static_cast<size_t>(n_update) * head_dim * element_size;
-  const size_t past_size = static_cast<size_t>(n_past) * head_dim * element_size;
+  const size_t past_size =
+      static_cast<size_t>(n_past) * head_dim * element_size;
   const int32_t n_iter = metadata_.num_heads;
   const int32_t iter_size = (cache_ar_len == metadata_.context_len)
       ? metadata_.context_len * head_dim * getDtypeSize(kv_cache_dtype_)
@@ -1025,9 +1140,9 @@ void KVManager::maybe_sync_swa_state_from_n_past_swa(
   }
 
   const int32_t inferred_valid_len = std::min(n_past, cache_len);
-  const int32_t inferred_write_pos =
-      (inferred_valid_len == cache_len) ? (n_past % cache_len)
-                                        : inferred_valid_len;
+  const int32_t inferred_write_pos = (inferred_valid_len == cache_len)
+      ? (n_past % cache_len)
+      : inferred_valid_len;
   swa_valid_len_swa_ = inferred_valid_len;
   swa_write_pos_swa_ = inferred_write_pos;
 }
@@ -1069,8 +1184,8 @@ void KVManager::fill_attention_mask_swa(
   }
 
   for (int i = 0; i < ar_len; ++i) {
-    std::byte* row_ptr = attention_mask +
-        static_cast<size_t>(i) * context_len * element_size;
+    std::byte* row_ptr =
+        attention_mask + static_cast<size_t>(i) * context_len * element_size;
     if (attention_map[i] < 0) {
       if (valid_len > 0) {
         fill_mask(
@@ -1123,12 +1238,10 @@ void KVManager::fill_attention_mask_swa(
     }
 
     if (effective_cache_len > 0 && valid_len > 0) {
-      const int32_t allowed_cache_len_raw =
-          sliding_window - (rel_i + 1);
+      const int32_t allowed_cache_len_raw = sliding_window - (rel_i + 1);
       const int32_t allowed_cache_len = std::min(
           valid_len,
-          std::max(
-              0, std::min(allowed_cache_len_raw, effective_cache_len)));
+          std::max(0, std::min(allowed_cache_len_raw, effective_cache_len)));
       const int32_t oldest_to_mask = valid_len - allowed_cache_len;
       if (oldest_to_mask > 0) {
         const int32_t oldest_start =
@@ -1136,9 +1249,10 @@ void KVManager::fill_attention_mask_swa(
         for (int j = 0; j < oldest_to_mask; ++j) {
           fill_mask(
               attention_mask_dtype_,
-              row_ptr + static_cast<size_t>(
-                            (oldest_start + j) % effective_cache_len) *
-                  element_size,
+              row_ptr +
+                  static_cast<size_t>(
+                      (oldest_start + j) % effective_cache_len) *
+                      element_size,
               1,
               /*use_pos_value=*/false);
         }
@@ -1188,42 +1302,40 @@ void KVManager::update_attention_mask_swa(
       write_pos = swa_write_pos_swa_ % effective_cache_len;
     }
 
-    auto fill_ring_segment = [&](std::byte* row_ptr,
-                                 int32_t start,
-                                 int32_t count,
-                                 bool visible) {
-      if (count <= 0 || effective_cache_len <= 0) {
-        return;
-      }
-      start %= effective_cache_len;
-      if (start < 0) {
-        start += effective_cache_len;
-      }
-      const int32_t first =
-          std::min(count, effective_cache_len - start);
-      fill_mask(
-          attention_mask_dtype_,
-          row_ptr + static_cast<size_t>(start) * element_size,
-          first,
-          visible);
-      if (first < count) {
-        fill_mask(
-            attention_mask_dtype_, row_ptr, count - first, visible);
-      }
-    };
+    auto fill_ring_segment =
+        [&](std::byte* row_ptr, int32_t start, int32_t count, bool visible) {
+          if (count <= 0 || effective_cache_len <= 0) {
+            return;
+          }
+          start %= effective_cache_len;
+          if (start < 0) {
+            start += effective_cache_len;
+          }
+          const int32_t first = std::min(count, effective_cache_len - start);
+          fill_mask(
+              attention_mask_dtype_,
+              row_ptr + static_cast<size_t>(start) * element_size,
+              first,
+              visible);
+          if (first < count) {
+            fill_mask(attention_mask_dtype_, row_ptr, count - first, visible);
+          }
+        };
 
     // Fast path for long prefill/decode runs where SWA cache is already full
     // and remains full: only the "oldest-to-mask" segment rotates each step.
     const bool cache_full_now =
         (effective_cache_len > 0) && (valid_len == effective_cache_len);
-    const bool cache_full_before = cache_full_now && (n_past >= effective_cache_len);
+    const bool cache_full_before =
+        cache_full_now && (n_past >= effective_cache_len);
     if (cache_full_before && n_update > 0) {
       const int32_t shift = n_update % effective_cache_len;
       const int32_t prev_write_pos =
           (write_pos - shift + effective_cache_len) % effective_cache_len;
       for (int32_t i = 0; i < ar_len; ++i) {
-        std::byte* row_ptr = attention_mask + static_cast<size_t>(i) *
-            static_cast<size_t>(context_len) * element_size;
+        std::byte* row_ptr = attention_mask +
+            static_cast<size_t>(i) * static_cast<size_t>(context_len) *
+                element_size;
         const int32_t allowed_cache_len_raw = sliding_window - (i + 1);
         const int32_t allowed_cache_len =
             std::max(0, std::min(allowed_cache_len_raw, effective_cache_len));
@@ -1240,8 +1352,9 @@ void KVManager::update_attention_mask_swa(
     }
 
     for (int32_t i = 0; i < ar_len; ++i) {
-      std::byte* row_ptr = attention_mask + static_cast<size_t>(i) *
-          static_cast<size_t>(context_len) * element_size;
+      std::byte* row_ptr = attention_mask +
+          static_cast<size_t>(i) * static_cast<size_t>(context_len) *
+              element_size;
       if (effective_cache_len <= 0) {
         continue;
       }
@@ -1260,8 +1373,7 @@ void KVManager::update_attention_mask_swa(
       const int32_t allowed_cache_len_raw = sliding_window - (i + 1);
       const int32_t allowed_cache_len = std::min(
           valid_len,
-          std::max(
-              0, std::min(allowed_cache_len_raw, effective_cache_len)));
+          std::max(0, std::min(allowed_cache_len_raw, effective_cache_len)));
       if (allowed_cache_len <= 0) {
         continue;
       }

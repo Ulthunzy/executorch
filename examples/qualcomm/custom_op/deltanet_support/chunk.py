@@ -1,4 +1,4 @@
-# Copyright (c) Qualcomm Innovation Center, Inc.
+# Copyright (c) Ulthunzy
 # All rights reserved.
 #
 # This source code is licensed under the BSD-style license found in the
@@ -8,10 +8,105 @@
 
 import torch
 
+from executorch.examples.qualcomm.custom_op.htp_op_package.package import op_package
+
+from .state_update import chunk_state_update
+
+
+_library = torch.library.Library("qnn_custom_ops", "FRAGMENT")
+_library.define(
+    "chunk(Tensor query, Tensor key, Tensor value, Tensor decay, Tensor beta, "
+    "Tensor state, Tensor key_transposed) -> (Tensor, Tensor)"
+)
+
+
+@torch.library.impl(_library, "chunk", "CompositeExplicitAutograd")
+def _chunk_reference(query, key, value, decay, beta, state, key_transposed):
+    decay = decay.clamp_min(2**-14)
+    beta = beta.transpose(-1, -2)
+    gram = (key * beta) @ key_transposed
+    qk = query @ key_transposed
+    weights = torch.zeros_like(decay[..., 0, :])
+    cumulative = torch.ones_like(decay[..., :1, :1], dtype=torch.float32)
+    columns = torch.arange(128, device=query.device)
+    lower, attention, prefix = [], [], []
+    for row in range(128):
+        d = decay[..., 0, row : row + 1]
+        cumulative = (cumulative * d.unsqueeze(-1).float()).clamp_min(
+            1.1253517471925912e-7
+        )
+        prefix.append(cumulative.half())
+        weights = (weights * d).clamp_min(2**-23)
+        weights = torch.where(columns == row, 1, torch.where(columns < row, weights, 0))
+        lower.append(torch.where(columns < row, -weights * gram[..., row, :], 0))
+        attention.append(weights * qk[..., row, :])
+    lower = torch.stack(lower, -2)
+    attention = torch.stack(attention, -2)
+    prefix = torch.cat(prefix, -2)
+    blocks = []
+    for start in (0, 64):
+        leaves = []
+        for offset in (start, start + 32):
+            inverse = lower[..., offset : offset + 32, offset : offset + 32].clone()
+            for row in range(32):
+                coefficients = inverse[..., row, :].clone()
+                for column in range(1, row):
+                    inverse[..., row, :] += (
+                        coefficients[..., column : column + 1] * inverse[..., column, :]
+                    )
+            inverse += torch.eye(32, dtype=query.dtype, device=query.device)
+            leaves.append(inverse)
+        left, right = leaves
+        cross = right @ lower[..., start + 32 : start + 64, start : start + 32] @ left
+        blocks.append(
+            torch.cat(
+                (
+                    torch.cat((left, torch.zeros_like(left)), -1),
+                    torch.cat((cross, right), -1),
+                ),
+                -2,
+            )
+        )
+    source = beta * (value - prefix * (key @ state))
+    first = blocks[0] @ source[..., :64, :]
+    second = blocks[1] @ (source[..., 64:, :] + lower[..., 64:, :64] @ first)
+    correction = torch.cat((first, second), -2)
+    return (
+        prefix * (query @ state) + attention @ correction,
+        prefix[..., -1:, :] * state
+        + key_transposed @ (weights.unsqueeze(-1) * correction),
+    )
+
+
+@torch.library.register_fake("qnn_custom_ops::chunk")
+def _chunk_fake(query, key, value, decay, beta, state, key_transposed):
+    torch._check(query.ndim == 4)
+    batch, heads = query.shape[:2]
+    torch._check(batch > 0)
+    torch._check(heads > 0)
+    torch._check(batch * heads <= 256)
+    for tensor in (query, key, value, state, key_transposed):
+        torch._check(tensor.shape == (batch, heads, 128, 128))
+        torch._check(tensor.dtype == torch.float16)
+    for tensor in (decay, beta):
+        torch._check(tensor.shape == (batch, heads, 1, 128))
+        torch._check(tensor.dtype == torch.float16)
+    return torch.empty_like(query), torch.empty_like(state)
+
+
+chunk = torch.ops.qnn_custom_ops.chunk.default
+
+
+def chunk_package(host, device):
+    """Register the fused AR128 operator with the host and device packages."""
+    return op_package(host, device, [(chunk, "Chunk")])
+
 
 class ChunkGDN(torch.nn.Module):
-    def __init__(self):
+    def __init__(self, fused_state_update=False, fused_chunk=False):
         super().__init__()
+        self.fused_state_update = fused_state_update
+        self.fused_chunk = fused_chunk
         chunk_size = 64
         dtype = torch.float16
         self.chunk_size = chunk_size
@@ -65,6 +160,21 @@ class ChunkGDN(torch.nn.Module):
         decay = decay.to(self.dtype).transpose(1, 2)
         beta = beta.to(self.dtype).transpose(1, 2)
         state = state.to(self.dtype)
+        if (
+            self.fused_chunk
+            and query.shape[2:] == (128, 128)
+            and value.shape[-1] == 128
+        ):
+            output, updated = chunk(
+                query,
+                key,
+                value,
+                decay.unsqueeze(-2),
+                beta.unsqueeze(-2),
+                state,
+                key.transpose(-1, -2),
+            )
+            return output.transpose(1, 2).float(), updated.float()
         outputs = []
         c = self.chunk_size
         for start in range(0, query.shape[2], c):
@@ -86,8 +196,17 @@ class ChunkGDN(torch.nn.Module):
                 prefix * (q @ state)
                 + ((q @ k.transpose(-1, -2)) * weights) @ correction
             )
-            state = prefix[:, :, -1:] * state + k.transpose(-1, -2) @ (
-                weights[:, :, -1:].transpose(-1, -2) * correction
-            )
+            if self.fused_state_update:
+                state = chunk_state_update(
+                    state,
+                    k.transpose(-1, -2),
+                    correction,
+                    weights[:, :, -1:].transpose(-1, -2),
+                    prefix[:, :, -1:],
+                )
+            else:
+                state = prefix[:, :, -1:] * state + k.transpose(-1, -2) @ (
+                    weights[:, :, -1:].transpose(-1, -2) * correction
+                )
             outputs.append(y)
         return torch.cat(outputs, dim=2).transpose(1, 2).float(), state.float()

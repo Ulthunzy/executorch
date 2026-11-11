@@ -9,7 +9,7 @@
 #include <cstdio>
 #include <limits>
 #include <random>
-#include "../src/ops/DeltaNetQhpi.cpp"
+#include "../src/kernels/DeltaNetU16.h"
 
 int main() {
   alignas(128) uint16_t state[256 * 256 + 64];

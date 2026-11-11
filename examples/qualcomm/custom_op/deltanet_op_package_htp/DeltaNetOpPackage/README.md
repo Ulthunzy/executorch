@@ -5,6 +5,163 @@ registration live in [htp_op_package](../../htp_op_package/README.md).
 Attention is maintained separately in
 [attention_op_package_htp](../../attention_op_package_htp/AttentionOpPackage/README.md).
 
+## Source boundaries
+
+`src/ops` owns QHPI tensor adapters, validation, rewrites and registration.
+`src/kernels` owns recurrence and chunk computation.
+`src/utils` owns common definitions, configuration, profiling and HMX tile
+layout helpers. The unused decode-fusion bridge and its `src/interfaces`
+header have been removed.
+
+| Operator source | Responsibility |
+|---|---|
+| `DeltaNetQhpi.cpp` | FP16/FP32/U16 recurrence adapters and the fused AR1 entry |
+| `Chunk.cpp` | AR128 chunk validation, VTCM reservation and HVX/HMX dispatch |
+| `ChunkStateUpdate.cpp` | Standalone state-update operator |
+
+The shared package's `include/OpDefinitions.h` is the operation-name and
+input/output-count catalog used by both package discovery and validation.
+`include/OpRegistration.h` declares registration entry points. The package
+identity and retained kernel names stay compatible with serialized contexts.
+`Chunk` replaces the experimental `ChunkRound2` interface with different
+inputs. Contexts containing `ChunkRound2` require their original package or
+re-export; the new package does not alias the old interface.
+
+The unused `ChunkReadout` and `QuantizedGemv` operators have been removed.
+Chunk retains their former shared packing code as `utils/HmxTileLayout.h`;
+`make test-hmx-tile-layout` checks it. Historical measurements below remain
+as records, including experiments that are no longer build targets.
+
+The 2026-11-11 cleanup also removes `GdnPrepared*`, standalone `GdnTriangle*`,
+`GdnGatedNorm`, `GdnWindowLookup` and `GdnLosslessLookup`, together with their
+exclusive helpers and tests. The shared bundle now registers 19 operations,
+down from 33. These interfaces are absent from the current llama export.
+Historical `GdnPreparedCached` **did** improve one full-model decode test by
+about 2%; it is removed because the current entry does not use it, not because
+that measurement was invalid. GatedNorm/Post and compressed/window lookup
+experiments did not establish a stable gain. Current `Chunk` performs its own
+triangular solve; it does not call the removed standalone operator.
+
+Evidence remains in the historical sections below and in
+[`qwen3_5-2b-mnn-fusion`](../../../../../llama-output/qwen3_5-2b-mnn-fusion/).
+The source snapshot before this cleanup and its validation results are in
+[`qwen3_5-interface-cleanup-20261111`](../../../../../llama-output/qwen3_5-interface-cleanup-20261111/).
+Contexts containing removed operations require their original package or a
+new export. Retained operations keep their serialized names.
+
+The historical Round2 Qwen3.5-2B contexts below used these build definitions:
+
+```text
+-DDELTANET_U16_FULL_PRECISION_REDUCTION=0
+-DDELTANET_U16_SPLIT_REDUCTION=1
+-DDELTANET_U16_KARATSUBA_REDUCTION=0
+-DDELTANET_U16_FIXED_DECODE=1
+-DCHUNK_ROUND2_VECTOR_WEIGHT=1
+-DCHUNK_ROUND2_ACTIVE_WORKERS=4
+```
+
+Use the matching definitions when loading those contexts; worker/layout
+variants have distinct serialized kernel names. General SDK export defaults
+and optional operators are retained for other graphs.
+
+## Fused AR128 Chunk
+
+`src/kernels/Chunk.h` contains the validated AR128 computation, including
+Gram/QK matmuls, fused decay/mask and tile packing, FP16 W recurrence and
+paired triangular solves, correction, readout and the state-update epilogue.
+The prefix product retains FP32 accumulation. Correction stays in HMX tile
+layout until its consumers finish. Six HVX workers share the HMX queue and
+reserve 3,172,352 bytes of VTCM per invocation.
+
+`src/ops/Chunk.cpp` contains only the QHPI adapter. Its public `Chunk` operation
+is rewritten into `ChunkReserve` and `ChunkExecute`; these are workspace and
+execution entries, not two token chunks. Each AR128 GDN layer calls `Chunk`
+once. Internal 32-row triangular leaves and dependent 64-row correction
+panels remain part of that invocation.
+
+All seven inputs are FP16. Query, key, value, state and transposed key have
+shape `[B,H,128,128]`; decay and beta have shape `[B,H,1,128]`. The two outputs
+are attention and updated state, both `[B,H,128,128]`. The transposed-key
+input must be the transpose of key. Supported execution is HTP v81 with
+`0 < B*H <= 256` and K=V=128.
+
+`ChunkGDN(fused_chunk=True)` and `chunk_package(host, device)` expose this
+interface to Python and the QNN exporter. The llama SM8850 prefill export
+selects it automatically for AR128/K=V=128; other shapes and targets keep
+the portable chunk path. On v81, that path also selects fused state update
+automatically; `Chunk` already includes it. Rebuild the package and re-export
+to use it.
+
+`make test-chunk` checks HMX layout, weighting across all 128 rows and FP16
+epilogue rounding. `custom_op/tests/test_chunk.py` checks the single-call
+export, unsupported shapes, padding and recurrent numerical behavior.
+The SM8850 migration comparison uses the same frozen complete layer, weights
+and quantization: three rounds of 384 calls, excluding the first 128 per
+round, give 1.645 ms for the experimental implementation and 1.643 ms for
+`Chunk`. Zero/nonzero-state outputs and all eight feedback blocks are
+byte-identical. This is a single-layer synthetic-input check, not full-model
+throughput or PPL. Commands, raw samples, package hashes and final-build
+checks are in the
+[migration report](../../../../../llama-output/qwen3_5-2b-gdn-chunk128-20261111/w_triangle_200/promote_chunk/report.json).
+
+## Fused AR1 decode gate
+
+`DeltaNetCoreGatedVtcm` replaces the calibrated decay subgraph and the usual
+U16 recurrence with one operator. The recurrence indexes an SDK-generated
+table using the original activation code; it retains the existing projection,
+delta/output and state-update arithmetic. The table contains every U16 input
+code for each head and must be generated with the actual AR1 SDK graph.
+Generating it with a larger tensor can change SDK rounding at some codes.
+
+The additional inputs are a flat DDR table stored as `[1,H,256,128]` INT32
+words containing consecutive little-endian U16 codes, and FP32 grids
+`[activation_scale, activation_zero, decay_scale, decay_zero]`. A 16-head
+table occupies 2 MiB per layer; 18 layers add 36 MiB of constants. The kernel
+indexes each head's table directly rather than copying the table into VTCM.
+
+The llama Qwen3.5 entry registers and selects this interface automatically on
+SM8850/v81. `prepare_gate_tables` generates tables on the target with the current
+SDK and caches them in `<artifact>/decode_gate_tables`; cache misses require
+ADB access and `ANDROID_NDK_ROOT`. `fuse_decode_gates` validates arithmetic and
+constant fingerprints, input/output encodings, table size and SHA256 before
+embedding the tables in the graph. Generation happens during export, and adds
+no inference-time table generation or warmup. Other supported SoCs retain
+`DeltaNetCoreVtcm` with SDK gates.
+
+## Fused ChunkGDN state update
+
+`ChunkStateUpdate` computes
+`decay * state + key @ (weight * correction)` from five FP16 tensors. Their
+shapes are `[B,H,K,V]`, `[B,H,K,C]`, `[B,H,C,V]`, `[B,H,C,1]` and `[B,H,1,1]`.
+K must be a positive multiple of 32 up to 256, V a multiple of 64 up to 256,
+and C a multiple of 32 up to 128.
+
+On v81, HVX weights correction while packing the HMX operand. One request per
+head batches its 32-row matrix tiles. The matrix result stays in VTCM; HVX
+applies decay to the old state and adds the product before writing the new
+state. Weighted correction, the matrix result and decayed state are not
+separate graph tensors. Weight multiplication, matrix output, decay
+multiplication and final addition retain their individual FP16 rounding;
+the epilogue does not use FMA. Chunk size, triangular inverse and recurrent
+state quantization remain unchanged.
+
+For K=V=128 and C=64, the shared queue and eight worker buffers use 530 KiB
+VTCM. The queue implementation is shared with Attention through
+`htp_op_package/include/HmxDispatch.h`. Other architectures retain a reference
+implementation; the optimized llama export is selected on v81.
+
+Use `ChunkGDN(fused_state_update=True)` and register `state_update_package`
+when lowering a standalone graph. The llama entry point selects fusion on v81
+automatically. Fusion runs after calibration
+when generation replaces the prefill recurrence cores. It does not alter the
+decode recurrence. Rebuild the shared package and re-export the PTE to use
+the new operator.
+
+`make test-chunk-state-update` checks packed row-pair layout and separate
+FP16 decay/add feedback with SDK libnative. Python export and feedback tests
+are in `custom_op/tests/test_chunk_state_update.py`. Device numerical and
+complete-model measurements are required in addition to these host checks.
+
 ## Optional typed FP16 recurrent state
 
 `DeltaNetCoreFp16State` accepts affine QUInt16 Q/K/value/decay/beta and a
@@ -1058,3 +1215,507 @@ state 12.735 dB。真实三输出 PTE 复核得到 attention 14.459 dB、state
 
 精度配置、量化范围、统一口径计时和复现命令见
 [全 Linear W4 报告](../../../oss_scripts/llama/README_QWEN35_TEST_RECORDS.md#record-06)。
+
+## 2026-11-08：GDN 融合与 prefill 调度实验
+
+`GdnFusion.cpp` 提供显式接图的实验算子，现有导出默认路径不变。
+`GdnPreparedCore` 合并四 tap INT8 depthwise Conv、SiLU、Q/K 归一化、
+beta 与 U16 gated recurrence，限定单 batch、单 token、K=V=128。
+Q/K/V 的中间量化参数必须分别传入，不能复用 SiLU 的量化参数解释 V。
+
+`GdnPreparedHistory` 支持 NCHW/NHWC 的五列历史，只计算末尾四列，并复用
+已经装填的向量写出下一步 Conv state，避免独立的输入和输出历史切片。
+实验接图也支持直接接收 QVAB/KZ 投影及原四列历史；该路径要求相关量化
+网格一致，省去 Q/V 拆分、QKV 拼接和五列历史临时张量。
+`GdnGatedNorm` 与 `GdnPreparedPost` 分别用于独立和整体融合的门控归一化
+对照；本轮实验中它们没有稳定性能收益，未放入整模候选。
+
+`GdnTriangle` 对 32 或 64 阶严格下三角矩阵计算 `(I-L)^-1`，内部保留
+FP32 累加，接口为 FP16。选用的 prefill 变体只替换两个 32 阶对角块，
+保留跨块 HMX 乘法与既有 FP16 subnormal 规避逻辑，GDN chunk 仍为 64。
+`ChunkStateUpdateBatch` 将两个 head 合入一次 HMX 请求，保留为调度对照。
+
+完整层计时必须包含输入/输出投影、Conv history 与门控归一化；单独核心的
+收益不能直接推算为整模收益。实验仍有非逐位一致的量化/归约误差，设备
+数值对照与短检索通过不能替代 PPL 验证。
+
+本轮 prefill 与 decode 分开计时，未运行完整模型。最终构建
+`linear-final2` 在 SM8850 上采用五轮交替测试，每轮 128 次执行，排除前
+8 次，记录各轮中位数的中位数。冻结原权重与量化参数，不重新校准。
+
+| Prefill 范围 | AR128 原版 → 候选 | AR256 原版 → 候选 |
+| --- | --- | --- |
+| GDN 核心 | 579.453 → 450.989 μs | 1047.655 → 833.542 μs |
+| 完整 linear-attention 单层 | 2011.620 → 1886.540 μs | 3431.695 → 3231.540 μs |
+
+核心优化将三角逆的系数按行加载到 HVX，再以 `vdelta` 广播，减少内层
+循环的标量 VTCM 读取。对角线与其余结果合并为向量写出。AR256 候选
+单 token 层耗时为 12.623 μs，相对 AR128 原版的吞吐提升 24.5%，其中
+同时包含批量增大与核心优化的收益。表中完整层包含投影、Conv history、
+GDN 和 GatedRMSNorm，不包含输入 RMSNorm、残差与 MLP。
+
+Decode 固定 AR1：原版单层 345.027 μs，直接接投影的融合版 335.443 μs，
+仍只有约 2.8% 耗时收益。归约时复制 state 的实验无稳定收益，默认关闭。
+设备内部分阶段计时显示 Conv/SiLU/QK 准备约 17 μs，首次 state 拷贝
+约 0.625 μs；这些时间不包含 QNN 调度和图边界搬运。
+
+`GdnPreparedLossless` 为显式启用的查表实验：SiLU 表以分段线性预测和
+4-bit 残差从 128 KiB 压缩到 36 KiB，使用 VTCM/HVX gather 查找。
+18 层各 65536 个码离线还原一致，layer 0 设备全码及相对未压缩融合版的
+三个输出逐值一致；
+但单层 340.104 μs 比直接投影融合版慢，未选用。自定义 U16 GEMV 的
+W4/W8 原型也慢于 SDK，保留独立对照，不接入选定单层。
+
+原始日志、构建、复现脚本与精度对照位于
+[`linear-block-report.json`](../../../../../llama-output/qwen3_5-2b-mnn-fusion/linear-block-report.json)。
+
+### Decode 前处理继续优化
+
+`GDN_PREP_HOIST_METADATA=1` 将 history 量化参数、数据指针与 A 的输入
+量化参数移到 head/channel 循环外。对于 16 heads、8 workers 的 history
+融合路径，history 的 QHPI 查询由每算子 384 次降到 16 次。
+`GDN_PREP_CACHE_QUANTIZERS=1` 在每个回调中预先计算量化比例倒数，保持
+原来的 FP32 运算顺序、量化网格与 U16 输出。两项默认启用。
+
+同一源码分别关闭和启用两项优化，AR1 五轮交替测试：
+
+| 范围 | 关闭 → 启用 |
+| --- | --- |
+| GDN 回调，包含初始化 | 30.521 → 22.969 μs |
+| Conv/SiLU/QK 前处理 | 17.135 → 8.646 μs |
+| 独立 GdnPreparedCore 图 | 128.880 → 122.526 μs |
+| 直接接投影的完整单层 | 336.276 → 327.552 μs |
+
+前两行使用设备 Qtimer。回调总时间从入口计至最后一个 head 完成，再取
+最慢 worker；前处理按每个 worker 两个 head 合计取最大。计时开销包含
+在内；回调初始化从 3.594 增加到 4.896 μs，已经计入回调总时间。
+后两行关闭内部计时，包含 QNN 执行、调度与图边界成本，不能混为同一范围。
+SDK 单层对照为 344.297 → 344.740 μs，未随该优化获得收益。
+
+正常性能对照、四组不同幅度输入及 U16 state 端点测试、分阶段计时对照的
+正常输出均逐值一致。未运行整模型。剩余前处理里 SiLU 标量查表约
+4.323 μs；512/1024/4096 码 TCM 缓存窗口及两种打包查表原型虽通过数值
+检查，但没有稳定的大幅收益，保留显式实验路径，未默认启用。
+
+复现构建为 `prep-control`、`prep-selected`，分阶段构建为
+`prep-control-profile-final`、`prep-selected-profile`。原始数据、开关参数、
+源码与设备库哈希见
+[`decode-prep-report.json`](../../../../../llama-output/qwen3_5-2b-mnn-fusion/decode-prep-report.json)。
+
+### Decode 图加载预计算实验
+
+`GdnPreparedCached` 将形状检查、量化参数、11 个比例倒数及常量 DDR 地址
+移到 QHPI 图加载预计算阶段。kernel predicate 要求输入 4–8 是常量，
+signature 强制这些输入放在 DDR；动态输入与输出地址仍在每次执行时查询。
+实验导出脚本用 `--precomputed` 显式启用，不接入整模默认路径。
+当前序列化函数名带 `.v2.hvx`，v1 context 必须配用当时的库，不能混用。
+
+`DELTANET_U16_FIXED_DECODE=1` 仅特化融合适配器的 AR1、K=V=128 recurrence，
+保留 radix-16 累加、FP32 重组和量化顺序；通用 recurrence 路径不变。
+本轮仍冻结 layer 0 的原权重与量化参数，prefill 沿用上一轮结果。
+
+SM8850、SDK 2.51，五轮交替，每轮 128 次执行，排除前 8 次：
+
+| 范围 | 前一版融合 → 图加载预计算候选 |
+| --- | --- |
+| GDN 回调，含初始化与两个 head/worker | 21.875 → 16.458 μs |
+| 回调初始化 | 4.688 → 0.573 μs |
+| Conv/SiLU/QK 前处理 | 8.542 → 7.187 μs |
+| 含投影的 linear-attention 单层 | 327.630 → 321.198 μs |
+
+前三行使用带插桩构建的 Qtimer 最慢 worker 时间，各阶段最大值不可相加。
+最后一行关闭内部计时，包含 QNN 调度及图 IO；基线是前一版融合实现，
+不是原 SDK。单层只节省 2.0%，仍不足以作为大幅提速的整模候选。
+本轮没有重导出整模，也不据此推算 tok/s。
+
+三个正常输出在五轮对照、四组不同幅度输入及 U16 state 端点测试中逐值
+一致。同一 context 五次重绑定全部动态 IO 到新缓冲区，保留并覆盖旧缓冲
+区后，原始输出也全部一致。
+
+额外实验保留显式开关，不选用：
+
+- 1024/2048 码 SiLU 寄存器表用整数线性预测和 1-bit 精确修正，分别占
+  264/392 字节；异常 block 与窗口外输入回退到原表。18 层全 65536 码的
+  host 检查及 layer 0 设备全码检查通过，但大幅度输入时无稳定收益。
+- `GDN_PREP_ACTIVE_SLICES=4/2` 比 8 workers 更慢，默认仍为 8。
+- `DELTANET_U16_PREPACK_COEFFICIENTS=1` 和
+  `DELTANET_U16_SPLIT_VECTORS=2` 分别尝试复用标量装填和扩大 V 分块；
+  单层为 321.355/322.318 μs，对照 320.026 μs，均不启用。
+- Karatsuba 的一个或两个 V 分块没有稳定收益，候选构建显式使用
+  `DELTANET_U16_KARATSUBA_REDUCTION=0`。
+
+候选的 Q/K × state 归约约 5.000 μs、SiLU 查表约 4.271 μs、state 更新
+约 1.771 μs。SDK detailed profiler 另行记录投影和 GDN 节点，原始 cycle
+可能包含 worker/fusion 归属，不能直接换算成 wall time 占比。
+构建开关、逐轮数据、分阶段数据、校验与源码/库哈希见
+[`decode-deep-report.json`](../../../../../llama-output/qwen3_5-2b-mnn-fusion/decode-deep-report.json)。
+
+### 完整 Transformer 单层复测
+
+从同一冻结量化图提取第 0 层，计时范围扩展到输入 RMSNorm、linear attention、
+两次残差、post-attention RMSNorm 与完整 MLP，不包含 embedding 与其他层。
+三个图均只有一个 QNN delegate。上一版直接使用保留的 `prep-selected` 库，
+新版使用 `prep-deep-final` 与 `GdnPreparedCached`，不重新校准。
+
+SM8850、decode AR1，五轮交替，每轮 256 次调用，排除前 8 次，关闭所有
+内部计时插桩。固定相同 hidden、history 和非零 state 重复执行：
+
+| 完整单层版本 | 各轮中位数的中位数 |
+| --- | --- |
+| 未融合前后处理的对照，保留已有 GDN gated core | 625.860 μs |
+| 上一版融合，`prep-selected` | 605.260 μs |
+| 本轮候选，`prep-deep-final` | 600.417 μs |
+
+新版比上一版少 4.843 μs，即 0.80%；五轮配对均更快，分别少
+2.396、3.672、4.088、6.249、5.025 μs。该收益小于只测 linear-attention
+部分时的约 2%，未据此接入整模或推算模型 tok/s。
+新版与上一版的层 hidden、history、state 三个输出在五轮中全部逐值一致。
+未融合对照与融合版存在已有的数值差异，其 hidden/history/state SQNR
+分别为 57.04/66.94/70.34 dB，不能称三版全部逐值一致。
+
+提取与导出脚本为 `prepare_transformer_layer.py`、`export.py --scope transformer-layer`；
+设备复现为 `benchmark_transformer_layer.py`，逐轮数据、输出校验与库/context
+哈希见
+[`complete-transformer-layer-report.json`](../../../../../llama-output/qwen3_5-2b-mnn-fusion/complete-transformer-layer-report.json)。
+
+### MNN 思路适配实验：U16 GEMV 与 SiLU
+
+参考 MNN 固定版本 `5b74a931887ba5b4d9f65b222cc18dd1a16599a8` 的
+Hexagon GEMV 激活复用、成对 INT4 解包和向量激活函数。其 GEMV 快路径
+会动态量化激活到 INT8；本实验保留当前 U16 激活与原量化网格，未采用
+A8。源码对照及固定版本文件清单分别见
+[`mnn-hexagon-audit.json`](../../../../../llama-output/qwen3_5-2b-mnn-fusion/mnn-hexagon-audit.json)
+和 `mnn-reference/sources.json`。
+
+改动均为默认关闭的实验开关，当前所选单层仍用 SDK 投影：
+
+- `GEMV_PAIR_UNPACK=1`：一次 128 字节权重装载的两半均用于计算。
+- `GEMV_PREPARED_ACTIVATION=1`：在已有 reserve 节点内预广播低/高字节，
+  每次执行刷新；单独开启未带来额外收益。
+- `GEMV_CENTERED_ACTIVATION=1`：仅支持 W4、group32 的 metadata kind2，
+  打包权重与 scale，省去每组 `sum(weight)`。用 low8、signed high8 与
+  可选的第 17 位 carry 精确表示 `U16-zero`；先按组在 int32 中合并，
+  再沿用原 FP32 scale 累加顺序。界限为 `32*65535*8 < 2^24`。
+- `GEMV_CENTERED_STREAM=1`：每 worker 用紧凑字节流配合寄存器广播，
+  避免重复读取展开后的激活向量。需同时开启上述三个开关与
+  `GEMV_DMA=1`，仅接受 kind2。
+
+decode AR1、冻结的 Qwen3.5-2B 第 0 层投影，SM8850/SDK2.51。五轮
+交替，每轮 128 次，排除前 8 次，取各轮中位数的中位数：
+
+| 投影范围 | 原自定义 GEMV | 紧凑 U16 版本 | 同轮 SDK |
+| --- | --- | --- | --- |
+| QVAB | 207.032 μs | 165.078 μs | 139.167 μs |
+| 输出投影 | 141.355 μs | 121.068 μs | 106.302 μs |
+
+相对原自定义版本分别少 20.26% / 14.35%，五轮均更快；仍比 SDK 慢
+18.62% / 13.89%，不接入当前所选单层或整模。QVAB 的权重及元数据
+DMA 描述符合计从 6.047 降到 5.039 MiB；这是逻辑 payload，未统计
+激活、workspace、其他 IO，也不是硬件 DDR 流量测量。
+
+`GEMV_DMA_TILES=2/4` 的合批实验反而更慢，保持默认 1。
+prepared v1、centered v2、batch2/4 和 centered.stream.v1 使用不同 QHPI
+函数名；context 与库必须配套，不能复用旧导出结果。导出原型为实验目录
+`prepare_projections.py --centered-meta` 与 `export.py` 的 projection scope。
+这些测试使用提取的 QNN context，不代表原型 PTE 已具备完整 ET IO 契约。
+
+SiLU 的两项实验也未选用：
+
+- `GDN_PREP_VECTOR_SILU=1`：负指数多项式加 reciprocal Newton 迭代。
+  18 层全 U16 码范围测试对数学参考最多差 1 码，对 SDK 表最多差
+  2–3 码；decode core 122.500 → 124.349 μs，未获得收益，也未测 PPL。
+- `GDN_PREP_FULL_GATHER=1`：128 KiB 原始表放入 TCM，用两个 64 KiB
+  bank 做 gather，混合 bank 输入也精确。查表子阶段 4.427 → 3.542 μs，
+  但回调总时长 16.458 → 16.406 μs，关闭内部计时的整个
+  linear-attention block 为 321.042 → 323.568 μs，未改善。
+  该版本使用 cached v3.gather 函数名，动态查询 TCM 表地址，不缓存
+  staging 指针；需要 state 输入输出分离。
+
+66 组正常/压力/批量及 profile 输出对照全部精确，其中 profile 只比较
+三个模型输出；全表 gather 另检查乱序的全部 65536 码。centered 与
+stream 各投影通过同一 context 内 A→零输入→A 的五轮刷新检查；五个
+context 均通过保留并覆盖旧缓冲区后的五轮 IO 重绑定。默认及实验构建
+通过 host GEMV 测试，默认库通过 x86/Android/v81 编译。
+
+prefill 本轮未改动或复测。MNN 更值得继续借鉴的是整个 chunk 的 phase
+融合与 HMX 中间 tile 复用。当前 `ChunkStateUpdate` 已经每次 op 只锁一次
+HMX；后续目标应是跨 Gram、readout、三角乘积和 state update 保留 tile
+与调度，而不是重复修改该锁。外层 AR128/256 分开测试，不等同于增加
+内部 chunk 长度。
+
+复现、逐轮数据、数值检查及源码/库/context 哈希见
+[`mnn-reuse-report.json`](../../../../../llama-output/qwen3_5-2b-mnn-fusion/mnn-reuse-report.json)。
+本轮没有新的完整 Transformer 单层、整模 tok/s 或 PPL 结论。
+
+### MNN prefill 适配：Gram 合并与共享 state readout
+
+本实验仅测 prefill。采用 Qwen3.5-2B 的 H16、K=V128 维度和合成的归一化
+Q/K 输入，保留现有 chunk64、leaf32 三角求解和 FP16 计算边界。
+参考固定版本 MNN 的 `la_hmx_round1/round2/la_hmx_prefill`；MNN 本身使用
+chunk32、FP32 持久 state，没有直接移植其精度与 chunk 设置。
+
+实验图变换位于 `llama-output/qwen3_5-2b-mnn-fusion/prefill_pair.py`：
+
+- `--prefill-pair gram` 将 `(K*beta) @ Kᵀ` 与 `Q @ Kᵀ` 的左矩阵按行合并，
+  共用右矩阵，拆分结果供原图消费。
+- `--prefill-pair readout/both` 用相同方式合并 K/Q 的 state readout，分别
+  做消融；仅图级 concat/slice 没有获得稳定的大收益。
+- `--prefill-pair kernel` 显式替换为 `ChunkReadout`，在算子内部复用一次
+  state 打包，两个结果仍保持原来的 FP16 边界。
+
+SM8850、SDK2.51，五轮交替、每轮 128 次、排除前 8 次，取各轮中位数的
+中位数。以下是 GDN 核心，不含投影、Conv、门控归一化或 Transformer MLP：
+
+| 核心范围 | 现有 leaf32 | Gram 图级合并 | 共享 state 的 readout 原型 |
+| --- | --- | --- | --- |
+| AR128 | 452.084 μs | 446.380 μs | 546.693 μs |
+| AR256 | 821.667 μs | 797.110 μs | 1019.375 μs |
+
+Gram 合并减少 1.26% / 2.99%，五轮配对均更快，但收益不足以选用，未测
+新的完整 linear-attention 层或整模。readout 原型则明确更慢。
+
+独立 readout 对照包含两个矩阵乘法、结果拼接及 QNN/RPC/图 IO：SDK
+146.251 μs，共享 state 原型 205.443 μs。另用
+`CHUNK_READOUT_DIRECT_HMX=1` 借鉴 MNN 每次调用只装一次输出 scale 的方式，
+内联 HMX 指令；三轮对照仍为 200.912 μs，SDK 为 145.521 μs，未选用。
+默认该开关为 0，direct 版本使用单独的 QHPI 函数名与 context。
+
+`ChunkReadoutProfile` 提供独立的诊断输出，正常算子不插入计时。三个进程
+末次执行的 Qtimer 快照显示：两次 readout、16 heads 共发起 256 个
+32×128×32 HMX 调用；HMX 服务合计 47.396 μs，最慢 worker 回调约
+54.635 μs，pack 的每 head 中位数 1.667 μs。部分 HVX 输出读回阶段有
+较大的停顿。state 输入和两个输出的运行时位置均为 TCM_ONLY。
+这些阶段最大值不可相加，也不能直接用来分摊 SDK 与原型的全部图时间
+差异；本实验没有测量硬件 DDR 流量或 SDK 内部的 tile 策略。
+
+67 组正常、消融、压力和 profile 模型输出的 first/final dump 均与相应
+对照逐字节一致。压力输入覆盖零初始 state、相关 key、不同 decay/beta、
+放大的 value 与非零 state。四个 context 各通过五轮动态 IO 重绑定。
+host 检查 2,359,296 个原始 FP16 布局 lane 及回转排列；最终源码通过
+x86/Android/v81 编译、Python 编译检查和 diff 空白检查。
+
+当前模型与 `ChunkGDN.forward` 的默认路径未接入这些实验。进一步可验证的
+方向仍是跨阶段保留 correction tile，供输出与 state update 的 HMX 乘法
+直接消费；本轮只验证了 Gram/readout，未实现整个 chunk 的阶段融合。
+复现参数、原始逐轮数据、诊断字段及源码/库/context 哈希见
+[`prefill-mnn-report.json`](../../../../../llama-output/qwen3_5-2b-mnn-fusion/prefill-mnn-report.json)。
+
+### MNN round2：correction tile 复用验证
+
+`ChunkRound2.cpp` 提供显式接图的实验算子，将 correction 生成、输出计算和
+state update 合在一次 HMX 资源持有期间执行：
+
+```text
+C = FP16(inverse @ source)
+Y = FP16(readout + FP16(attention @ C))
+S' = FP16(FP16(decay * S) + FP16(Kt @ FP16(weight * C)))
+```
+
+限定 chunk64、K=V128，输入和计算边界保持原 FP16 定义。`uint16_t` scratch
+保存的是 FP16 位模式。correction 写出时直接选择 B 操作数的 tile 顺序，
+解决 chunk64 中两个 32-row block 与 N-tile 排列不同的问题，不先转成行式
+张量。保留 `weight*C` 的 FP16 舍入，HVX 在 tile 中计算加权副本并复用已经
+死亡的 packed Z 空间。后续两次 HMX 乘法分别消费原 C 与加权 C。
+
+MNN 固定版本仍为 `5b74a931887ba5b4d9f65b222cc18dd1a16599a8`，参考
+`la_hmx_round2`。MNN 本身使用 chunk32、FP32 持久 state，并在 K 上提前
+乘权重；本实验没有直接替换这两个精度与 chunk 设置，也未运行 MNN 整模。
+
+显式实验开关：
+
+- `CHUNK_ROUND2_VECTOR_WEIGHT=1`：一次 HVX 读取 64 个 FP16 权重，用
+  `vdelta` 广播 row pair，代替 64 次标量读取。唯一权重 payload 仍为
+  128 字节，不将标量指令减少解释成相同比例的 IO 流量减少。
+- `CHUNK_ROUND2_ACTIVE_WORKERS=4`：本次 AR256 最好的数值一致候选。
+  仍处理全部 16 个 head，只减少并发 head slot。该 op 的 TCM workspace
+  从 1,067,008 降至 534,528 字节，包含为消融保留的行式临时区。
+- `CHUNK_ROUND2_REPACK=1`：强制 C tile→行式→tile；其算术、调度和
+  workspace 与相同 worker 配置的 tile 版一致，用于拆包消融。
+- `CHUNK_ROUND2_WEIGHTED_KEY=1`：单独的精度实验，提前给 K 加权，从而
+  连续执行三个 HMX 乘法；会改变 FP16 舍入，不作为数值一致候选。
+
+默认新路径仍需显式 FX 替换。构建最佳候选需同时传入
+`-DCHUNK_ROUND2_VECTOR_WEIGHT=1 -DCHUNK_ROUND2_ACTIVE_WORKERS=4`，
+保留 REPACK、WEIGHTED_KEY、BATCH_PHASES 为 0。不同变体使用不同 QHPI
+函数名，context 与库必须配套。
+
+SM8850/v81、SDK2.51，Qwen3.5-2B 的 H16、K=V128 维度与合成输入，
+三角求解仍为现有 leaf32。以下计时范围是整个 GDN recurrence 核心，
+不含投影、Conv、GatedRMSNorm、MLP 或其他 Transformer 层。
+
+| AR | 现有核心，独立进程 | 新版 4-worker | 耗时下降 |
+| --- | --- | --- | --- |
+| 128 | 450.443 μs | 438.203 μs | 2.72% |
+| 256 | 820.052 μs | 715.365 μs | 12.77% |
+
+上表为五轮交替，每个进程 128 次执行、排除前 8 次，取各轮中位数的
+中位数。另增加同一进程内两个 context 交替执行，每个图先 warmup 16 次，
+256 对调用逐次反转先后顺序，排除前 8 对，重复三个进程：
+
+| AR | 同进程现有核心 | 新版 4-worker | 耗时下降 |
+| --- | --- | --- | --- |
+| 128 | 432.266 μs | 424.427 μs | 1.81% |
+| 256 | 810.990 μs | 721.614 μs | 11.02% |
+
+两个口径有不同的 context/cache 行为，绝对时间不能混用。AR256 在三个
+进程的全部 744 对有效调用中都更快；AR128 仍只有小收益。
+
+AR256 的同进程消融：8-worker 强制重打包版为 760.652 μs，同组对照
+810.833 μs；8-worker 直接复用 tile 为 747.891 μs，同组对照 809.766 μs。
+4-worker 进一步达到上表的 721.614 μs。不能把全部收益都归给消除一次
+拆包；跨节点融合、tile 生命周期和 workspace/head 并发选择也在变化。
+独立 round2 微图包含八个外部输入的转换、QNN/RPC 和 IO，4-worker
+与当前 state-update 融合版约为 194.166/194.271 μs，基本持平；未声称
+HMX 算术本身提速 11%。
+
+提前给 K 加权的实验在 AR256 同进程测试为 728.672 μs，同组对照
+811.537 μs，快约 10.21%，但会改变反馈 state。正常输入 state SQNR
+约 68 dB，压力输入最差约 61 dB，最大 state 差异 0.01171875；未测 PPL，
+未选用。它沿用我们的 FP16 数据，不能等同于 MNN 的 FP32 master state。
+2-worker 版更慢，未选用。
+
+验证包含 90 个压力 context，覆盖零 state、相关 key、大小数值、混合
+decay/beta，以及有效 token 数 0/1/63/65/AR-1 的 padding。数值一致路径
+未发现非零值差异；极小输入的 Y 存在正负零符号位差异，因此不称全部
+输出逐字节一致。state 数值一致，各 case 的 first/final 输出确定。
+10 个 context 各通过五轮 IO 重绑定及同一 context 内原输入→全零→原输入
+检查。host 测试覆盖 4,718,592 个布局、权重乘法和 epilogue lane；默认及
+候选的最终源码通过 x86/Android/v81 编译。
+
+等待所有切片就绪的调度实验首轮触发 CDSP SSR，未保留在当前源码中，
+归档为 `round2-batch-wait-all.cpp`；新进程的正常路径随后恢复并完成上述
+测试。当前可选 BATCH_PHASES 路径只处理已就绪的 wave，不等待未就绪
+切片，但没有性能优势，也不推荐启用。不能据该失败推断具体硬件线程数。
+
+提取/导出使用实验目录的 `fuse_round2.py` 和 `export.py --round2`；
+`--round2-profile` 另输出每个 chunk 的阶段数据。`benchmark_round2.py`、
+`run_pair.py`、`validate_round2.py` 与 `validate_round2_workers4.py` 提供复现。
+阶段 Qtimer 记录为各进程末次执行的快照，包含插桩，跨 worker 的最大值
+不可相加。未测量硬件 DDR 流量。
+
+默认 `ChunkGDN.forward`、`llama.py` 与模型部署路径未接入该候选。
+原始逐轮数据、两种计时口径、精度检查及源码/库/context 哈希见
+[`round2-report.json`](../../../../../llama-output/qwen3_5-2b-mnn-fusion/round2-report.json)。
+
+### round2 完整图 1K 验证
+
+将上述数值一致的 4-worker/vector-weight 版本显式接入 24 层
+Qwen3.5-2B 完整图。18 层 GDN 的三角求解保持 leaf32；六层 FA 保持
+KV8；decode 保持 GdnPreparedHistory。AR128 替换 36 处 round2，
+AR256 替换 72 处，不启用提前给 K 加权的舍入变体。
+
+SM8850/v81、SDK2.51，冻结同一份 8K 校准权重和量化参数，不重新校准。
+名义上下文 1K，物理 cache 为 1152，输入 1024 token、强制生成 64 token。
+四个版本使用同一 runner 和同一算子库，分别预热后交替测试五轮，以下
+为中位数；模型加载时间不计入 prefill。
+
+| AR | 现有完整图 prefill | round2 完整图 prefill | 同 AR 吞吐提升 |
+| --- | --- | --- | --- |
+| 128 | 400 ms / 2560 tok/s | 391 ms / 2619 tok/s | 2.30% |
+| 256 | 550 ms / 1862 tok/s | 534 ms / 1918 tok/s | 3.00% |
+
+AR128 现有图范围 399–403 ms，新图 388–397 ms；AR256 分别为
+548–552 / 531–535 ms。每个 AR 的五轮配对都是 round2 更快。另一次
+仅 AR128 的五轮交替为 402→390 ms，支持收益方向，但不混合两轮数据。
+核心测试的 AR256 11% 收益在完整图中只有约 3% 的吞吐提升；AR256
+完整图本身还慢于 AR128，因此本轮最快候选为 AR128 + round2。
+AR256 整图的额外耗时尚未做逐算子定位，不能归因于 round2 核心。
+
+Decode 中位数：AR128 为 47.94→47.83 tok/s，AR256 为
+47.69→47.87 tok/s，没有稳定提升。四个版本的检索全部通过；同一 AR
+新旧版本强制生成 64 token 的文本一致，五轮输出确定，未做 PPL 测试。
+两种方法均为一个 QNN delegate、零 CPU kernel fallback。
+
+AR256 从冻结图重新展开四个 chunk64，检查了 880 个共享张量、
+2,319,499,896 字节，原有权重和量化 buffer 一致，仅
+gdn_prefill_positions 从 128 扩展为 256。配套 CPU 4bit embedding PTE
+只调整调用方分配的输入输出形状，packed weight/scales 哈希保持一致。
+
+实验目录为 `llama-output/qwen3_5-2b-mnn-fusion`，完整 PTE 分别位于
+`full-history-1k`、`full-round2-ar128-1k`、`full-control-ar256-1k`、
+`full-round2-ar256-1k`；匹配算子库为 `round2-workers4`。导出入口是
+`export_full.py --variant fa --history-state`，用 `--round2` 显式接入，
+`--prefill-ar 256` 选择 AR256。AR256 导出前需运行
+`retarget_prefill.py` 和 `prepare_embedding_ar256.py`。
+
+```bash
+source env.sh
+task_python=/home/hunter/anaconda3/envs/et_npu/bin/python
+FUSION_BUILD=round2-workers4 "$task_python" \
+  llama-output/qwen3_5-2b-mnn-fusion/export_full.py \
+  --variant fa --history-state --round2 --label full-round2-ar128-1k
+"$task_python" llama-output/qwen3_5-2b-mnn-fusion/benchmark_round2_full.py \
+  --repeats 5 --lengths 1024 --tag round2-full-reproduce
+```
+
+测试脚本在独立目录部署四份 PTE，核对设备哈希，结束后恢复实验算子库。
+默认 llama.py/ChunkGDN 路径未切换；直接运行候选 PTE 需要匹配的
+round2-workers4 库，AR256 另需匹配的 embedding PTE。
+
+完整结果、PTE 委派检查、模型与库哈希、逐轮结果、生成文本和恢复状态见
+[`round2-full-report.json`](../../../../../llama-output/qwen3_5-2b-mnn-fusion/round2-full-report.json)。
+
+### 完整图 decode 与质量复核
+
+在相同 24 层 Qwen3.5-2B、冻结量化参数和 AR128 round2 prefill 上，
+显式接入 18 处直接投影输入的 GdnPreparedCached，并启用
+DELTANET_U16_FIXED_DECODE。构建为 `round2-decode-final`，仍保留
+4-worker/vector-weight round2。图加载预计算只缓存常量参数；动态 IO
+地址每次执行查询。`fuse_projected.py` 支持完整图的 channels-last
+clone/permute 包装，并继续检查所有相关量化网格。
+
+SM8850/v81、SDK2.51，名义 1K、物理 cache 1152；896-token 输入后
+强制生成 256 token，五轮交替取中位数。使用普通性能 runner，质量评分
+驱动的额外计算不参与计时。
+
+| Decode 版本 | 吞吐 | QNN execute/step |
+| --- | --- | --- |
+| 上一版图与库，GdnPreparedHistory | 47.4513 tok/s | 20.9542 ms |
+| 上一版图 + AR1 特化新库 | 47.3986 tok/s | 20.9818 ms |
+| 新库 + 直接投影输入/GdnPreparedCached | 48.4115 tok/s | 20.5379 ms |
+
+新版吞吐提高约 2.02%，五轮配对均更快，仍未达到 55 tok/s。
+单独的 AR1 特化没有稳定性能收益。本轮 PTE 为
+`full-round2-cached-ar128-1k/hybrid_llama_qnn.pte`，两个方法均为一个
+QNN delegate、零 CPU kernel fallback。默认导出未启用该候选。
+
+质量使用固定 WikiText-2 test 前 4093 个 token，四个 1024-token 窗口、
+stride 1023。无 chat template、无额外 special token。AR1 从每个窗口的
+第一个 token 开始 teacher forcing，恰好评分 4092 个 next-token 目标。
+另一组固定前 128 token 为 prefill，只评分其后的 3584 个条件目标。
+两种 PPL 的目标集合不同，不能横向比较。
+
+| 指标 | 上一版量化 PTE | 仅 round2 prefill | 再接入新 decode |
+| --- | --- | --- | --- |
+| AR1 PPL，4092 个目标 | 15.497531 | 未重复测量 | 15.470219 |
+| 固定 128-token 前缀条件 PPL，3584 个目标 | 13.958712 | 13.958712 | 13.950013 |
+
+round2 prefill 的全部 3584 个逐步 logits 校验值、Top1、NLL 与上一版
+一致。新 decode 并非无损：AR1 Top1 一致率 97.4096%，最大逐 token
+NLL 差异 0.97965；固定前缀 Top1 一致率 97.4609%。四个窗口的首行
+完整 logits 均一致，后续轨迹存在差异。旧图配新库控制组在全部 4092
+个目标上 logits 校验值及 NLL 一致，将变化范围缩小到新增图融合路径，
+没有进一步区分直接投影输入与图加载预计算各自的数值影响。
+该小样本未观察到 PPL 退化，不能据此声称质量提升或代表完整测试集。
+
+独立的 `quality-driver` 在私有 decoder header overlay 中读取采样前的
+全词表 UInt16 logits，使用 FP64 logsumexp 等价计算并返回参考 token。
+每个后续 decode 的实际输入均核对为上一步参考 token；每个 case 的首行
+完整 logits 由 Python 独立复算 NLL。原始 runner/header 未修改。
+
+八组固定提示词的生成文本，上一版、仅 round2、新 decode 三版均一致。
+五个可严格判定的任务均为 3/5：三版都将 17×23 回答为 411，正确值
+为 391；三版都在要求纯 JSON 时添加代码围栏。翻译、回文 Python 函数
+和英文摘要样例已保存，但不视作通用能力 benchmark。已有错误没有被
+本次优化修复。
+
+复现入口为 `export_full.py --variant fa --history-state --round2
+--decode-cached --label full-round2-cached-ar128-1k`，需设置
+FUSION_BUILD=round2-decode-final。`benchmark_decode_full.py` 包含旧图旧库、
+旧图新库和新图新库的五轮对照。`build_quality_driver.py` 构建隔离评分
+runner，`run_quality.py` 执行固定 token 评分，`generation_quality.py`
+执行固定提示词；`decode_quality_report.py` 汇总结果。所有设备阶段均
+核对模型/库哈希，结束后恢复原实验库。
+
+逐轮性能、PPL 目标与 NLL、logits 对照、生成文本、PTE/库/驱动哈希见
+[`decode-quality-report.json`](../../../../../llama-output/qwen3_5-2b-mnn-fusion/decode-quality-report.json)。

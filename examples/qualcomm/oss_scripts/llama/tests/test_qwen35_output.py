@@ -58,6 +58,19 @@ def test_exact_scope_uses_logical_context_control_argument():
     assert use_split_qwen35_output(*values)
 
 
+def test_online_attention_keeps_output_split():
+    values = scoped_inputs()
+    values[3].meta.update(
+        get_attention_valid=True,
+        get_attention_cache_capacity=8192,
+        get_max_context_len=8192,
+        get_max_seq_len=8192,
+    )
+    assert use_split_qwen35_output(*values)
+    values[3].meta["get_attention_cache_capacity"] = 4096
+    assert not use_split_qwen35_output(*values)
+
+
 @pytest.mark.parametrize(
     "index,changes",
     [
@@ -249,13 +262,21 @@ def test_split_rejects_unsafe_graphs(kind):
         )
 
 
-def test_qwen35_wrapper_transforms_both_methods_before_original_lowering():
+@pytest.mark.parametrize("mapped", [False, True])
+def test_qwen35_wrapper_transforms_both_methods_before_original_lowering(mapped):
     from executorch.examples.qualcomm.oss_scripts.llama.decoder_constants import (
         TEXT_DECODER,
     )
     from executorch.examples.qualcomm.oss_scripts.llama.wrappers import llm_wrappers
 
     control, data, config, decode, prefill = scoped_inputs()
+    if mapped:
+        decode.meta.update(
+            get_attention_valid=True,
+            get_attention_cache_capacity=8192,
+            get_max_context_len=8192,
+            get_max_seq_len=8192,
+        )
     decode.decoder, _ = frozen_projection(1)
     prefill.decoder, _ = frozen_projection(128)
     wrapper = llm_wrappers.Qwen35TextDecoder.__new__(llm_wrappers.Qwen35TextDecoder)
@@ -280,10 +301,11 @@ def test_qwen35_wrapper_transforms_both_methods_before_original_lowering():
     def split(module):
         return split_qwen35_output(module, 32, 83, 32)
 
-    with patch.object(
-        llm_wrappers, "split_qwen35_output", side_effect=split
-    ) as transform, patch.object(
-        llm_wrappers.HybridTextDecoder, "_compile_models", lower
+    with (
+        patch.object(
+            llm_wrappers, "split_qwen35_output", side_effect=split
+        ) as transform,
+        patch.object(llm_wrappers.HybridTextDecoder, "_compile_models", lower),
     ):
         wrapper._compile_models(request)
     assert transform.call_count == 2

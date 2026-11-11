@@ -43,6 +43,8 @@ struct Metrics {
   double router_io_overlap = 0;
   double attention_io_overlap = 0;
   double gdn_attention = 0, full_attention = 0;
+  double router_input_copy = 0;
+  uint64_t router_input_copy_bytes = 0;
 };
 
 // 完整 40 层 AR128 调度；多块计划逐层处理整段输入，复用当前层的临时权重。
@@ -88,7 +90,7 @@ struct PrefillSession {
   std::vector<std::shared_ptr<Buffer>> pipeline_banks;
   std::string startup_policy = getenv("STARTUP_EXPERT_PREFETCH")
       ? getenv("STARTUP_EXPERT_PREFETCH")
-      : "none";
+      : async_io ? "overlap" : "none";
   bool startup_seed_pending = false;
   // Positions are absolute; workspace and route-table indices use their offset
   // from sequence_start.
@@ -121,7 +123,8 @@ struct PrefillSession {
   std::vector<uint64_t> sequence_stamps;
 
   explicit PrefillSession(
-      const std::string& path, int plan_tokens = 128, bool resident_chat = false);
+      const std::string& path, int plan_tokens = 128, bool resident_chat = false,
+      int layer_count = 40);
 
   void prepare_layer_memo(int layer);
 

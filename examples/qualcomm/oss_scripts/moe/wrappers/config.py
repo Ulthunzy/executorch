@@ -275,11 +275,14 @@ def load_export_config(
     prefill_gdn_core = data.get("prefill_gdn_core", "chunked_mixed_fp16")
     if prefill_gdn_core not in (
         "chunked_mixed_fp16",
+        "chunk128_hmx",
         "custom_fp16",
         "custom_fp32",
         "custom_u16",
     ):
         raise ValueError("Unsupported prefill_gdn_core")
+    if prefill_gdn_core == "chunk128_hmx" and settings.target.soc_model != "SM8850":
+        raise ValueError("Chunk128 HMX requires SM8850 (HTP v81)")
     gdn_state_vtcm = data.get("gdn_state_vtcm", False)
     if type(gdn_state_vtcm) is not bool:
         raise ValueError("gdn_state_vtcm must be a JSON boolean")
@@ -287,7 +290,7 @@ def load_export_config(
         raise ValueError("GDN VTCM layout requires a UINT16 core")
     if settings.cache.gdn_state_dtype == "float16" and (
         source != "calibrated"
-        or prefill_gdn_core != "chunked_mixed_fp16"
+        or prefill_gdn_core not in ("chunked_mixed_fp16", "chunk128_hmx")
         or gdn_state_vtcm
     ):
         raise ValueError(

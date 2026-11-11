@@ -13,6 +13,7 @@
 #include <executorch/runtime/core/exec_aten/util/scalar_type_util.h>
 #include <executorch/test/utils/DeathTest.h>
 
+#include <cstring>
 #include <gtest/gtest.h>
 
 using namespace ::testing;
@@ -23,6 +24,63 @@ using torch::executor::native::quantized_embedding_4bit_dtype_out;
 using torch::executor::native::quantized_embedding_4bit_out;
 
 using torch::executor::testing::TensorFactory;
+
+TEST(OpQuantizedEmbedding4bTest, FloatGroupedEmbeddingPackingAndScales) {
+  et_pal_init();
+  TensorFactory<ScalarType::Byte> tfb;
+  TensorFactory<ScalarType::Float> tf;
+  TensorFactory<ScalarType::Long> tfl;
+  TensorFactory<ScalarType::Int> tfi;
+  const std::vector<float> scales = {
+      0.1f, -0.37f, 1.234567f, 0.0f, -0.0f, 0.000031f, 2.5f, 0.13f, -1.0f};
+  const int rows[] = {2, 0, 2, 1};
+  for (int group_size : {32, 64, 48}) {
+    const int dim = group_size * 3;
+    std::vector<uint8_t> packed(3 * dim / 2);
+    for (size_t i = 0; i < packed.size(); ++i) {
+      packed[i] = static_cast<uint8_t>(((i % 16) << 4) | ((i * 7 + 3) % 16));
+    }
+    Tensor weight = tfb.make({3, dim / 2}, packed);
+    Tensor weight_scales = tf.make({3, 3}, scales);
+    std::vector<float> expected(4 * dim);
+    for (int i = 0; i < 4; ++i) {
+      for (int j = 0; j < dim; ++j) {
+        const uint8_t code = packed[rows[i] * dim / 2 + j / 2];
+        const int value = (j % 2 == 0 ? code >> 4 : code & 15) - 8;
+        expected[i * dim + j] =
+            (static_cast<float>(value) - 0.0f) *
+            scales[rows[i] * 3 + j / group_size];
+      }
+    }
+    for (const Tensor& indices :
+         {tfl.make({4}, {2, 0, 2, 1}), tfi.make({4}, {2, 0, 2, 1})}) {
+      Tensor out = tf.zeros({4, dim});
+      quantized_embedding_4bit_out(
+          weight, weight_scales, std::nullopt, -8, 7, indices, out);
+      EXPECT_EQ(
+          std::memcmp(
+              out.const_data_ptr<float>(),
+              expected.data(),
+              expected.size() * sizeof(float)),
+          0);
+      quantized_embedding_4bit_dtype_out(
+          weight,
+          weight_scales,
+          std::nullopt,
+          -8,
+          7,
+          indices,
+          ScalarType::Float,
+          out);
+      EXPECT_EQ(
+          std::memcmp(
+              out.const_data_ptr<float>(),
+              expected.data(),
+              expected.size() * sizeof(float)),
+          0);
+    }
+  }
+}
 
 TEST(OpQuantizedEmbedding4bTest, TestGroupWiseQuantizedEmbedding) {
   et_pal_init();

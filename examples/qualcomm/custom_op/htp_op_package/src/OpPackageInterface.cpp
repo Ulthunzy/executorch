@@ -1,31 +1,23 @@
 //==============================================================================
-// Shared HTP package interface; the legacy package name preserves PTE compatibility.
+// Shared HTP package interface; the legacy package name preserves PTE
+// compatibility.
 //==============================================================================
 
 #include "HTP/QnnHtpCommon.h"
 #include "QnnOpPackage.h"
 #include "QnnSdkBuildId.h"
 
-#include <array>
-#include <string>
+#include "OpDefinitions.h"
+#include "OpRegistration.h"
+
+#include <cstring>
 
 #define STRINGIZE_DETAIL(X) #X
 #define STRINGIZE(X) STRINGIZE_DETAIL(X)
 #define THIS_PKG_NAME_STR STRINGIZE(THIS_PKG_NAME)
 
 static constexpr auto sg_packageName = THIS_PKG_NAME_STR;
-static std::array<const char*, 10> sg_opNames{{
-    "DeltaNetCore",
-    "DeltaNetCoreStream",
-    "DeltaNetCoreVtcm",
-    "DeltaNetCoreFp16Accum",
-    "DeltaNetCoreFp16State",
-    "DeltaNetCoreValid",
-    "DeltaNetCoreValidVtcm",
-    "AttentionValid",
-    "AttentionInitialize",
-    "AttentionExecute",
-}};
+static auto sg_opNames = htp_op_package::operationNames();
 
 static Qnn_ApiVersion_t sg_sdkApiVersion = QNN_HTP_API_VERSION_INIT;
 static QnnOpPackage_Info_t sg_packageInfo = QNN_OP_PACKAGE_INFO_INIT;
@@ -102,41 +94,22 @@ Qnn_ErrorHandle_t DeltaNetOpPackageLogTerminate() {
   return QNN_SUCCESS;
 }
 
-Qnn_ErrorHandle_t DeltaNetOpPackageValidateOpConfig(Qnn_OpConfig_t opConfig) {
-  if (std::string(sg_packageName) != opConfig.v1.packageName) {
+Qnn_ErrorHandle_t DeltaNetOpPackageValidateOpConfig(Qnn_OpConfig_t config) {
+  if (config.version != QNN_OPCONFIG_VERSION_1 || !config.v1.packageName ||
+      !config.v1.typeName ||
+      std::strcmp(sg_packageName, config.v1.packageName) ||
+      config.v1.numOfParams != 0) {
     return QNN_OP_PACKAGE_ERROR_VALIDATION_FAILURE;
   }
-
-  const std::string type(opConfig.v1.typeName);
-  if (type == "AttentionValid" || type == "AttentionInitialize" ||
-      type == "AttentionExecute") {
-    const unsigned inputs = type == "AttentionExecute" ? 9 : 7;
-    const unsigned outputs = type == "AttentionInitialize" ? 2 : 1;
-    return opConfig.v1.numOfParams == 0 && opConfig.v1.numOfInputs == inputs &&
-            opConfig.v1.numOfOutputs == outputs
-        ? QNN_SUCCESS
-        : QNN_OP_PACKAGE_ERROR_VALIDATION_FAILURE;
-  }
-  if (std::string(opConfig.v1.typeName) == "DeltaNetCoreValid" ||
-      std::string(opConfig.v1.typeName) == "DeltaNetCoreValidVtcm") {
-    if (opConfig.v1.numOfParams != 0 || opConfig.v1.numOfInputs != 7 ||
-        opConfig.v1.numOfOutputs != 2) {
-      return QNN_OP_PACKAGE_ERROR_VALIDATION_FAILURE;
+  for (const auto& op : htp_op_package::operations) {
+    if (std::strcmp(config.v1.typeName, op.name) == 0) {
+      return config.v1.numOfInputs == op.inputs &&
+              config.v1.numOfOutputs == op.outputs
+          ? QNN_SUCCESS
+          : QNN_OP_PACKAGE_ERROR_VALIDATION_FAILURE;
     }
-  } else if (std::string(opConfig.v1.typeName) == "DeltaNetCore" ||
-      std::string(opConfig.v1.typeName) == "DeltaNetCoreStream" ||
-      std::string(opConfig.v1.typeName) == "DeltaNetCoreVtcm" ||
-      std::string(opConfig.v1.typeName) == "DeltaNetCoreFp16Accum" ||
-      std::string(opConfig.v1.typeName) == "DeltaNetCoreFp16State") {
-    if (opConfig.v1.numOfParams != 0 || opConfig.v1.numOfInputs != 6 ||
-        opConfig.v1.numOfOutputs != 2) {
-      return QNN_OP_PACKAGE_ERROR_VALIDATION_FAILURE;
-    }
-  } else {
-    return QNN_OP_PACKAGE_ERROR_VALIDATION_FAILURE;
   }
-
-  return QNN_SUCCESS;
+  return QNN_OP_PACKAGE_ERROR_VALIDATION_FAILURE;
 }
 
 extern "C" void release_attention_cache_maps();
@@ -151,9 +124,6 @@ Qnn_ErrorHandle_t DeltaNetOpPackageTerminate() {
   sg_packageInitialized = false;
   return QNN_SUCCESS;
 }
-
-void register_deltanet_qhpi_ops();
-void register_attention_qhpi_ops();
 
 #ifdef __cplusplus
 extern "C" {
@@ -178,6 +148,8 @@ Qnn_ErrorHandle_t DeltaNetOpPackageInterfaceProvider(
 }
 
 const char* qhpi_init() {
+  register_chunk_ops();
+  register_chunk_state_qhpi_ops();
   register_deltanet_qhpi_ops();
   register_attention_qhpi_ops();
   return THIS_PKG_NAME_STR;

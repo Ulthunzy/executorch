@@ -87,6 +87,7 @@ def main(argv=None):
             )
     if len(prefill_cores) != 1 or not prefill_cores <= {
         "chunked_mixed_fp16",
+        "chunk128_hmx",
         "custom_fp16",
         "custom_fp32",
         "custom_u16",
@@ -94,6 +95,8 @@ def main(argv=None):
         parser.error(
             "Shared groups must select one supported prefill GDN implementation"
         )
+    if "chunk128_hmx" in prefill_cores and settings.target.soc_model != "SM8850":
+        parser.error("Chunk128 HMX requires SM8850 (HTP v81)")
     if len(gdn_layouts) != 1:
         parser.error("Shared groups must select one GDN state layout")
     from executorch.exir._serialize._program import (

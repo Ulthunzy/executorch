@@ -13,10 +13,16 @@
 namespace attention {
 
 struct Inputs {
-  const uint16_t *query, *key, *new_key, *value, *new_value;
+  const uint16_t* query;
+  const void *key, *new_key, *value, *new_value;
   const float* grids;
   Quantization query_quant, new_key_quant, new_value_quant, output_quant;
 };
+
+inline unsigned cache_code(const void* data, size_t index, unsigned bytes) {
+  return bytes == 1 ? static_cast<const uint8_t*>(data)[index]
+                    : static_cast<const uint16_t*>(data)[index];
+}
 
 // Portable FP32 fallback. Work is one output vector and a bounded score tile;
 // neither allocation nor iteration depends on unused cache capacity.
@@ -57,13 +63,14 @@ inline void reference_row(
       float dot = 0;
       for (unsigned d = 0; d < g.dimension; ++d) {
         const float k = logical < c.history
-            ? kq.dequantize(
-                  in.key
-                      [(kv * g.dimension + d) * c.capacity + c.first + logical])
-            : in.new_key_quant.dequantize(
-                  in.new_key
-                      [(kv * g.dimension + d) * g.queries + logical -
-                       c.history]);
+            ? kq.dequantize(cache_code(
+                  in.key,
+                  (kv * g.dimension + d) * c.capacity + c.first + logical,
+                  c.element_bytes))
+            : in.new_key_quant.dequantize(cache_code(
+                  in.new_key,
+                  (kv * g.dimension + d) * g.queries + logical - c.history,
+                  c.element_bytes));
         dot += in.query_quant.dequantize(in.query[query_index + d]) * k;
       }
       dot = dot_quant.dequantize(dot_quant.quantize(dot));
@@ -82,13 +89,14 @@ inline void reference_row(
       normalizer += probability;
       for (unsigned d = 0; d < g.dimension; ++d) {
         const float v = logical < c.history
-            ? vq.dequantize(
-                  in.value
-                      [(kv * c.capacity + c.first + logical) * g.dimension + d])
-            : in.new_value_quant.dequantize(
-                  in.new_value
-                      [(kv * g.queries + logical - c.history) * g.dimension +
-                       d]);
+            ? vq.dequantize(cache_code(
+                  in.value,
+                  (kv * c.capacity + c.first + logical) * g.dimension + d,
+                  c.element_bytes))
+            : in.new_value_quant.dequantize(cache_code(
+                  in.new_value,
+                  (kv * g.queries + logical - c.history) * g.dimension + d,
+                  c.element_bytes));
         work[d] += probability * v;
       }
     }

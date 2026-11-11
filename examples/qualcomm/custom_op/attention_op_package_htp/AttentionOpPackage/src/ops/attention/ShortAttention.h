@@ -11,6 +11,7 @@ static void short_attention(
     const uint8_t* kpack,
     const uint8_t* vpack,
     unsigned keys,
+    unsigned kv_rows,
     unsigned slice,
     uint8_t* work,
     QHPI_Quant_Parameters qq,

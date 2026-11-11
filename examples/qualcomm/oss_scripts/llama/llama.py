@@ -724,7 +724,6 @@ def _build_parser():
         default=str(DEFAULT_OP_PACKAGE_DIR),
         help="DeltaNet VTCM op package source directory for Qwen3.5.",
     )
-
     parser.add_argument(
         "--checkpoint",
         help="Pass llama checkpoint.",

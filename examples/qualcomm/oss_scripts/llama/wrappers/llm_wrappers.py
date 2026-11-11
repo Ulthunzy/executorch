@@ -18,6 +18,7 @@ import time
 import types
 
 from functools import partial
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import torch
@@ -1366,6 +1367,8 @@ class TextDecoder(Component):
                 if not (isinstance(user.target, str) and user.target == "_guards_fn")
             ]
             node_shape = tuple(node.meta["val"].size())
+            if node.meta["val"].dtype == torch.int32 and node_shape == (1, 1, 1, 3):
+                return None
             if (
                 _is_qwen35_decoder_model(self.control_args.decoder_model)
                 and node_shape in self.cache_io_shape
@@ -2371,6 +2374,18 @@ class Qwen35TextDecoder(HybridTextDecoder):
         )
         self.decode = None
         self.prefill = None
+        self.attention_cache = {}
+        self.decode_gate_tables = []
+        layer_types = self.calibration_prefill.model_args.layer_types
+        self.fused_gdn = (
+            control_args.soc_model == "SM8850" and "linear_attention" in layer_types
+        )
+        self.online_attention = (
+            control_args.soc_model == "SM8850"
+            and "full_attention" in layer_types
+            and "sliding_attention" not in layer_types
+            and not control_args.use_attention_sink
+        )
 
     def _compile_models(self, request):
         if use_split_qwen35_output(
@@ -2489,9 +2504,10 @@ class Qwen35TextDecoder(HybridTextDecoder):
         attention_conversions = {}
         for model in (self.decode, self.prefill):
             model._align_kv_cache_io_qparams()
-            _, attention_conversions[model.mode.name] = optimize_grouped_attention(
-                model.decoder
-            )
+            if not self.online_attention:
+                _, attention_conversions[model.mode.name] = optimize_grouped_attention(
+                    model.decoder
+                )
             model._align_kv_cache_io_qparams()
             model.decoder = torch.export.export(
                 model.decoder, model.export_input, strict=False
@@ -2531,14 +2547,16 @@ class Qwen35TextDecoder(HybridTextDecoder):
         report.update(
             calibration_ar=128,
             prefill_ar=128 if self.prefill.decoder is not None else None,
-            chunk_size=64 if self.prefill.decoder is not None else None,
-            inverse_leaf=8 if self.prefill.decoder is not None else None,
+            prefill_gdn=self.prefill_gdn_report(),
             cache_dtype=(
                 "attention:uint8; gdn_recurrent/conv:uint16"
                 if base.quant_recipe.get_kv_io_bit_width() == 8
                 else "uint16"
             ),
             attention_cache_conversions=attention_conversions,
+            attention_core="valid_online" if self.online_attention else "sdk",
+            decode_gate_tables=self.decode_gate_tables,
+            attention_cache=self.attention_cache,
             language_precision="K/z W8; other Linear W4 group32; out_proj GPTQ",
             mha_to_sha=False,
             embedding_quantize=(
@@ -2559,6 +2577,19 @@ class Qwen35TextDecoder(HybridTextDecoder):
             json.dump(report, stream, indent=2)
         self.calibration_prefill = None
         _release_memory()
+
+    def prefill_gdn_report(self):
+        if self.prefill.decoder is None:
+            return None
+        targets = [str(n.target) for n in self.prefill.decoder.graph.nodes]
+        fused = targets.count("qnn_custom_ops.chunk.default")
+        return dict(
+            core="Chunk" if fused else "portable",
+            chunk_size=128 if fused else 64,
+            inverse_leaf=32 if fused else 8,
+            fused_calls=fused,
+            state_update="fused" if self.fused_gdn else "sdk",
+        )
 
     def _prepare_generation_graphs(self, base, inputs):
         from executorch.examples.qualcomm.oss_scripts.llama.gdn import (
@@ -2598,15 +2629,77 @@ class Qwen35TextDecoder(HybridTextDecoder):
                 if has_full_attention
                 else inputs[1].shape[-1]
             )
-            if has_full_attention:
+            if has_full_attention and not self.online_attention:
                 trim_prefill_capacity(prefill, inputs, capacity, sliding_layers)
-            replace_prefill_cores(prefill)
+            replace_prefill_cores(
+                prefill,
+                fused_state_update=self.fused_gdn,
+                fused_chunk=self.fused_gdn,
+            )
             self.prefill.decoder = torch.export.export(
                 prefill, inputs, strict=False
             ).module()
             self.prefill.export_input = inputs
             self.decode.meta["get_prefill_max_past"] = capacity - 128
             models = ((self.decode, 1), (self.prefill, 128))
+
+        if self.fused_gdn:
+            from executorch.examples.qualcomm.custom_op.deltanet_support.decode_gate import (
+                fuse_decode_gates,
+            )
+            from executorch.examples.qualcomm.custom_op.deltanet_support.gate_lut import (
+                prepare_gate_tables,
+            )
+
+            directory = prepare_gate_tables(
+                self.decode.decoder,
+                Path(self.control_args.artifact) / "decode_gate_tables",
+                self.control_args.soc_model,
+                device=self.control_args.device,
+                host=self.control_args.host,
+            )
+            self.decode_gate_tables = fuse_decode_gates(self.decode.decoder, directory)
+            self.decode.decoder = torch.export.export(
+                self.decode.decoder, self.decode.export_input, strict=False
+            ).module()
+            remove_export_checks(self.decode.decoder)
+
+        if self.online_attention:
+            from executorch.examples.qualcomm.custom_op.attention_support.graph import (
+                replace_attention_layers,
+            )
+
+            self.attention_cache = {}
+            for model, _ in models:
+                model.decoder, model.export_input, records = replace_attention_layers(
+                    model.decoder, model.export_input, self.control_args.max_seq_len
+                )
+                model.meta["get_attention_valid"] = True
+                model.meta["get_attention_cache_capacity"] = (
+                    self.control_args.max_seq_len
+                )
+                model.meta["get_max_seq_len"] = self.control_args.max_seq_len
+                model.meta["get_max_context_len"] = self.control_args.max_seq_len
+                if model is self.decode and self.prefill.decoder is not None:
+                    model.meta["get_prefill_position_capacity"] = base.meta[
+                        "get_max_context_len"
+                    ]
+                    model.meta["get_prefill_max_past"] = (
+                        model.meta["get_prefill_position_capacity"] - 128
+                    )
+                self.attention_cache[model.mode.name] = records
+                logging.info(
+                    "Qwen3.5 %s: replaced %d full attention cores",
+                    model.mode.name,
+                    len(records),
+                )
+            if self.prefill.decoder is not None:
+                prefill_records = self.attention_cache[Mode.PREFILL.name]
+                decode_records = self.attention_cache[Mode.DECODE.name]
+                if prefill_records != decode_records:
+                    raise ValueError(
+                        "Mapped attention requires shared prefill/decode cache encodings"
+                    )
 
         for model, ar in models:
             embedding_input = (base.tok_embedding_export_input[0][:, :ar].clone(),)

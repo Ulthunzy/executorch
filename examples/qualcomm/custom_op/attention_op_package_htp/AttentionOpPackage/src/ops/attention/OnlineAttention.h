@@ -7,11 +7,13 @@
 static uint32_t online_prefill(
     QHPI_RuntimeHandle* handle,
     QHPI_Tensor** out,
-    const QHPI_Tensor* const* in) {
+    const QHPI_Tensor* const* in,
+    unsigned kv_rows) {
   const unsigned slice = qhpi_slice_number(handle),
                  workers = qhpi_num_slices(handle);
   const unsigned qheads = qhpi_tensor_shape(in[1]).dims[1],
                  kvheads = qhpi_tensor_shape(in[3]).dims[1],
+                 groups = qheads / kvheads,
                  kv_bytes = kvheads * kv_rows * 256 * 2;
   auto* work = static_cast<uint8_t*>(qhpi_tensor_raw_data(in[0]));
   auto& queue = *reinterpret_cast<attention_hmx::Queue*>(work);
@@ -51,8 +53,8 @@ static uint32_t online_prefill(
 
   for (unsigned head = slice; head < (qrows == 1 ? kvheads : qheads);
        head += workers) {
-    const unsigned kv = qrows == 1 ? head : head / 8;
-    const unsigned queries = qrows == 1 ? 8u : valid;
+    const unsigned kv = qrows == 1 ? head : head / groups;
+    const unsigned queries = qrows == 1 ? groups : valid;
     for (unsigned begin = 0; begin < queries; begin += rows) {
       const unsigned actual = std::min(rows, queries - begin);
       for (unsigned r = 0; r < (qrows == 1 ? 8u : rows); ++r) {
@@ -61,7 +63,9 @@ static uint32_t online_prefill(
         if (r < actual)
           to_half(
               qa + r * 256,
-              q + (qrows == 1 ? head * 8 + r : head * qrows + begin + r) * 256,
+              q +
+                  (qrows == 1 ? head * groups + r : head * qrows + begin + r) *
+                      256,
               256,
               qq);
         else
@@ -90,7 +94,8 @@ static uint32_t online_prefill(
             to_half(
                 qa + r * 256,
                 q +
-                    (qrows == 1 ? head * 8 + r : head * qrows + begin + r) *
+                    (qrows == 1 ? head * groups + r
+                                : head * qrows + begin + r) *
                         256,
                 256,
                 qq);
@@ -384,7 +389,9 @@ static uint32_t online_prefill(
                   inverse),
               hvxSplatF32(oq.zero_offset + .5f));
           *reinterpret_cast<HVX_Vector*>(
-              y + (qrows == 1 ? head * 8 + r : head * qrows + begin + r) * 256 +
+              y +
+              (qrows == 1 ? head * groups + r : head * qrows + begin + r) *
+                  256 +
               c) =
               Q6_Vuh_vpack_VwVw_sat(Q6_Vw_equals_Vsf(b), Q6_Vw_equals_Vsf(a));
         }
